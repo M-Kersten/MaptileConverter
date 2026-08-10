@@ -498,6 +498,78 @@ class TestImagery(unittest.TestCase):
         self.assertFalse(looks_like_xml(b"\xff\xd8\xff\xe0\x00\x10JFIF"))
 
 
+class TestServiceFailures(unittest.TestCase):
+    """A dead service should be cheap to discover and obvious to read."""
+
+    def test_connect_is_bounded_separately_from_read(self):
+        """One shared timeout makes a dead host cost the whole read budget."""
+        from src.http_util import CONNECT_TIMEOUT_S
+
+        self.assertLessEqual(CONNECT_TIMEOUT_S, 15.0)
+        # At the configured 180 s read budget, four attempts against a host
+        # that is not listening must not run into the minutes.
+        worst_case = 4 * CONNECT_TIMEOUT_S + (2 + 4 + 8)
+        self.assertLess(worst_case, 60.0)
+
+    def test_unreachable_is_told_apart_from_a_refusal(self):
+        import requests
+
+        from src.http_util import is_unreachable
+
+        self.assertTrue(is_unreachable(requests.ConnectionError("boom")))
+        self.assertTrue(is_unreachable(requests.ConnectTimeout("boom")))
+        # A refusal reached a server, so it is a different kind of problem.
+        self.assertFalse(is_unreachable(requests.HTTPError("400")))
+        self.assertFalse(is_unreachable(ValueError("nope")))
+
+    def test_error_text_is_readable(self):
+        from src.http_util import short_error
+
+        raw = (
+            "HTTPSConnectionPool(host='api.3dbag.nl', port=443): Max retries "
+            "exceeded with url: /collections/pand/items (Caused by "
+            "ConnectTimeoutError(<HTTPSConnection object at 0x10a41c690>, "
+            "'Connection to api.3dbag.nl timed out. (connect timeout=180.0)'))"
+        )
+        self.assertEqual(short_error(Exception(raw)), "connection timed out")
+        self.assertEqual(
+            short_error(Exception("HTTPSConnectionPool(...): Read timed out.")),
+            "connected, but the server never replied",
+        )
+        self.assertEqual(
+            short_error(Exception("Connection reset by peer")),
+            "connection reset by the server",
+        )
+        # Anything unrecognised still comes through, just bounded.
+        self.assertLess(len(short_error(Exception("x" * 500))), 165)
+
+    def test_host_is_extracted_for_the_message(self):
+        from src.http_util import host_of
+
+        self.assertEqual(host_of("https://api.3dbag.nl/collections/pand"), "api.3dbag.nl")
+
+    def test_preflight_reports_every_service_that_is_down(self):
+        from src import http_util
+
+        original = http_util.check_reachable
+        try:
+            http_util.check_reachable = lambda url, timeout=8.0: (
+                ("3dbag" not in url), "connection timed out"
+            )
+            down = http_util.preflight(
+                {
+                    "buildings (3DBAG)": "https://api.3dbag.nl/collections/pand/items",
+                    "AHN terrain (PDOK)": "https://service.pdok.nl/rws/ahn/wcs/v1_0",
+                }
+            )
+        finally:
+            http_util.check_reachable = original
+
+        self.assertEqual(len(down), 1)
+        self.assertIn("api.3dbag.nl", down[0])
+        self.assertIn("buildings (3DBAG)", down[0])
+
+
 class TestFacade(unittest.TestCase):
     def test_tile_wraps_seamlessly(self):
         """A wall repeats the tile, so opposite edges have to match."""

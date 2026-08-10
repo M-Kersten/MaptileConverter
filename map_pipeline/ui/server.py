@@ -605,6 +605,50 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"areas": list_areas()})
             return
 
+        if route == "/api/health":
+            # Checked here so a service outage is visible before committing to
+            # a run, rather than after several minutes of work.
+            sys.path.insert(0, str(REPO_ROOT))
+            from src.config import DEFAULTS
+            from src.http_util import check_reachable, host_of
+
+            services = {
+                "AHN terrain": DEFAULTS["terrain"]["wcs_url"],
+                "aerial imagery": DEFAULTS["aerial"]["wms_url"],
+                "3DBAG buildings": DEFAULTS["buildings"]["api_url"],
+                "BGT": DEFAULTS["trees"]["api_url"],
+                "BAG": "https://service.pdok.nl/lv/bag/wfs/v2_0",
+            }
+
+            results = {}
+            lock = threading.Lock()
+
+            def probe(label: str, url: str) -> None:
+                ok, detail = check_reachable(url, timeout=6.0)
+                with lock:
+                    results[label] = {
+                        "ok": ok,
+                        "detail": detail,
+                        "host": host_of(url),
+                    }
+
+            threads = [
+                threading.Thread(target=probe, args=(label, url), daemon=True)
+                for label, url in services.items()
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=12.0)
+
+            self.send_json(
+                {
+                    "services": results,
+                    "down": sorted(k for k, v in results.items() if not v["ok"]),
+                }
+            )
+            return
+
         if route == "/api/estimate":
             def flag(name: str, default: bool = True) -> bool:
                 raw = (query.get(name) or [str(default).lower()])[0]

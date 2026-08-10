@@ -941,6 +941,22 @@ function showResult(area) {
   $("out").innerHTML = parts.join("");
 }
 
+/* ---------- service health ---------- */
+async function checkServices() {
+  try {
+    const r = await fetch("/api/health");
+    const d = await r.json();
+    if (!d.down || !d.down.length) { $("banner").innerHTML = ""; return; }
+    const detail = d.down
+      .map(k => `${escapeHtml(k)} (${escapeHtml(d.services[k].host)}: ${escapeHtml(d.services[k].detail)})`)
+      .join("<br>");
+    $("banner").innerHTML =
+      `<div class="err"><b>Unreachable right now:</b><br>${detail}<br><br>` +
+      `These are national open-data services, so this is normally an outage at ` +
+      `their end. A build needs them, so it will fail until they are back.</div>`;
+  } catch { /* the page is still usable without this */ }
+}
+
 /* ---------- start ---------- */
 fitToSelection();
 updateBboxInfo();
@@ -948,6 +964,7 @@ updateBboxInfo();
 // their markup defaults and can disagree with the preset shown next to them.
 applyPreset($("preset").value);
 refreshEstimate();
+checkServices();
 
 probeTileSource().then(source => {
   if (source === tileSource) return;

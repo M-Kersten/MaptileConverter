@@ -36,6 +36,7 @@ from src.export import (  # noqa: E402
     write_metadata,
     write_scene_description,
 )
+from src.http_util import preflight  # noqa: E402
 from src.facade import (  # noqa: E402
     generate_facade_textures,
     generate_furniture_texture,
@@ -279,6 +280,32 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     for warning in config.warnings:
         LOG.warning("  %s", warning)
 
+    if not args.skip_preflight:
+        # Cheaper to ask now than to find out at stage five.
+        LOG.info("checking the services this run needs")
+        services = {
+            "AHN terrain (PDOK)": str(config.terrain["wcs_url"]),
+            "aerial imagery (PDOK)": str(config.aerial["wms_url"]),
+            "buildings (3DBAG)": str(config.buildings["api_url"]),
+        }
+        if config.trees["enabled"] or config.surfaces["water"] or (
+            config.surfaces["land_cover"] or config.furniture["enabled"]
+        ):
+            services["BGT (PDOK)"] = str(config.trees["api_url"])
+        if config.usage["enabled"]:
+            services["BAG (PDOK)"] = "https://service.pdok.nl/lv/bag/wfs/v2_0"
+
+        down = preflight(services)
+        if down:
+            raise SystemExit(
+                "cannot start: "
+                + "; ".join(down)
+                + ". These are national open-data services, so this is normally "
+                "an outage at their end. Check https://www.pdok.nl and "
+                "https://3dbag.nl, and try again later. Run with "
+                "--skip-preflight to attempt it anyway."
+            )
+
     want_trees = bool(config.trees["enabled"])
     want_surfaces = bool(config.surfaces["water"] or config.surfaces["land_cover"])
     want_furniture = bool(config.furniture["enabled"])
@@ -509,6 +536,11 @@ def main(argv: list[str] | None = None) -> int:
         "--preview",
         action="store_true",
         help="also render top-down, oblique and street views of the result",
+    )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="do not check the data services are reachable before starting",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
