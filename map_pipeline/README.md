@@ -38,6 +38,22 @@ Open <http://127.0.0.1:8765>. Search for a place or click the map, set the side
 length, press **Build model**, and watch the log. When it finishes you get the
 check results, the preview renders and download links.
 
+The Build button carries a time estimate that updates as you change settings,
+and hovering it breaks the figure down by stage. A progress bar then follows the
+run stage by stage — the pipeline already announces every stage as
+`Step N/M`, so progress needs no extra protocol between the two.
+
+Treat the estimate as a rough figure. It comes from a cost model calibrated on
+measured runs over Utrecht, within about 15% there, but the largest term is the
+3DBAG fetch and that varies with how busy their servers are. Every run records
+what it actually cost to `work/<area>/timings.json`, and the estimate rescales
+itself from those, so it converges on the machine it is running on rather than
+the one it was calibrated on. Failed and partial runs are left out of that.
+
+Rough costs for a 1 km² area, previews included: Draft about 3 minutes,
+Standard about 7, High about 10, Maximum about 15. Previews alone are over half
+of that, so turning them off roughly halves the wait.
+
 The map works directly in RD New, so the square you position *is* the bbox that
 gets built — no reprojection anywhere in the page. It is plain HTML with no
 JavaScript dependencies, and the server is standard library only.

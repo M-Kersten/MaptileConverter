@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -47,13 +48,140 @@ TILE_CACHE_MAX = 400
 TILE_CACHE_LOCK = threading.Lock()
 
 
+# Cost model for the run-time estimate. Each stage costs a constant, plus a
+# rate per square kilometre, plus a rate per aerial megapixel. The numbers come
+# from measured runs over Utrecht: a 1 km area at 4096 px takes about 220 s
+# without previews and about 470 s with them.
+#
+# These are only the starting point. `speed_factor` rescales the whole model
+# from the timings of previous runs, so the estimate adapts to the machine it is
+# actually on rather than to the one it was calibrated on.
+STAGE_COSTS: dict[str, dict[str, float]] = {
+    #                      constant  per km2  per megapixel
+    "terrain":            {"c": 1.0, "a": 8.0,  "m": 0.0},
+    "aerial":             {"c": 1.0, "a": 0.0,  "m": 0.75},
+    "surfaces":           {"c": 1.0, "a": 30.0, "m": 2.5},
+    "usage":              {"c": 0.5, "a": 5.0,  "m": 0.0},
+    "buildings":          {"c": 2.0, "a": 75.0, "m": 0.0},
+    "trees":              {"c": 1.0, "a": 23.0, "m": 0.0},
+    "furniture":          {"c": 0.5, "a": 3.0,  "m": 0.0},
+    "facade":             {"c": 1.0, "a": 0.0,  "m": 0.0},
+    "scene":              {"c": 0.3, "a": 0.0,  "m": 0.0},
+    "blender":            {"c": 2.0, "a": 8.0,  "m": 0.0},
+    # Rendering three views costs more than every data stage together, and
+    # varies with what is in the scene rather than with area alone, so this is
+    # the loosest term in the model.
+    "preview":            {"c": 5.0, "a": 160.0, "m": 0.0},
+    "validation":         {"c": 3.0, "a": 2.0,  "m": 0.3},
+}
+
+# Fixed overhead per run: interpreter start, capability documents, TLS setup.
+BASE_OVERHEAD_S = 12.0
+
+
+def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
+    """Predict how long a run with these settings will take."""
+    bbox = payload.get("bbox") or {}
+    try:
+        width = abs(float(bbox["xmax"]) - float(bbox["xmin"]))
+        height = abs(float(bbox["ymax"]) - float(bbox["ymin"]))
+    except (KeyError, TypeError, ValueError):
+        width = height = 1000.0
+    area_km2 = max(width * height / 1e6, 1e-6)
+    megapixels = int(payload.get("size_px", 4096)) ** 2 / 1e6
+
+    enabled = {
+        "terrain": True,
+        "aerial": True,
+        "surfaces": bool(payload.get("water", True) or payload.get("land_cover", True)),
+        "usage": bool(payload.get("usage", True)),
+        "buildings": True,
+        "trees": bool(payload.get("trees", True)),
+        "furniture": bool(payload.get("furniture", True)),
+        "facade": True,
+        "scene": True,
+        "blender": True,
+        "preview": bool(payload.get("preview", True)),
+        "validation": True,
+    }
+
+    breakdown: dict[str, float] = {}
+    for stage, cost in STAGE_COSTS.items():
+        if not enabled.get(stage):
+            continue
+        seconds = cost["c"] + cost["a"] * area_km2 + cost["m"] * megapixels
+        breakdown[stage] = round(seconds * speed, 1)
+
+    total = BASE_OVERHEAD_S * speed + sum(breakdown.values())
+    return {
+        "seconds": round(total, 1),
+        "breakdown": breakdown,
+        "area_km2": round(area_km2, 4),
+        "megapixels": round(megapixels, 2),
+        "speed_factor": round(speed, 3),
+    }
+
+
+def measured_speed_factor() -> tuple[float, int]:
+    """Scale the model by how past runs on this machine actually went.
+
+    One factor over the whole model rather than refitting every coefficient:
+    with a handful of runs that is all the data supports, and it captures what
+    actually differs between machines, which is how fast they are.
+    """
+    root = REPO_ROOT / "work"
+    if not root.is_dir():
+        return 1.0, 0
+
+    ratios: list[float] = []
+    for path in sorted(root.glob("*/timings.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            drivers = record["drivers"]
+            actual = float(record["total_seconds"])
+        except (OSError, ValueError, KeyError):
+            continue
+        if actual <= 0 or any(stage.get("failed") for stage in record.get("stages", [])):
+            continue
+        if drivers.get("skip_blender"):
+            continue  # not a comparable run
+
+        # Rebuild the settings the model takes, from what the run recorded.
+        side = (drivers["area_km2"] * 1e6) ** 0.5
+        predicted = estimate_seconds(
+            {
+                "bbox": {"xmin": 0, "ymin": 0, "xmax": side, "ymax": side},
+                "size_px": int(
+                    drivers.get("aerial_size_px")
+                    or round(drivers["aerial_megapixels"] ** 0.5 * 1000)
+                ),
+                "trees": drivers.get("trees", True),
+                "water": drivers.get("surfaces", True),
+                "land_cover": drivers.get("surfaces", True),
+                "furniture": drivers.get("furniture", True),
+                "usage": drivers.get("usage", True),
+                "preview": drivers.get("preview", False),
+            }
+        )["seconds"]
+        if predicted > 0:
+            ratios.append(actual / predicted)
+
+    if not ratios:
+        return 1.0, 0
+    ratios.sort()
+    median = ratios[len(ratios) // 2]
+    # Bounded so one odd run cannot make every estimate nonsense.
+    return max(0.25, min(4.0, median)), len(ratios)
+
+
 class Job:
     """One pipeline run."""
 
-    def __init__(self, job_id: str, name: str, config: dict) -> None:
+    def __init__(self, job_id: str, name: str, config: dict, estimate: float) -> None:
         self.id = job_id
         self.name = name
         self.config = config
+        self.estimate = estimate
         self.lines: list[str] = []
         self.status = "starting"  # starting | running | done | failed | cancelled
         self.returncode: int | None = None
@@ -61,15 +189,52 @@ class Job:
         self.finished: float | None = None
         self.process: subprocess.Popen | None = None
         self.lock = threading.Lock()
+        self.step = 0
+        self.total_steps = 0
+        self.stage = "starting"
 
     def log(self, line: str) -> None:
         with self.lock:
             self.lines.append(line)
+            self._track_progress(line)
+
+    def _track_progress(self, line: str) -> None:
+        """Follow the run by the step headers it already prints.
+
+        The pipeline announces every stage as "Step N/M  name", so progress
+        needs no extra protocol between the two.
+        """
+        match = re.search(r"Step (\d+)/(\d+)\s+(.+?)\s*$", line)
+        if match:
+            self.step = int(match.group(1))
+            self.total_steps = int(match.group(2))
+            self.stage = match.group(3)
+            return
+        # Previews run after the last numbered stage, and take longer than all
+        # of them together, so they get their own label rather than looking
+        # like a stall on validation.
+        if "preview.py via" in line:
+            self.stage = "rendering previews"
+            self.step = max(self.step, self.total_steps)
 
     def snapshot(self, offset: int) -> dict:
         with self.lock:
             lines = self.lines[offset:]
             total = len(self.lines)
+            step, total_steps, stage = self.step, self.total_steps, self.stage
+
+        elapsed = (self.finished or time.time()) - self.started
+        if self.status in ("done", "failed", "cancelled"):
+            fraction = 1.0
+        elif total_steps:
+            fraction = min(0.99, step / (total_steps + 1))
+        else:
+            fraction = 0.0
+
+        remaining = None
+        if self.status in ("running", "starting") and self.estimate > 0:
+            remaining = max(0.0, self.estimate - elapsed)
+
         return {
             "id": self.id,
             "name": self.name,
@@ -77,7 +242,13 @@ class Job:
             "returncode": self.returncode,
             "lines": lines,
             "offset": total,
-            "elapsed": round((self.finished or time.time()) - self.started, 1),
+            "elapsed": round(elapsed, 1),
+            "step": step,
+            "total_steps": total_steps,
+            "stage": stage,
+            "fraction": round(fraction, 4),
+            "estimate": round(self.estimate, 1),
+            "remaining": None if remaining is None else round(remaining, 1),
         }
 
 
@@ -434,6 +605,37 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"areas": list_areas()})
             return
 
+        if route == "/api/estimate":
+            def flag(name: str, default: bool = True) -> bool:
+                raw = (query.get(name) or [str(default).lower()])[0]
+                return raw not in ("0", "false", "no")
+
+            try:
+                payload = {
+                    "bbox": {
+                        "xmin": float((query.get("xmin") or ["0"])[0]),
+                        "ymin": float((query.get("ymin") or ["0"])[0]),
+                        "xmax": float((query.get("xmax") or ["1000"])[0]),
+                        "ymax": float((query.get("ymax") or ["1000"])[0]),
+                    },
+                    "size_px": int((query.get("size_px") or ["4096"])[0]),
+                    "trees": flag("trees"),
+                    "water": flag("water"),
+                    "land_cover": flag("land_cover"),
+                    "furniture": flag("furniture"),
+                    "usage": flag("usage"),
+                    "preview": flag("preview"),
+                }
+            except ValueError:
+                self.send_json({"error": "bad estimate request"}, status=400)
+                return
+
+            speed, samples = measured_speed_factor()
+            result = estimate_seconds(payload, speed)
+            result["calibrated_from_runs"] = samples
+            self.send_json(result)
+            return
+
         if route.startswith("/output/"):
             relative = urllib.parse.unquote(route[len("/output/") :])
             self.serve_file(REPO_ROOT / "output" / relative, REPO_ROOT / "output")
@@ -462,7 +664,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=400)
                 return
 
-            job = Job(uuid.uuid4().hex[:12], name, config)
+            speed, _ = measured_speed_factor()
+            job = Job(
+                uuid.uuid4().hex[:12],
+                name,
+                config,
+                estimate_seconds(payload, speed)["seconds"],
+            )
             register(job)
             threading.Thread(
                 target=run_job,

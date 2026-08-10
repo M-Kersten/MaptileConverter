@@ -753,6 +753,90 @@ class TestUIServer(unittest.TestCase):
         self.assertEqual(loaded.facade["texture_px"], 2048)
         self.assertFalse(loaded.facade["normal_map"])
 
+    def test_estimate_grows_with_area_pixels_and_features(self):
+        estimate = self.server.estimate_seconds
+        small = {"bbox": {"xmin": 0, "ymin": 0, "xmax": 500, "ymax": 500}, "size_px": 2048}
+        large = {"bbox": {"xmin": 0, "ymin": 0, "xmax": 1000, "ymax": 1000}, "size_px": 2048}
+        self.assertGreater(estimate(large)["seconds"], estimate(small)["seconds"])
+
+        coarse = dict(large, size_px=2048)
+        fine = dict(large, size_px=8192)
+        self.assertGreater(estimate(fine)["seconds"], estimate(coarse)["seconds"])
+
+        # Previews cost more than every data stage put together.
+        with_preview = dict(large, preview=True)
+        without = dict(large, preview=False)
+        self.assertGreater(
+            estimate(with_preview)["seconds"], 1.5 * estimate(without)["seconds"]
+        )
+
+        # Turning a source off has to make the estimate smaller.
+        for flag in ("trees", "furniture", "usage", "water"):
+            self.assertLess(
+                estimate({**without, flag: False, "land_cover": flag != "water"})["seconds"],
+                estimate(without)["seconds"],
+                f"disabling {flag} did not reduce the estimate",
+            )
+
+    def test_estimate_matches_measured_runs(self):
+        """Calibrated against real runs over Utrecht; keep it honest."""
+        estimate = self.server.estimate_seconds
+
+        def seconds(side, px, **kw):
+            payload = {
+                "bbox": {"xmin": 0, "ymin": 0, "xmax": side, "ymax": side},
+                "size_px": px,
+            }
+            payload.update(kw)
+            return estimate(payload)["seconds"]
+
+        measured = [
+            (seconds(1000, 4096, preview=True), 468),
+            (seconds(1000, 4096, preview=False), 218),
+            (seconds(500, 2048, preview=False), 75),
+        ]
+        for predicted, actual in measured:
+            self.assertLess(
+                abs(predicted - actual) / actual,
+                0.30,
+                f"estimate {predicted:.0f}s is more than 30% off the measured {actual}s",
+            )
+
+    def test_speed_factor_is_bounded(self):
+        speed, samples = self.server.measured_speed_factor()
+        self.assertGreaterEqual(speed, 0.25)
+        self.assertLessEqual(speed, 4.0)
+        self.assertGreaterEqual(samples, 0)
+
+    def test_progress_follows_the_step_headers(self):
+        """The pipeline already prints its stages; progress reads those."""
+        job = self.server.Job("id", "area", {}, estimate=100.0)
+        job.status = "running"
+
+        job.log("12:00:00 INFO pipeline | Step 3/10  ground surfaces (BGT water)")
+        snapshot = job.snapshot(0)
+        self.assertEqual(snapshot["step"], 3)
+        self.assertEqual(snapshot["total_steps"], 10)
+        self.assertEqual(snapshot["stage"], "ground surfaces (BGT water)")
+        self.assertGreater(snapshot["fraction"], 0.0)
+        self.assertLess(snapshot["fraction"], 1.0)
+
+        # Previews run after the last numbered stage and dominate the runtime,
+        # so they get named rather than looking like a stall.
+        job.log("12:05:00 INFO pipeline | running preview.py via bpy")
+        self.assertEqual(job.snapshot(0)["stage"], "rendering previews")
+
+        job.status = "done"
+        job.finished = job.started + 42
+        self.assertEqual(job.snapshot(0)["fraction"], 1.0)
+
+    def test_progress_stays_indeterminate_before_the_first_stage(self):
+        job = self.server.Job("id", "area", {}, estimate=100.0)
+        job.status = "starting"
+        snapshot = job.snapshot(0)
+        self.assertEqual(snapshot["total_steps"], 0)
+        self.assertEqual(snapshot["fraction"], 0.0)
+
     def test_oversampling_past_the_source_only_warns(self):
         """Asking for more than the source holds is allowed, but flagged."""
         config = self.server.build_config(

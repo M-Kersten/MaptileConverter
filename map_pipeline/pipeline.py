@@ -16,6 +16,7 @@ interpreter. Any of the three produces the same output.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import shutil
 import subprocess
@@ -77,6 +78,11 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
+# Filled in as the run goes, and written out at the end. The UI reads these
+# back to calibrate its estimates against the machine it is actually running on.
+STAGE_TIMINGS: list[dict] = []
+
+
 class Stage:
     """Times a stage and labels its log output."""
 
@@ -93,7 +99,53 @@ class Stage:
         return self
 
     def __exit__(self, *exc_info) -> None:
-        LOG.info("  %s finished in %.1fs", self.name, time.time() - self.started)
+        elapsed = time.time() - self.started
+        LOG.info("  %s finished in %.1fs", self.name, elapsed)
+        STAGE_TIMINGS.append(
+            {
+                "step": self.index,
+                "name": self.name,
+                "seconds": round(elapsed, 2),
+                "failed": exc_info[0] is not None,
+            }
+        )
+
+
+def write_timings(
+    config: PipelineConfig,
+    work_dir: Path,
+    total_seconds: float,
+    args: argparse.Namespace | None = None,
+) -> None:
+    """Record what the run cost, alongside the settings that drove it."""
+    payload = {
+        "name": config.name,
+        "total_seconds": round(total_seconds, 2),
+        "stages": STAGE_TIMINGS,
+        "drivers": {
+            # What the estimate scales on: area and aerial pixel count.
+            "area_km2": round(config.bbox.width * config.bbox.height / 1e6, 5),
+            "aerial_size_px": int(config.aerial["size_px"]),
+            "aerial_megapixels": round(int(config.aerial["size_px"]) ** 2 / 1e6, 3),
+            "mesh_vertices_per_side": int(config.terrain["mesh_vertices_per_side"]),
+            "trees": bool(config.trees["enabled"]),
+            "surfaces": bool(config.surfaces["water"] or config.surfaces["land_cover"]),
+            "furniture": bool(config.furniture["enabled"]),
+            "usage": bool(config.usage["enabled"]),
+            # Rendering previews costs more than every data stage put together,
+            # and it happens outside the timed stages, so calibration needs to
+            # know whether it ran.
+            "preview": bool(args.preview) if args is not None else False,
+            "skip_blender": bool(args.skip_blender) if args is not None else False,
+        },
+    }
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "timings.json").write_text(
+            json.dumps(payload, indent=1) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:  # noqa: BLE001 - timings are a convenience
+        LOG.debug("could not write timings: %s", exc)
 
 
 def find_blender(explicit: str | None) -> tuple[str, list[str]]:
@@ -475,6 +527,12 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         LOG.error("interrupted")
         return 130
+    finally:
+        # Written even on failure: a partial run still says what the stages
+        # that did complete actually cost on this machine.
+        write_timings(
+            config, config.work_dir(REPO_ROOT), time.time() - started, args
+        )
     LOG.info("total runtime %.1fs", time.time() - started)
     return code
 

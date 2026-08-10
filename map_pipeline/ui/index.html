@@ -71,6 +71,30 @@
     border-radius: 50%; background: var(--accent); cursor: pointer; border: 0; }
   .ticks { display: flex; justify-content: space-between; color: var(--muted);
            font-size: 10px; }
+
+  /* ---------- progress ---------- */
+  #progress { margin-top: 12px; }
+  .pbar { height: 7px; background: #2b303a; border-radius: 4px; overflow: hidden; }
+  .pfill { height: 100%; width: 0%; border-radius: 4px; background: var(--accent);
+           transition: width .45s ease; }
+  .pfill.done { background: var(--ok); }
+  .pfill.fail { background: var(--bad); }
+  /* Until a stage boundary lands there is nothing real to report, so the bar
+     shows motion rather than a number it cannot justify. */
+  .pfill.indeterminate {
+    width: 35% !important; transition: none;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    animation: sweep 1.4s ease-in-out infinite;
+  }
+  @keyframes sweep { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+  .prow { display: flex; justify-content: space-between; gap: 10px; margin-top: 5px;
+          font-size: 11.5px; color: var(--muted); align-items: baseline; }
+  .prow span { font-family: var(--mono); }
+  /* Stage names are long enough to wrap under the timing and shove it around,
+     so it is clipped instead; the full name is on the title. */
+  .prow #pstage { color: var(--text); white-space: nowrap; overflow: hidden;
+                  text-overflow: ellipsis; min-width: 0; }
+  .prow #ptime { flex: 0 0 auto; white-space: nowrap; }
   .kv { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
         white-space: pre-wrap; word-break: break-all; }
   .kv b { color: var(--text); font-weight: 600; }
@@ -255,7 +279,16 @@
   </fieldset>
 
   <button class="primary" id="run">Build model</button>
+  <div class="hint" id="estimate" style="text-align:center"></div>
   <button class="danger" id="cancel" style="margin-top:6px; display:none">Cancel</button>
+
+  <div id="progress" style="display:none">
+    <div class="pbar"><div class="pfill" id="pfill"></div></div>
+    <div class="prow">
+      <span id="pstage">starting</span>
+      <span id="ptime"></span>
+    </div>
+  </div>
 
   <fieldset style="margin-top:14px">
     <legend>Log <span id="status"></span></legend>
@@ -660,9 +693,90 @@ function updateFacadeNote() {
 $("facade").addEventListener("change", updateFacadeNote);
 updateFacadeNote();
 
+/* ---------- estimate ---------- */
+function humanTime(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return "?";
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+let estimateTimer = null, lastEstimate = null;
+
+function settingsForEstimate() {
+  const b = bbox(), q = quality();
+  return new URLSearchParams({
+    xmin: b.xmin, ymin: b.ymin, xmax: b.xmax, ymax: b.ymax,
+    size_px: q.sizePx,
+    trees: $("trees").checked, water: $("water").checked,
+    land_cover: $("landcover").checked, furniture: $("furniture").checked,
+    usage: $("usage").checked, preview: $("preview").checked
+  });
+}
+
+function refreshEstimate() {
+  clearTimeout(estimateTimer);
+  estimateTimer = setTimeout(async () => {
+    try {
+      const r = await fetch("/api/estimate?" + settingsForEstimate());
+      const d = await r.json();
+      lastEstimate = d.seconds;
+      const note = d.calibrated_from_runs
+        ? `, from ${d.calibrated_from_runs} past run${d.calibrated_from_runs > 1 ? "s" : ""}`
+        : "";
+      $("estimate").textContent = `about ${humanTime(d.seconds)}${note}`;
+      $("estimate").title = Object.entries(d.breakdown || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${k}: ${humanTime(v)}`).join("\n");
+    } catch {
+      $("estimate").textContent = "";
+    }
+  }, 200);
+}
+
+/* Anything that changes the cost changes the estimate. */
+for (const id of ["aerialCm", "terrainM", "facadePx", "size", "preset"]) {
+  $(id).addEventListener("input", refreshEstimate);
+  $(id).addEventListener("change", refreshEstimate);
+}
+for (const id of ["trees", "water", "landcover", "furniture", "usage", "preview"]) {
+  $(id).addEventListener("change", refreshEstimate);
+}
+
 /* ---------- running ---------- */
 const logEl = $("log");
 let job = null, offset = 0, poller = null;
+
+function showProgress(data) {
+  const bar = $("pfill");
+  $("progress").style.display = "block";
+
+  const running = data.status === "running" || data.status === "starting";
+  // With no stage boundary yet there is nothing honest to show as a number.
+  const indeterminate = running && !data.total_steps;
+  bar.classList.toggle("indeterminate", indeterminate);
+  bar.classList.toggle("done", data.status === "done");
+  bar.classList.toggle("fail", data.status === "failed" || data.status === "cancelled");
+  if (!indeterminate) bar.style.width = `${Math.round((data.fraction || 0) * 100)}%`;
+
+  const step = data.total_steps
+    ? `step ${Math.min(data.step, data.total_steps)}/${data.total_steps} · ` : "";
+  const label = running
+    ? `${step}${data.stage || "working"}`
+    : (data.status === "done" ? "finished" : data.status);
+  $("pstage").textContent = label;
+  $("pstage").title = label;
+
+  const parts = [humanTime(data.elapsed)];
+  if (running && data.remaining != null) {
+    // Counting down to "~0s left" and sitting there says nothing. Once a run
+    // passes its estimate, say so instead of pretending it is about to finish.
+    parts.push(data.remaining > 1 ? `~${humanTime(data.remaining)} left` : "over estimate");
+  }
+  $("ptime").textContent = parts.join(" · ");
+}
 
 function addLog(line) {
   const div = document.createElement("div");
@@ -722,6 +836,10 @@ $("run").onclick = async () => {
   $("run").disabled = true;
   $("cancel").style.display = "block";
   setStatus("run", "running");
+  showProgress({ status: "starting", elapsed: 0, fraction: 0, total_steps: 0 });
+  // The settings panel is taller than most windows, so the progress and log
+  // would otherwise sit below the fold exactly when they matter.
+  $("progress").scrollIntoView({ behavior: "smooth", block: "center" });
   poller = setInterval(poll, 700);
   poll();
 };
@@ -745,9 +863,10 @@ async function poll() {
 
   (data.lines || []).forEach(addLog);
   offset = data.offset;
+  showProgress(data);
 
   if (data.status === "running" || data.status === "starting") {
-    setStatus("run", `running ${data.elapsed}s`);
+    setStatus("run", `running ${humanTime(data.elapsed)}`);
     return;
   }
 
@@ -756,9 +875,11 @@ async function poll() {
   $("run").disabled = false;
   $("cancel").style.display = "none";
   job = null;
+  // The finished run is a fresh data point for the estimate.
+  refreshEstimate();
 
   if (data.status === "done") {
-    setStatus("done", `done in ${data.elapsed}s`);
+    setStatus("done", `done in ${humanTime(data.elapsed)}`);
     showResult(data.area);
   } else {
     setStatus("fail", data.status);
@@ -823,7 +944,10 @@ function showResult(area) {
 /* ---------- start ---------- */
 fitToSelection();
 updateBboxInfo();
-updateQuality();
+// The preset dropdown is the authority at load: without this the sliders keep
+// their markup defaults and can disagree with the preset shown next to them.
+applyPreset($("preset").value);
+refreshEstimate();
 
 probeTileSource().then(source => {
   if (source === tileSource) return;
