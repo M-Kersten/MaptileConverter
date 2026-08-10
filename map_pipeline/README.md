@@ -191,8 +191,16 @@ ui/index.html      the page: RD map picker, settings, live log, results
 ```
 
 The heavy CityJSON and raster work all happens on the Python side.
-`blender/process.py` only reads `scene.json`, two npz files and the textures, so
-nothing depends on a GUI add-on being present in headless mode.
+`blender/process.py` only reads `scene.json`, the npz intermediates and the
+textures, so nothing depends on a GUI add-on being present in headless mode.
+
+**The Blender scripts may only import what Blender itself bundles** — `bpy`,
+`numpy`, `mathutils` and the standard library. When Blender is a real
+application rather than the pip module it runs its own Python, where none of
+this pipeline's dependencies exist. Anything else, triangulation included,
+belongs in `src/` with its result passed through the intermediate files. A test
+enforces this statically, because running the pipeline here cannot catch it: the
+pip-`bpy` path shares the caller's interpreter, so every import resolves.
 
 ## Coordinates
 

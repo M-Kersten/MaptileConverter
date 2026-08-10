@@ -341,6 +341,48 @@ def build_surfaces(
     return result
 
 
+def triangulate_water(bodies: list[WaterBody]) -> tuple[np.ndarray, np.ndarray]:
+    """Triangulate the water outlines into ``(triangles, body index)``.
+
+    This belongs here rather than in the Blender stage. That script may only use
+    what Blender itself bundles, which is bpy and numpy: when Blender is a real
+    application rather than the pip module, its Python is a different
+    interpreter with none of this pipeline's dependencies on it.
+    """
+    import mapbox_earcut
+
+    triangles: list[np.ndarray] = []
+    owner: list[np.ndarray] = []
+
+    for index, body in enumerate(bodies):
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in body.rings]
+        rings = [r for r in rings if len(r) >= 3]
+        if not rings:
+            continue
+
+        flat = np.vstack(rings)
+        ring_ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
+        try:
+            indices = mapbox_earcut.triangulate_float64(flat, ring_ends)
+        except Exception as exc:  # noqa: BLE001 - one bad outline is not fatal
+            LOG.debug("could not triangulate a water body: %s", exc)
+            continue
+        if len(indices) < 3:
+            continue
+
+        corners = flat[np.asarray(indices, dtype=np.int64)].reshape(-1, 3, 2)
+        # Carry the surface height with the geometry, as buildings do.
+        with_z = np.dstack(
+            [corners, np.full((len(corners), 3, 1), body.level_nap)]
+        )
+        triangles.append(with_z)
+        owner.append(np.full(len(corners), index, dtype=np.int32))
+
+    if not triangles:
+        return np.zeros((0, 3, 3)), np.zeros(0, dtype=np.int32)
+    return np.concatenate(triangles), np.concatenate(owner)
+
+
 def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
     """Write water outlines and the class grid for the Blender stage."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -360,8 +402,14 @@ def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
             ring_offsets.append(ring_offsets[-1] + len(ring))
             ring_body.append(index)
 
+    water_tris, water_tri_body = triangulate_water(surfaces.water)
+
     np.savez_compressed(
         path,
+        # Triangulated here, not in the Blender stage: that script only has
+        # what Blender bundles, and a real Blender install has its own Python.
+        water_tris=water_tris,
+        water_tri_body=water_tri_body,
         water_points=(
             np.vstack(ring_points) if ring_points else np.zeros((0, 2))
         ),
@@ -505,6 +553,7 @@ __all__ = [
     "blend_surface_detail",
     "build_surfaces",
     "clip_ring_to_bbox",
+    "triangulate_water",
     "save_surfaces",
     "write_land_cover",
 ]

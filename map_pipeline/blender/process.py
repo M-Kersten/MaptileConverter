@@ -246,70 +246,37 @@ def _sink_water_bed(
 
 
 def build_water(scene: dict, work_dir: Path, material):
-    """Flat surfaces over the BGT water outlines, one level per body."""
-    import mapbox_earcut
+    """Flat surfaces over the BGT water outlines, one level per body.
 
+    The outlines were triangulated upstream, where the triangulation library
+    lives. This script only gets what Blender itself bundles.
+    """
     data = _load_surfaces(scene, work_dir)
-    if data is None or "water_levels" not in data.files:
+    if data is None or "water_tris" not in data.files:
         return None
 
-    points = data["water_points"]
-    offsets = data["water_ring_offsets"]
-    ring_body = data["water_ring_body"]
-    levels = data["water_levels"]
-    if len(levels) == 0 or len(points) == 0:
+    triangles = data["water_tris"]
+    if len(triangles) == 0:
         return None
 
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
 
-    vertices: list[np.ndarray] = []
-    faces: list[np.ndarray] = []
-    uvs: list[np.ndarray] = []
-    offset = 0
+    local = triangles.copy()
+    local[:, :, 0] -= origin_x
+    local[:, :, 1] -= origin_y
+    local[:, :, 2] -= z_offset
 
-    # Rings are stored flat; group them back into one polygon per body.
-    for body in range(len(levels)):
-        indices = [i for i, b in enumerate(ring_body) if b == body]
-        if not indices:
-            continue
-        rings = [points[offsets[i] : offsets[i + 1]] for i in indices]
-        rings = [r for r in rings if len(r) >= 3]
-        if not rings:
-            continue
-
-        flat = np.vstack(rings)
-        ring_ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
-        try:
-            triangles = mapbox_earcut.triangulate_float64(flat, ring_ends)
-        except Exception:  # noqa: BLE001 - one bad outline must not stop the run
-            continue
-        if len(triangles) < 3:
-            continue
-
-        z = float(levels[body]) - z_offset
-        local = np.column_stack(
-            [flat[:, 0] - origin_x, flat[:, 1] - origin_y, np.full(len(flat), z)]
-        )
-        vertices.append(local)
-        faces.append(np.asarray(triangles, dtype=np.int64).reshape(-1, 3) + offset)
-        offset += len(flat)
-
-    if not faces:
-        return None
-
-    all_vertices = np.vstack(vertices)
-    all_faces = np.vstack(faces)
+    corners = local.reshape(-1, 3)
+    n_triangles = len(local)
 
     # UV in metres so a tiling water texture keeps a constant wave scale.
-    corners = all_vertices[all_faces.reshape(-1)]
     uvs = np.column_stack([corners[:, 0] / 8.0, corners[:, 1] / 8.0])
 
-    n_triangles = len(all_faces)
     obj = build_mesh_object(
         "Water",
-        all_vertices,
-        all_faces.reshape(-1),
+        corners,
+        np.arange(n_triangles * 3),
         np.arange(0, n_triangles * 3, 3),
         np.full(n_triangles, 3),
         uvs,
@@ -317,7 +284,8 @@ def build_water(scene: dict, work_dir: Path, material):
         [material],
         shade_smooth=False,
     )
-    log(f"water: {len(levels)} bodies, {n_triangles} triangles")
+    bodies = len(data["water_levels"]) if "water_levels" in data.files else 0
+    log(f"water: {bodies} bodies, {n_triangles} triangles")
     return obj
 
 

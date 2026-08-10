@@ -628,6 +628,63 @@ class TestConfig(unittest.TestCase):
                 load_config(path)
 
 
+class TestBlenderStageIsolation(unittest.TestCase):
+    """The Blender scripts may only use what Blender itself bundles.
+
+    When Blender is a real application rather than the pip module, it runs its
+    own Python: none of this pipeline's dependencies are importable there. That
+    cannot be caught by running the pipeline here, because the pip-bpy path
+    shares this interpreter and every import resolves, so it is checked
+    statically instead.
+    """
+
+    BUNDLED = {
+        "bpy", "numpy", "mathutils", "bmesh", "gpu", "aud",
+        "addon_utils", "bpy_extras", "bl_ui",
+    }
+
+    @staticmethod
+    def _imported_modules(path: Path) -> set[str]:
+        import ast
+
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    modules.add(node.module.split(".")[0])
+                elif node.level:
+                    modules.add(f"<relative:{node.module}>")
+        return modules
+
+    def test_blender_scripts_import_nothing_extra(self):
+        allowed = self.BUNDLED | set(sys.stdlib_module_names)
+        scripts = sorted((REPO_ROOT / "blender").glob("*.py"))
+        self.assertTrue(scripts, "no Blender scripts found")
+
+        for script in scripts:
+            extra = self._imported_modules(script) - allowed
+            self.assertEqual(
+                extra,
+                set(),
+                f"{script.name} imports {sorted(extra)}, which Blender does not "
+                f"bundle. Move that work into src/ and pass the result through "
+                f"the intermediate files.",
+            )
+
+    def test_blender_scripts_do_not_import_the_pipeline(self):
+        """They read intermediate files, so they never need src/."""
+        for script in sorted((REPO_ROOT / "blender").glob("*.py")):
+            modules = self._imported_modules(script)
+            self.assertNotIn("src", modules, f"{script.name} imports src")
+            self.assertFalse(
+                any(m.startswith("<relative:") for m in modules),
+                f"{script.name} uses a relative import",
+            )
+
+
 class TestUIServer(unittest.TestCase):
     """The UI writes a config and shells out to pipeline.py, so the translation
     from form fields to config is the part worth pinning down."""
