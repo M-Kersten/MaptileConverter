@@ -128,6 +128,12 @@ def build_config(payload: dict) -> dict:
             "ground_floor": bool(payload.get("facade_ground_floor", True)),
         },
         "trees": {"enabled": bool(payload.get("trees", True))},
+        "surfaces": {
+            "water": bool(payload.get("water", True)),
+            "land_cover": bool(payload.get("land_cover", True)),
+        },
+        "furniture": {"enabled": bool(payload.get("furniture", True))},
+        "usage": {"enabled": bool(payload.get("usage", True))},
     }
     return config
 

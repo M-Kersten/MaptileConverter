@@ -56,6 +56,9 @@ class Building:
     # ridge, and it is what the facade has to divide into storeys.
     wall_top_nap: float = 0.0
     build_year: int | None = None
+    # BAG function group, when available. Decides which ground storey the
+    # building gets, and shifts its wall style.
+    function: int | None = None
     # Filled in when the ground storey is split off; carries its own material.
     ground_wall_tris: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float64)
@@ -853,6 +856,20 @@ def save_buildings(
         build_year=np.array(
             [b.build_year or 0 for b in buildings.buildings], dtype=np.int32
         ),
+        # 1 selects the shopfront ground storey, 0 the residential one. Only
+        # retail and public buildings get a shopfront; everything else, and
+        # anything the BAG does not cover, gets doors and windows.
+        ground_style=np.array(
+            [
+                1 if b.function in (1, 4) else 0
+                for b in buildings.buildings
+            ],
+            dtype=np.int32,
+        ),
+        function=np.array(
+            [-1 if b.function is None else b.function for b in buildings.buildings],
+            dtype=np.int32,
+        ),
         # Fixed-width unicode rather than object dtype, so loading the archive
         # never needs allow_pickle.
         building_ids=np.array(
@@ -885,6 +902,7 @@ def build_buildings(
     terrain_sampler: Callable[[Any, Any], Any] | None = None,
     facade_variants: int = 1,
     ground_floor_height_m: float | None = None,
+    usage=None,
 ) -> BuildingSet:
     """Fetch, clean, ground, and cache the buildings for `bbox`."""
     result = fetch_buildings(bbox, buildings_cfg=buildings_cfg)
@@ -919,6 +937,17 @@ def build_buildings(
     # carry its own material.
     if ground_floor_height_m:
         apply_ground_floor_split(result, ground_floor_height_m)
+
+    if usage is not None and len(usage):
+        matched = 0
+        for building in result.buildings:
+            group = usage.group_for(building.identifier)
+            if group is not None:
+                building.function = group
+                matched += 1
+        LOG.info(
+            "matched BAG function to %d of %d buildings", matched, len(result.buildings)
+        )
 
     from .facade import style_for_building
 

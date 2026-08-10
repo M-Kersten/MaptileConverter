@@ -195,8 +195,125 @@ def planar_uv(points_xy: np.ndarray, aerial_bbox_local: list[float]) -> np.ndarr
 
 
 # ---------------------------------------------------------------------------
-# Terrain
+# Terrain and water
 # ---------------------------------------------------------------------------
+
+
+def _load_surfaces(scene: dict, work_dir: Path):
+    surface_file = scene.get("surfaces", {}).get("file")
+    if not surface_file or not (work_dir / surface_file).is_file():
+        return None
+    return np.load(work_dir / surface_file)
+
+
+def _sink_water_bed(
+    scene: dict, work_dir: Path, heights: np.ndarray, n: int
+) -> np.ndarray:
+    """Push the terrain under each water body below its surface.
+
+    The DTM has almost nothing to work from over water, so the gap filler
+    interpolates inward from the banks and leaves a mound where a canal should
+    be. Left alone that mound pokes straight through the water surface, so the
+    grid inside a water outline is set to a flat bed below its level.
+    """
+    data = _load_surfaces(scene, work_dir)
+    if data is None or "water_bed" not in data.files:
+        return heights
+
+    # One bed level per water body, worked out upstream: levels across an area
+    # differ by metres, so a single shared bed would sit above the surface of
+    # the lowest canal and poke straight through it.
+    bed = data["water_bed"]
+    if bed.size == 0 or bed.shape != heights.shape:
+        return heights
+
+    water = np.isfinite(bed)
+    if not water.any():
+        return heights
+
+    out = heights.copy()
+    out[water] = np.minimum(out[water], bed[water])
+    log(
+        f"terrain: sank {int(water.sum())} cells to water beds between "
+        f"{np.nanmin(bed):.2f} and {np.nanmax(bed):.2f} m NAP"
+    )
+    return out
+
+
+def build_water(scene: dict, work_dir: Path, material):
+    """Flat surfaces over the BGT water outlines, one level per body."""
+    import mapbox_earcut
+
+    data = _load_surfaces(scene, work_dir)
+    if data is None or "water_levels" not in data.files:
+        return None
+
+    points = data["water_points"]
+    offsets = data["water_ring_offsets"]
+    ring_body = data["water_ring_body"]
+    levels = data["water_levels"]
+    if len(levels) == 0 or len(points) == 0:
+        return None
+
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+
+    vertices: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+    uvs: list[np.ndarray] = []
+    offset = 0
+
+    # Rings are stored flat; group them back into one polygon per body.
+    for body in range(len(levels)):
+        indices = [i for i, b in enumerate(ring_body) if b == body]
+        if not indices:
+            continue
+        rings = [points[offsets[i] : offsets[i + 1]] for i in indices]
+        rings = [r for r in rings if len(r) >= 3]
+        if not rings:
+            continue
+
+        flat = np.vstack(rings)
+        ring_ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
+        try:
+            triangles = mapbox_earcut.triangulate_float64(flat, ring_ends)
+        except Exception:  # noqa: BLE001 - one bad outline must not stop the run
+            continue
+        if len(triangles) < 3:
+            continue
+
+        z = float(levels[body]) - z_offset
+        local = np.column_stack(
+            [flat[:, 0] - origin_x, flat[:, 1] - origin_y, np.full(len(flat), z)]
+        )
+        vertices.append(local)
+        faces.append(np.asarray(triangles, dtype=np.int64).reshape(-1, 3) + offset)
+        offset += len(flat)
+
+    if not faces:
+        return None
+
+    all_vertices = np.vstack(vertices)
+    all_faces = np.vstack(faces)
+
+    # UV in metres so a tiling water texture keeps a constant wave scale.
+    corners = all_vertices[all_faces.reshape(-1)]
+    uvs = np.column_stack([corners[:, 0] / 8.0, corners[:, 1] / 8.0])
+
+    n_triangles = len(all_faces)
+    obj = build_mesh_object(
+        "Water",
+        all_vertices,
+        all_faces.reshape(-1),
+        np.arange(0, n_triangles * 3, 3),
+        np.full(n_triangles, 3),
+        uvs,
+        np.zeros(n_triangles),
+        [material],
+        shade_smooth=False,
+    )
+    log(f"water: {len(levels)} bodies, {n_triangles} triangles")
+    return obj
 
 
 def build_terrain(scene: dict, work_dir: Path, material) -> object:
@@ -209,6 +326,8 @@ def build_terrain(scene: dict, work_dir: Path, material) -> object:
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
     n = heights.shape[0]
+
+    heights = _sink_water_bed(scene, work_dir, heights, n)
 
     # Row 0 of the height grid is the southern edge, so a plain meshgrid lines
     # up with Blender's +Y = north without any flipping.
@@ -301,7 +420,7 @@ def build_buildings(
     work_dir: Path,
     facade_materials: list,
     aerial_material,
-    ground_material=None,
+    ground_materials: list | None = None,
 ):
     """One mesh holding every building, with facade and aerial material slots."""
     data = np.load(work_dir / scene["buildings"]["file"])
@@ -309,10 +428,15 @@ def build_buildings(
     roof_tris = data["roof_tris"]
     wall_owner = data["wall_building"]
     roof_owner = data["roof_building"]
-    has_ground = "ground_wall_tris" in data.files and ground_material is not None
+    has_ground = "ground_wall_tris" in data.files and bool(ground_materials)
     ground_tris = data["ground_wall_tris"] if has_ground else np.zeros((0, 3, 3))
     ground_owner = (
         data["ground_wall_building"] if has_ground else np.zeros((0,), dtype=np.int32)
+    )
+    ground_style = (
+        data["ground_style"]
+        if "ground_style" in data.files
+        else np.zeros(len(data["ground_z_nap"]), dtype=np.int32)
     )
     ground_z_nap = data["ground_z_nap"]
     # Storeys divide the wall, not the roof ridge, so the top row of windows
@@ -353,9 +477,9 @@ def build_buildings(
 
     materials = list(facade_materials) + [aerial_material]
     aerial_slot = len(facade_materials)
+    ground_slot_base = len(materials)
     if has_ground:
-        materials.append(ground_material)
-    ground_slot = len(materials) - 1
+        materials.extend(ground_materials)
 
     parts = [chunk for chunk in (walls, roofs, grounds) if len(chunk)]
     triangles = np.concatenate(parts, axis=0)
@@ -402,7 +526,10 @@ def build_buildings(
         else:
             material_indices[:n_walls] = 0
     material_indices[n_walls : n_walls + n_roofs] = aerial_slot
-    material_indices[n_walls + n_roofs :] = ground_slot
+    if n_grounds:
+        material_indices[n_walls + n_roofs :] = ground_slot_base + np.clip(
+            ground_style[ground_owner], 0, max(0, len(ground_materials) - 1)
+        )
 
     n_triangles = n_walls + n_roofs + n_grounds
     loop_vertex_indices = np.arange(n_triangles * 3)
@@ -578,6 +705,125 @@ def build_trees(scene: dict, work_dir: Path, tree_material):
 
 
 # ---------------------------------------------------------------------------
+# Street furniture
+# ---------------------------------------------------------------------------
+
+
+def _box(cx, cy, cz, sx, sy, sz, spin=0.0):
+    """Axis-aligned box, optionally spun about Z, as (verts, faces)."""
+    corners = np.array(
+        [
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+        ],
+        dtype=np.float64,
+    ) * np.array([sx, sy, sz]) * 0.5
+
+    if spin:
+        cos_a, sin_a = np.cos(spin), np.sin(spin)
+        rotated = corners.copy()
+        rotated[:, 0] = corners[:, 0] * cos_a - corners[:, 1] * sin_a
+        rotated[:, 1] = corners[:, 0] * sin_a + corners[:, 1] * cos_a
+        corners = rotated
+
+    corners += np.array([cx, cy, cz])
+    faces = np.array(
+        [
+            [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+            [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
+            [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7],
+        ],
+        dtype=np.int64,
+    )
+    return corners, faces
+
+
+def build_furniture(scene: dict, work_dir: Path, material):
+    """Lampposts, bollards, signs and benches as simple boxes.
+
+    Every piece shares one material, so a couple of thousand objects cost one
+    draw call rather than a couple of thousand.
+    """
+    furniture_file = scene.get("furniture", {}).get("file")
+    if not furniture_file or not (work_dir / furniture_file).is_file():
+        return None
+
+    data = np.load(work_dir / furniture_file)
+    xy = data["xy"]
+    if len(xy) == 0:
+        return None
+
+    ground = data["ground_z_nap"]
+    kinds = data["kind"]
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    cfg = scene.get("furniture", {})
+
+    lamp_h = float(cfg.get("lamp_height_m", 5.0))
+    bollard_h = float(cfg.get("bollard_height_m", 0.9))
+    bench_l = float(cfg.get("bench_length_m", 1.8))
+
+    vertices: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+    uvs: list[np.ndarray] = []
+    offset = 0
+    rng = np.random.default_rng(808)
+
+    # A dark metal patch and a wood patch, addressed by UV like the tree atlas.
+    metal_uv = np.array([0.25, 0.5])
+    wood_uv = np.array([0.75, 0.5])
+
+    for index in range(len(xy)):
+        x = float(xy[index, 0]) - origin_x
+        y = float(xy[index, 1]) - origin_y
+        base = float(ground[index]) - z_offset
+        kind = int(kinds[index])
+        spin = float(rng.random()) * np.pi
+
+        pieces = []
+        if kind == 0:  # lamppost: column plus a short arm
+            pieces.append((_box(x, y, base + lamp_h / 2, 0.14, 0.14, lamp_h, spin), metal_uv))
+            pieces.append(
+                (_box(x, y, base + lamp_h + 0.08, 0.7, 0.24, 0.16, spin), metal_uv)
+            )
+        elif kind == 1:  # bollard
+            pieces.append(
+                (_box(x, y, base + bollard_h / 2, 0.16, 0.16, bollard_h, spin), metal_uv)
+            )
+        elif kind == 2:  # bench: seat on two legs
+            pieces.append((_box(x, y, base + 0.45, bench_l, 0.5, 0.08, spin), wood_uv))
+            pieces.append((_box(x, y, base + 0.22, bench_l * 0.8, 0.1, 0.44, spin), metal_uv))
+        else:  # sign post
+            pieces.append((_box(x, y, base + 1.1, 0.09, 0.09, 2.2, spin), metal_uv))
+            pieces.append((_box(x, y, base + 2.1, 0.5, 0.05, 0.4, spin), metal_uv))
+
+        for (piece_verts, piece_faces), uv in pieces:
+            vertices.append(piece_verts)
+            faces.append(piece_faces + offset)
+            uvs.append(np.tile(uv, (len(piece_faces) * 3, 1)))
+            offset += len(piece_verts)
+
+    all_vertices = np.vstack(vertices)
+    all_faces = np.vstack(faces)
+    all_uvs = np.vstack(uvs)
+    n_triangles = len(all_faces)
+
+    obj = build_mesh_object(
+        "StreetFurniture",
+        all_vertices,
+        all_faces.reshape(-1),
+        np.arange(0, n_triangles * 3, 3),
+        np.full(n_triangles, 3),
+        all_uvs,
+        np.zeros(n_triangles),
+        [material],
+        shade_smooth=False,
+    )
+    log(f"street furniture: {len(xy)} objects, {n_triangles} triangles")
+    return obj
+
+
+# ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
 
@@ -623,7 +869,7 @@ def export_fbx(out_path: Path) -> None:
 
 def copy_textures(
     scene: dict, work_dir: Path, out_dir: Path
-) -> tuple[Path, list[tuple[Path, Path | None]], Path | None]:
+) -> tuple[Path, list[tuple[Path, Path | None]], dict[str, Path]]:
     """Place the textures beside the FBX before the materials reference them."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -647,9 +893,16 @@ def copy_textures(
         for name, normal in zip(scene["facade"]["files"], normals)
     ]
 
-    tree_texture = scene.get("trees", {}).get("texture")
-    tree_dst = copy(tree_texture) if tree_texture else None
-    return aerial_dst, facades, tree_dst
+    extras: dict[str, Path] = {}
+    for key, section in (
+        ("tree", "trees"),
+        ("water", "surfaces"),
+        ("furniture", "furniture"),
+    ):
+        name = scene.get(section, {}).get("texture")
+        if name and (work_dir / name).is_file():
+            extras[key] = copy(name)
+    return aerial_dst, facades, extras
 
 
 def main() -> int:
@@ -665,14 +918,14 @@ def main() -> int:
     log(f"building scene {scene['name']!r}")
     reset_scene()
 
-    aerial_texture, facade_textures, tree_texture = copy_textures(
+    aerial_texture, facade_textures, extra_textures = copy_textures(
         scene, work_dir, out_dir
     )
 
-    # The ground-storey texture is written last, so it is the trailing entry.
-    has_ground_floor = bool(scene["facade"].get("ground_floor"))
-    wall_textures = facade_textures[:-1] if has_ground_floor else facade_textures
-    ground_texture = facade_textures[-1] if has_ground_floor else None
+    # Ground-storey textures are written last, so they are the trailing entries.
+    n_ground = int(scene["facade"].get("ground_variants", 0))
+    wall_textures = facade_textures[: len(facade_textures) - n_ground] if n_ground else facade_textures
+    ground_textures = facade_textures[len(facade_textures) - n_ground :] if n_ground else []
 
     aerial_material = make_textured_material("M_aerial", aerial_texture, roughness=0.9)
     facade_materials = [
@@ -684,25 +937,45 @@ def main() -> int:
         )
         for i, (colour, normal) in enumerate(wall_textures)
     ]
-    ground_material = (
+    ground_materials = [
         make_textured_material(
-            "M_facade_ground",
-            ground_texture[0],
+            f"M_facade_{colour.stem.replace('facade_', '')}",
+            colour,
             roughness=0.6,
-            normal_path=ground_texture[1],
+            normal_path=normal,
         )
-        if ground_texture
-        else None
-    )
+        for colour, normal in ground_textures
+    ]
 
     build_terrain(scene, work_dir, aerial_material)
     build_buildings(
-        scene, work_dir, facade_materials, aerial_material, ground_material
+        scene, work_dir, facade_materials, aerial_material, ground_materials
     )
 
-    if tree_texture is not None:
-        tree_material = make_textured_material("M_tree", tree_texture, roughness=0.85)
-        build_trees(scene, work_dir, tree_material)
+    if "water" in extra_textures:
+        # Water is the one smooth thing in the scene, so it gets a low
+        # roughness while everything else stays matte.
+        build_water(
+            scene,
+            work_dir,
+            make_textured_material("M_water", extra_textures["water"], roughness=0.12),
+        )
+
+    if "tree" in extra_textures:
+        build_trees(
+            scene,
+            work_dir,
+            make_textured_material("M_tree", extra_textures["tree"], roughness=0.85),
+        )
+
+    if "furniture" in extra_textures:
+        build_furniture(
+            scene,
+            work_dir,
+            make_textured_material(
+                "M_furniture", extra_textures["furniture"], roughness=0.55
+            ),
+        )
 
     # Report the scene bounds so a coordinate or scale error shows up in the log
     # rather than only in Unity.

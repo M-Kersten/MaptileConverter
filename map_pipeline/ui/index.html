@@ -229,8 +229,24 @@
       <label for="normal">Facade normal map (relief on walls)</label>
     </div>
     <div class="inline">
+      <input type="checkbox" id="usage" checked>
+      <label for="usage">Building function from the BAG (shops vs homes)</label>
+    </div>
+    <div class="inline">
       <input type="checkbox" id="trees" checked>
       <label for="trees">Trees from the BGT, heights from AHN</label>
+    </div>
+    <div class="inline">
+      <input type="checkbox" id="water" checked>
+      <label for="water">Water surfaces (fixes the canal bulge)</label>
+    </div>
+    <div class="inline">
+      <input type="checkbox" id="landcover" checked>
+      <label for="landcover">Land cover: roads, green, paving</label>
+    </div>
+    <div class="inline">
+      <input type="checkbox" id="furniture" checked>
+      <label for="furniture">Street furniture: lampposts, benches</label>
     </div>
     <div class="inline">
       <input type="checkbox" id="preview" checked>
@@ -675,6 +691,10 @@ $("run").onclick = async () => {
     facade_variants: +$("facade").value,
     facade_ground_floor: $("groundFloor").checked,
     trees: $("trees").checked,
+    water: $("water").checked,
+    land_cover: $("landcover").checked,
+    furniture: $("furniture").checked,
+    usage: $("usage").checked,
     clip_mode: $("clip").value,
     preview: $("preview").checked
   };

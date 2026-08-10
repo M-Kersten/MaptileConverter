@@ -35,9 +35,22 @@ from src.export import (  # noqa: E402
     write_metadata,
     write_scene_description,
 )
-from src.facade import generate_facade_textures, generate_tree_texture  # noqa: E402
+from src.facade import (  # noqa: E402
+    generate_facade_textures,
+    generate_furniture_texture,
+    generate_tree_texture,
+    generate_water_texture,
+)
+from src.furniture import FurnitureSet, build_furniture  # noqa: E402
 from src.imagery import build_aerial  # noqa: E402
+from src.surfaces import (  # noqa: E402
+    SurfaceSet,
+    blend_surface_detail,
+    build_surfaces,
+    write_land_cover,
+)
 from src.trees import TreeSet, build_trees, write_tree_list  # noqa: E402
+from src.usage import UsageSet, fetch_usage  # noqa: E402
 from src.validate import (  # noqa: E402
     CheckReport,
     check_aerial,
@@ -46,6 +59,8 @@ from src.validate import (  # noqa: E402
     check_buildings_on_terrain,
     check_export,
     check_fbx_reimport,
+    check_furniture,
+    check_surfaces,
     check_terrain,
     check_trees,
     write_report,
@@ -165,7 +180,13 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         LOG.warning("  %s", warning)
 
     want_trees = bool(config.trees["enabled"])
-    total = (7 if args.skip_blender else 8) if want_trees else (6 if args.skip_blender else 7)
+    want_surfaces = bool(config.surfaces["water"] or config.surfaces["land_cover"])
+    want_furniture = bool(config.furniture["enabled"])
+    want_usage = bool(config.usage["enabled"])
+
+    total = 5 + sum(
+        (want_trees, want_surfaces, want_furniture, want_usage)
+    ) + (0 if args.skip_blender else 1)
     step = 0
 
     def next_step() -> int:
@@ -179,6 +200,32 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     with Stage("aerial imagery (PDOK)", next_step(), total):
         aerial = build_aerial(config.bbox, work_dir, aerial_cfg=config.aerial)
 
+    surfaces = SurfaceSet()
+    water_texture = None
+    if want_surfaces:
+        with Stage("ground surfaces (BGT water and land cover)", next_step(), total):
+            surfaces = build_surfaces(
+                config.bbox,
+                work_dir,
+                surfaces_cfg=config.surfaces,
+                terrain=terrain,
+            )
+            if surfaces.class_grid is not None:
+                write_land_cover(surfaces, config.bbox, out_dir)
+                blend_surface_detail(
+                    aerial.path,
+                    surfaces,
+                    config.bbox,
+                    strength=float(config.surfaces["detail_strength"]),
+                )
+            if surfaces.water:
+                water_texture = generate_water_texture(work_dir)
+
+    usage = UsageSet()
+    if want_usage:
+        with Stage("building function (BAG)", next_step(), total):
+            usage = fetch_usage(config.bbox, usage_cfg=config.usage)
+
     with Stage("buildings (3DBAG LoD2.2)", next_step(), total):
         buildings = build_buildings(
             config.bbox,
@@ -191,6 +238,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 if config.facade["ground_floor"]
                 else None
             ),
+            usage=usage if len(usage) else None,
         )
 
     trees = TreeSet()
@@ -211,8 +259,26 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                         work_dir, size_px=int(config.trees["texture_px"])
                     )
 
+    furniture = FurnitureSet()
+    furniture_texture = None
+    if want_furniture:
+        with Stage("street furniture (BGT)", next_step(), total):
+            furniture = build_furniture(
+                config.bbox,
+                work_dir,
+                furniture_cfg=config.furniture,
+                terrain=terrain,
+            )
+            if len(furniture):
+                furniture_texture = generate_furniture_texture(work_dir)
+
     with Stage("facade textures", next_step(), total):
-        facade_paths = generate_facade_textures(work_dir, facade_cfg=config.facade)
+        facade_cfg = dict(config.facade)
+        facade_cfg["ground_by_function"] = bool(len(usage))
+        facade_paths = generate_facade_textures(work_dir, facade_cfg=facade_cfg)
+        ground_variants = (
+            (2 if len(usage) else 1) if config.facade["ground_floor"] else 0
+        )
 
     with Stage("scene description", next_step(), total):
         write_scene_description(
@@ -226,6 +292,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             export_cfg=config.export,
             work_dir=work_dir,
             tree_texture=tree_texture,
+            water_texture=water_texture,
+            furniture_texture=furniture_texture,
+            surfaces_cfg=config.surfaces,
+            furniture_cfg=config.furniture,
+            ground_variants=ground_variants,
         )
 
     if not args.skip_blender:
@@ -243,6 +314,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             lod=str(config.buildings["lod"]),
             ahn_model=str(config.terrain["ahn_model"]),
             trees=trees,
+            extra={
+                "surfaces": surfaces.stats(),
+                "street_furniture": furniture.stats(),
+                "building_function": usage.stats(),
+            },
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
         write_attribution(out_dir)
@@ -255,6 +331,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         )
         check_buildings_on_terrain(report, buildings, terrain)
         check_trees(report, trees if want_trees else None, config.bbox)
+        check_surfaces(report, surfaces if want_surfaces else None, terrain)
+        check_furniture(report, furniture if want_furniture else None, config.bbox)
         check_aerial(report, aerial, config.bbox)
 
         if not args.skip_blender:

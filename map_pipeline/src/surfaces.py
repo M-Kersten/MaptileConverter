@@ -1,0 +1,510 @@
+"""Ground surfaces: water bodies and land cover, from the BGT.
+
+Water is the reason this module exists. Lidar does not reflect off water, so the
+AHN DTM is 73% empty over a canal against 47% on land, and the few returns that
+do come back scatter over several metres. The gap filler then interpolates from
+the banks inward, which turns every canal into a bulge with random lumps in it.
+The fix is to stop guessing: take the water outlines from the BGT, work out one
+level per body, sink the bed below it and lay a flat surface on top.
+
+Land cover comes from the same three BGT terrain collections. It gives each part
+of the ground a class, which the aerial photo cannot: a photo of grass and a
+photo of asphalt are just pixels. The class map is exported for Unity to use,
+and drives a light per-surface detail pass over the aerial, because a 25 cm
+ortho is mushy at street level whatever its pixel count.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+from .bgt import fetch_current, polygon_rings, rasterize_rings, ring_area
+from .geo import BBox, build_grid_coords
+
+LOG = logging.getLogger(__name__)
+
+# Class ids burned into the land-cover raster. 0 means "no BGT class here",
+# which is normal: the BGT does not tile the whole country edge to edge.
+CLASS_NONE = 0
+CLASS_ROAD = 1
+CLASS_GREEN = 2
+CLASS_PAVED = 3
+CLASS_UNPAVED = 4
+CLASS_WATER = 5
+
+CLASS_NAMES = {
+    CLASS_NONE: "unclassified",
+    CLASS_ROAD: "road",
+    CLASS_GREEN: "green",
+    CLASS_PAVED: "paved",
+    CLASS_UNPAVED: "unpaved",
+    CLASS_WATER: "water",
+}
+
+# Tint and grain used to give each surface class some texture of its own on top
+# of the photo. Kept subtle: the aerial still has to be the thing you see.
+CLASS_DETAIL = {
+    CLASS_ROAD: {"tint": (74, 76, 80), "grain": 0.55, "cells": 3.0},
+    CLASS_GREEN: {"tint": (86, 116, 62), "grain": 0.85, "cells": 1.1},
+    CLASS_PAVED: {"tint": (128, 124, 118), "grain": 0.60, "cells": 1.6},
+    CLASS_UNPAVED: {"tint": (132, 118, 96), "grain": 0.70, "cells": 1.3},
+}
+
+
+@dataclass
+class WaterBody:
+    """One water polygon with the level its surface sits at."""
+
+    rings: list[np.ndarray]
+    level_nap: float
+    area_m2: float
+    measured: bool  # False when AHN gave nothing usable and banks were used
+
+
+@dataclass
+class SurfaceSet:
+    water: list[WaterBody] = field(default_factory=list)
+    class_grid: np.ndarray | None = None  # (n, n) uint8 on the terrain grid
+    # (n, n) float, NaN off water: how far down the bed goes under each body.
+    water_bed: np.ndarray | None = None
+    counts: dict[str, int] = field(default_factory=dict)
+    stats_by_collection: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def water_area_m2(self) -> float:
+        return float(sum(body.area_m2 for body in self.water))
+
+    def stats(self) -> dict:
+        out: dict = {
+            "water_bodies": len(self.water),
+            "water_area_m2": round(self.water_area_m2, 1),
+            "water_levels_measured": sum(1 for b in self.water if b.measured),
+        }
+        if self.class_grid is not None:
+            total = self.class_grid.size
+            out["land_cover_fractions"] = {
+                name: round(float((self.class_grid == code).sum()) / total, 4)
+                for code, name in CLASS_NAMES.items()
+            }
+        out.update(self.counts)
+        return out
+
+
+def clip_ring_to_bbox(ring: np.ndarray, bbox: BBox) -> np.ndarray:
+    """Clip a polygon ring to the bbox by Sutherland-Hodgman.
+
+    Water polygons come back whole, and a canal can run a long way past the
+    area: one Utrecht outline stretched the model 300 m beyond its terrain.
+    Buildings are kept whole because cutting one opens it up, but a water
+    surface is flat, so trimming it costs nothing and keeps the model bounded.
+    The bbox is convex, which is exactly the case this algorithm handles.
+    """
+    edges = (
+        ("x", bbox.xmin, True),
+        ("x", bbox.xmax, False),
+        ("y", bbox.ymin, True),
+        ("y", bbox.ymax, False),
+    )
+    points = np.asarray(ring, dtype=np.float64)
+    if len(points) > 1 and np.allclose(points[0], points[-1]):
+        points = points[:-1]
+
+    for axis, limit, keep_greater in edges:
+        if len(points) == 0:
+            return np.zeros((0, 2))
+        index = 0 if axis == "x" else 1
+
+        def inside(point: np.ndarray) -> bool:
+            return (
+                point[index] >= limit if keep_greater else point[index] <= limit
+            )
+
+        output: list[np.ndarray] = []
+        for i in range(len(points)):
+            current = points[i]
+            previous = points[i - 1]
+            current_in = inside(current)
+            previous_in = inside(previous)
+
+            if current_in != previous_in:
+                span = current[index] - previous[index]
+                if abs(span) > 1e-12:
+                    t = (limit - previous[index]) / span
+                    output.append(previous + t * (current - previous))
+            if current_in:
+                output.append(current)
+        points = np.asarray(output) if output else np.zeros((0, 2))
+
+    if len(points) < 3:
+        return np.zeros((0, 2))
+    return np.vstack([points, points[0]])
+
+
+def _water_level(
+    rings: list[np.ndarray],
+    raster: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    nodata_cutoff: float,
+) -> tuple[float, bool]:
+    """Work out the surface level of one water body.
+
+    Where lidar did return something inside the polygon, a low percentile of
+    those samples is the water surface: the high ones are boats, bridges and
+    bank spill, and taking the median would ride up on them. With too few
+    returns, the ring vertices give the bank height and the water sits just
+    below that.
+    """
+    mask = rasterize_rings([rings], bounds, raster.shape)
+    samples = raster[mask]
+    samples = samples[np.isfinite(samples) & (samples < nodata_cutoff)]
+
+    if len(samples) >= 25:
+        return float(np.percentile(samples, 20)), True
+
+    # Fall back to the banks: sample the raster along the outline.
+    left, bottom, right, top = bounds
+    rows, cols = raster.shape
+    cell_x = (right - left) / cols
+    cell_y = (top - bottom) / rows
+    outline = rings[0]
+    col = np.clip(((outline[:, 0] - left) / cell_x).astype(int), 0, cols - 1)
+    row = np.clip(((top - outline[:, 1]) / cell_y).astype(int), 0, rows - 1)
+    bank = raster[row, col]
+    bank = bank[np.isfinite(bank) & (bank < nodata_cutoff)]
+    if len(bank):
+        return float(np.percentile(bank, 25) - 0.4), False
+    return float("nan"), False
+
+
+def build_surfaces(
+    bbox: BBox,
+    work_dir: Path,
+    *,
+    surfaces_cfg: dict,
+    terrain,
+) -> SurfaceSet:
+    """Fetch water and land cover, and classify the terrain grid."""
+    import rasterio
+
+    from .elevation import NODATA_CUTOFF
+
+    result = SurfaceSet()
+    n = terrain.n
+    grid_bounds = (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+
+    with rasterio.open(terrain.geotiff_path) as dataset:
+        raster = dataset.read(1).astype(np.float64)
+        raster_bounds = (
+            dataset.bounds.left,
+            dataset.bounds.bottom,
+            dataset.bounds.right,
+            dataset.bounds.top,
+        )
+
+    fetch_kwargs = {
+        "page_limit": int(surfaces_cfg["page_limit"]),
+        "timeout": float(surfaces_cfg["timeout_s"]),
+        "max_retries": int(surfaces_cfg["max_retries"]),
+        "max_pages": int(surfaces_cfg["max_pages"]),
+    }
+
+    # ---- water -----------------------------------------------------------
+    if bool(surfaces_cfg["water"]):
+        features, stats = fetch_current("waterdeel", bbox, **fetch_kwargs)
+        result.stats_by_collection["waterdeel"] = stats.summary()
+
+        for feature in features:
+            for rings in polygon_rings(feature.get("geometry")):
+                # Level is read before clipping, so a body that mostly lies
+                # outside the area still gets its true surface height.
+                level, measured = _water_level(
+                    rings, raster, raster_bounds, NODATA_CUTOFF
+                )
+                if not np.isfinite(level):
+                    continue
+
+                clipped = [clip_ring_to_bbox(ring, bbox) for ring in rings]
+                clipped = [ring for ring in clipped if len(ring) >= 3]
+                if not clipped:
+                    continue
+                rings = clipped
+
+                area = ring_area(rings[0]) - sum(ring_area(r) for r in rings[1:])
+                result.water.append(
+                    WaterBody(
+                        rings=rings,
+                        level_nap=level,
+                        area_m2=float(max(area, 0.0)),
+                        measured=measured,
+                    )
+                )
+
+        if result.water:
+            levels = np.array([b.level_nap for b in result.water])
+            LOG.info(
+                "%d water bodies covering %.0f m2, levels %.2f to %.2f m NAP",
+                len(result.water),
+                result.water_area_m2,
+                levels.min(),
+                levels.max(),
+            )
+
+    # ---- land cover ------------------------------------------------------
+    if bool(surfaces_cfg["land_cover"]):
+        xs, ys = build_grid_coords(bbox, n)
+        # Row 0 of the class grid is the southern edge, matching the terrain
+        # grid, so it is built north-up and flipped at the end.
+        class_grid = np.zeros((n, n), dtype=np.uint8)
+        flip_bounds = (bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+
+        # Painted in this order so the more specific class wins the overlap.
+        layers = [
+            ("onbegroeidterreindeel", CLASS_PAVED, "fysiek_voorkomen"),
+            ("begroeidterreindeel", CLASS_GREEN, "fysiek_voorkomen"),
+            ("wegdeel", CLASS_ROAD, "fysiek_voorkomen"),
+        ]
+        for collection, code, class_field in layers:
+            features, stats = fetch_current(
+                collection, bbox, class_field=class_field, **fetch_kwargs
+            )
+            result.stats_by_collection[collection] = stats.summary()
+            result.counts[f"{collection}_count"] = stats.current_features
+
+            groups: list[list[np.ndarray]] = []
+            unpaved: list[list[np.ndarray]] = []
+            for feature in features:
+                physical = str(
+                    (feature.get("properties") or {}).get("fysiek_voorkomen") or ""
+                )
+                target = (
+                    unpaved
+                    if code == CLASS_PAVED and "onverhard" in physical
+                    else groups
+                )
+                target.extend(polygon_rings(feature.get("geometry")))
+
+            if groups:
+                rasterize_rings(
+                    groups, flip_bounds, class_grid.shape, out=class_grid, value=code
+                )
+            if unpaved:
+                rasterize_rings(
+                    unpaved,
+                    flip_bounds,
+                    class_grid.shape,
+                    out=class_grid,
+                    value=CLASS_UNPAVED,
+                )
+
+        # Water last: it wins over anything a road or terrain polygon claimed.
+        if result.water:
+            rasterize_rings(
+                [b.rings for b in result.water],
+                flip_bounds,
+                class_grid.shape,
+                out=class_grid,
+                value=CLASS_WATER,
+            )
+
+        # rasterize_rings works north-up; the terrain grid is south-up.
+        result.class_grid = np.flipud(class_grid)
+
+    # Bed level per water body, on the terrain grid. It has to be per body:
+    # levels across one area span metres, so a single bed taken from the median
+    # would sit above the surface of the lowest canal and poke through it.
+    if result.water:
+        depth = float(surfaces_cfg["water_depth_m"])
+        bed = np.full((n, n), np.nan, dtype=np.float64)
+        for body in result.water:
+            mask = rasterize_rings([body.rings], grid_bounds, bed.shape)
+            level = body.level_nap - depth
+            bed[mask] = np.where(
+                np.isnan(bed[mask]), level, np.minimum(bed[mask], level)
+            )
+        result.water_bed = np.flipud(bed)
+
+        fractions = {
+            CLASS_NAMES[code]: float((result.class_grid == code).mean())
+            for code in CLASS_NAMES
+        }
+        LOG.info(
+            "land cover: %s",
+            ", ".join(f"{k} {100 * v:.0f}%" for k, v in fractions.items() if v > 0.005),
+        )
+
+    save_surfaces(result, bbox, work_dir)
+    return result
+
+
+def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
+    """Write water outlines and the class grid for the Blender stage."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "surfaces.npz"
+
+    # Rings are ragged, so they go in flattened with an index of where each one
+    # starts rather than as an object array.
+    ring_points: list[np.ndarray] = []
+    ring_offsets: list[int] = [0]
+    ring_body: list[int] = []
+    body_levels: list[float] = []
+
+    for index, body in enumerate(surfaces.water):
+        body_levels.append(body.level_nap)
+        for ring in body.rings:
+            ring_points.append(ring)
+            ring_offsets.append(ring_offsets[-1] + len(ring))
+            ring_body.append(index)
+
+    np.savez_compressed(
+        path,
+        water_points=(
+            np.vstack(ring_points) if ring_points else np.zeros((0, 2))
+        ),
+        water_ring_offsets=np.asarray(ring_offsets, dtype=np.int64),
+        water_ring_body=np.asarray(ring_body, dtype=np.int32),
+        water_levels=np.asarray(body_levels, dtype=np.float64),
+        class_grid=(
+            surfaces.class_grid
+            if surfaces.class_grid is not None
+            else np.zeros((0, 0), dtype=np.uint8)
+        ),
+        water_bed=(
+            surfaces.water_bed
+            if surfaces.water_bed is not None
+            else np.zeros((0, 0), dtype=np.float64)
+        ),
+        bbox=np.asarray(bbox.as_list(), dtype=np.float64),
+    )
+    LOG.info("wrote %s", path)
+    return path
+
+
+def write_land_cover(
+    surfaces: SurfaceSet, bbox: BBox, out_dir: Path
+) -> list[Path]:
+    """Export the class map as a PNG plus a legend, for use in Unity."""
+    if surfaces.class_grid is None:
+        return []
+    from PIL import Image
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Row 0 of the grid is the south edge; PNG rows run north-down.
+    image = Image.fromarray(np.flipud(surfaces.class_grid), mode="L")
+    png = out_dir / "landcover.png"
+    image.save(png)
+
+    legend = out_dir / "landcover.json"
+    legend.write_text(
+        json.dumps(
+            {
+                "note": (
+                    "Greyscale value is the surface class. Row 0 is the north "
+                    "edge; the image covers bbox_rd exactly, like aerial.png."
+                ),
+                "bbox_rd": bbox.as_list(),
+                "size_px": list(surfaces.class_grid.shape),
+                "classes": {str(code): name for code, name in CLASS_NAMES.items()},
+                "source": "BGT wegdeel, begroeidterreindeel, onbegroeidterreindeel, waterdeel",
+            },
+            indent=1,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    LOG.info("wrote %s and %s", png.name, legend.name)
+    return [png, legend]
+
+
+def blend_surface_detail(
+    aerial_path: Path,
+    surfaces: SurfaceSet,
+    bbox: BBox,
+    *,
+    strength: float = 0.22,
+    seed: int = 99,
+) -> bool:
+    """Mix a per-class grain into the aerial photo, in place.
+
+    An ortho is flown at 8 cm and delivered as JPEG, so close up it is mushy
+    whatever resolution it is resampled to: there is no detail left to resolve.
+    Adding grain matched to what each surface actually is puts high-frequency
+    texture back where the photo has none, without touching its colour or
+    structure. Kept low: the photo still has to be the thing you see.
+    """
+    if surfaces.class_grid is None or strength <= 0:
+        return False
+
+    from PIL import Image
+
+    from .facade import _value_noise
+    from .imagery import _allow_large_images
+
+    _allow_large_images()
+    with Image.open(aerial_path) as image:
+        pixels = np.asarray(image.convert("RGB")).astype(np.float64)
+
+    height, width = pixels.shape[:2]
+    rng = np.random.default_rng(seed)
+
+    # Class grid is south-up and low resolution; match the image orientation
+    # and size by nearest-neighbour, which keeps class edges crisp.
+    classes = np.flipud(surfaces.class_grid)
+    row_index = (np.arange(height) * classes.shape[0] // height).clip(
+        0, classes.shape[0] - 1
+    )
+    col_index = (np.arange(width) * classes.shape[1] // width).clip(
+        0, classes.shape[1] - 1
+    )
+    class_map = classes[np.ix_(row_index, col_index)]
+
+    metres_per_px = bbox.width / width
+    touched = False
+
+    for code, detail in CLASS_DETAIL.items():
+        mask = class_map == code
+        if not mask.any():
+            continue
+
+        # Noise cell size in metres, converted to the texture's own grid.
+        cells = max(8, int(width * metres_per_px / detail["cells"]))
+        cells = min(cells, 2048)
+        noise = _value_noise((height, width), cells=cells, rng=rng)
+        fine = _value_noise((height, width), cells=min(cells * 3, 4096), rng=rng)
+        combined = (0.6 * noise + 0.4 * fine - 0.5)[:, :, None]
+
+        tint = np.asarray(detail["tint"], dtype=np.float64)
+        amount = strength * detail["grain"]
+        # Nudge toward the class tint, then modulate brightness with the grain.
+        blended = pixels * (1 - amount * 0.35) + tint * (amount * 0.35)
+        blended = blended * (1.0 + amount * combined * 1.6)
+        pixels[mask] = blended[mask]
+        touched = True
+
+    if touched:
+        Image.fromarray(np.clip(pixels, 0, 255).astype(np.uint8)).save(aerial_path)
+        LOG.info("blended per-surface detail into %s", aerial_path.name)
+    return touched
+
+
+__all__ = [
+    "CLASS_DETAIL",
+    "CLASS_GREEN",
+    "CLASS_NAMES",
+    "CLASS_NONE",
+    "CLASS_PAVED",
+    "CLASS_ROAD",
+    "CLASS_UNPAVED",
+    "CLASS_WATER",
+    "SurfaceSet",
+    "WaterBody",
+    "blend_surface_detail",
+    "build_surfaces",
+    "clip_ring_to_bbox",
+    "save_surfaces",
+    "write_land_cover",
+]

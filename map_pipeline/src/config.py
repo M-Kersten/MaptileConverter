@@ -112,6 +112,40 @@ DEFAULTS: dict[str, Any] = {
         "geometry": True,
         "texture_px": 512,
     },
+    "surfaces": {
+        # Water is the reason this exists: lidar does not reflect off it, so
+        # the DTM is mostly empty over a canal and the gap filler turns every
+        # one into a bulge. BGT outlines replace the guesswork.
+        "water": True,
+        "land_cover": True,
+        # How far the bed is sunk below the water surface.
+        "water_depth_m": 1.2,
+        # Grain mixed into the aerial per surface class, to counter how mushy
+        # an ortho looks close up. 0 disables it.
+        "detail_strength": 0.22,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+    },
+    "furniture": {
+        "enabled": True,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+        "lamp_height_m": 5.0,
+        "bollard_height_m": 0.9,
+        "bench_length_m": 1.8,
+    },
+    "usage": {
+        # BAG building function, joined to 3DBAG on the building id.
+        "enabled": True,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 60,
+    },
     "export": {
         "fbx_name": "model.fbx",
         "aerial_name": "aerial.png",
@@ -143,6 +177,9 @@ class PipelineConfig:
     buildings: dict[str, Any]
     facade: dict[str, Any]
     trees: dict[str, Any]
+    surfaces: dict[str, Any]
+    furniture: dict[str, Any]
+    usage: dict[str, Any]
     export: dict[str, Any]
     source_path: Path | None = None
     warnings: list[str] = field(default_factory=list)
@@ -269,6 +306,9 @@ def load_config(path: str | Path) -> PipelineConfig:
         buildings=merged["buildings"],
         facade=merged["facade"],
         trees=merged["trees"],
+        surfaces=merged["surfaces"],
+        furniture=merged["furniture"],
+        usage=merged["usage"],
         export=merged["export"],
         source_path=path,
         warnings=warnings,

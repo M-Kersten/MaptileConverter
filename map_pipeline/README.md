@@ -6,12 +6,16 @@ runtime.
 
 ```
 output/<area_name>/
-├── model.fbx        terrain + buildings + trees, one file
+├── model.fbx        terrain, water, buildings, trees, street furniture
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
+├── landcover.png    surface class per pixel, registered to the same bbox
+├── landcover.json   what the class values mean
 ├── facade*.png      generated facade textures, referenced by the FBX
 ├── tree.png         bark and foliage atlas
+├── water.png        canal water
+├── furniture.png    metal and wood atlas
 └── ATTRIBUTION.txt  source credits
 ```
 
@@ -150,6 +154,12 @@ Other knobs worth knowing:
 | `trees.enabled` | `true` | Fetch BGT trees and give them AHN heights. |
 | `trees.geometry` | `true` | Also bake low-poly tree meshes into the FBX. `trees.json` is written either way. |
 | `trees.crown_search_m` | `3.0` | Radius the canopy height is taken as a maximum over. |
+| `surfaces.water` | `true` | Replace the interpolated canal bulge with real water surfaces. |
+| `surfaces.land_cover` | `true` | Classify the ground and export the class map. |
+| `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
+| `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
+| `furniture.enabled` | `true` | Lampposts, bollards, sign posts and benches. |
+| `usage.enabled` | `true` | BAG building function, deciding the ground storey. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
 | `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
 | `facade.normal_map` | `true` | Write a normal map beside each facade texture. |
@@ -166,8 +176,12 @@ src/geo.py         bbox parsing, WGS84 to RD, origin offset
 src/elevation.py   AHN WCS -> GeoTIFF -> height grid
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
-src/facade.py      generated facade and tree textures
+src/facade.py      generated facade, tree, water and furniture textures
+src/bgt.py         shared BGT client: paging, version filter, rasterising
 src/trees.py       BGT tree points, heights from AHN DSM minus DTM
+src/surfaces.py    BGT water bodies and land cover
+src/furniture.py   BGT lampposts, bollards, signs and benches
+src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
 blender/process.py builds the scene, assigns materials, exports FBX
@@ -214,6 +228,62 @@ nap  = local_y + ground_z_offset_nap
 without any fitting. Both get the same `ground_z_offset_nap` subtracted. Much of
 the Netherlands sits below NAP, so negative heights are normal and are never
 clamped away.
+
+## Ground surfaces
+
+**Water is the reason this exists.** Lidar does not reflect off water, so the AHN
+DTM is 73% empty over a canal against 47% on land, and the returns that do come
+back scatter over six metres. The gap filler then interpolates inward from the
+banks, which turns every canal into a bulge with lumps in it — the worst
+geometric artifact in the model. The BGT has the outlines, so the pipeline stops
+guessing: it takes a level per body from a low percentile of whatever lidar did
+return inside it, sinks the bed below that, and lays a flat surface on top.
+
+The level is per body, not shared. Levels across one square kilometre of Utrecht
+run from −0.57 to 1.00 m NAP, so a single bed taken from the median would sit
+above the surface of the lowest canal and poke straight through it. A check
+asserts every bed clears its own surface.
+
+Water polygons are clipped to the bbox, unlike buildings. A canal runs a long
+way past the area and one Utrecht outline stretched the model 300 m beyond its
+terrain. Cutting a building open would show its inside; a water surface is flat,
+so trimming it costs nothing.
+
+**Land cover** comes from three more BGT collections: `wegdeel`, plus vegetated
+and unvegetated terrain. Over the demo area that classifies about 63% of the
+ground as road, green, paved, unpaved or water. It leaves in two forms:
+
+- `landcover.png` and `landcover.json` — a class map registered to the same
+  bbox as `aerial.png`, for driving materials or walkable/drivable logic
+  in Unity.
+- A light per-class grain mixed into the aerial itself. An ortho is flown at
+  8 cm and delivered as JPEG, so close up it is mushy no matter what resolution
+  it is resampled to — there is simply no detail left to resolve. Adding grain
+  matched to what each surface actually is puts high-frequency texture back
+  where the photo has none. `surfaces.detail_strength` controls it; 0 turns it
+  off.
+
+## Street furniture
+
+About 2000 poles and 200 pieces of furniture per square kilometre: lampposts,
+bollards, sign posts and benches, from BGT `paal` and `straatmeubilair`. None of
+it is structurally important, which is the point — a street with nothing on it
+reads as a model. They are simple boxes sharing one material, so a couple of
+thousand objects cost one draw call.
+
+## Building function
+
+3DBAG says how tall a building is and when it was built, but not what it is for.
+The BAG does: every verblijfsobject carries a `gebruiksdoel` and a
+`pandidentificatie`, which is the same building id 3DBAG uses, so the two join
+on a key rather than by geometry. Over the demo area that resolves a function
+for about 2200 buildings from 6500 units.
+
+It decides which ground storey a building gets. Shopfronts along a residential
+street look as wrong as a blank wall along a shopping street, so only retail and
+public buildings get them; housing gets doors and windows. Where a building holds
+several uses, the most street-facing one wins — a shop under flats is a shop at
+street level.
 
 ## Trees
 
@@ -360,4 +430,7 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
 - **3DBAG** — 3D geoinformation research group, TU Delft, and Kadaster (CC BY 4.0)
 - **AHN** — Actueel Hoogtebestand Nederland via PDOK (CC BY 4.0)
 - **Aerial** — PDOK / Beeldmateriaal Nederland (CC BY 4.0)
-- **Trees** — BGT (Basisregistratie Grootschalige Topografie) via PDOK (CC BY 4.0)
+- **Trees, water, land cover, street furniture** — BGT (Basisregistratie
+  Grootschalige Topografie) via PDOK (CC BY 4.0)
+- **Building function** — BAG (Basisregistratie Adressen en Gebouwen) via PDOK
+  (CC BY 4.0)

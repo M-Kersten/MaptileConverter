@@ -29,9 +29,13 @@ ATTRIBUTION = {
         "Luchtfoto via PDOK / Beeldmateriaal Nederland (CC BY 4.0). "
         "https://www.beeldmateriaal.nl"
     ),
-    "trees": (
-        "Tree positions from the BGT (Basisregistratie Grootschalige "
-        "Topografie) via PDOK, CC BY 4.0."
+    "bgt": (
+        "Trees, water, land cover and street furniture from the BGT "
+        "(Basisregistratie Grootschalige Topografie) via PDOK, CC BY 4.0."
+    ),
+    "bag": (
+        "Building function from the BAG (Basisregistratie Adressen en "
+        "Gebouwen) via PDOK, CC BY 4.0."
     ),
 }
 
@@ -150,6 +154,11 @@ def write_scene_description(
     export_cfg: dict,
     work_dir: Path,
     tree_texture: Path | None = None,
+    water_texture: Path | None = None,
+    furniture_texture: Path | None = None,
+    surfaces_cfg: dict | None = None,
+    furniture_cfg: dict | None = None,
+    ground_variants: int = 0,
 ) -> Path:
     """Write scene.json: everything the Blender stage needs, and nothing else.
 
@@ -157,6 +166,8 @@ def write_scene_description(
     thin reader instead of depending on a CityJSON add-on inside Blender.
     """
     local = geo.local_bbox()
+    surfaces_cfg = surfaces_cfg or {}
+    furniture_cfg = furniture_cfg or {}
     scene = {
         "name": name,
         "origin_rd": [geo.origin_x, geo.origin_y],
@@ -185,6 +196,7 @@ def write_scene_description(
             "floor_height_m": float(facade_cfg["floor_height_m"]),
             "variants": len(facade_paths),
             "ground_floor": bool(facade_cfg.get("ground_floor", False)),
+            "ground_variants": int(ground_variants),
             "ground_floor_height_m": float(
                 facade_cfg.get("ground_floor_height_m", 3.6)
             ),
@@ -192,6 +204,26 @@ def write_scene_description(
         "trees": (
             {"file": "trees.npz", "texture": tree_texture.name}
             if tree_texture is not None
+            else {}
+        ),
+        "surfaces": (
+            {
+                "file": "surfaces.npz",
+                "texture": water_texture.name,
+                "water_depth_m": float(surfaces_cfg.get("water_depth_m", 1.2)),
+            }
+            if water_texture is not None
+            else {}
+        ),
+        "furniture": (
+            {
+                "file": "furniture.npz",
+                "texture": furniture_texture.name,
+                "lamp_height_m": float(furniture_cfg.get("lamp_height_m", 5.0)),
+                "bollard_height_m": float(furniture_cfg.get("bollard_height_m", 0.9)),
+                "bench_length_m": float(furniture_cfg.get("bench_length_m", 1.8)),
+            }
+            if furniture_texture is not None
             else {}
         ),
         "export": {
@@ -221,7 +253,8 @@ def write_attribution(out_dir: Path) -> Path:
         f"Buildings: {ATTRIBUTION['buildings']}",
         f"Terrain:   {ATTRIBUTION['terrain']}",
         f"Aerial:    {ATTRIBUTION['aerial']}",
-        f"Trees:     {ATTRIBUTION['trees']}",
+        f"BGT:       {ATTRIBUTION['bgt']}",
+        f"BAG:       {ATTRIBUTION['bag']}",
         "",
         "Keep this notice with the model when you redistribute it.",
         "",

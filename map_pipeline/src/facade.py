@@ -117,18 +117,39 @@ STYLES: tuple[FacadeStyle, ...] = (
 # The ground storey is what makes a street read as a street: shopfronts and
 # doors rather than another row of the same windows. It is a separate material
 # because a wall has to be split at the first-floor line to use it.
-GROUND_STYLE = FacadeStyle(
-    name="ground",
-    label="ground floor, shopfronts and doors",
-    wall_rgb=(150, 142, 134),
-    trim_rgb=(224, 222, 216),
-    glass_rgb=(58, 70, 80),
-    windows_across=2,
-    window_width_frac=0.36,
-    window_height_frac=0.62,
-    sill_frac=0.06,
-    grain=0.05,
+#
+# Which one a building gets comes from its BAG function. Shopfronts along a
+# residential street look as wrong as a blank wall along a shopping street, so
+# housing gets a door-and-window ground floor instead.
+GROUND_STYLES: tuple[FacadeStyle, ...] = (
+    FacadeStyle(
+        name="ground_home",
+        label="ground floor, doors and windows",
+        wall_rgb=(146, 116, 96),
+        trim_rgb=(228, 226, 220),
+        glass_rgb=(56, 68, 78),
+        windows_across=2,
+        window_width_frac=0.26,
+        window_height_frac=0.46,
+        sill_frac=0.20,
+        grain=0.09,
+    ),
+    FacadeStyle(
+        name="ground_retail",
+        label="ground floor, shopfronts",
+        wall_rgb=(150, 142, 134),
+        trim_rgb=(224, 222, 216),
+        glass_rgb=(58, 70, 80),
+        windows_across=2,
+        window_width_frac=0.40,
+        window_height_frac=0.66,
+        sill_frac=0.05,
+        grain=0.05,
+    ),
 )
+
+# Kept for callers that want the single default ground storey.
+GROUND_STYLE = GROUND_STYLES[1]
 
 
 def _value_noise(shape: tuple[int, int], cells: int, rng: np.random.Generator) -> np.ndarray:
@@ -337,15 +358,27 @@ def generate_facade_textures(
     want_normal = bool(facade_cfg.get("normal_map", True))
 
     styles = list(STYLES[:variants])
+    ground_styles: list[FacadeStyle] = []
     if bool(facade_cfg.get("ground_floor", True)):
-        styles.append(GROUND_STYLE)
+        # Both ground variants are written when building function is available,
+        # so a residential street does not get a parade of shopfronts.
+        ground_styles = (
+            list(GROUND_STYLES)
+            if facade_cfg.get("ground_by_function")
+            else [GROUND_STYLE]
+        )
+        styles.extend(ground_styles)
+    single_ground = len(ground_styles) == 1
 
     paths: list[tuple[Path, Path | None]] = []
     for index, style in enumerate(styles):
         pixels, relief = render_facade_layers(style, size_px, seed=seed + index)
 
-        if style.name == "ground":
-            stem = "facade_ground"
+        if style.name.startswith("ground"):
+            # With nothing to choose between, the one ground storey is just
+            # "ground" rather than being labelled with a function it does not
+            # actually know.
+            stem = "facade_ground" if single_ground else f"facade_{style.name}"
         elif variants == 1:
             stem = "facade"
         else:
@@ -412,9 +445,66 @@ def generate_tree_texture(work_dir: Path, size_px: int = 512, seed: int = 7) -> 
     return path
 
 
+def generate_water_texture(work_dir: Path, size_px: int = 512, seed: int = 21) -> Path:
+    """A seamless canal-water tile: dark green-brown with a soft ripple."""
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+    canvas[:, :] = (58, 74, 68)
+
+    broad = _value_noise((size_px, size_px), cells=max(3, size_px // 128), rng=rng)
+    ripple = _value_noise((size_px, size_px), cells=max(8, size_px // 24), rng=rng)
+    glint = _value_noise((size_px, size_px), cells=max(16, size_px // 8), rng=rng)
+
+    canvas *= 1.0 + 0.22 * (broad - 0.5)[:, :, None] * 2.0
+    canvas *= 1.0 + 0.14 * (ripple - 0.5)[:, :, None] * 2.0
+    # A few brighter specks read as light catching the surface.
+    highlight = np.clip((glint - 0.78) * 4.0, 0, 1)[:, :, None]
+    canvas = canvas * (1 - highlight) + np.array([150, 168, 172]) * highlight
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "water.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB").save(path)
+    LOG.info("wrote %s (%dpx)", path.name, size_px)
+    return path
+
+
+def generate_furniture_texture(
+    work_dir: Path, size_px: int = 256, seed: int = 33
+) -> Path:
+    """Atlas for street furniture: dark metal on the left, wood on the right."""
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    half = size_px // 2
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+
+    metal = np.zeros((size_px, half, 3), dtype=np.float64)
+    metal[:, :] = (62, 64, 68)
+    grain = _value_noise((size_px, half), cells=max(4, half // 8), rng=rng)
+    metal *= 1.0 + 0.16 * (grain - 0.5)[:, :, None] * 2.0
+    canvas[:, :half] = metal
+
+    wood = np.zeros((size_px, size_px - half, 3), dtype=np.float64)
+    wood[:, :] = (124, 92, 58)
+    streak = _value_noise((size_px, size_px - half), cells=max(3, half // 4), rng=rng)
+    wood *= 1.0 + 0.26 * (streak - 0.5)[:, :, None] * 2.0
+    canvas[:, half:] = wood
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "furniture.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB").save(path)
+    LOG.info("wrote %s (metal and wood atlas, %dpx)", path.name, size_px)
+    return path
+
+
 __all__ = [
     "GROUND_STYLE",
+    "GROUND_STYLES",
+    "generate_furniture_texture",
     "generate_tree_texture",
+    "generate_water_texture",
     "RELIEF_DEPTH",
     "STYLES",
     "FacadeStyle",

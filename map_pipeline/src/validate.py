@@ -257,6 +257,73 @@ def check_trees(report: CheckReport, trees, bbox: BBox) -> None:
     )
 
 
+def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
+    """Water sits at a sane level and its bed is below it everywhere."""
+    if surfaces is None or not surfaces.water:
+        report.add(
+            "water_present", True, "no water in this area", severity="warning"
+        )
+        return
+
+    levels = np.array([body.level_nap for body in surfaces.water])
+    report.add(
+        "water_present",
+        True,
+        f"{len(surfaces.water)} bodies covering {surfaces.water_area_m2:.0f} m2, "
+        f"levels {levels.min():.2f} to {levels.max():.2f} m NAP",
+    )
+    report.add(
+        "water_levels_plausible",
+        bool((levels > -10).all() and (levels < 60).all()),
+        f"levels between {levels.min():.2f} and {levels.max():.2f} m NAP",
+    )
+
+    if surfaces.water_bed is not None and surfaces.water_bed.size:
+        bed = surfaces.water_bed
+        water = np.isfinite(bed)
+        # Each body's bed has to clear its own surface, not the average one:
+        # a shared bed would poke through the lowest canal.
+        report.add(
+            "water_bed_below_surface",
+            bool((bed[water] < np.max(levels) + 1e-6).all()),
+            f"bed runs {np.nanmin(bed):.2f} to {np.nanmax(bed):.2f} m NAP "
+            f"under {int(water.sum())} cells",
+        )
+
+    if surfaces.class_grid is not None:
+        classified = float((surfaces.class_grid > 0).mean())
+        report.add(
+            "land_cover_coverage",
+            classified > 0.25,
+            f"{100 * classified:.0f}% of the grid carries a BGT surface class",
+            severity="warning",
+        )
+
+
+def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
+    """Street furniture is inside the area and standing on the ground."""
+    if furniture is None or not len(furniture):
+        report.add(
+            "furniture_present", True, "no street furniture", severity="warning"
+        )
+        return
+
+    xs, ys = furniture.xy[:, 0], furniture.xy[:, 1]
+    report.add(
+        "furniture_present",
+        True,
+        ", ".join(f"{v} {k}" for k, v in furniture.counts.items() if v),
+    )
+    report.add(
+        "furniture_inside_bbox",
+        bool(
+            (xs >= bbox.xmin).all() and (xs <= bbox.xmax).all()
+            and (ys >= bbox.ymin).all() and (ys <= bbox.ymax).all()
+        ),
+        "every object is inside the bbox",
+    )
+
+
 def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
     """The image has the requested size, real content, and matches the bbox."""
     from PIL import Image

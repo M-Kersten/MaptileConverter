@@ -338,6 +338,110 @@ class TestTrees(unittest.TestCase):
         self.assertEqual(float(wider[0]), 14.0)
 
 
+class TestSurfaces(unittest.TestCase):
+    @staticmethod
+    def _area(ring):
+        if len(ring) < 3:
+            return 0.0
+        x, y = ring[:, 0], ring[:, 1]
+        return 0.5 * abs(
+            float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+        )
+
+    def test_clipping_bounds_a_canal_that_leaves_the_area(self):
+        from src.surfaces import clip_ring_to_bbox
+
+        bbox = BBox(0, 0, 100, 100)
+        # A canal running well past the area on both sides.
+        ring = np.array(
+            [[-500, 40], [600, 40], [600, 60], [-500, 60], [-500, 40]], dtype=float
+        )
+        clipped = clip_ring_to_bbox(ring, bbox)
+        self.assertGreater(len(clipped), 3)
+        self.assertGreaterEqual(clipped[:, 0].min(), -1e-9)
+        self.assertLessEqual(clipped[:, 0].max(), 100 + 1e-9)
+        self.assertAlmostEqual(self._area(clipped), 100 * 20, places=6)
+
+    def test_clipping_leaves_an_interior_ring_alone(self):
+        from src.surfaces import clip_ring_to_bbox
+
+        bbox = BBox(0, 0, 100, 100)
+        ring = np.array([[10, 10], [90, 10], [90, 90], [10, 90], [10, 10]], float)
+        self.assertAlmostEqual(
+            self._area(clip_ring_to_bbox(ring, bbox)), self._area(ring), places=6
+        )
+
+    def test_polygon_entirely_outside_disappears(self):
+        from src.surfaces import clip_ring_to_bbox
+
+        ring = np.array([[200, 200], [300, 200], [300, 300], [200, 200]], float)
+        self.assertEqual(len(clip_ring_to_bbox(ring, BBox(0, 0, 100, 100))), 0)
+
+    def test_rasterizer_respects_holes(self):
+        from src.bgt import rasterize_rings
+
+        outer = np.array([[1, 1], [9, 1], [9, 9], [1, 9], [1, 1]], float)
+        hole = np.array([[3, 3], [7, 3], [7, 7], [3, 7], [3, 3]], float)
+        mask = rasterize_rings([[outer, hole]], (0.0, 0.0, 10.0, 10.0), (10, 10))
+        self.assertTrue(mask[8, 2])    # inside the outer ring
+        self.assertFalse(mask[5, 5])   # inside the hole
+        self.assertFalse(mask[0, 0])   # outside everything
+
+    def test_polygon_rings_normalises_multipolygon(self):
+        from src.bgt import polygon_rings
+
+        square = [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]
+        single = polygon_rings({"type": "Polygon", "coordinates": [square]})
+        multi = polygon_rings(
+            {"type": "MultiPolygon", "coordinates": [[square], [square]]}
+        )
+        self.assertEqual(len(single), 1)
+        self.assertEqual(len(multi), 2)
+        self.assertEqual(polygon_rings({"type": "Point", "coordinates": [0, 0]}), [])
+
+
+class TestBgtVersioning(unittest.TestCase):
+    """Every BGT collection returns its full version history."""
+
+    def test_only_the_open_registration_is_current(self):
+        from src.bgt import is_current
+
+        self.assertTrue(is_current({"lokaal_id": "a"}))
+        self.assertTrue(is_current({"lokaal_id": "a", "eind_registratie": None}))
+        self.assertFalse(
+            is_current({"lokaal_id": "a", "eind_registratie": "2022-01-14"})
+        )
+
+
+class TestBuildingFunction(unittest.TestCase):
+    def test_gebruiksdoel_maps_to_a_group(self):
+        from src.usage import (
+            FUNCTION_HOME,
+            FUNCTION_OFFICE,
+            FUNCTION_RETAIL,
+            _group_from_gebruiksdoel,
+        )
+
+        self.assertEqual(_group_from_gebruiksdoel("woonfunctie"), FUNCTION_HOME)
+        self.assertEqual(_group_from_gebruiksdoel("winkelfunctie"), FUNCTION_RETAIL)
+        self.assertEqual(_group_from_gebruiksdoel("kantoorfunctie"), FUNCTION_OFFICE)
+
+    def test_mixed_use_takes_the_street_facing_function(self):
+        """A shop under flats is a shop at street level."""
+        from src.usage import FUNCTION_RETAIL, _group_from_gebruiksdoel
+
+        self.assertEqual(
+            _group_from_gebruiksdoel("woonfunctie,winkelfunctie"), FUNCTION_RETAIL
+        )
+
+    def test_lookup_strips_the_3dbag_prefix(self):
+        from src.usage import UsageSet
+
+        usage = UsageSet(by_pand={"0344100000071252": 1})
+        self.assertEqual(usage.group_for("NL.IMBAG.Pand.0344100000071252"), 1)
+        self.assertIsNone(usage.group_for("NL.IMBAG.Pand.0000000000000000"))
+
+
 class TestElevation(unittest.TestCase):
     def test_nodata_is_masked_not_averaged(self):
         """AHN nodata is ~3.4e38; averaging it in would ruin the whole tile."""
