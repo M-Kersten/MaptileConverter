@@ -177,6 +177,167 @@ class TestCityJSON(unittest.TestCase):
         )
 
 
+class TestGroundFloorSplit(unittest.TestCase):
+    """Cutting a wall at the first-floor line must not lose or move any surface."""
+
+    @staticmethod
+    def _area(triangles):
+        if len(triangles) == 0:
+            return 0.0
+        return float(
+            sum(
+                0.5 * np.linalg.norm(np.cross(t[1] - t[0], t[2] - t[0]))
+                for t in triangles
+            )
+        )
+
+    def test_area_is_conserved(self):
+        from src.buildings import split_walls_at_height
+
+        rng = np.random.default_rng(11)
+        walls = rng.random((500, 3, 3)) * np.array([12.0, 12.0, 9.0])
+        lower, upper = split_walls_at_height(walls, np.full(len(walls), 3.6))
+        self.assertAlmostEqual(
+            self._area(walls), self._area(lower) + self._area(upper), places=6
+        )
+
+    def test_nothing_crosses_the_cut(self):
+        from src.buildings import split_walls_at_height
+
+        rng = np.random.default_rng(12)
+        walls = rng.random((300, 3, 3)) * np.array([10.0, 10.0, 8.0])
+        lower, upper = split_walls_at_height(walls, np.full(len(walls), 4.0))
+        if len(lower):
+            self.assertLessEqual(lower[:, :, 2].max(), 4.0 + 1e-9)
+        if len(upper):
+            self.assertGreaterEqual(upper[:, :, 2].min(), 4.0 - 1e-9)
+
+    def test_wall_entirely_below_or_above_is_untouched(self):
+        from src.buildings import split_walls_at_height
+
+        below = np.array([[[0, 0, 0], [2, 0, 0], [0, 0, 1]]], dtype=float)
+        lower, upper = split_walls_at_height(below, np.array([3.0]))
+        self.assertEqual(len(lower), 1)
+        self.assertEqual(len(upper), 0)
+
+        above = np.array([[[0, 0, 5], [2, 0, 5], [0, 0, 7]]], dtype=float)
+        lower, upper = split_walls_at_height(above, np.array([3.0]))
+        self.assertEqual(len(lower), 0)
+        self.assertEqual(len(upper), 1)
+
+    def test_each_building_is_cut_at_its_own_height(self):
+        """The cut follows the terrain, so it cannot be one global plane."""
+        from src.buildings import split_walls_at_height
+
+        walls = np.array(
+            [
+                [[0, 0, 0], [2, 0, 0], [0, 0, 10]],
+                [[0, 0, 0], [2, 0, 0], [0, 0, 10]],
+            ],
+            dtype=float,
+        )
+        lower, _ = split_walls_at_height(walls, np.array([2.0, 8.0]))
+        self.assertLess(self._area(lower[:1]), self._area(lower[1:]))
+
+
+class TestEraStyles(unittest.TestCase):
+    def test_build_year_picks_the_era(self):
+        from src.facade import STYLES, style_for_building
+
+        n = len(STYLES)
+        self.assertEqual(style_for_building(12.0, 1890, n), 0)   # historic
+        self.assertEqual(style_for_building(12.0, 1935, n), 1)   # interbellum
+        self.assertEqual(style_for_building(12.0, 1960, n), 2)   # postwar
+        self.assertEqual(style_for_building(12.0, 1985, n), 3)   # modern
+        self.assertEqual(style_for_building(12.0, 2015, n), 4)   # contemporary
+
+    def test_same_height_different_era_gives_different_styles(self):
+        from src.facade import STYLES, style_for_building
+
+        n = len(STYLES)
+        self.assertNotEqual(
+            style_for_building(20.0, 1890, n), style_for_building(20.0, 2015, n)
+        )
+
+    def test_missing_year_falls_back_to_height(self):
+        from src.facade import STYLES, style_for_building
+
+        n = len(STYLES)
+        self.assertEqual(style_for_building(4.0, None, n), 0)
+        self.assertGreater(style_for_building(40.0, None, n), 0)
+
+    def test_single_variant_collapses_to_one_style(self):
+        from src.facade import style_for_building
+
+        self.assertEqual(style_for_building(40.0, 2015, 1), 0)
+
+
+class TestTrees(unittest.TestCase):
+    def test_superseded_versions_are_dropped(self):
+        """The BGT returns every past version; only the current one is a tree."""
+        from src.trees import TreeSet
+
+        features = [
+            {"properties": {"lokaal_id": "a", "eind_registratie": "2022-01-01"},
+             "geometry": {"type": "Point", "coordinates": [136100, 455100]}},
+            {"properties": {"lokaal_id": "a", "eind_registratie": None},
+             "geometry": {"type": "Point", "coordinates": [136100, 455100]}},
+            {"properties": {"lokaal_id": "b", "eind_registratie": None},
+             "geometry": {"type": "Point", "coordinates": [136200, 455200]}},
+        ]
+        result = TreeSet()
+        kept = []
+        seen = set()
+        for feature in features:
+            properties = feature["properties"]
+            if properties.get("eind_registratie"):
+                result.superseded_dropped += 1
+                continue
+            if properties["lokaal_id"] in seen:
+                result.superseded_dropped += 1
+                continue
+            seen.add(properties["lokaal_id"])
+            kept.append(feature)
+
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(result.superseded_dropped, 1)
+
+    def test_building_mask_covers_roofs(self):
+        from src.buildings import Building, BuildingSet
+        from src.trees import _rasterize_buildings
+
+        roof = np.array([[[10, 10, 5], [30, 10, 5], [30, 30, 5]]], dtype=float)
+        building = Building(
+            identifier="x",
+            wall_tris=np.zeros((0, 3, 3)),
+            roof_tris=roof,
+            ground_z_nap=0.0,
+            roof_max_nap=5.0,
+            floors=1,
+        )
+        mask = _rasterize_buildings(
+            BuildingSet(buildings=[building]), (0.0, 0.0, 40.0, 40.0), (40, 40)
+        )
+        # Inside the triangle is masked, well outside it is not.
+        self.assertTrue(mask[int(40 - 20), 25])
+        self.assertFalse(mask[int(40 - 35), 5])
+
+    def test_local_maximum_finds_a_crown_beside_the_point(self):
+        """A BGT point marks the trunk, so a point sample misses the canopy."""
+        from src.trees import _max_in_radius
+
+        grid = np.zeros((40, 40))
+        grid[20, 22] = 14.0  # crown top, two cells east of the trunk
+        bounds = (0.0, 0.0, 40.0, 40.0)
+        x = np.array([20.5])
+        y = np.array([40 - 20.5])
+
+        point_like = _max_in_radius(grid, bounds, x, y, 0.5)
+        wider = _max_in_radius(grid, bounds, x, y, 3.0)
+        self.assertEqual(float(point_like[0]), 0.0)
+        self.assertEqual(float(wider[0]), 14.0)
+
+
 class TestElevation(unittest.TestCase):
     def test_nodata_is_masked_not_averaged(self):
         """AHN nodata is ~3.4e38; averaging it in would ruin the whole tile."""
@@ -284,6 +445,7 @@ class TestFacade(unittest.TestCase):
             cfg = {
                 "texture_px": 64, "variants": 1, "seed": 1,
                 "normal_map": True, "relief_depth": 0.035,
+                "ground_floor": False,
             }
             pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
             self.assertEqual(len(pairs), 1)
@@ -296,6 +458,20 @@ class TestFacade(unittest.TestCase):
             cfg["normal_map"] = False
             _, without = generate_facade_textures(Path(tmp), facade_cfg=cfg)[0]
             self.assertIsNone(without)
+
+    def test_ground_floor_texture_is_written_last(self):
+        """The Blender stage addresses it as the trailing material slot."""
+        from src.facade import generate_facade_textures
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {
+                "texture_px": 64, "variants": 2, "seed": 1,
+                "normal_map": False, "relief_depth": 0.035,
+                "ground_floor": True,
+            }
+            pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
+            self.assertEqual(len(pairs), 3)  # two wall variants plus the ground
+            self.assertEqual(pairs[-1][0].name, "facade_ground.png")
 
 
 class TestConfig(unittest.TestCase):

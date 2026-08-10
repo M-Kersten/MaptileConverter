@@ -6,10 +6,12 @@ runtime.
 
 ```
 output/<area_name>/
-├── model.fbx        terrain + buildings, one file
+├── model.fbx        terrain + buildings + trees, one file
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
-├── facade.png       generated facade texture, referenced by the FBX
+├── trees.json       tree positions and heights, for spawning Unity prefabs
+├── facade*.png      generated facade textures, referenced by the FBX
+├── tree.png         bark and foliage atlas
 └── ATTRIBUTION.txt  source credits
 ```
 
@@ -142,7 +144,12 @@ Other knobs worth knowing:
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `facade.variants` | `1` | `1` gives exactly two materials. Up to `4` assigns brick/plaster/concrete/glass by height. |
+| `facade.variants` | `1` | `1` gives exactly two materials. Up to `5` assigns a style by construction year. |
+| `facade.ground_floor` | `true` | Split walls at the first-floor line and give the ground storey its own material. |
+| `facade.ground_floor_height_m` | `3.6` | Where that cut sits above each building's own ground level. |
+| `trees.enabled` | `true` | Fetch BGT trees and give them AHN heights. |
+| `trees.geometry` | `true` | Also bake low-poly tree meshes into the FBX. `trees.json` is written either way. |
+| `trees.crown_search_m` | `3.0` | Radius the canopy height is taken as a maximum over. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
 | `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
 | `facade.normal_map` | `true` | Write a normal map beside each facade texture. |
@@ -159,7 +166,8 @@ src/geo.py         bbox parsing, WGS84 to RD, origin offset
 src/elevation.py   AHN WCS -> GeoTIFF -> height grid
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
-src/facade.py      generated facade textures
+src/facade.py      generated facade and tree textures
+src/trees.py       BGT tree points, heights from AHN DSM minus DTM
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
 blender/process.py builds the scene, assigns materials, exports FBX
@@ -207,6 +215,39 @@ without any fitting. Both get the same `ground_z_offset_nap` subtracted. Much of
 the Netherlands sits below NAP, so negative heights are normal and are never
 clamped away.
 
+## Trees
+
+Two national sources combine into something neither has alone. The BGT registers
+individual trees as points with authoritative positions but no height. AHN has
+height everywhere but does not say what is a tree. Subtracting the DTM from the
+DSM leaves a canopy height model, and sampling that at each BGT point gives every
+tree its own measured height. Over a square kilometre of Utrecht that is 1488
+trees, 91% of them with a measured height.
+
+Two things make the difference between plausible trees and nonsense:
+
+**The BGT returns the full version history of every object.** A naive read finds
+4834 "trees" in that same square kilometre, because superseded versions stack up
+on the same spots. Only rows with no closed registration are kept.
+
+**A tree point marks the trunk, not the crown.** Sampling the canopy model at the
+point lands on whatever is beside the tree and reads far too low, so the height
+is the local maximum within a few metres. Building roofs are cut out of the
+canopy model first, otherwise a tree standing near a wall inherits the height of
+the building next to it.
+
+Trees leave in two forms, and you get both:
+
+- Low-poly geometry in the FBX — a trunk prism and a subdivided-octahedron
+  canopy, about 42 triangles each, all sharing one `M_tree` material so the whole
+  set is a single draw call. Solid geometry rather than crossed billboards, so
+  nothing depends on alpha settings surviving FBX and being set up again.
+- `trees.json`, a spawn list with position, height, crown radius and trunk
+  height, in both RD and the model's local frame, for dropping in real Unity
+  tree prefabs instead.
+
+Set `trees.enabled` to `false` to skip them entirely.
+
 ## Materials
 
 Two materials, by default.
@@ -219,6 +260,22 @@ so roofs pick up real photo texture for free and buildings blend into the ground
 the wall divided by `tile_width_m`, V counts storeys from the building's own
 ground level. The storey height is `wall_height / floors`, so the top row of
 windows finishes flush with the eaves instead of being cut in half.
+
+**The facade follows the building's era, not its height.** 3DBAG carries an
+original construction year on every building — 100% coverage in practice, ranging
+from 1250 to 2022 in Utrecht centre — and era predicts how a wall looks far
+better than height does. A 1890s canal house and a 1970s office block can be the
+same height and look nothing alike. Five styles run from pre-1920 brick with
+tall narrow windows, through interbellum brick, post-war plaster, and 1975-2000
+panel, to contemporary glass. Height is only the fallback when a year is missing.
+
+**`M_facade_ground`** is the ground storey: shopfronts and doors rather than
+another row of the same windows. A repeating grid of identical storeys is the
+clearest sign a facade was generated, and the ground floor is what makes a
+street read as a street. Because a triangle spanning two storeys cannot switch
+texture partway through, the walls are cut along the first-floor line — per
+building, so the cut follows the terrain. Set `facade.ground_floor` to `false` to
+skip the split.
 
 Building `GroundSurface` faces are dropped — they sit under the terrain.
 
@@ -303,3 +360,4 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
 - **3DBAG** — 3D geoinformation research group, TU Delft, and Kadaster (CC BY 4.0)
 - **AHN** — Actueel Hoogtebestand Nederland via PDOK (CC BY 4.0)
 - **Aerial** — PDOK / Beeldmateriaal Nederland (CC BY 4.0)
+- **Trees** — BGT (Basisregistratie Grootschalige Topografie) via PDOK (CC BY 4.0)

@@ -35,8 +35,9 @@ from src.export import (  # noqa: E402
     write_metadata,
     write_scene_description,
 )
-from src.facade import generate_facade_textures  # noqa: E402
+from src.facade import generate_facade_textures, generate_tree_texture  # noqa: E402
 from src.imagery import build_aerial  # noqa: E402
+from src.trees import TreeSet, build_trees, write_tree_list  # noqa: E402
 from src.validate import (  # noqa: E402
     CheckReport,
     check_aerial,
@@ -46,6 +47,7 @@ from src.validate import (  # noqa: E402
     check_export,
     check_fbx_reimport,
     check_terrain,
+    check_trees,
     write_report,
 )
 
@@ -162,27 +164,57 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     for warning in config.warnings:
         LOG.warning("  %s", warning)
 
-    total = 6 if args.skip_blender else 7
+    want_trees = bool(config.trees["enabled"])
+    total = (7 if args.skip_blender else 8) if want_trees else (6 if args.skip_blender else 7)
+    step = 0
 
-    with Stage("terrain (AHN DTM)", 1, total):
+    def next_step() -> int:
+        nonlocal step
+        step += 1
+        return step
+
+    with Stage("terrain (AHN DTM)", next_step(), total):
         terrain = build_terrain(config.bbox, work_dir, terrain_cfg=config.terrain)
 
-    with Stage("aerial imagery (PDOK)", 2, total):
+    with Stage("aerial imagery (PDOK)", next_step(), total):
         aerial = build_aerial(config.bbox, work_dir, aerial_cfg=config.aerial)
 
-    with Stage("buildings (3DBAG LoD2.2)", 3, total):
+    with Stage("buildings (3DBAG LoD2.2)", next_step(), total):
         buildings = build_buildings(
             config.bbox,
             work_dir,
             buildings_cfg=config.buildings,
             terrain_sampler=terrain.sample,
             facade_variants=int(config.facade["variants"]),
+            ground_floor_height_m=(
+                float(config.facade["ground_floor_height_m"])
+                if config.facade["ground_floor"]
+                else None
+            ),
         )
 
-    with Stage("facade textures", 4, total):
+    trees = TreeSet()
+    tree_texture = None
+    if want_trees:
+        with Stage("trees (BGT points, AHN heights)", next_step(), total):
+            trees = build_trees(
+                config.bbox,
+                work_dir,
+                trees_cfg=config.trees,
+                terrain=terrain,
+                buildings=buildings,
+            )
+            if len(trees):
+                write_tree_list(trees, config.geo, out_dir)
+                if bool(config.trees["geometry"]):
+                    tree_texture = generate_tree_texture(
+                        work_dir, size_px=int(config.trees["texture_px"])
+                    )
+
+    with Stage("facade textures", next_step(), total):
         facade_paths = generate_facade_textures(work_dir, facade_cfg=config.facade)
 
-    with Stage("scene description", 5, total):
+    with Stage("scene description", next_step(), total):
         write_scene_description(
             name=config.name,
             geo=config.geo,
@@ -193,10 +225,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             buildings_cfg=config.buildings,
             export_cfg=config.export,
             work_dir=work_dir,
+            tree_texture=tree_texture,
         )
 
     if not args.skip_blender:
-        with Stage("Blender scene build and FBX export", 6, total):
+        with Stage("Blender scene build and FBX export", next_step(), total):
             run_blender_stage(work_dir, out_dir, args.blender)
 
     with Stage("metadata and validation", total, total):
@@ -209,6 +242,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             facade_cfg=config.facade,
             lod=str(config.buildings["lod"]),
             ahn_model=str(config.terrain["ahn_model"]),
+            trees=trees,
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
         write_attribution(out_dir)
@@ -220,6 +254,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             report, buildings, max_height_m=float(config.buildings["max_height_m"])
         )
         check_buildings_on_terrain(report, buildings, terrain)
+        check_trees(report, trees if want_trees else None, config.bbox)
         check_aerial(report, aerial, config.bbox)
 
         if not args.skip_blender:

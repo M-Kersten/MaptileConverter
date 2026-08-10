@@ -75,12 +75,42 @@ DEFAULTS: dict[str, Any] = {
         "floor_height_m": 3.0,
         "tile_width_m": 4.0,
         "texture_px": 512,
-        "variants": 1,
+        # One style per era. 3DBAG supplies a construction year on effectively
+        # every building, and era predicts a facade far better than height.
+        # Set to 1 for a single wall material.
+        "variants": 5,
         "seed": 20240501,
         # A normal map gives the windows and storey bands real relief under a
         # moving light. It costs one extra texture and exports through FBX.
         "normal_map": True,
         "relief_depth": 0.035,
+        # A distinct ground storey is what stops a facade reading as a
+        # repeating grid. Walls are cut at this height to carry it.
+        "ground_floor": True,
+        "ground_floor_height_m": 3.6,
+    },
+    "trees": {
+        "enabled": True,
+        # BGT registers individual trees as points. Heights come from AHN.
+        "api_url": (
+            "https://api.pdok.nl/lv/bgt/ogc/v1/collections/"
+            "vegetatieobject_punt/items"
+        ),
+        "wcs_url": "https://service.pdok.nl/rws/ahn/wcs/v1_0",
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+        # A BGT point marks the trunk; the crown top is metres off it, so the
+        # canopy height is the local maximum within this radius.
+        "crown_search_m": 3.0,
+        "min_height_m": 2.0,
+        "max_height_m": 40.0,
+        "default_height_m": 7.0,
+        "crown_radius_ratio": 0.26,
+        "trunk_height_ratio": 0.38,
+        "geometry": True,
+        "texture_px": 512,
     },
     "export": {
         "fbx_name": "model.fbx",
@@ -112,6 +142,7 @@ class PipelineConfig:
     terrain: dict[str, Any]
     buildings: dict[str, Any]
     facade: dict[str, Any]
+    trees: dict[str, Any]
     export: dict[str, Any]
     source_path: Path | None = None
     warnings: list[str] = field(default_factory=list)
@@ -237,6 +268,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         terrain=merged["terrain"],
         buildings=merged["buildings"],
         facade=merged["facade"],
+        trees=merged["trees"],
         export=merged["export"],
         source_path=path,
         warnings=warnings,

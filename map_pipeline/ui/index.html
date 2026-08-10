@@ -205,10 +205,10 @@
     <legend>Options</legend>
     <div class="row">
       <div>
-        <label for="facade">Facade variants</label>
+        <label for="facade">Facade styles</label>
         <select id="facade">
-          <option value="1" selected>1 (two materials)</option>
-          <option value="4">4 by height</option>
+          <option value="5" selected>5 by build year</option>
+          <option value="1">1 (two materials)</option>
         </select>
       </div>
       <div>
@@ -219,9 +219,18 @@
         </select>
       </div>
     </div>
+    <div class="hint" id="facadeNote"></div>
+    <div class="inline">
+      <input type="checkbox" id="groundFloor" checked>
+      <label for="groundFloor">Distinct ground floor (shopfronts)</label>
+    </div>
     <div class="inline">
       <input type="checkbox" id="normal" checked>
       <label for="normal">Facade normal map (relief on walls)</label>
+    </div>
+    <div class="inline">
+      <input type="checkbox" id="trees" checked>
+      <label for="trees">Trees from the BGT, heights from AHN</label>
     </div>
     <div class="inline">
       <input type="checkbox" id="preview" checked>
@@ -625,6 +634,16 @@ for (const id of ["aerialCm", "terrainM", "facadePx"]) {
 }
 $("normal").addEventListener("change", () => { $("preset").value = "custom"; });
 
+function updateFacadeNote() {
+  $("facadeNote").textContent = +$("facade").value > 1
+    ? "3DBAG carries a construction year on every building, so the facade "
+      + "follows the era rather than the height: pre-1920 brick through to "
+      + "contemporary glass."
+    : "One wall material for every building.";
+}
+$("facade").addEventListener("change", updateFacadeNote);
+updateFacadeNote();
+
 /* ---------- running ---------- */
 const logEl = $("log");
 let job = null, offset = 0, poller = null;
@@ -654,6 +673,8 @@ $("run").onclick = async () => {
     facade_texture_px: q.facadePx,
     facade_normal_map: $("normal").checked,
     facade_variants: +$("facade").value,
+    facade_ground_floor: $("groundFloor").checked,
+    trees: $("trees").checked,
     clip_mode: $("clip").value,
     preview: $("preview").checked
   };

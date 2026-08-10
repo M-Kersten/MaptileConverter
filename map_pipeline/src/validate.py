@@ -161,13 +161,12 @@ def check_buildings(report: CheckReport, buildings, *, max_height_m: float) -> N
         bool((heights <= max_height_m).all()),
         f"tallest {heights.max():.2f} m (ceiling {max_height_m:.0f} m)",
     )
+    missing_walls = sum(1 for b in buildings.buildings if not len(b.all_wall_tris))
+    missing_roofs = sum(1 for b in buildings.buildings if not len(b.roof_tris))
     report.add(
         "buildings_have_walls_and_roofs",
-        all(len(b.wall_tris) and len(b.roof_tris) for b in buildings.buildings)
-        or True,
-        f"{sum(1 for b in buildings.buildings if not len(b.wall_tris))} without "
-        f"walls, "
-        f"{sum(1 for b in buildings.buildings if not len(b.roof_tris))} without roofs",
+        missing_walls == 0 and missing_roofs == 0,
+        f"{missing_walls} without walls, {missing_roofs} without roofs",
         severity="warning",
     )
     report.add(
@@ -191,9 +190,12 @@ def check_buildings_on_terrain(
     """
     floating = []
     for building in buildings.buildings:
-        if not len(building.wall_tris):
+        # After the ground-floor split the base of the building sits in the
+        # ground-storey geometry, so both halves have to be considered.
+        walls = building.all_wall_tris
+        if not len(walls):
             continue
-        points = building.wall_tris.reshape(-1, 3)
+        points = walls.reshape(-1, 3)
         base_z = float(points[:, 2].min())
         xs = np.linspace(points[:, 0].min(), points[:, 0].max(), 3)
         ys = np.linspace(points[:, 1].min(), points[:, 1].max(), 3)
@@ -211,6 +213,47 @@ def check_buildings_on_terrain(
             else f"{len(floating)} buildings float, worst by "
             f"{max(gap for _, gap in floating):.2f} m"
         ),
+    )
+
+
+def check_trees(report: CheckReport, trees, bbox: BBox) -> None:
+    """Trees are inside the area, plausibly tall, and not duplicated."""
+    if trees is None or not len(trees):
+        report.add("trees_present", True, "no trees requested or found", severity="warning")
+        return
+
+    xs = np.array([t.x for t in trees.trees])
+    ys = np.array([t.y for t in trees.trees])
+    heights = np.array([t.height_m for t in trees.trees])
+
+    report.add(
+        "trees_present",
+        len(trees) > 0,
+        f"{len(trees)} trees ({trees.superseded_dropped} superseded BGT "
+        f"versions dropped)",
+    )
+    report.add(
+        "trees_inside_bbox",
+        bool(
+            (xs >= bbox.xmin).all() and (xs <= bbox.xmax).all()
+            and (ys >= bbox.ymin).all() and (ys <= bbox.ymax).all()
+        ),
+        "every tree is inside the bbox",
+    )
+    report.add(
+        "tree_heights_plausible",
+        bool((heights > 0).all() and (heights <= 45).all()),
+        f"heights {heights.min():.1f} to {heights.max():.1f} m "
+        f"(median {np.median(heights):.1f})",
+    )
+
+    # Stacked duplicates are what a naive read of the BGT version history gives.
+    positions = np.column_stack([np.round(xs, 2), np.round(ys, 2)])
+    unique = len(np.unique(positions, axis=0))
+    report.add(
+        "trees_not_duplicated",
+        unique == len(trees),
+        f"{unique} distinct positions for {len(trees)} trees",
     )
 
 

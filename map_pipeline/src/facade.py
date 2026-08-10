@@ -36,55 +36,98 @@ class FacadeStyle:
     window_height_frac: float
     sill_frac: float
     grain: float
+    # Newest construction year this style covers. 3DBAG carries the original
+    # build year on every building, and era predicts how a facade looks far
+    # better than height does: a 1890s canal house and a 1970s office block can
+    # be the same height and look nothing alike.
+    era_until: int = 3000
+    label: str = ""
 
 
-# Ordered from low-rise brick to high-rise glass. Buildings are matched to a
-# style by height, so taller stock reads as more modern.
+# Ordered oldest to newest. A building picks the first style whose era covers
+# its construction year.
 STYLES: tuple[FacadeStyle, ...] = (
     FacadeStyle(
-        name="brick",
-        wall_rgb=(150, 96, 78),
+        name="historic",
+        label="pre-1920 brick, tall narrow windows",
+        era_until=1920,
+        wall_rgb=(138, 84, 68),
+        trim_rgb=(232, 230, 224),
+        glass_rgb=(58, 72, 84),
+        windows_across=2,
+        window_width_frac=0.26,
+        window_height_frac=0.56,
+        sill_frac=0.18,
+        grain=0.13,
+    ),
+    FacadeStyle(
+        name="interbellum",
+        label="1920-1945 brick",
+        era_until=1945,
+        wall_rgb=(158, 102, 82),
         trim_rgb=(226, 224, 218),
         glass_rgb=(66, 82, 94),
         windows_across=2,
-        window_width_frac=0.30,
+        window_width_frac=0.31,
         window_height_frac=0.46,
         sill_frac=0.22,
         grain=0.10,
     ),
     FacadeStyle(
-        name="plaster",
-        wall_rgb=(198, 190, 176),
+        name="postwar",
+        label="1945-1975 plaster and concrete",
+        era_until=1975,
+        wall_rgb=(196, 188, 174),
         trim_rgb=(238, 236, 232),
         glass_rgb=(74, 88, 100),
-        windows_across=2,
-        window_width_frac=0.32,
+        windows_across=3,
+        window_width_frac=0.26,
         window_height_frac=0.50,
         sill_frac=0.20,
         grain=0.06,
     ),
     FacadeStyle(
-        name="concrete",
-        wall_rgb=(166, 166, 162),
-        trim_rgb=(206, 208, 210),
-        glass_rgb=(60, 76, 90),
-        windows_across=3,
-        window_width_frac=0.24,
-        window_height_frac=0.52,
-        sill_frac=0.18,
-        grain=0.05,
-    ),
-    FacadeStyle(
-        name="glass",
-        wall_rgb=(108, 118, 128),
-        trim_rgb=(150, 158, 166),
-        glass_rgb=(84, 108, 126),
+        name="modern",
+        label="1975-2000 brick and panel",
+        era_until=2000,
+        wall_rgb=(170, 148, 130),
+        trim_rgb=(214, 214, 212),
+        glass_rgb=(64, 80, 94),
         windows_across=3,
         window_width_frac=0.28,
+        window_height_frac=0.54,
+        sill_frac=0.16,
+        grain=0.07,
+    ),
+    FacadeStyle(
+        name="contemporary",
+        label="2000 onwards, glass and panel",
+        era_until=3000,
+        wall_rgb=(112, 122, 132),
+        trim_rgb=(152, 160, 168),
+        glass_rgb=(86, 110, 128),
+        windows_across=3,
+        window_width_frac=0.30,
         window_height_frac=0.66,
         sill_frac=0.10,
         grain=0.03,
     ),
+)
+
+# The ground storey is what makes a street read as a street: shopfronts and
+# doors rather than another row of the same windows. It is a separate material
+# because a wall has to be split at the first-floor line to use it.
+GROUND_STYLE = FacadeStyle(
+    name="ground",
+    label="ground floor, shopfronts and doors",
+    wall_rgb=(150, 142, 134),
+    trim_rgb=(224, 222, 216),
+    glass_rgb=(58, 70, 80),
+    windows_across=2,
+    window_width_frac=0.36,
+    window_height_frac=0.62,
+    sill_frac=0.06,
+    grain=0.05,
 )
 
 
@@ -247,23 +290,40 @@ def relief_to_normal_map(relief: np.ndarray, depth: float = RELIEF_DEPTH) -> np.
     return np.clip((normal * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
 
 
-def style_for_height(height_m: float, n_variants: int) -> int:
-    """Pick a style index for a building height.
+def style_for_building(
+    height_m: float, build_year: int | None, n_variants: int
+) -> int:
+    """Pick a facade style for one building.
 
-    Low buildings get brick, tall ones get glass, which matches how Dutch urban
-    stock actually reads from the street.
+    Construction year decides it when 3DBAG supplies one, which it does for
+    every building in practice. Height is only the fallback, and a poor proxy:
+    era is what actually determines whether a wall is dark brick or glass.
     """
     if n_variants <= 1:
         return 0
+
+    if build_year:
+        for index, style in enumerate(STYLES[:n_variants]):
+            if build_year <= style.era_until:
+                return index
+        return n_variants - 1
+
     thresholds = (9.0, 18.0, 32.0)
-    index = sum(height_m >= t for t in thresholds)
-    return int(min(index, n_variants - 1))
+    return int(min(sum(height_m >= t for t in thresholds), n_variants - 1))
+
+
+def style_for_height(height_m: float, n_variants: int) -> int:
+    """Height-only style pick, kept for callers with no build year."""
+    return style_for_building(height_m, None, n_variants)
 
 
 def generate_facade_textures(
     work_dir: Path, *, facade_cfg: dict
 ) -> list[tuple[Path, Path | None]]:
     """Write the facade textures, returning ``(colour, normal)`` per variant.
+
+    When the ground storey is enabled its texture comes last, so the Blender
+    stage can address it as the final material slot.
 
     The normal map is named ``*_normal.png`` because Unity's importer keys off
     that suffix to set the texture type automatically.
@@ -276,12 +336,20 @@ def generate_facade_textures(
     seed = int(facade_cfg["seed"])
     want_normal = bool(facade_cfg.get("normal_map", True))
 
+    styles = list(STYLES[:variants])
+    if bool(facade_cfg.get("ground_floor", True)):
+        styles.append(GROUND_STYLE)
+
     paths: list[tuple[Path, Path | None]] = []
-    for index in range(variants):
-        style = STYLES[index]
+    for index, style in enumerate(styles):
         pixels, relief = render_facade_layers(style, size_px, seed=seed + index)
 
-        stem = "facade" if variants == 1 else f"facade_{index:02d}_{style.name}"
+        if style.name == "ground":
+            stem = "facade_ground"
+        elif variants == 1:
+            stem = "facade"
+        else:
+            stem = f"facade_{index:02d}_{style.name}"
         # Row 0 of the array is the bottom of the tile in UV space, but PNG rows
         # run top-down, so flip on the way out.
         colour_path = work_dir / f"{stem}.png"
@@ -305,7 +373,48 @@ def generate_facade_textures(
     return paths
 
 
+def generate_tree_texture(work_dir: Path, size_px: int = 512, seed: int = 7) -> Path:
+    """One atlas holding bark and foliage, so all trees cost a single material.
+
+    The left half is bark and the right half foliage. Trunk UVs sample the left,
+    canopy UVs the right, which keeps every tree in the scene on one draw call.
+    """
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    half = size_px // 2
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+
+    # Bark: brown with vertical grain.
+    bark = np.zeros((size_px, half, 3), dtype=np.float64)
+    bark[:, :] = (96, 72, 54)
+    streaks = _value_noise((size_px, half), cells=max(4, half // 6), rng=rng)
+    fine = _value_noise((size_px, half), cells=max(8, half // 2), rng=rng)
+    bark *= 1.0 + 0.30 * ((0.7 * streaks + 0.3 * fine) - 0.5)[:, :, None] * 2.0
+    canvas[:, :half] = bark
+
+    # Foliage: mottled green, darker low down so a canopy reads as rounded.
+    leaf = np.zeros((size_px, size_px - half, 3), dtype=np.float64)
+    leaf[:, :] = (78, 108, 56)
+    blobs = _value_noise((size_px, size_px - half), cells=max(5, half // 10), rng=rng)
+    speckle = _value_noise((size_px, size_px - half), cells=max(10, half // 3), rng=rng)
+    leaf *= 1.0 + 0.34 * ((0.6 * blobs + 0.4 * speckle) - 0.5)[:, :, None] * 2.0
+    shade = np.linspace(0.72, 1.16, size_px)[:, None, None]
+    leaf *= shade
+    canvas[:, half:] = leaf
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "tree.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8)[::-1], mode="RGB").save(
+        path, format="PNG"
+    )
+    LOG.info("wrote %s (bark and foliage atlas, %dpx)", path.name, size_px)
+    return path
+
+
 __all__ = [
+    "GROUND_STYLE",
+    "generate_tree_texture",
     "RELIEF_DEPTH",
     "STYLES",
     "FacadeStyle",
@@ -313,5 +422,6 @@ __all__ = [
     "relief_to_normal_map",
     "render_facade_layers",
     "render_facade_tile",
+    "style_for_building",
     "style_for_height",
 ]

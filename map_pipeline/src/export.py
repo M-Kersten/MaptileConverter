@@ -29,6 +29,10 @@ ATTRIBUTION = {
         "Luchtfoto via PDOK / Beeldmateriaal Nederland (CC BY 4.0). "
         "https://www.beeldmateriaal.nl"
     ),
+    "trees": (
+        "Tree positions from the BGT (Basisregistratie Grootschalige "
+        "Topografie) via PDOK, CC BY 4.0."
+    ),
 }
 
 
@@ -42,6 +46,7 @@ def build_metadata(
     facade_cfg: dict,
     lod: str,
     ahn_model: str,
+    trees=None,
     extra: dict[str, Any] | None = None,
 ) -> dict:
     """Assemble the metadata document."""
@@ -78,6 +83,16 @@ def build_metadata(
             "lod": lod,
             "ground_surfaces": "dropped (hidden under the terrain)",
         },
+        "trees": (
+            {
+                **trees.stats(),
+                "source": "BGT vegetatieobject_punt",
+                "heights_from": "AHN DSM minus DTM, local maximum at each point",
+                "spawn_list": "trees.json",
+            }
+            if trees is not None and len(trees)
+            else {"count": 0}
+        ),
         "materials": {
             "M_aerial": (
                 "aerial ortho, top-down planar UV; used on terrain and roofs"
@@ -87,6 +102,17 @@ def build_metadata(
                 f"{facade_cfg['tile_width_m']} m per tile across, "
                 f"one storey up (nominal {facade_cfg['floor_height_m']} m)"
             ),
+            **(
+                {
+                    "M_facade_ground": (
+                        "ground storey, one tile over "
+                        f"{facade_cfg['ground_floor_height_m']} m"
+                    )
+                }
+                if facade_cfg.get("ground_floor")
+                else {}
+            ),
+            **({"M_tree": "bark and foliage atlas"} if trees and len(trees) else {}),
         },
         "unity_import": {
             "local_to_rd": "rd_x = local_x + origin_rd[0], rd_y = local_z + origin_rd[1]",
@@ -123,6 +149,7 @@ def write_scene_description(
     buildings_cfg: dict,
     export_cfg: dict,
     work_dir: Path,
+    tree_texture: Path | None = None,
 ) -> Path:
     """Write scene.json: everything the Blender stage needs, and nothing else.
 
@@ -157,7 +184,16 @@ def write_scene_description(
             "tile_width_m": float(facade_cfg["tile_width_m"]),
             "floor_height_m": float(facade_cfg["floor_height_m"]),
             "variants": len(facade_paths),
+            "ground_floor": bool(facade_cfg.get("ground_floor", False)),
+            "ground_floor_height_m": float(
+                facade_cfg.get("ground_floor_height_m", 3.6)
+            ),
         },
+        "trees": (
+            {"file": "trees.npz", "texture": tree_texture.name}
+            if tree_texture is not None
+            else {}
+        ),
         "export": {
             "fbx_name": export_cfg["fbx_name"],
             "aerial_name": export_cfg["aerial_name"],
@@ -185,6 +221,7 @@ def write_attribution(out_dir: Path) -> Path:
         f"Buildings: {ATTRIBUTION['buildings']}",
         f"Terrain:   {ATTRIBUTION['terrain']}",
         f"Aerial:    {ATTRIBUTION['aerial']}",
+        f"Trees:     {ATTRIBUTION['trees']}",
         "",
         "Keep this notice with the model when you redistribute it.",
         "",

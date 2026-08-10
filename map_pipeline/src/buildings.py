@@ -55,6 +55,11 @@ class Building:
     # Top of the walls. On a pitched roof this is the eaves, well below the
     # ridge, and it is what the facade has to divide into storeys.
     wall_top_nap: float = 0.0
+    build_year: int | None = None
+    # Filled in when the ground storey is split off; carries its own material.
+    ground_wall_tris: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float64)
+    )
 
     @property
     def height_m(self) -> float:
@@ -63,6 +68,19 @@ class Building:
     @property
     def wall_height_m(self) -> float:
         return max(self.wall_top_nap - self.ground_z_nap, 0.0)
+
+    @property
+    def all_wall_tris(self) -> np.ndarray:
+        """Every wall triangle, whichever side of the ground-floor cut it fell.
+
+        After the split the base of the building lives in ``ground_wall_tris``,
+        so anything reasoning about where the building meets the ground has to
+        look at both.
+        """
+        chunks = [c for c in (self.wall_tris, self.ground_wall_tris) if len(c)]
+        if not chunks:
+            return np.zeros((0, 3, 3), dtype=np.float64)
+        return np.concatenate(chunks, axis=0)
 
     @property
     def n_triangles(self) -> int:
@@ -502,6 +520,12 @@ def _extract_feature(
     if floors == 0:
         floors = max(1, int(round(wall_height / DEFAULT_FLOOR_HEIGHT_M)))
 
+    build_year = attributes.get("oorspronkelijkbouwjaar")
+    try:
+        build_year = int(build_year) if build_year else None
+    except (TypeError, ValueError):
+        build_year = None
+
     return Building(
         identifier=str(parent_id),
         wall_tris=walls,
@@ -510,6 +534,7 @@ def _extract_feature(
         roof_max_nap=roof_max,
         floors=floors,
         wall_top_nap=wall_top,
+        build_year=build_year,
     )
 
 
@@ -680,6 +705,103 @@ def apply_ground_skirt(
     return adjusted
 
 
+def split_walls_at_height(
+    triangles: np.ndarray, split_z: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cut wall triangles along a horizontal line, returning ``(lower, upper)``.
+
+    A repeating grid of identical windows is the clearest sign a facade was
+    generated. Real streets have a different ground storey, and giving it its
+    own material means the wall has to be cut at the first-floor line: a
+    triangle spanning both storeys cannot switch texture partway through,
+    because UVs only exist at its corners.
+
+    Each triangle is clipped against its own building's split height, so the
+    cut follows the terrain rather than one global plane.
+    """
+    if len(triangles) == 0:
+        empty = np.zeros((0, 3, 3), dtype=np.float64)
+        return empty, empty
+
+    lower: list[np.ndarray] = []
+    upper: list[np.ndarray] = []
+
+    for triangle, z_cut in zip(triangles, split_z):
+        below = triangle[:, 2] < z_cut
+        count = int(below.sum())
+
+        if count == 3:
+            lower.append(triangle)
+            continue
+        if count == 0:
+            upper.append(triangle)
+            continue
+
+        # One or two corners are below the cut. Interpolate along the two edges
+        # that cross it; the result is a triangle on one side and a quad on the
+        # other, and the quad becomes two triangles.
+        if count == 1:
+            lone = int(np.flatnonzero(below)[0])
+        else:
+            lone = int(np.flatnonzero(~below)[0])
+
+        apex = triangle[lone]
+        other_a = triangle[(lone + 1) % 3]
+        other_b = triangle[(lone + 2) % 3]
+
+        def crossing(start: np.ndarray, end: np.ndarray) -> np.ndarray:
+            span = end[2] - start[2]
+            if abs(span) < 1e-12:
+                return start.copy()
+            t = float(np.clip((z_cut - start[2]) / span, 0.0, 1.0))
+            return start + t * (end - start)
+
+        cut_a = crossing(apex, other_a)
+        cut_b = crossing(apex, other_b)
+
+        apex_side = lower if count == 1 else upper
+        quad_side = upper if count == 1 else lower
+
+        apex_side.append(np.array([apex, cut_a, cut_b]))
+        quad_side.append(np.array([cut_a, other_a, other_b]))
+        quad_side.append(np.array([cut_a, other_b, cut_b]))
+
+    def stack(chunks: list[np.ndarray]) -> np.ndarray:
+        if not chunks:
+            return np.zeros((0, 3, 3), dtype=np.float64)
+        return np.stack(chunks).astype(np.float64)
+
+    return stack(lower), stack(upper)
+
+
+def apply_ground_floor_split(
+    buildings: BuildingSet, ground_floor_height_m: float
+) -> int:
+    """Separate each building's ground storey from the storeys above it."""
+    split_count = 0
+
+    for building in buildings.buildings:
+        if len(building.wall_tris) == 0:
+            continue
+        # Nothing to split on a single-storey building: it is all ground floor.
+        if building.wall_height_m <= ground_floor_height_m * 1.2:
+            building.ground_wall_tris = building.wall_tris
+            building.wall_tris = np.zeros((0, 3, 3), dtype=np.float64)
+            split_count += 1
+            continue
+
+        cut = np.full(
+            len(building.wall_tris), building.ground_z_nap + ground_floor_height_m
+        )
+        lower, upper = split_walls_at_height(building.wall_tris, cut)
+        building.ground_wall_tris = lower
+        building.wall_tris = upper
+        split_count += 1
+
+    LOG.info("split the ground storey off %d buildings", split_count)
+    return split_count
+
+
 def save_buildings(
     buildings: BuildingSet, path: Path, style_index: np.ndarray | None = None
 ) -> Path:
@@ -689,8 +811,8 @@ def save_buildings(
     building index. That keeps the Blender side to array slicing instead of
     CityJSON parsing.
     """
-    wall_chunks, roof_chunks = [], []
-    wall_owner, roof_owner = [], []
+    wall_chunks, roof_chunks, ground_chunks = [], [], []
+    wall_owner, roof_owner, ground_owner = [], [], []
 
     for index, building in enumerate(buildings.buildings):
         if len(building.wall_tris):
@@ -699,6 +821,11 @@ def save_buildings(
         if len(building.roof_tris):
             roof_chunks.append(building.roof_tris)
             roof_owner.append(np.full(len(building.roof_tris), index, dtype=np.int32))
+        if len(building.ground_wall_tris):
+            ground_chunks.append(building.ground_wall_tris)
+            ground_owner.append(
+                np.full(len(building.ground_wall_tris), index, dtype=np.int32)
+            )
 
     def stack(chunks: list[np.ndarray]) -> np.ndarray:
         if chunks:
@@ -721,6 +848,11 @@ def save_buildings(
         wall_building=stack_ids(wall_owner),
         roof_tris=stack(roof_chunks),
         roof_building=stack_ids(roof_owner),
+        ground_wall_tris=stack(ground_chunks),
+        ground_wall_building=stack_ids(ground_owner),
+        build_year=np.array(
+            [b.build_year or 0 for b in buildings.buildings], dtype=np.int32
+        ),
         # Fixed-width unicode rather than object dtype, so loading the archive
         # never needs allow_pickle.
         building_ids=np.array(
@@ -752,6 +884,7 @@ def build_buildings(
     buildings_cfg: dict,
     terrain_sampler: Callable[[Any, Any], Any] | None = None,
     facade_variants: int = 1,
+    ground_floor_height_m: float | None = None,
 ) -> BuildingSet:
     """Fetch, clean, ground, and cache the buildings for `bbox`."""
     result = fetch_buildings(bbox, buildings_cfg=buildings_cfg)
@@ -782,12 +915,30 @@ def build_buildings(
             skirt_m=float(buildings_cfg["ground_skirt_m"]),
         )
 
-    from .facade import style_for_height
+    # Split before saving: the ground storey has to be its own geometry to
+    # carry its own material.
+    if ground_floor_height_m:
+        apply_ground_floor_split(result, ground_floor_height_m)
+
+    from .facade import style_for_building
 
     style_index = np.array(
-        [style_for_height(b.height_m, facade_variants) for b in result.buildings],
+        [
+            style_for_building(b.height_m, b.build_year, facade_variants)
+            for b in result.buildings
+        ],
         dtype=np.int32,
     )
+    years = [b.build_year for b in result.buildings if b.build_year]
+    if years:
+        LOG.info(
+            "construction years on %d/%d buildings, %d to %d",
+            len(years),
+            len(result.buildings),
+            min(years),
+            max(years),
+        )
+
     save_buildings(result, work_dir / "buildings.npz", style_index=style_index)
     return result
 
@@ -795,7 +946,9 @@ def build_buildings(
 __all__ = [
     "Building",
     "BuildingSet",
+    "apply_ground_floor_split",
     "apply_ground_skirt",
+    "split_walls_at_height",
     "build_buildings",
     "decode_vertices",
     "fetch_buildings",

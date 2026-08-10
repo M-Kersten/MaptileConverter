@@ -125,7 +125,9 @@ def build_config(payload: dict) -> dict:
             "variants": int(payload.get("facade_variants", 1)),
             "texture_px": int(payload.get("facade_texture_px", 512)),
             "normal_map": bool(payload.get("facade_normal_map", True)),
+            "ground_floor": bool(payload.get("facade_ground_floor", True)),
         },
+        "trees": {"enabled": bool(payload.get("trees", True))},
     }
     return config
 

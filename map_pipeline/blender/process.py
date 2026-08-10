@@ -296,13 +296,24 @@ def wall_uvs(
     return np.column_stack([u, v])
 
 
-def build_buildings(scene: dict, work_dir: Path, facade_materials: list, aerial_material):
+def build_buildings(
+    scene: dict,
+    work_dir: Path,
+    facade_materials: list,
+    aerial_material,
+    ground_material=None,
+):
     """One mesh holding every building, with facade and aerial material slots."""
     data = np.load(work_dir / scene["buildings"]["file"])
     wall_tris = data["wall_tris"]
     roof_tris = data["roof_tris"]
     wall_owner = data["wall_building"]
     roof_owner = data["roof_building"]
+    has_ground = "ground_wall_tris" in data.files and ground_material is not None
+    ground_tris = data["ground_wall_tris"] if has_ground else np.zeros((0, 3, 3))
+    ground_owner = (
+        data["ground_wall_building"] if has_ground else np.zeros((0,), dtype=np.int32)
+    )
     ground_z_nap = data["ground_z_nap"]
     # Storeys divide the wall, not the roof ridge, so the top row of windows
     # finishes at the eaves instead of being cut in half by them.
@@ -327,8 +338,9 @@ def build_buildings(scene: dict, work_dir: Path, facade_materials: list, aerial_
 
     walls = to_local(wall_tris)
     roofs = to_local(roof_tris)
-    n_walls, n_roofs = len(walls), len(roofs)
-    if n_walls + n_roofs == 0:
+    grounds = to_local(ground_tris)
+    n_walls, n_roofs, n_grounds = len(walls), len(roofs), len(grounds)
+    if n_walls + n_roofs + n_grounds == 0:
         raise SystemExit("buildings.npz holds no triangles")
 
     ground_z_local = ground_z_nap - z_offset
@@ -341,8 +353,12 @@ def build_buildings(scene: dict, work_dir: Path, facade_materials: list, aerial_
 
     materials = list(facade_materials) + [aerial_material]
     aerial_slot = len(facade_materials)
+    if has_ground:
+        materials.append(ground_material)
+    ground_slot = len(materials) - 1
 
-    triangles = np.concatenate([walls, roofs], axis=0) if n_roofs else walls
+    parts = [chunk for chunk in (walls, roofs, grounds) if len(chunk)]
+    triangles = np.concatenate(parts, axis=0)
     corners = triangles.reshape(-1, 3)
 
     uv_chunks = []
@@ -360,9 +376,24 @@ def build_buildings(scene: dict, work_dir: Path, facade_materials: list, aerial_
         uv_chunks.append(
             planar_uv(roofs.reshape(-1, 3)[:, :2], scene["aerial"]["bbox_local"])
         )
+    if n_grounds:
+        # The ground storey gets exactly one tile vertically, so the shopfront
+        # spans it instead of repeating inside it.
+        storey = np.full(
+            len(ground_z_local), float(facade_cfg.get("ground_floor_height_m", 3.6))
+        )
+        uv_chunks.append(
+            wall_uvs(
+                grounds,
+                ground_owner,
+                ground_z_local,
+                storey,
+                float(facade_cfg["tile_width_m"]),
+            )
+        )
     uvs = np.concatenate(uv_chunks, axis=0)
 
-    material_indices = np.empty(n_walls + n_roofs, dtype=np.int32)
+    material_indices = np.empty(n_walls + n_roofs + n_grounds, dtype=np.int32)
     if n_walls:
         if style_index is not None and len(facade_materials) > 1:
             material_indices[:n_walls] = np.clip(
@@ -370,9 +401,10 @@ def build_buildings(scene: dict, work_dir: Path, facade_materials: list, aerial_
             )
         else:
             material_indices[:n_walls] = 0
-    material_indices[n_walls:] = aerial_slot
+    material_indices[n_walls : n_walls + n_roofs] = aerial_slot
+    material_indices[n_walls + n_roofs :] = ground_slot
 
-    n_triangles = n_walls + n_roofs
+    n_triangles = n_walls + n_roofs + n_grounds
     loop_vertex_indices = np.arange(n_triangles * 3)
     loop_starts = np.arange(0, n_triangles * 3, 3)
     loop_totals = np.full(n_triangles, 3)
@@ -389,9 +421,159 @@ def build_buildings(scene: dict, work_dir: Path, facade_materials: list, aerial_
         shade_smooth=False,
     )
     log(
-        f"buildings: {len(ground_z_nap)} buildings, "
-        f"{n_walls} wall triangles, {n_roofs} roof triangles"
+        f"buildings: {len(ground_z_nap)} buildings, {n_walls} wall triangles, "
+        f"{n_roofs} roof triangles, {n_grounds} ground-storey triangles"
     )
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Trees
+# ---------------------------------------------------------------------------
+
+
+def _octahedron_canopy(subdivisions: int = 1):
+    """A low-poly ball: an octahedron, subdivided and pushed onto a sphere.
+
+    One subdivision is 32 triangles, which reads as a canopy at street distance
+    without putting a real sphere on every tree in the area.
+    """
+    verts = [
+        (0, 0, 1), (1, 0, 0), (0, 1, 0),
+        (-1, 0, 0), (0, -1, 0), (0, 0, -1),
+    ]
+    faces = [
+        (0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 1),
+        (5, 2, 1), (5, 3, 2), (5, 4, 3), (5, 1, 4),
+    ]
+    verts = [np.asarray(v, dtype=np.float64) for v in verts]
+
+    for _ in range(subdivisions):
+        midpoints: dict[tuple[int, int], int] = {}
+        new_faces = []
+
+        def midpoint(a: int, b: int) -> int:
+            key = (min(a, b), max(a, b))
+            if key not in midpoints:
+                point = (verts[a] + verts[b]) * 0.5
+                verts.append(point / np.linalg.norm(point))
+                midpoints[key] = len(verts) - 1
+            return midpoints[key]
+
+        for a, b, c in faces:
+            ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
+            new_faces += [(a, ab, ca), (ab, b, bc), (ca, bc, c), (ab, bc, ca)]
+        faces = new_faces
+
+    return np.asarray(verts), np.asarray(faces, dtype=np.int64)
+
+
+def build_trees(scene: dict, work_dir: Path, tree_material):
+    """One mesh holding every tree: a trunk prism plus a low-poly canopy.
+
+    Solid geometry rather than crossed billboards, so nothing depends on alpha
+    settings surviving the FBX trip and being configured again in Unity.
+    """
+    tree_file = scene.get("trees", {}).get("file")
+    if not tree_file or not (work_dir / tree_file).is_file():
+        return None
+
+    data = np.load(work_dir / tree_file)
+    xy = data["xy"]
+    if len(xy) == 0:
+        return None
+
+    ground = data["ground_z_nap"]
+    heights = data["height_m"]
+    crowns = data["crown_radius_m"]
+    trunks = data["trunk_height_m"]
+
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+
+    canopy_verts, canopy_faces = _octahedron_canopy(1)
+    trunk_sides = 5
+    angles = np.linspace(0, 2 * np.pi, trunk_sides, endpoint=False)
+
+    # UVs address one atlas: bark on the left half, foliage on the right.
+    bark_uv = np.array([0.25, 0.5])
+    leaf_uv = np.array([0.75, 0.5])
+
+    all_verts: list[np.ndarray] = []
+    all_faces: list[np.ndarray] = []
+    all_uvs: list[np.ndarray] = []
+    offset = 0
+    rng = np.random.default_rng(4242)
+
+    for index in range(len(xy)):
+        base_x = float(xy[index, 0]) - origin_x
+        base_y = float(xy[index, 1]) - origin_y
+        base_z = float(ground[index]) - z_offset
+        height = float(heights[index])
+        crown_r = float(crowns[index])
+        trunk_h = float(trunks[index])
+
+        # A little variation so a street of trees does not look cloned.
+        spin = float(rng.random()) * 2 * np.pi
+        squash = 0.85 + 0.3 * float(rng.random())
+
+        trunk_r = max(0.08, crown_r * 0.11)
+        ring_x = base_x + trunk_r * np.cos(angles + spin)
+        ring_y = base_y + trunk_r * np.sin(angles + spin)
+        canopy_base = base_z + trunk_h
+
+        lower = np.column_stack([ring_x, ring_y, np.full(trunk_sides, base_z)])
+        upper = np.column_stack(
+            [ring_x, ring_y, np.full(trunk_sides, canopy_base + crown_r * 0.3)]
+        )
+        all_verts.append(np.vstack([lower, upper]))
+
+        for side in range(trunk_sides):
+            nxt = (side + 1) % trunk_sides
+            all_faces.append(
+                np.array(
+                    [
+                        [offset + side, offset + nxt, offset + trunk_sides + nxt],
+                        [offset + side, offset + trunk_sides + nxt, offset + trunk_sides + side],
+                    ]
+                )
+            )
+        all_uvs.append(np.tile(bark_uv, (trunk_sides * 2 * 3, 1)))
+        offset += trunk_sides * 2
+
+        # Canopy: an ellipsoid sitting on top of the trunk.
+        crown_centre = np.array(
+            [base_x, base_y, canopy_base + (height - trunk_h) * 0.5]
+        )
+        radii = np.array(
+            [crown_r, crown_r * squash, max(0.6, (height - trunk_h) * 0.5)]
+        )
+        all_verts.append(canopy_verts * radii + crown_centre)
+        all_faces.append(canopy_faces + offset)
+        all_uvs.append(np.tile(leaf_uv, (len(canopy_faces) * 3, 1)))
+        offset += len(canopy_verts)
+
+    vertices = np.vstack(all_verts)
+    faces = np.vstack(all_faces)
+    uvs = np.vstack(all_uvs)
+
+    n_triangles = len(faces)
+    loop_vertex_indices = faces.reshape(-1)
+    loop_starts = np.arange(0, n_triangles * 3, 3)
+    loop_totals = np.full(n_triangles, 3)
+
+    obj = build_mesh_object(
+        "Trees",
+        vertices,
+        loop_vertex_indices,
+        loop_starts,
+        loop_totals,
+        uvs,
+        np.zeros(n_triangles),
+        [tree_material],
+        shade_smooth=False,
+    )
+    log(f"trees: {len(xy)} trees, {n_triangles} triangles")
     return obj
 
 
@@ -441,7 +623,7 @@ def export_fbx(out_path: Path) -> None:
 
 def copy_textures(
     scene: dict, work_dir: Path, out_dir: Path
-) -> tuple[Path, list[tuple[Path, Path | None]]]:
+) -> tuple[Path, list[tuple[Path, Path | None]], Path | None]:
     """Place the textures beside the FBX before the materials reference them."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -464,7 +646,10 @@ def copy_textures(
         (copy(name), copy(normal) if normal else None)
         for name, normal in zip(scene["facade"]["files"], normals)
     ]
-    return aerial_dst, facades
+
+    tree_texture = scene.get("trees", {}).get("texture")
+    tree_dst = copy(tree_texture) if tree_texture else None
+    return aerial_dst, facades, tree_dst
 
 
 def main() -> int:
@@ -480,21 +665,44 @@ def main() -> int:
     log(f"building scene {scene['name']!r}")
     reset_scene()
 
-    aerial_texture, facade_textures = copy_textures(scene, work_dir, out_dir)
+    aerial_texture, facade_textures, tree_texture = copy_textures(
+        scene, work_dir, out_dir
+    )
+
+    # The ground-storey texture is written last, so it is the trailing entry.
+    has_ground_floor = bool(scene["facade"].get("ground_floor"))
+    wall_textures = facade_textures[:-1] if has_ground_floor else facade_textures
+    ground_texture = facade_textures[-1] if has_ground_floor else None
 
     aerial_material = make_textured_material("M_aerial", aerial_texture, roughness=0.9)
     facade_materials = [
         make_textured_material(
-            "M_facade" if len(facade_textures) == 1 else f"M_facade_{i:02d}",
+            "M_facade" if len(wall_textures) == 1 else f"M_facade_{i:02d}",
             colour,
             roughness=0.75,
             normal_path=normal,
         )
-        for i, (colour, normal) in enumerate(facade_textures)
+        for i, (colour, normal) in enumerate(wall_textures)
     ]
+    ground_material = (
+        make_textured_material(
+            "M_facade_ground",
+            ground_texture[0],
+            roughness=0.6,
+            normal_path=ground_texture[1],
+        )
+        if ground_texture
+        else None
+    )
 
     build_terrain(scene, work_dir, aerial_material)
-    build_buildings(scene, work_dir, facade_materials, aerial_material)
+    build_buildings(
+        scene, work_dir, facade_materials, aerial_material, ground_material
+    )
+
+    if tree_texture is not None:
+        tree_material = make_textured_material("M_tree", tree_texture, roughness=0.85)
+        build_trees(scene, work_dir, tree_material)
 
     # Report the scene bounds so a coordinate or scale error shows up in the log
     # rather than only in Unity.
