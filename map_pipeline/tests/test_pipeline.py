@@ -301,6 +301,54 @@ class TestConfig(unittest.TestCase):
                 load_config(path)
 
 
+class TestUIServer(unittest.TestCase):
+    """The UI writes a config and shells out to pipeline.py, so the translation
+    from form fields to config is the part worth pinning down."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO_ROOT / "ui"))
+        import server
+
+        self.server = server
+
+    def test_form_payload_becomes_a_loadable_config(self):
+        payload = {
+            "name": "somewhere",
+            "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+            "size_px": 2048,
+            "mesh_vertices": 129,
+            "facade_variants": 4,
+            "clip_mode": "intersect",
+        }
+        config = self.server.build_config(payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+
+        self.assertEqual(loaded.name, "somewhere")
+        self.assertEqual(loaded.bbox.width, 1000.0)
+        self.assertEqual(loaded.aerial["size_px"], 2048)
+        self.assertEqual(loaded.terrain["mesh_vertices_per_side"], 129)
+        self.assertEqual(loaded.facade["variants"], 4)
+        self.assertEqual(loaded.buildings["clip_mode"], "intersect")
+
+    def test_defaults_apply_when_the_form_omits_fields(self):
+        config = self.server.build_config(
+            {
+                "name": "bare",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+            }
+        )
+        self.assertEqual(config["aerial"]["size_px"], 4096)
+        self.assertEqual(config["terrain"]["ahn_model"], "DTM")
+        self.assertEqual(config["buildings"]["lod"], "2.2")
+
+    def test_area_summary_is_none_for_unknown_area(self):
+        self.assertIsNone(self.server.area_summary("no_such_area_xyz"))
+
+
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")
 class TestLiveServices(unittest.TestCase):
     """Checks against the real services, for the assumptions that can drift."""

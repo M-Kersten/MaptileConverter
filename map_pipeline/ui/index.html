@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map pipeline</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1c1f25;
+    --panel-2: #23272f;
+    --line: #333944;
+    --text: #e6e9ee;
+    --muted: #9aa3b0;
+    --accent: #4c9be8;
+    --ok: #4caf72;
+    --warn: #d8a339;
+    --bad: #e05c5c;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid; grid-template-columns: 380px 1fr; height: 100vh; overflow: hidden;
+  }
+  @media (max-width: 900px) {
+    body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; overflow: auto; }
+    #map { min-height: 55vh; }
+  }
+
+  /* ---------- panel ---------- */
+  #panel { background: var(--panel); border-right: 1px solid var(--line);
+           overflow-y: auto; padding: 16px; }
+  h1 { font-size: 15px; margin: 0 0 2px; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 14px;
+             padding: 12px; background: var(--panel-2); }
+  legend { color: var(--muted); font-size: 11px; text-transform: uppercase;
+           letter-spacing: .8px; padding: 0 6px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  label:first-of-type { margin-top: 0; }
+  input, select, button {
+    font: inherit; color: var(--text); background: #171a1f;
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; width: 100%;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .inline { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .inline input[type=checkbox] { width: auto; }
+  .inline label { margin: 0; color: var(--text); font-size: 13px; }
+  button { cursor: pointer; background: #2b303a; }
+  button:hover:not(:disabled) { background: #343a46; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent);
+                   color: #07121d; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #63aaf0; }
+  button.danger { background: #4a2626; border-color: #6b3333; }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .kv { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+        white-space: pre-wrap; word-break: break-all; }
+  .kv b { color: var(--text); font-weight: 600; }
+
+  /* ---------- search ---------- */
+  #searchWrap { position: relative; }
+  #results { position: absolute; z-index: 40; left: 0; right: 0; top: 100%;
+             background: #171a1f; border: 1px solid var(--line); border-radius: 6px;
+             margin-top: 3px; max-height: 240px; overflow-y: auto; display: none; }
+  #results div { padding: 7px 9px; cursor: pointer; font-size: 12.5px;
+                 border-bottom: 1px solid #23262c; }
+  #results div:last-child { border-bottom: 0; }
+  #results div:hover { background: #232830; }
+  #results .t { color: var(--muted); font-size: 11px; }
+
+  /* ---------- map ---------- */
+  #map { position: relative; overflow: hidden; background: #0e1013;
+         cursor: grab; touch-action: none; }
+  #map.dragging { cursor: grabbing; }
+  #tiles { position: absolute; inset: 0; }
+  #tiles img { position: absolute; width: 256px; height: 256px;
+               user-select: none; -webkit-user-drag: none; }
+  #sel { position: absolute; border: 2px solid var(--accent);
+         background: rgba(76,155,232,.14); pointer-events: none;
+         box-shadow: 0 0 0 9999px rgba(10,12,15,.34); }
+  #selLabel { position: absolute; transform: translateY(-100%);
+              background: var(--accent); color: #07121d; font-size: 11px;
+              font-weight: 600; padding: 2px 6px; border-radius: 4px 4px 0 0;
+              white-space: nowrap; }
+  #mapUI { position: absolute; left: 12px; bottom: 12px; z-index: 20;
+           background: rgba(20,22,26,.9); border: 1px solid var(--line);
+           border-radius: 8px; padding: 8px 10px; font-family: var(--mono);
+           font-size: 11.5px; color: var(--muted); }
+  #zoomUI { position: absolute; right: 12px; top: 12px; z-index: 20;
+            display: flex; flex-direction: column; gap: 4px; }
+  #zoomUI button { width: 34px; height: 34px; padding: 0; font-size: 17px;
+                   background: rgba(20,22,26,.9); }
+  .attrib { position: absolute; right: 8px; bottom: 6px; z-index: 20;
+            font-size: 10.5px; color: #7b8493; background: rgba(20,22,26,.75);
+            padding: 2px 6px; border-radius: 4px; }
+
+  /* ---------- log / results ---------- */
+  #log { font-family: var(--mono); font-size: 11px; background: #101216;
+         border: 1px solid var(--line); border-radius: 6px; padding: 9px;
+         height: 230px; overflow-y: auto; white-space: pre-wrap;
+         word-break: break-word; color: #c3c9d3; }
+  #log .e { color: var(--bad); }
+  #log .w { color: var(--warn); }
+  #log .p { color: var(--ok); }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px;
+           border-radius: 999px; font-weight: 600; }
+  .badge.run { background: #2b3a4a; color: #8fc4f5; }
+  .badge.done { background: #21402f; color: #8fe0ac; }
+  .badge.fail { background: #4a2626; color: #ffa3a3; }
+  .files a { color: var(--accent); text-decoration: none; font-size: 12.5px; }
+  .files a:hover { text-decoration: underline; }
+  .files div { display: flex; justify-content: space-between; gap: 8px;
+               padding: 3px 0; border-bottom: 1px solid #262a31; }
+  .files span { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .shots { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+  .shots a { display: block; }
+  .shots img { width: 100%; border-radius: 5px; border: 1px solid var(--line);
+               display: block; }
+  .err { background: #3a2020; border: 1px solid #6b3333; color: #ffb3b3;
+         border-radius: 6px; padding: 8px 10px; font-size: 12.5px; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+
+<div id="panel">
+  <h1>Map pipeline</h1>
+  <div class="sub">3DBAG + AHN + PDOK aerial &rarr; textured FBX for Unity</div>
+
+  <div id="banner"></div>
+
+  <fieldset>
+    <legend>Area</legend>
+    <label for="q">Find a place</label>
+    <div id="searchWrap">
+      <input id="q" placeholder="Domtoren Utrecht, Delft, 3011 AA&hellip;" autocomplete="off">
+      <div id="results"></div>
+    </div>
+    <div class="hint">Or click the map to place the square.</div>
+
+    <div class="row" style="margin-top:10px">
+      <div>
+        <label for="size">Side (m)</label>
+        <input id="size" type="number" value="1000" min="200" max="4000" step="50">
+      </div>
+      <div>
+        <label for="name">Name</label>
+        <input id="name" value="demo_area">
+      </div>
+    </div>
+
+    <div class="kv" id="bboxInfo" style="margin-top:10px"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Settings</legend>
+    <div class="row">
+      <div>
+        <label for="size_px">Aerial resolution</label>
+        <select id="size_px">
+          <option value="2048">2048 px</option>
+          <option value="4096" selected>4096 px</option>
+          <option value="8192">8192 px (slow)</option>
+        </select>
+      </div>
+      <div>
+        <label for="mesh">Terrain grid</label>
+        <select id="mesh">
+          <option value="129">129 (coarse)</option>
+          <option value="257" selected>257 (default)</option>
+          <option value="513">513 (fine)</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label for="facade">Facade variants</label>
+        <select id="facade">
+          <option value="1" selected>1 (two materials)</option>
+          <option value="4">4 by height</option>
+        </select>
+      </div>
+      <div>
+        <label for="clip">Edge buildings</label>
+        <select id="clip">
+          <option value="centroid" selected>Centre inside</option>
+          <option value="intersect">Keep all</option>
+        </select>
+      </div>
+    </div>
+    <div class="inline">
+      <input type="checkbox" id="preview" checked>
+      <label for="preview">Render preview images</label>
+    </div>
+  </fieldset>
+
+  <button class="primary" id="run">Build model</button>
+  <button class="danger" id="cancel" style="margin-top:6px; display:none">Cancel</button>
+
+  <fieldset style="margin-top:14px">
+    <legend>Log <span id="status"></span></legend>
+    <div id="log">Pick an area and press Build.</div>
+  </fieldset>
+
+  <div id="out"></div>
+</div>
+
+<div id="map">
+  <div id="tiles"></div>
+  <div id="sel"><div id="selLabel"></div></div>
+  <div id="zoomUI">
+    <button id="zin" title="Zoom in">+</button>
+    <button id="zout" title="Zoom out">&minus;</button>
+  </div>
+  <div id="mapUI"></div>
+  <div class="attrib">Aerial &copy; PDOK / Beeldmateriaal (CC BY 4.0)</div>
+</div>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------------------
+   The map works directly in RD New (EPSG:28992), the same frame the pipeline
+   uses, so the rectangle you drag is literally the bbox that gets built. No
+   reprojection anywhere in this page.
+
+   PDOK's EPSG:28992 tile matrix set, read from its WMTS capabilities:
+     top left      -285401.92, 903401.92
+     tile size     256 px
+     resolution    (12288000 / 2^z) * 0.00028 metres per pixel
+--------------------------------------------------------------------------- */
+const TOP_X = -285401.92, TOP_Y = 903401.92, TILE = 256;
+const TILE_URL = "https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0/Actueel_orthoHR/EPSG:28992";
+const MIN_Z = 6, MAX_Z = 16;
+
+const res  = z => (12288000 / Math.pow(2, z)) * 0.00028;
+const span = z => TILE * res(z);
+
+const view = { x: 136500, y: 455500, z: 12 };   // Utrecht centre
+const sel  = { x: 136500, y: 455500, size: 1000 };
+
+const mapEl = document.getElementById("map");
+const tilesEl = document.getElementById("tiles");
+const selEl = document.getElementById("sel");
+const selLabelEl = document.getElementById("selLabel");
+
+const $ = id => document.getElementById(id);
+
+function viewport() { return { w: mapEl.clientWidth, h: mapEl.clientHeight }; }
+
+/* Centre on the selection and pick the zoom where it fills a comfortable part
+   of the view. Without this a 1 km square at the default zoom is wider than the
+   window, so the thing you are about to build is not actually visible. */
+function fitToSelection(fraction = 0.85) {
+  const { w, h } = viewport();
+  if (!w || !h) return;
+  // Zoom steps are powers of two, so take the closest zoom in which the square
+  // still fits inside `fraction` of the shorter side.
+  const budget = Math.min(w, h) * fraction;
+  let best = MIN_Z;
+  for (let z = MIN_Z; z <= MAX_Z; z++) {
+    if (sel.size / res(z) <= budget) best = z; else break;
+  }
+  view.z = best;
+  view.x = sel.x;
+  view.y = sel.y;
+  render();
+}
+
+function toScreen(rx, ry) {
+  const { w, h } = viewport(), r = res(view.z);
+  return { sx: (rx - view.x) / r + w / 2, sy: (view.y - ry) / r + h / 2 };
+}
+function toRD(sx, sy) {
+  const { w, h } = viewport(), r = res(view.z);
+  return { x: view.x + (sx - w / 2) * r, y: view.y - (sy - h / 2) * r };
+}
+
+/* Reuse <img> nodes across renders, otherwise panning re-downloads every tile
+   and the map flickers. */
+const tileCache = new Map();
+
+/* Tiles normally come straight from PDOK. Where the browser cannot reach it —
+   behind a corporate proxy, or on a machine where only the pipeline process has
+   network — they come through our own server instead, which had to reach PDOK
+   anyway. One probe at startup decides which, because a blocked request often
+   hangs rather than failing, and a hang never fires an error event. */
+let tileSource = "direct";
+
+function tileSrc(z, col, row, zs) {
+  return tileSource === "direct"
+    ? `${TILE_URL}/${zs}/${col}/${row}.jpeg`
+    : `/api/tile?z=${z}&col=${col}&row=${row}`;
+}
+
+function probeTileSource() {
+  return new Promise(resolve => {
+    const img = new Image();
+    const done = result => { img.onload = img.onerror = null; resolve(result); };
+    const timer = setTimeout(() => done("proxy"), 5000);
+    img.onload  = () => { clearTimeout(timer); done("direct"); };
+    img.onerror = () => { clearTimeout(timer); done("proxy"); };
+    // A tile over Utrecht at zoom 9, only used to test reachability.
+    img.src = `${TILE_URL}/09/245/260.jpeg?probe=${Date.now()}`;
+  });
+}
+
+function render() {
+  const { w, h } = viewport();
+  const s = span(view.z), r = res(view.z);
+  const nw = toRD(0, 0), se = toRD(w, h);
+
+  const c0 = Math.floor((nw.x - TOP_X) / s), c1 = Math.floor((se.x - TOP_X) / s);
+  const r0 = Math.floor((TOP_Y - nw.y) / s), r1 = Math.floor((TOP_Y - se.y) / s);
+  const limit = Math.pow(2, view.z);
+  const zs = String(view.z).padStart(2, "0");
+  const seen = new Set();
+
+  for (let col = c0; col <= c1; col++) {
+    for (let row = r0; row <= r1; row++) {
+      if (col < 0 || row < 0 || col >= limit || row >= limit) continue;
+      const key = `${view.z}/${col}/${row}`;
+      seen.add(key);
+      let img = tileCache.get(key);
+      if (!img) {
+        img = new Image();
+        img.draggable = false;
+        img.alt = "";
+        img.src = tileSrc(view.z, col, row, zs);
+        tileCache.set(key, img);
+        tilesEl.appendChild(img);
+      }
+      const p = toScreen(TOP_X + col * s, TOP_Y - row * s);
+      img.style.left = p.sx + "px";
+      img.style.top = p.sy + "px";
+      // Sub-pixel scaling avoids hairline seams between neighbouring tiles.
+      img.style.width = img.style.height = Math.ceil(TILE * 1.002) + "px";
+    }
+  }
+
+  for (const [key, img] of tileCache) {
+    if (!seen.has(key)) { img.remove(); tileCache.delete(key); }
+  }
+  if (tileCache.size > 900) {
+    for (const [key, img] of tileCache) {
+      if (!seen.has(key)) { img.remove(); tileCache.delete(key); }
+    }
+  }
+
+  const half = sel.size / 2;
+  const a = toScreen(sel.x - half, sel.y + half);
+  const px = sel.size / r;
+  selEl.style.left = a.sx + "px";
+  selEl.style.top = a.sy + "px";
+  selEl.style.width = px + "px";
+  selEl.style.height = px + "px";
+  selLabelEl.textContent = `${Math.round(sel.size)} × ${Math.round(sel.size)} m`;
+
+  $("mapUI").textContent =
+    `RD ${view.x.toFixed(0)}, ${view.y.toFixed(0)}   z${view.z}   ${r.toFixed(2)} m/px`;
+  updateBboxInfo();
+}
+
+function bbox() {
+  const half = sel.size / 2;
+  return {
+    xmin: +(sel.x - half).toFixed(2), ymin: +(sel.y - half).toFixed(2),
+    xmax: +(sel.x + half).toFixed(2), ymax: +(sel.y + half).toFixed(2)
+  };
+}
+
+function updateBboxInfo() {
+  const b = bbox();
+  const warn = sel.size < 900 || sel.size > 1100
+    ? `\n<b style="color:#d8a339">tuned for 900-1100 m; it still runs</b>` : "";
+  $("bboxInfo").innerHTML =
+    `<b>bbox RD</b>  ${b.xmin}, ${b.ymin}\n          ${b.xmax}, ${b.ymax}\n` +
+    `<b>centre</b>   ${sel.x.toFixed(1)}, ${sel.y.toFixed(1)}` + warn;
+}
+
+/* ---------- interaction ---------- */
+let drag = null;
+
+mapEl.addEventListener("pointerdown", e => {
+  if (e.target.closest("#zoomUI")) return;
+  mapEl.setPointerCapture(e.pointerId);
+  drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: 0 };
+  mapEl.classList.add("dragging");
+});
+
+mapEl.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.moved = Math.max(drag.moved, Math.abs(dx) + Math.abs(dy));
+  const r = res(view.z);
+  view.x = drag.vx - dx * r;
+  view.y = drag.vy + dy * r;
+  render();
+});
+
+mapEl.addEventListener("pointerup", e => {
+  if (!drag) return;
+  const wasClick = drag.moved < 4;
+  drag = null;
+  mapEl.classList.remove("dragging");
+  if (wasClick) {
+    // A click without a drag places the selection.
+    const rect = mapEl.getBoundingClientRect();
+    const p = toRD(e.clientX - rect.left, e.clientY - rect.top);
+    sel.x = p.x; sel.y = p.y;
+    render();
+  }
+});
+
+mapEl.addEventListener("wheel", e => {
+  e.preventDefault();
+  const rect = mapEl.getBoundingClientRect();
+  const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+  const before = toRD(sx, sy);
+  const next = Math.max(MIN_Z, Math.min(MAX_Z, view.z + (e.deltaY < 0 ? 1 : -1)));
+  if (next === view.z) return;
+  view.z = next;
+  // Keep the point under the cursor fixed while zooming.
+  const after = toRD(sx, sy);
+  view.x += before.x - after.x;
+  view.y += before.y - after.y;
+  render();
+}, { passive: false });
+
+$("zin").onclick = () => { view.z = Math.min(MAX_Z, view.z + 1); render(); };
+$("zout").onclick = () => { view.z = Math.max(MIN_Z, view.z - 1); render(); };
+
+$("size").addEventListener("input", () => {
+  const v = parseFloat($("size").value);
+  if (!(v > 0)) return;
+  sel.size = v;
+  // Refit only when the square has grown past the window, so a deliberate zoom
+  // is not undone on every keystroke.
+  const { w, h } = viewport();
+  if (sel.size / res(view.z) > Math.min(w, h) * 0.95) fitToSelection();
+  else render();
+});
+
+window.addEventListener("resize", render);
+
+/* ---------- geocoder ---------- */
+let searchTimer = null;
+const resultsEl = $("results");
+
+$("q").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  const term = $("q").value.trim();
+  if (term.length < 2) { resultsEl.style.display = "none"; return; }
+  searchTimer = setTimeout(async () => {
+    try {
+      const r = await fetch("/api/geocode?q=" + encodeURIComponent(term));
+      const data = await r.json();
+      resultsEl.innerHTML = "";
+      if (!data.results || !data.results.length) {
+        resultsEl.style.display = "none";
+        return;
+      }
+      for (const item of data.results) {
+        const row = document.createElement("div");
+        row.innerHTML = `${escapeHtml(item.label)}<div class="t">${escapeHtml(item.type)}</div>`;
+        row.onclick = () => {
+          sel.x = item.x;
+          sel.y = item.y;
+          resultsEl.style.display = "none";
+          $("q").value = item.label;
+          $("name").value = slug(item.label);
+          fitToSelection();
+        };
+        resultsEl.appendChild(row);
+      }
+      resultsEl.style.display = "block";
+    } catch { resultsEl.style.display = "none"; }
+  }, 250);
+});
+
+document.addEventListener("click", e => {
+  if (!e.target.closest("#searchWrap")) resultsEl.style.display = "none";
+});
+
+function slug(text) {
+  return text.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "area";
+}
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ---------- running ---------- */
+const logEl = $("log");
+let job = null, offset = 0, poller = null;
+
+function addLog(line) {
+  const div = document.createElement("div");
+  if (/\bERROR\b|\[FAIL\]|Traceback|failed/.test(line)) div.className = "e";
+  else if (/\bWARNING\b|\[WARN\]/.test(line)) div.className = "w";
+  else if (/\[PASS\]|checks passed|finished/.test(line)) div.className = "p";
+  div.textContent = line;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(state, text) {
+  $("status").innerHTML = state
+    ? `<span class="badge ${state}">${escapeHtml(text)}</span>` : "";
+}
+
+$("run").onclick = async () => {
+  const payload = {
+    name: $("name").value.trim(),
+    bbox: bbox(),
+    size_px: +$("size_px").value,
+    mesh_vertices: +$("mesh").value,
+    facade_variants: +$("facade").value,
+    clip_mode: $("clip").value,
+    preview: $("preview").checked
+  };
+
+  $("banner").innerHTML = "";
+  logEl.innerHTML = "";
+  $("out").innerHTML = "";
+  offset = 0;
+
+  let data;
+  try {
+    const r = await fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    data = await r.json();
+    if (!r.ok) throw new Error(data.error || "could not start");
+  } catch (err) {
+    $("banner").innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
+    return;
+  }
+
+  job = data.id;
+  $("run").disabled = true;
+  $("cancel").style.display = "block";
+  setStatus("run", "running");
+  poller = setInterval(poll, 700);
+  poll();
+};
+
+$("cancel").onclick = async () => {
+  if (!job) return;
+  await fetch("/api/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: job })
+  });
+};
+
+async function poll() {
+  if (!job) return;
+  let data;
+  try {
+    const r = await fetch(`/api/job?id=${job}&offset=${offset}`);
+    data = await r.json();
+  } catch { return; }
+
+  (data.lines || []).forEach(addLog);
+  offset = data.offset;
+
+  if (data.status === "running" || data.status === "starting") {
+    setStatus("run", `running ${data.elapsed}s`);
+    return;
+  }
+
+  clearInterval(poller);
+  poller = null;
+  $("run").disabled = false;
+  $("cancel").style.display = "none";
+  job = null;
+
+  if (data.status === "done") {
+    setStatus("done", `done in ${data.elapsed}s`);
+    showResult(data.area);
+  } else {
+    setStatus("fail", data.status);
+    if (data.area) showResult(data.area);
+  }
+}
+
+function showResult(area) {
+  if (!area) return;
+  const parts = [];
+
+  if (area.validation) {
+    const v = area.validation;
+    const colour = v.ok ? "var(--ok)" : "var(--bad)";
+    parts.push(
+      `<fieldset><legend>Checks</legend>
+       <div style="color:${colour};font-weight:600">
+         ${v.passed} passed, ${v.failed} failed, ${v.warned} warnings
+       </div>`);
+    const notable = (v.checks || []).filter(c => !c.passed);
+    for (const c of notable) {
+      parts.push(`<div class="hint" style="color:${
+        c.severity === "error" ? "var(--bad)" : "var(--warn)"
+      }">${escapeHtml(c.name)}: ${escapeHtml(c.detail)}</div>`);
+    }
+    parts.push(`</fieldset>`);
+  }
+
+  if (area.previews && area.previews.length) {
+    parts.push(`<fieldset><legend>Preview</legend><div class="shots">`);
+    for (const p of area.previews) {
+      parts.push(
+        `<a href="${p.url}" target="_blank" title="${escapeHtml(p.name)}">
+           <img src="${p.url}?t=${Date.now()}" alt="${escapeHtml(p.name)}"></a>`);
+    }
+    parts.push(`</div></fieldset>`);
+  }
+
+  if (area.files && area.files.length) {
+    parts.push(`<fieldset><legend>Files</legend><div class="files">`);
+    for (const f of area.files) {
+      parts.push(
+        `<div><a href="${f.url}" download>${escapeHtml(f.name)}</a>
+         <span>${f.size_mb} MB</span></div>`);
+    }
+    parts.push(`</div>`);
+    if (area.metadata) {
+      const m = area.metadata;
+      parts.push(
+        `<div class="kv" style="margin-top:8px">` +
+        `<b>origin RD</b>  ${m.origin_rd?.join(", ")}\n` +
+        `<b>z offset</b>   ${m.ground_z_offset_nap} m NAP\n` +
+        `<b>buildings</b>  ${m.buildings?.count ?? "?"}\n` +
+        `<b>axes</b>       ${escapeHtml(m.unity_axis || "")}</div>`);
+    }
+    parts.push(`</fieldset>`);
+  }
+
+  $("out").innerHTML = parts.join("");
+}
+
+/* ---------- start ---------- */
+fitToSelection();
+updateBboxInfo();
+
+probeTileSource().then(source => {
+  if (source === tileSource) return;
+  tileSource = source;
+  // Drop the tiles that were pointed at the unreachable host and redraw.
+  for (const [, img] of tileCache) img.remove();
+  tileCache.clear();
+  render();
+});
+</script>
+</body>
+</html>

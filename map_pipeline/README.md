@@ -17,6 +17,32 @@ The pipeline stops there. No Unity layer, no viewer, no WebGL build.
 
 ## Running it
 
+There is a small web UI, and there is the command line. They do the same thing:
+the UI writes a config file and shells out to `pipeline.py`, so it cannot drift
+away from the CLI.
+
+### The UI
+
+```bash
+pip install -r requirements.txt
+python ui/server.py
+```
+
+Open <http://127.0.0.1:8765>. Search for a place or click the map, set the side
+length, press **Build model**, and watch the log. When it finishes you get the
+check results, the preview renders and download links.
+
+The map works directly in RD New, so the square you position *is* the bbox that
+gets built — no reprojection anywhere in the page. It is plain HTML with no
+JavaScript dependencies, and the server is standard library only.
+
+Tiles come straight from PDOK. If the browser cannot reach it — behind a
+corporate proxy, or on a machine where only the pipeline process has network —
+the page detects that at startup and routes tiles through the local server
+instead.
+
+### The command line
+
 ```bash
 pip install -r requirements.txt
 python pipeline.py --config config.json
@@ -89,6 +115,8 @@ src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
 blender/process.py builds the scene, assigns materials, exports FBX
 blender/preview.py renders preview images of an exported FBX
+ui/server.py       local web UI, standard library only
+ui/index.html      the page: RD map picker, settings, live log, results
 ```
 
 The heavy CityJSON and raster work all happens on the Python side.
