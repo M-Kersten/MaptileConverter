@@ -150,18 +150,66 @@ def run_blender_script(
     for line in result.stdout.splitlines():
         if line.strip():
             LOG.info("  %s", line.rstrip())
+
+    # Blender reports success even after the script it was given raises, so a
+    # zero exit code is not proof. Flag it here; whoever called this decides
+    # whether the run is salvageable and prints the detail.
+    stderr = result.stderr or ""
+    if any(
+        marker in stderr for marker in ("Traceback", "[blender] FAILED")
+    ):
+        last = [line for line in stderr.splitlines() if line.strip()]
+        LOG.warning(
+            "%s raised inside Blender: %s", script_name, last[-1] if last else "?"
+        )
+
     if result.returncode != 0:
-        for line in result.stderr.splitlines()[-40:]:
+        for line in stderr.splitlines()[-40:]:
             LOG.error("  %s", line.rstrip())
         raise SystemExit(f"{script_name} failed with exit code {result.returncode}")
     return result
 
 
-def run_blender_stage(work_dir: Path, out_dir: Path, blender: str | None) -> None:
-    run_blender_script(
+def run_blender_stage(
+    work_dir: Path, out_dir: Path, blender: str | None, fbx_name: str
+) -> None:
+    """Run the scene build, and verify it actually produced the FBX.
+
+    Blender in background mode exits 0 even when the script it was given raises,
+    so the exit code alone does not prove anything. The file it was supposed to
+    write is the real test.
+    """
+    error_file = work_dir / "blender_error.txt"
+    if error_file.exists():
+        error_file.unlink()
+
+    result = run_blender_script(
         "process.py",
         ["--work", str(work_dir), "--out", str(out_dir)],
         blender,
+    )
+
+    if (out_dir / fbx_name).is_file():
+        return
+
+    LOG.error("Blender exited %s but wrote no %s", result.returncode, fbx_name)
+    if error_file.is_file():
+        LOG.error("Blender reported:")
+        for line in error_file.read_text(encoding="utf-8").splitlines():
+            LOG.error("  %s", line)
+    else:
+        # No traceback file means it died before it could write one, so fall
+        # back to whatever the process printed.
+        for stream, label in ((result.stderr, "stderr"), (result.stdout, "stdout")):
+            tail = [line for line in (stream or "").splitlines() if line.strip()][-30:]
+            if tail:
+                LOG.error("Blender %s tail:", label)
+                for line in tail:
+                    LOG.error("  %s", line)
+
+    raise SystemExit(
+        f"the Blender stage did not produce {fbx_name}. The traceback above is "
+        f"from Blender itself; {error_file} has the full copy."
     )
 
 
@@ -301,7 +349,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     if not args.skip_blender:
         with Stage("Blender scene build and FBX export", next_step(), total):
-            run_blender_stage(work_dir, out_dir, args.blender)
+            run_blender_stage(
+                work_dir, out_dir, args.blender, str(config.export["fbx_name"])
+            )
 
     with Stage("metadata and validation", total, total):
         metadata = build_metadata(

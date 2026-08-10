@@ -172,10 +172,15 @@ def build_mesh_object(
     mesh.update()
     mesh.validate(verbose=False)
 
-    if shade_smooth:
-        mesh.shade_smooth()
+    # Mesh.shade_smooth() and shade_flat() only exist from Blender 4.1. Older
+    # versions carry the flag per polygon, so fall back to setting it directly
+    # rather than failing the whole run over shading.
+    if hasattr(mesh, "shade_smooth") and hasattr(mesh, "shade_flat"):
+        mesh.shade_smooth() if shade_smooth else mesh.shade_flat()
     else:
-        mesh.shade_flat()
+        mesh.polygons.foreach_set(
+            "use_smooth", np.full(n_polygons, bool(shade_smooth), dtype=bool)
+        )
 
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
@@ -910,6 +915,13 @@ def main() -> int:
     work_dir = work_dir.resolve()
     out_dir = out_dir.resolve()
 
+    log(f"Blender {bpy.app.version_string} on {sys.platform}")
+    if bpy.app.version < (3, 3):
+        log(
+            f"WARNING: Blender {bpy.app.version_string} is older than 3.3 and is "
+            f"not supported; the mesh and export APIs differ"
+        )
+
     scene_path = work_dir / "scene.json"
     if not scene_path.is_file():
         raise SystemExit(f"missing {scene_path}; run the Python stages first")
@@ -1010,5 +1022,37 @@ def main() -> int:
     return 0
 
 
+ERROR_FILE = "blender_error.txt"
+
+
+def _run() -> int:
+    """Run main and record any failure where the orchestrator can find it.
+
+    Blender in background mode exits 0 even when the script it was given raises,
+    so a traceback here would otherwise scroll past and the run would look like
+    it succeeded until the FBX turned out to be missing. The traceback is
+    written next to the intermediates so the orchestrator can quote it.
+    """
+    import traceback
+
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except BaseException:
+        detail = traceback.format_exc()
+        print("[blender] FAILED\n" + detail, file=sys.stderr, flush=True)
+        try:
+            work_dir, _ = parse_args(list(sys.argv))
+            work_dir.mkdir(parents=True, exist_ok=True)
+            (work_dir / ERROR_FILE).write_text(
+                f"Blender {bpy.app.version_string} on {sys.platform}\n\n{detail}",
+                encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001 - the original error is what matters
+            pass
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_run())
