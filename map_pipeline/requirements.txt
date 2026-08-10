@@ -1,0 +1,26 @@
+# Core pipeline dependencies.
+# Install rasterio from the PyPI wheels (they bundle GDAL). Do not build GDAL
+# separately. If an import still trips over GDAL, switch to conda-forge:
+#   conda install -c conda-forge rasterio
+requests>=2.31
+rasterio>=1.3
+numpy>=1.24
+pyproj>=3.5
+mapbox_earcut>=1.0
+pillow>=10.0
+
+# owslib is deliberately not a dependency. For the AHN WCS it follows the
+# operation URL advertised in the capabilities document, which currently 404s,
+# and it serialises a list-valued coverage id into the query string. The WCS
+# request is a plain GET instead (see src/elevation.py).
+# shapely is not needed either: the only geometry work is triangulation, which
+# mapbox_earcut handles.
+
+# Blender. The pip module runs the whole Blender stage headless without a
+# separate Blender install, and needs CPython 3.11.
+# If you would rather drive a Blender application install, skip this and pass
+# --blender /path/to/blender to pipeline.py.
+bpy>=4.2 ; python_version >= "3.11" and python_version < "3.12"
+
+# Optional, for CityJSON sanity checks outside the pipeline.
+# cjio

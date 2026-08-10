@@ -1,0 +1,376 @@
+"""Checks for the parts that are easy to get subtly wrong.
+
+Run everything (network tests included):
+
+    python tests/test_pipeline.py
+
+Run only the offline tests:
+
+    python tests/test_pipeline.py --offline
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from src.buildings import (  # noqa: E402
+    _newell_normal,
+    _plane_basis,
+    decode_vertices,
+    is_degenerate_surface,
+    triangulate_surface,
+)
+from src.config import load_config  # noqa: E402
+from src.elevation import _bilinear_on_grid, _fill_holes, _resample_to_grid  # noqa: E402
+from src.facade import STYLES, render_facade_tile, style_for_height  # noqa: E402
+from src.geo import (  # noqa: E402
+    BBox,
+    GeoContext,
+    build_grid_coords,
+    parse_bbox,
+    validate_bbox,
+    wgs84_bbox_to_rd,
+)
+from src.http_util import extract_service_exception, looks_like_xml  # noqa: E402
+from src.imagery import _tile_edges  # noqa: E402
+
+RUN_NETWORK = "--offline" not in sys.argv
+
+
+class TestGeo(unittest.TestCase):
+    def test_bbox_rejects_inverted(self):
+        with self.assertRaises(ValueError):
+            BBox(10, 10, 0, 20)
+
+    def test_local_frame_round_trips(self):
+        bbox = BBox(136000, 455000, 137000, 456000)
+        geo = GeoContext.from_bbox(bbox)
+        self.assertEqual(geo.origin, (136500.0, 455500.0))
+
+        local = geo.rd_to_local(136000.0, 456000.0)
+        self.assertAlmostEqual(local[0], -500.0)
+        self.assertAlmostEqual(local[1], 500.0)
+
+        back = geo.local_to_rd(*local)
+        self.assertAlmostEqual(back[0], 136000.0)
+        self.assertAlmostEqual(back[1], 456000.0)
+
+    def test_wgs84_bbox_converts_to_utrecht(self):
+        # A box over Utrecht city centre in lon/lat.
+        bbox = parse_bbox(
+            {
+                "crs": "EPSG:4326",
+                "xmin": 5.108,
+                "ymin": 52.086,
+                "xmax": 5.123,
+                "ymax": 52.096,
+            }
+        )
+        # Utrecht sits near RD 136000, 455000.
+        self.assertTrue(133000 < bbox.xmin < 139000, bbox)
+        self.assertTrue(453000 < bbox.ymin < 458000, bbox)
+
+    def test_wgs84_envelope_is_a_superset(self):
+        """Edge sampling must not clip the box the way four corners can."""
+        wgs = BBox(5.10, 52.08, 5.14, 52.11)
+        rd = wgs84_bbox_to_rd(wgs)
+        corners_only = wgs84_bbox_to_rd(wgs, edge_samples=1)
+        self.assertLessEqual(rd.xmin, corners_only.xmin + 1e-9)
+        self.assertGreaterEqual(rd.xmax, corners_only.xmax - 1e-9)
+
+    def test_lonlat_without_crs_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_bbox(BBox(5.10, 52.08, 5.14, 52.11))
+
+    def test_non_square_bbox_warns(self):
+        warnings = validate_bbox(BBox(136000, 455000, 137000, 455400))
+        self.assertTrue(any("not square" in w for w in warnings), warnings)
+
+    def test_grid_spans_bbox_inclusively(self):
+        bbox = BBox(0, 0, 1000, 1000)
+        xs, ys = build_grid_coords(bbox, 257)
+        self.assertEqual(xs[0], 0.0)
+        self.assertEqual(xs[-1], 1000.0)
+        self.assertAlmostEqual(float(xs[1] - xs[0]), 1000.0 / 256)
+
+
+class TestCityJSON(unittest.TestCase):
+    def test_transform_is_applied(self):
+        """Quantised vertices must come back as real RD coordinates."""
+        transform = {"scale": [0.001, 0.001, 0.001], "translate": [136000.0, 455000.0, 0.0]}
+        decoded = decode_vertices([[1000, 2000, 3000]], transform)
+        np.testing.assert_allclose(decoded[0], [136001.0, 455002.0, 3.0])
+
+    def test_newell_normal_points_up_for_ccw_ring(self):
+        ring = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=float)
+        np.testing.assert_allclose(_newell_normal(ring), [0, 0, 1], atol=1e-9)
+
+    def test_plane_basis_is_right_handed(self):
+        for normal in (
+            np.array([0.0, 0.0, 1.0]),
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.3, -0.5, 0.81]) / np.linalg.norm([0.3, -0.5, 0.81]),
+        ):
+            u, v = _plane_basis(normal)
+            np.testing.assert_allclose(np.cross(u, v), normal, atol=1e-9)
+
+    def test_triangulates_square(self):
+        ring = np.array([[0, 0, 5], [10, 0, 5], [10, 10, 5], [0, 10, 5]], dtype=float)
+        tris = triangulate_surface([ring])
+        self.assertEqual(len(tris), 2)
+        area = sum(
+            0.5 * np.linalg.norm(np.cross(t[1] - t[0], t[2] - t[0])) for t in tris
+        )
+        self.assertAlmostEqual(area, 100.0)
+
+    def test_triangulates_ring_with_hole(self):
+        outer = np.array([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]], dtype=float)
+        hole = np.array([[3, 3, 0], [3, 7, 0], [7, 7, 0], [7, 3, 0]], dtype=float)
+        tris = triangulate_surface([outer, hole])
+        area = sum(
+            0.5 * np.linalg.norm(np.cross(t[1] - t[0], t[2] - t[0])) for t in tris
+        )
+        # 100 for the square minus 16 for the hole.
+        self.assertAlmostEqual(area, 84.0, places=6)
+
+    def test_triangulates_vertical_wall(self):
+        """Walls are vertical, which is the degenerate case for XY projection."""
+        wall = np.array(
+            [[0, 0, 0], [0, 0, 10], [10, 0, 10], [10, 0, 0]], dtype=float
+        )
+        tris = triangulate_surface([wall])
+        area = sum(
+            0.5 * np.linalg.norm(np.cross(t[1] - t[0], t[2] - t[0])) for t in tris
+        )
+        self.assertAlmostEqual(area, 100.0)
+
+    def test_winding_follows_surface_normal(self):
+        ring = np.array([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]], dtype=float)
+        expected = _newell_normal(ring)
+        for tri in triangulate_surface([ring]):
+            normal = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+            self.assertGreater(float(normal @ expected), 0.0)
+
+    def test_non_planar_surface_still_triangulates(self):
+        """LoD2.2 roof faces are not exactly planar."""
+        ring = np.array(
+            [[0, 0, 0], [10, 0, 0.4], [10, 10, 0], [0, 10, -0.3]], dtype=float
+        )
+        self.assertEqual(len(triangulate_surface([ring])), 2)
+
+    def test_degenerate_surface_is_detected(self):
+        sliver = np.array([[0, 0, 0], [1, 1, 1], [0, 0, 0]], dtype=float)
+        self.assertTrue(is_degenerate_surface([sliver]))
+        self.assertFalse(
+            is_degenerate_surface(
+                [np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=float)]
+            )
+        )
+
+
+class TestElevation(unittest.TestCase):
+    def test_nodata_is_masked_not_averaged(self):
+        """AHN nodata is ~3.4e38; averaging it in would ruin the whole tile."""
+        values = np.array([[1.0, 3.4028235e38], [2.0, 3.0]])
+        valid = values < 1e30
+        grid, hit = _resample_to_grid(
+            values, valid, (0.0, 0.0, 2.0, 2.0), np.array([0.5, 1.5]), np.array([0.5, 1.5])
+        )
+        self.assertTrue(np.all(np.nan_to_num(grid, nan=0.0) < 10.0))
+
+    def test_holes_are_filled_from_neighbours(self):
+        grid = np.full((9, 9), 5.0)
+        grid[3:6, 3:6] = np.nan
+        filled, missing = _fill_holes(grid)
+        self.assertEqual(missing, 9)
+        self.assertFalse(np.isnan(filled).any())
+        np.testing.assert_allclose(filled, 5.0)
+
+    def test_fill_raises_when_everything_is_nodata(self):
+        with self.assertRaises(Exception):
+            _fill_holes(np.full((4, 4), np.nan))
+
+    def test_bilinear_sampling(self):
+        grid = np.array([[0.0, 10.0], [20.0, 30.0]])
+        xs = np.array([0.0, 100.0])
+        ys = np.array([0.0, 100.0])
+        self.assertAlmostEqual(float(_bilinear_on_grid(grid, xs, ys, 0.0, 0.0)), 0.0)
+        self.assertAlmostEqual(float(_bilinear_on_grid(grid, xs, ys, 100.0, 0.0)), 10.0)
+        self.assertAlmostEqual(float(_bilinear_on_grid(grid, xs, ys, 50.0, 50.0)), 15.0)
+        # Outside the grid clamps rather than extrapolating.
+        self.assertAlmostEqual(float(_bilinear_on_grid(grid, xs, ys, -50.0, 0.0)), 0.0)
+
+
+class TestImagery(unittest.TestCase):
+    def test_tiles_cover_every_pixel_exactly_once(self):
+        for total, cap in ((4096, 2000), (8192, 2000), (1000, 2000), (2500, 2500)):
+            spans = _tile_edges(total, cap)
+            self.assertEqual(spans[0][0], 0)
+            self.assertEqual(spans[-1][1], total)
+            for a, b in zip(spans, spans[1:]):
+                self.assertEqual(a[1], b[0])
+            self.assertTrue(all(end - start <= cap for start, end in spans))
+
+    def test_service_exception_is_recognised(self):
+        payload = (
+            b'<?xml version="1.0"?>\n<ServiceExceptionReport version="1.3.0">'
+            b"<ServiceException>image size too large</ServiceException>"
+            b"</ServiceExceptionReport>"
+        )
+        self.assertTrue(looks_like_xml(payload))
+        self.assertEqual(extract_service_exception(payload), "image size too large")
+
+    def test_jpeg_is_not_mistaken_for_xml(self):
+        self.assertFalse(looks_like_xml(b"\xff\xd8\xff\xe0\x00\x10JFIF"))
+
+
+class TestFacade(unittest.TestCase):
+    def test_tile_wraps_seamlessly(self):
+        """A wall repeats the tile, so opposite edges have to match."""
+        tile = render_facade_tile(STYLES[0], 128, seed=7).astype(int)
+        left_gap = np.abs(tile[:, 0] - tile[:, -1]).mean()
+        self.assertLess(left_gap, 12.0, "left and right edges do not match")
+
+    def test_styles_scale_with_height(self):
+        self.assertEqual(style_for_height(6.0, 4), 0)
+        self.assertEqual(style_for_height(40.0, 4), 3)
+        # With a single variant every building shares the one material.
+        self.assertEqual(style_for_height(40.0, 1), 0)
+
+    def test_windows_are_darker_than_wall(self):
+        tile = render_facade_tile(STYLES[0], 256, seed=3).astype(float)
+        self.assertLess(tile.min(), tile.mean())
+
+
+class TestConfig(unittest.TestCase):
+    def test_shipped_config_loads(self):
+        config = load_config(REPO_ROOT / "config.json")
+        self.assertEqual(config.bbox.width, 1000.0)
+        self.assertEqual(config.geo.origin, (136500.0, 455500.0))
+        self.assertEqual(config.warnings, [])
+
+    def test_defaults_fill_in_missing_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "minimal.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "minimal",
+                        "bbox": {
+                            "crs": "EPSG:28992",
+                            "xmin": 136000,
+                            "ymin": 455000,
+                            "xmax": 137000,
+                            "ymax": 456000,
+                        },
+                    }
+                )
+            )
+            config = load_config(path)
+            self.assertEqual(config.aerial["size_px"], 4096)
+            self.assertEqual(config.buildings["lod"], "2.2")
+            self.assertEqual(config.terrain["ahn_model"], "DTM")
+
+    def test_bad_ahn_model_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "bad",
+                        "bbox": {
+                            "xmin": 136000,
+                            "ymin": 455000,
+                            "xmax": 137000,
+                            "ymax": 456000,
+                        },
+                        "terrain": {"ahn_model": "LIDAR"},
+                    }
+                )
+            )
+            with self.assertRaises(ValueError):
+                load_config(path)
+
+
+@unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")
+class TestLiveServices(unittest.TestCase):
+    """Checks against the real services, for the assumptions that can drift."""
+
+    def test_wms_layer_title_resolves_to_name(self):
+        from src.config import DEFAULTS
+        from src.imagery import resolve_layer_name
+
+        name, title = resolve_layer_name(
+            DEFAULTS["aerial"]["wms_url"], "Luchtfoto Actueel Ortho 8cm RGB"
+        )
+        self.assertEqual(name, "Actueel_orthoHR")
+        self.assertEqual(title, "Luchtfoto Actueel Ortho 8cm RGB")
+
+    def test_ahn_still_offers_the_expected_coverages(self):
+        from src.config import DEFAULTS
+        from src.elevation import discover_coverages
+
+        coverages = discover_coverages(DEFAULTS["terrain"]["wcs_url"])
+        self.assertIn("dtm_05m", coverages)
+        self.assertIn("dsm_05m", coverages)
+
+    def test_wmts_fallback_produces_a_usable_image(self):
+        """The fallback only runs when WMS fails, so exercise it directly."""
+        from PIL import Image
+
+        from src.config import DEFAULTS
+        from src.imagery import fetch_aerial_wmts
+
+        bbox = BBox(136200, 455200, 136500, 455500)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "wmts.png"
+            fetch_aerial_wmts(
+                bbox,
+                out,
+                layer_name="Actueel_orthoHR",
+                size_px=512,
+                wmts_url=DEFAULTS["aerial"]["wmts_url"],
+            )
+            with Image.open(out) as image:
+                self.assertEqual(image.size, (512, 512))
+                self.assertGreater(np.asarray(image.convert("RGB")).std(), 5.0)
+
+    def test_3dbag_pages_decode_with_their_own_transform(self):
+        """Each page carries its own quantisation grid, and it does differ."""
+        from src.buildings import iter_api_pages
+        from src.config import DEFAULTS
+
+        cfg = DEFAULTS["buildings"]
+        translates = []
+        for index, page in enumerate(
+            iter_api_pages(
+                BBox(136000, 455000, 136100, 455100),
+                api_url=cfg["api_url"],
+                page_limit=2,
+                max_pages=4,
+            )
+        ):
+            translates.append(tuple(page["metadata"]["transform"]["translate"]))
+            if index >= 2:
+                break
+
+        self.assertGreater(len(translates), 1)
+        self.assertGreater(
+            len(set(translates)),
+            1,
+            "pages shared a transform; merging raw pages would be safe, but the "
+            "pipeline no longer assumes that",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(argv=[a for a in sys.argv if a != "--offline"], verbosity=2)

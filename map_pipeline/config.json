@@ -1,0 +1,22 @@
+{
+  "name": "demo_area",
+  "bbox": {
+    "crs": "EPSG:28992",
+    "xmin": 136000,
+    "ymin": 455000,
+    "xmax": 137000,
+    "ymax": 456000
+  },
+  "aerial": {
+    "layer": "Luchtfoto Actueel Ortho 8cm RGB",
+    "size_px": 4096
+  },
+  "terrain": {
+    "ahn_model": "DTM",
+    "resolution_m": 0.5,
+    "mesh_vertices_per_side": 257
+  },
+  "buildings": {
+    "lod": "2.2"
+  }
+}
