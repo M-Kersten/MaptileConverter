@@ -120,6 +120,19 @@ def _tile_edges(total_px: int, max_px: int) -> list[tuple[int, int]]:
     return [(edges[i], edges[i + 1]) for i in range(n_tiles)]
 
 
+def _allow_large_images() -> None:
+    """Lift Pillow's decompression-bomb guard.
+
+    The guard trips at 89.5 megapixels, which is a 9459 px square: below the
+    12500 px that a 1 km area needs to reach the source's native 8 cm. The guard
+    exists to stop a malicious upload from exhausting memory, and here the size
+    is one the caller asked for, from a known government service.
+    """
+    from PIL import Image
+
+    Image.MAX_IMAGE_PIXELS = None
+
+
 def fetch_aerial_wms(
     bbox: BBox,
     out_path: Path,
@@ -137,6 +150,7 @@ def fetch_aerial_wms(
     Each tile's sub-bbox is derived from its exact pixel span, so the tiles line
     up seam-free and the finished image maps linearly onto `bbox`.
     """
+    _allow_large_images()
     from PIL import Image
 
     cols = _tile_edges(size_px, max_request_px)
@@ -280,6 +294,7 @@ def fetch_aerial_wmts(
     fetches every tile touching the bbox, then crops and resamples the mosaic to
     exactly `size_px`.
     """
+    _allow_large_images()
     from PIL import Image
 
     xml = _fetch_capabilities(wmts_url, "WMTS", timeout)

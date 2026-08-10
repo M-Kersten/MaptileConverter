@@ -68,11 +68,15 @@ def reset_scene() -> None:
             collection.remove(item)
 
 
-def make_textured_material(name: str, image_path: Path, roughness: float):
+def make_textured_material(
+    name: str, image_path: Path, roughness: float, normal_path: Path | None = None
+):
     """Principled BSDF with `image_path` wired into base colour.
 
     FBX carries the base-colour texture reference and the scalar parameters, so
-    this survives the trip into Unity as an albedo map.
+    this survives the trip into Unity as an albedo map. A normal map, when given,
+    goes through a Normal Map node, which the FBX exporter writes to the
+    material's bump slot.
     """
     material = bpy.data.materials.new(name=name)
     material.use_nodes = True
@@ -91,6 +95,23 @@ def make_textured_material(name: str, image_path: Path, roughness: float):
     texture.extension = "REPEAT"
     texture.location = (-400, 0)
     links.new(texture.outputs["Color"], bsdf.inputs["Base Color"])
+
+    if normal_path is not None:
+        normal_texture = nodes.new("ShaderNodeTexImage")
+        normal_texture.image = bpy.data.images.load(
+            str(normal_path), check_existing=True
+        )
+        normal_texture.image.name = normal_path.name
+        # Normals are vectors, not colour: reading them through sRGB would bend
+        # every one of them.
+        normal_texture.image.colorspace_settings.name = "Non-Color"
+        normal_texture.extension = "REPEAT"
+        normal_texture.location = (-700, -320)
+
+        normal_map = nodes.new("ShaderNodeNormalMap")
+        normal_map.location = (-380, -320)
+        links.new(normal_texture.outputs["Color"], normal_map.inputs["Color"])
+        links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
 
     if "Roughness" in bsdf.inputs:
         bsdf.inputs["Roughness"].default_value = roughness
@@ -418,25 +439,32 @@ def export_fbx(out_path: Path) -> None:
     log(f"exported {out_path}")
 
 
-def copy_textures(scene: dict, work_dir: Path, out_dir: Path) -> list[Path]:
+def copy_textures(
+    scene: dict, work_dir: Path, out_dir: Path
+) -> tuple[Path, list[tuple[Path, Path | None]]]:
     """Place the textures beside the FBX before the materials reference them."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    copied = []
+
+    def copy(name: str) -> Path:
+        src = work_dir / name
+        dst = out_dir / name
+        if src.resolve() != dst.resolve():
+            shutil.copyfile(src, dst)
+        return dst
 
     aerial_src = work_dir / scene["aerial"]["file"]
     aerial_dst = out_dir / scene["export"]["aerial_name"]
     if aerial_src.resolve() != aerial_dst.resolve():
         shutil.copyfile(aerial_src, aerial_dst)
-    copied.append(aerial_dst)
 
-    for name in scene["facade"]["files"]:
-        src = work_dir / name
-        dst = out_dir / name
-        if src.resolve() != dst.resolve():
-            shutil.copyfile(src, dst)
-        copied.append(dst)
-
-    return copied
+    normals = scene["facade"].get("normal_files") or [None] * len(
+        scene["facade"]["files"]
+    )
+    facades = [
+        (copy(name), copy(normal) if normal else None)
+        for name, normal in zip(scene["facade"]["files"], normals)
+    ]
+    return aerial_dst, facades
 
 
 def main() -> int:
@@ -452,18 +480,17 @@ def main() -> int:
     log(f"building scene {scene['name']!r}")
     reset_scene()
 
-    textures = copy_textures(scene, work_dir, out_dir)
-    aerial_texture = textures[0]
-    facade_textures = textures[1:]
+    aerial_texture, facade_textures = copy_textures(scene, work_dir, out_dir)
 
     aerial_material = make_textured_material("M_aerial", aerial_texture, roughness=0.9)
     facade_materials = [
         make_textured_material(
             "M_facade" if len(facade_textures) == 1 else f"M_facade_{i:02d}",
-            path,
+            colour,
             roughness=0.75,
+            normal_path=normal,
         )
-        for i, path in enumerate(facade_textures)
+        for i, (colour, normal) in enumerate(facade_textures)
     ]
 
     build_terrain(scene, work_dir, aerial_material)

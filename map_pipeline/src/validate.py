@@ -218,6 +218,9 @@ def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
     """The image has the requested size, real content, and matches the bbox."""
     from PIL import Image
 
+    from .imagery import _allow_large_images
+
+    _allow_large_images()
     with Image.open(aerial.path) as image:
         size = image.size
         sample = np.asarray(image.convert("RGB").resize((256, 256))).astype(np.float64)

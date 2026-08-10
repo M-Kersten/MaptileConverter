@@ -92,12 +92,61 @@ latitude in `ymin`/`ymax`. It is converted to RD New once, in `geo.py`, and
 everything downstream stays in RD. The bbox is validated as roughly square and
 roughly 1 km per side, and warns rather than fails when it is not.
 
+## Resolution and quality
+
+The UI has a preset plus three sliders. Detail is set as ground resolution
+rather than pixel count, so a setting means the same thing whatever the area
+size, and the pixel counts are derived from the box.
+
+| Preset | Aerial | Terrain | Facade | Normal map | 1 km² run |
+| --- | --- | --- | --- | --- | --- |
+| Draft | 50 cm/px | 8 m | 256 px | off | ~1 min |
+| Standard | 25 cm/px | 4 m | 512 px | on | ~2.5 min |
+| High | 12 cm/px | 2 m | 1024 px | on | ~5 min |
+| Maximum | 8 cm/px | 1 m | 2048 px | on | ~8 min |
+
+**Both dials hit a source-data ceiling**, and going past it costs time without
+adding information. The aerial layer is an 8 cm ortho, so a 1 km area is fully
+resolved at about 12500 px. The AHN DTM is 0.5 m, so the same area is fully
+resolved at about 2001 vertices per side. The pipeline warns instead of
+refusing; the UI shows the derived numbers and flags when a setting has gone
+past what the data holds.
+
+Three things are worth knowing before you reach for the top of the sliders.
+
+**The aerial jump from 25 to 12 cm/px is large; from 12 cm to native 8 cm it is
+small.** At 25 cm/px cars are blobs. At 12 cm/px you can see individual cars,
+kerb lines and bare branches. Native 8 cm adds little over that for double the
+file (92 MB against 174 MB for 1 km²). 12 cm/px is the sweet spot.
+
+**Terrain has a sweet spot, not a "more is better" curve.** The DTM has a hole
+wherever a building stands — 49% of source pixels over Utrecht centre. At 4 m
+spacing each output vertex averages many real measurements and 33% end up
+interpolated. At native 0.5 m spacing that rises to 86%: you get sixteen times
+the vertices, and most of them carry reconstructed ground rather than measured
+ground. Around 1-2 m is where the extra vertices still buy real detail.
+
+**Unity has its own limits.** Textures over 16384 px cannot be imported at full
+size, which a 2 km area at native resolution would exceed. Imported textures
+are also capped at 2048 by default, so raise *Max Size* on `aerial.png` or none
+of this is visible. A terrain over 65k vertices needs a 32-bit index buffer,
+which Unity sets automatically.
+
+The facade normal map is the one quality lever that is not about resolution: it
+gives window reveals, sills and storey bands real relief under a moving light.
+It costs one small extra texture and survives FBX as the material's bump slot.
+It is written as `*_normal.png` because Unity keys off that suffix to set the
+texture type automatically.
+
 Other knobs worth knowing:
 
 | Key | Default | What it does |
 | --- | --- | --- |
 | `facade.variants` | `1` | `1` gives exactly two materials. Up to `4` assigns brick/plaster/concrete/glass by height. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
+| `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
+| `facade.normal_map` | `true` | Write a normal map beside each facade texture. |
+| `facade.relief_depth` | `0.035` | How far window reveals and storey bands stand out. Small on purpose: a facade is nearly flat. |
 | `buildings.clip_mode` | `centroid` | `centroid` keeps buildings whose centre is inside the bbox. `intersect` keeps every building the API returns. |
 | `buildings.merge` | `single` | One merged buildings mesh. `per_building` gives one object each. |
 | `terrain.mesh_vertices_per_side` | `257` | 257 → 66k terrain vertices. |

@@ -118,7 +118,7 @@ def write_scene_description(
     geo: GeoContext,
     terrain,
     aerial,
-    facade_paths: list[Path],
+    facade_paths: list[tuple[Path, Path | None]],
     facade_cfg: dict,
     buildings_cfg: dict,
     export_cfg: dict,
@@ -150,7 +150,10 @@ def write_scene_description(
             "size_px": aerial.size_px,
         },
         "facade": {
-            "files": [p.name for p in facade_paths],
+            "files": [colour.name for colour, _ in facade_paths],
+            "normal_files": [
+                normal.name if normal else None for _, normal in facade_paths
+            ],
             "tile_width_m": float(facade_cfg["tile_width_m"]),
             "floor_height_m": float(facade_cfg["floor_height_m"]),
             "variants": len(facade_paths),

@@ -125,20 +125,34 @@ def _shade(rgb: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     return (int(r * 255), int(g * 255), int(b * 255))
 
 
-def render_facade_tile(
+# Relief heights for the normal map, 0 = deepest. Glass sits behind its frame,
+# the storey band and the sills stand proud of the wall.
+RELIEF_WALL = 0.50
+RELIEF_BAND = 0.62
+RELIEF_FRAME = 0.45
+RELIEF_GLASS = 0.28
+RELIEF_SILL = 0.60
+# How far the relief actually stands out, in tile-widths. Small: a facade is
+# nearly flat, and overdoing this makes windows look like portholes.
+RELIEF_DEPTH = 0.035
+
+
+def render_facade_layers(
     style: FacadeStyle, size_px: int, seed: int = 0
-) -> "np.ndarray":
-    """Render one seamlessly tiling storey of facade as an RGB array.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Render one storey of facade as ``(rgb, relief)``.
 
     The tile wraps in both directions: windows sit inside the tile with a margin,
     and the storey band runs along the bottom edge, so repeating the image in U
-    and V produces a continuous wall.
+    and V produces a continuous wall. The relief channel drives the normal map,
+    so both come out of the same geometry and stay in register.
     """
     rng = np.random.default_rng(seed)
     height = width = size_px
 
     canvas = np.zeros((height, width, 3), dtype=np.float64)
     canvas[:, :] = style.wall_rgb
+    relief = np.full((height, width), RELIEF_WALL, dtype=np.float64)
 
     # Wall grain.
     noise = _value_noise((height, width), cells=max(4, size_px // 32), rng=rng)
@@ -150,6 +164,7 @@ def render_facade_tile(
     band_px = max(2, int(round(0.055 * height)))
     canvas[:band_px, :] = _shade(style.wall_rgb, 0.80)
     canvas[band_px : band_px + max(1, band_px // 2), :] = _shade(style.wall_rgb, 1.10)
+    relief[:band_px, :] = RELIEF_BAND
 
     # Windows.
     cell_width = width / style.windows_across
@@ -173,6 +188,7 @@ def render_facade_tile(
 
         # Frame first, then glass inset into it.
         canvas[y0:y1, x0:x1] = style.trim_rgb
+        relief[y0:y1, x0:x1] = RELIEF_FRAME
 
         gx0, gx1 = x0 + frame_px, x1 - frame_px
         gy0, gy1 = y0 + frame_px, y1 - frame_px
@@ -187,20 +203,48 @@ def render_facade_tile(
         # Faint per-window variation so a wall is not a perfect grid.
         glass *= 1.0 + 0.06 * (rng.random() - 0.5)
         canvas[gy0:gy1, gx0:gx1] = glass
+        relief[gy0:gy1, gx0:gx1] = RELIEF_GLASS
 
         # Mullion splitting the pane, skipped when the window is small.
         if gx1 - gx0 > 8 * frame_px:
             mid = (gx0 + gx1) // 2
             canvas[gy0:gy1, mid : mid + frame_px] = style.trim_rgb
+            relief[gy0:gy1, mid : mid + frame_px] = RELIEF_FRAME
         if gy1 - gy0 > 8 * frame_px:
             mid = (gy0 + gy1) // 2
             canvas[mid : mid + frame_px, gx0:gx1] = style.trim_rgb
+            relief[mid : mid + frame_px, gx0:gx1] = RELIEF_FRAME
 
         # Sill under the window.
         sill_y0 = max(0, y0 - max(1, frame_px))
         canvas[sill_y0:y0, x0:x1] = _shade(style.trim_rgb, 0.88)
+        relief[sill_y0:y0, x0:x1] = RELIEF_SILL
 
-    return np.clip(canvas, 0, 255).astype(np.uint8)
+    return np.clip(canvas, 0, 255).astype(np.uint8), relief
+
+
+def render_facade_tile(style: FacadeStyle, size_px: int, seed: int = 0) -> np.ndarray:
+    """The colour channel of :func:`render_facade_layers`."""
+    return render_facade_layers(style, size_px, seed)[0]
+
+
+def relief_to_normal_map(relief: np.ndarray, depth: float = RELIEF_DEPTH) -> np.ndarray:
+    """Turn a relief field into a tangent-space normal map.
+
+    Uses the OpenGL convention, green pointing up, which is what Blender and
+    Unity both expect. Gradients wrap, so the normal map tiles exactly like the
+    colour it came from.
+    """
+    scale = depth * relief.shape[0]
+    # np.roll wraps, which keeps the seams of a tiling texture consistent.
+    d_dx = (np.roll(relief, -1, axis=1) - np.roll(relief, 1, axis=1)) * 0.5 * scale
+    d_dy = (np.roll(relief, -1, axis=0) - np.roll(relief, 1, axis=0)) * 0.5 * scale
+
+    # Surface normal of a height field is (-dz/dx, -dz/dy, 1), normalised.
+    normal = np.stack([-d_dx, -d_dy, np.ones_like(relief)], axis=-1)
+    normal /= np.linalg.norm(normal, axis=-1, keepdims=True)
+
+    return np.clip((normal * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
 
 
 def style_for_height(height_m: float, n_variants: int) -> int:
@@ -218,35 +262,56 @@ def style_for_height(height_m: float, n_variants: int) -> int:
 
 def generate_facade_textures(
     work_dir: Path, *, facade_cfg: dict
-) -> list[Path]:
-    """Write one facade PNG per variant and return the paths in style order."""
+) -> list[tuple[Path, Path | None]]:
+    """Write the facade textures, returning ``(colour, normal)`` per variant.
+
+    The normal map is named ``*_normal.png`` because Unity's importer keys off
+    that suffix to set the texture type automatically.
+    """
     from PIL import Image
 
     work_dir.mkdir(parents=True, exist_ok=True)
     size_px = int(facade_cfg["texture_px"])
     variants = min(int(facade_cfg["variants"]), len(STYLES))
     seed = int(facade_cfg["seed"])
+    want_normal = bool(facade_cfg.get("normal_map", True))
 
-    paths: list[Path] = []
+    paths: list[tuple[Path, Path | None]] = []
     for index in range(variants):
         style = STYLES[index]
-        pixels = render_facade_tile(style, size_px, seed=seed + index)
+        pixels, relief = render_facade_layers(style, size_px, seed=seed + index)
+
+        stem = "facade" if variants == 1 else f"facade_{index:02d}_{style.name}"
         # Row 0 of the array is the bottom of the tile in UV space, but PNG rows
         # run top-down, so flip on the way out.
-        image = Image.fromarray(pixels[::-1], mode="RGB")
-        name = "facade.png" if variants == 1 else f"facade_{index:02d}_{style.name}.png"
-        path = work_dir / name
-        image.save(path, format="PNG")
-        paths.append(path)
-        LOG.info("wrote %s (%s, %dpx)", path, style.name, size_px)
+        colour_path = work_dir / f"{stem}.png"
+        Image.fromarray(pixels[::-1], mode="RGB").save(colour_path, format="PNG")
+
+        normal_path = None
+        if want_normal:
+            normal = relief_to_normal_map(relief, float(facade_cfg["relief_depth"]))
+            normal_path = work_dir / f"{stem}_normal.png"
+            Image.fromarray(normal[::-1], mode="RGB").save(normal_path, format="PNG")
+
+        paths.append((colour_path, normal_path))
+        LOG.info(
+            "wrote %s (%s, %dpx)%s",
+            colour_path.name,
+            style.name,
+            size_px,
+            " with normal map" if normal_path else "",
+        )
 
     return paths
 
 
 __all__ = [
+    "RELIEF_DEPTH",
     "STYLES",
     "FacadeStyle",
     "generate_facade_textures",
+    "relief_to_normal_map",
+    "render_facade_layers",
     "render_facade_tile",
     "style_for_height",
 ]

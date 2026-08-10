@@ -17,6 +17,10 @@ from .geo import BBox, GeoContext, parse_bbox, validate_bbox
 
 LOG = logging.getLogger(__name__)
 
+# The aerial layer is an 8 cm ortho, so a 1 km area resolves fully at about
+# 12500 px. Above that the pipeline is upsampling a JPEG, not gaining detail.
+AERIAL_SOURCE_M_PER_PX = 0.08
+
 DEFAULTS: dict[str, Any] = {
     "name": "demo_area",
     "aerial": {
@@ -73,6 +77,10 @@ DEFAULTS: dict[str, Any] = {
         "texture_px": 512,
         "variants": 1,
         "seed": 20240501,
+        # A normal map gives the windows and storey bands real relief under a
+        # moving light. It costs one extra texture and exports through FBX.
+        "normal_map": True,
+        "relief_depth": 0.035,
     },
     "export": {
         "fbx_name": "model.fbx",
@@ -174,10 +182,33 @@ def load_config(path: str | Path) -> PipelineConfig:
         )
     merged["terrain"]["mesh_vertices_per_side"] = n
 
+    # Both dials have a ceiling set by the source data. Past it you are
+    # interpolating, not resolving, so the run just costs more.
+    native_terrain = int(round(bbox.width / float(merged["terrain"]["resolution_m"]))) + 1
+    if n > native_terrain:
+        LOG.warning(
+            "terrain.mesh_vertices_per_side is %d, finer than the %.2f m AHN "
+            "source supports over this bbox (native is about %d); the extra "
+            "vertices are interpolated",
+            n,
+            float(merged["terrain"]["resolution_m"]),
+            native_terrain,
+        )
+
     size_px = int(merged["aerial"]["size_px"])
     if size_px < 16:
         raise ValueError(f"aerial.size_px must be at least 16, got {size_px}")
     merged["aerial"]["size_px"] = size_px
+
+    native_aerial = int(round(bbox.width / AERIAL_SOURCE_M_PER_PX))
+    if size_px > native_aerial:
+        LOG.warning(
+            "aerial.size_px is %d, finer than the %.0f cm source supports over "
+            "this bbox (native is about %d px); the image is upsampled",
+            size_px,
+            AERIAL_SOURCE_M_PER_PX * 100,
+            native_aerial,
+        )
 
     variants = int(merged["facade"]["variants"])
     if variants < 1:

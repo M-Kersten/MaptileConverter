@@ -121,7 +121,11 @@ def build_config(payload: dict) -> dict:
             "clip_mode": payload.get("clip_mode", "centroid"),
             "merge": payload.get("merge", "single"),
         },
-        "facade": {"variants": int(payload.get("facade_variants", 1))},
+        "facade": {
+            "variants": int(payload.get("facade_variants", 1)),
+            "texture_px": int(payload.get("facade_texture_px", 512)),
+            "normal_map": bool(payload.get("facade_normal_map", True)),
+        },
     }
     return config
 

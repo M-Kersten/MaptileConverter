@@ -250,6 +250,53 @@ class TestFacade(unittest.TestCase):
         tile = render_facade_tile(STYLES[0], 256, seed=3).astype(float)
         self.assertLess(tile.min(), tile.mean())
 
+    def test_normal_map_is_mostly_flat_and_tiles(self):
+        from src.facade import relief_to_normal_map, render_facade_layers
+
+        _, relief = render_facade_layers(STYLES[0], 128, seed=5)
+        normal = relief_to_normal_map(relief)
+
+        # A facade is nearly flat, so the map sits close to (128, 128, 255).
+        means = normal.reshape(-1, 3).mean(axis=0)
+        self.assertAlmostEqual(means[0], 127.5, delta=6)
+        self.assertAlmostEqual(means[1], 127.5, delta=6)
+        self.assertGreater(means[2], 235)
+
+        # Gradients wrap, so the normal map tiles as exactly as the colour does.
+        left_right = np.abs(normal[:, 0].astype(int) - normal[:, -1].astype(int))
+        top_bottom = np.abs(normal[0].astype(int) - normal[-1].astype(int))
+        self.assertEqual(left_right.max(), 0)
+        self.assertEqual(top_bottom.max(), 0)
+
+    def test_relief_and_colour_stay_in_register(self):
+        from src.facade import render_facade_layers
+
+        rgb, relief = render_facade_layers(STYLES[0], 128, seed=9)
+        self.assertEqual(rgb.shape[:2], relief.shape)
+        # The recessed glass must be the deepest thing in the tile.
+        self.assertLess(relief.min(), 0.4)
+        self.assertGreater(relief.max(), 0.55)
+
+    def test_normal_map_written_alongside_colour(self):
+        from src.facade import generate_facade_textures
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {
+                "texture_px": 64, "variants": 1, "seed": 1,
+                "normal_map": True, "relief_depth": 0.035,
+            }
+            pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
+            self.assertEqual(len(pairs), 1)
+            colour, normal = pairs[0]
+            self.assertTrue(colour.is_file())
+            self.assertIsNotNone(normal)
+            # Unity keys off the _normal suffix to set the texture type.
+            self.assertTrue(normal.name.endswith("_normal.png"))
+
+            cfg["normal_map"] = False
+            _, without = generate_facade_textures(Path(tmp), facade_cfg=cfg)[0]
+            self.assertIsNone(without)
+
 
 class TestConfig(unittest.TestCase):
     def test_shipped_config_loads(self):
@@ -347,6 +394,48 @@ class TestUIServer(unittest.TestCase):
 
     def test_area_summary_is_none_for_unknown_area(self):
         self.assertIsNone(self.server.area_summary("no_such_area_xyz"))
+
+    def test_quality_fields_reach_the_config(self):
+        config = self.server.build_config(
+            {
+                "name": "q",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                "size_px": 12288,
+                "mesh_vertices": 1025,
+                "facade_texture_px": 2048,
+                "facade_normal_map": False,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+
+        self.assertEqual(loaded.aerial["size_px"], 12288)
+        self.assertEqual(loaded.terrain["mesh_vertices_per_side"], 1025)
+        self.assertEqual(loaded.facade["texture_px"], 2048)
+        self.assertFalse(loaded.facade["normal_map"])
+
+    def test_oversampling_past_the_source_only_warns(self):
+        """Asking for more than the source holds is allowed, but flagged."""
+        config = self.server.build_config(
+            {
+                "name": "q",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                "size_px": 16384,     # finer than the 8 cm ortho
+                "mesh_vertices": 4097,  # finer than the 0.5 m DTM
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            with self.assertLogs("src.config", level="WARNING") as captured:
+                loaded = load_config(path)
+
+        messages = " ".join(captured.output)
+        self.assertIn("finer than the 8 cm source", messages)
+        self.assertIn("finer than the 0.50 m AHN source", messages)
+        self.assertEqual(loaded.aerial["size_px"], 16384)
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

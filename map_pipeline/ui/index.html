@@ -58,6 +58,19 @@
   button.primary:hover:not(:disabled) { background: #63aaf0; }
   button.danger { background: #4a2626; border-color: #6b3333; }
   .hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .derived { float: right; color: var(--text); font-family: var(--mono);
+             font-size: 11px; text-transform: none; letter-spacing: 0; }
+  .derived.over { color: var(--warn); }
+  input[type=range].slider { -webkit-appearance: none; appearance: none;
+    padding: 0; height: 5px; background: #2b303a; border: 0; border-radius: 3px;
+    margin: 8px 0 2px; }
+  input[type=range].slider::-webkit-slider-thumb { -webkit-appearance: none;
+    width: 15px; height: 15px; border-radius: 50%; background: var(--accent);
+    cursor: pointer; border: 0; }
+  input[type=range].slider::-moz-range-thumb { width: 15px; height: 15px;
+    border-radius: 50%; background: var(--accent); cursor: pointer; border: 0; }
+  .ticks { display: flex; justify-content: space-between; color: var(--muted);
+           font-size: 10px; }
   .kv { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
         white-space: pre-wrap; word-break: break-all; }
   .kv b { color: var(--text); font-weight: 600; }
@@ -157,26 +170,40 @@
   </fieldset>
 
   <fieldset>
-    <legend>Settings</legend>
+    <legend>Quality</legend>
+    <label for="preset">Preset</label>
+    <select id="preset">
+      <option value="draft">Draft &mdash; fast look</option>
+      <option value="standard" selected>Standard</option>
+      <option value="high">High</option>
+      <option value="max">Maximum &mdash; source native</option>
+      <option value="custom">Custom</option>
+    </select>
+
+    <label for="aerialCm" style="margin-top:12px">
+      Aerial detail <span class="derived" id="aerialDerived"></span>
+    </label>
+    <input type="range" id="aerialCm" min="0" max="4" step="1" value="2" class="slider">
+    <div class="ticks"><span>coarse</span><span>8 cm native</span></div>
+
+    <label for="terrainM" style="margin-top:10px">
+      Terrain detail <span class="derived" id="terrainDerived"></span>
+    </label>
+    <input type="range" id="terrainM" min="0" max="4" step="1" value="1" class="slider">
+    <div class="ticks"><span>coarse</span><span>0.5 m native</span></div>
+
+    <label for="facadePx" style="margin-top:10px">
+      Facade texture <span class="derived" id="facadeDerived"></span>
+    </label>
+    <input type="range" id="facadePx" min="0" max="3" step="1" value="1" class="slider">
+    <div class="ticks"><span>256 px</span><span>2048 px</span></div>
+
+    <div id="qualityNote" class="hint"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Options</legend>
     <div class="row">
-      <div>
-        <label for="size_px">Aerial resolution</label>
-        <select id="size_px">
-          <option value="2048">2048 px</option>
-          <option value="4096" selected>4096 px</option>
-          <option value="8192">8192 px (slow)</option>
-        </select>
-      </div>
-      <div>
-        <label for="mesh">Terrain grid</label>
-        <select id="mesh">
-          <option value="129">129 (coarse)</option>
-          <option value="257" selected>257 (default)</option>
-          <option value="513">513 (fine)</option>
-        </select>
-      </div>
-    </div>
-    <div class="row" style="margin-top:8px">
       <div>
         <label for="facade">Facade variants</label>
         <select id="facade">
@@ -191,6 +218,10 @@
           <option value="intersect">Keep all</option>
         </select>
       </div>
+    </div>
+    <div class="inline">
+      <input type="checkbox" id="normal" checked>
+      <label for="normal">Facade normal map (relief on walls)</label>
     </div>
     <div class="inline">
       <input type="checkbox" id="preview" checked>
@@ -438,6 +469,8 @@ $("size").addEventListener("input", () => {
   const v = parseFloat($("size").value);
   if (!(v > 0)) return;
   sel.size = v;
+  // Detail is per metre, so the derived pixel counts move with the box size.
+  updateQuality();
   // Refit only when the square has grown past the window, so a deliberate zoom
   // is not undone on every keystroke.
   const { w, h } = viewport();
@@ -495,6 +528,103 @@ function escapeHtml(text) {
     c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/* ---------------------------------------------------------------------------
+   Quality.
+
+   Detail is expressed as ground resolution, not as a pixel count, so a setting
+   means the same thing whatever the area size: 12 cm/px is 12 cm/px over a
+   500 m box and over a 2 km one. Pixel counts are derived from the box.
+
+   Both dials have a ceiling set by the source. The aerial layer is an 8 cm
+   ortho and the AHN DTM is 0.5 m; asking for finer just interpolates, so the
+   readout says so rather than silently costing you time.
+--------------------------------------------------------------------------- */
+const AERIAL_NATIVE_CM = 8;      // PDOK ortho ground sample distance
+const TERRAIN_NATIVE_M = 0.5;    // AHN DTM cell size
+const UNITY_MAX_TEXTURE = 16384; // Unity will not import a larger texture at full size
+
+const AERIAL_STEPS  = [50, 25, 12, 8, 6];        // cm per pixel
+const TERRAIN_STEPS = [8, 4, 2, 1, 0.5];         // metres between vertices
+const FACADE_STEPS  = [256, 512, 1024, 2048];    // px per storey tile
+
+const PRESETS = {
+  draft:    { aerial: 0, terrain: 0, facade: 0, normal: false },
+  standard: { aerial: 1, terrain: 1, facade: 1, normal: true  },
+  high:     { aerial: 2, terrain: 2, facade: 2, normal: true  },
+  max:      { aerial: 3, terrain: 3, facade: 3, normal: true  }
+};
+
+function quality() {
+  const side = sel.size;
+  const cm = AERIAL_STEPS[+$("aerialCm").value];
+  const spacing = TERRAIN_STEPS[+$("terrainM").value];
+
+  // Round the aerial to a multiple of 4 px: the mosaic splits it into tiles and
+  // whole numbers keep every tile boundary on an exact pixel.
+  let sizePx = Math.max(256, Math.round(side / (cm / 100) / 4) * 4);
+  let mesh = Math.max(33, Math.round(side / spacing) + 1);
+
+  return {
+    cm, spacing, sizePx, mesh,
+    facadePx: FACADE_STEPS[+$("facadePx").value],
+    aerialOver: cm < AERIAL_NATIVE_CM,
+    terrainOver: spacing < TERRAIN_NATIVE_M,
+    megapixels: (sizePx * sizePx) / 1e6,
+    vertices: mesh * mesh
+  };
+}
+
+function updateQuality() {
+  const q = quality();
+
+  $("aerialDerived").textContent = `${q.cm} cm/px · ${q.sizePx} px · ~${Math.round(q.megapixels * 1.5)} MB`;
+  $("aerialDerived").className = "derived" + (q.aerialOver ? " over" : "");
+
+  $("terrainDerived").textContent =
+    `${q.spacing} m · ${q.mesh}² = ${(q.vertices / 1000).toFixed(0)}k verts`;
+  $("terrainDerived").className = "derived" + (q.terrainOver ? " over" : "");
+
+  $("facadeDerived").textContent =
+    `${q.facadePx} px per storey · ${(q.facadePx / 4).toFixed(0)} px/m`;
+
+  const notes = [];
+  if (q.aerialOver)
+    notes.push(`Aerial is finer than the ${AERIAL_NATIVE_CM} cm source; the extra pixels are upsampled.`);
+  if (q.terrainOver)
+    notes.push(`Terrain is finer than the ${TERRAIN_NATIVE_M} m AHN source; the extra vertices are interpolated.`);
+  if (q.spacing <= 1 && !q.terrainOver)
+    notes.push("Below about 1 m most terrain vertices sit inside AHN's building-shaped holes, so they are reconstructed rather than measured.");
+  if (q.sizePx > UNITY_MAX_TEXTURE)
+    notes.push(`Over Unity's ${UNITY_MAX_TEXTURE} px texture limit: it will be downscaled on import. Use a smaller area to keep this detail.`);
+  else if (q.sizePx > 2048)
+    notes.push("Unity caps imported textures at 2048 by default; raise Max Size on the texture to see this detail.");
+  if (q.vertices > 1e6)
+    notes.push(`${(q.vertices / 1e6).toFixed(1)}M terrain vertices needs a 32-bit index buffer, which Unity sets automatically on import.`);
+
+  $("qualityNote").innerHTML = notes.map(escapeHtml).join("<br>");
+  $("qualityNote").style.color = (q.aerialOver || q.terrainOver)
+    ? "var(--warn)" : "var(--muted)";
+}
+
+function applyPreset(name) {
+  const preset = PRESETS[name];
+  if (!preset) return;
+  $("aerialCm").value = preset.aerial;
+  $("terrainM").value = preset.terrain;
+  $("facadePx").value = preset.facade;
+  $("normal").checked = preset.normal;
+  updateQuality();
+}
+
+$("preset").addEventListener("change", () => applyPreset($("preset").value));
+for (const id of ["aerialCm", "terrainM", "facadePx"]) {
+  $(id).addEventListener("input", () => {
+    $("preset").value = "custom";
+    updateQuality();
+  });
+}
+$("normal").addEventListener("change", () => { $("preset").value = "custom"; });
+
 /* ---------- running ---------- */
 const logEl = $("log");
 let job = null, offset = 0, poller = null;
@@ -515,11 +645,14 @@ function setStatus(state, text) {
 }
 
 $("run").onclick = async () => {
+  const q = quality();
   const payload = {
     name: $("name").value.trim(),
     bbox: bbox(),
-    size_px: +$("size_px").value,
-    mesh_vertices: +$("mesh").value,
+    size_px: q.sizePx,
+    mesh_vertices: q.mesh,
+    facade_texture_px: q.facadePx,
+    facade_normal_map: $("normal").checked,
     facade_variants: +$("facade").value,
     clip_mode: $("clip").value,
     preview: $("preview").checked
@@ -649,6 +782,7 @@ function showResult(area) {
 /* ---------- start ---------- */
 fitToSelection();
 updateBboxInfo();
+updateQuality();
 
 probeTileSource().then(source => {
   if (source === tileSource) return;
