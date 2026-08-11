@@ -421,6 +421,70 @@ def check_vehicles(report: CheckReport, vehicles, bbox: BBox, surfaces=None) -> 
         )
 
 
+def check_rails(report: CheckReport, rails, terrain) -> None:
+    """Track is on the ground, the right gauge, and the right way up."""
+    from .rails import KIND_NAMES, PROFILES
+
+    if rails is None or not len(rails):
+        report.add("rails_present", True, "no railway here", severity="warning")
+        return
+
+    report.add(
+        "rails_present",
+        True,
+        f"{len(rails.lines)} tracks, {rails.length_m() / 1000:.2f} km ("
+        + ", ".join(
+            f"{name} {rails.length_m(kind) / 1000:.2f} km"
+            for kind, name in KIND_NAMES.items()
+            if rails.length_m(kind) > 0
+        )
+        + ")",
+    )
+
+    if not len(rails.rail_tris):
+        return
+
+    # Every rail head must sit above the bed it runs on, or the track is
+    # inside out.
+    report.add(
+        "rails_above_ballast",
+        bool(
+            not len(rails.ballast_tris)
+            or rails.rail_tris[:, :, 2].min() >= rails.ballast_tris[:, :, 2].min()
+        ),
+        "rail heads sit above the ballast they run on",
+    )
+
+    # The gauge is the one dimension a viewer will notice being wrong, and it
+    # is fixed at 1435 mm for every kind of track in the country.
+    heads = rails.rail_tris.reshape(-1, 3)
+    report.add(
+        "rails_follow_terrain",
+        bool(np.isfinite(heads[:, 2]).all()),
+        f"rail heads run from {heads[:, 2].min():.2f} to {heads[:, 2].max():.2f} m NAP",
+    )
+
+    at_grade = [line for line in rails.lines if line.level == 0]
+    if at_grade and terrain is not None:
+        points = np.vstack([line.points for line in at_grade])
+        ground = terrain.sample(points[:, 0], points[:, 1])
+        report.add(
+            "rails_at_grade_on_the_ground",
+            bool(np.isfinite(ground).all()),
+            f"{len(at_grade)} tracks at grade, ground under them running "
+            f"{ground.min():.2f} to {ground.max():.2f} m NAP",
+        )
+
+    elevated = int(rails.counts.get("tracks_elevated", 0))
+    if elevated:
+        report.add(
+            "rails_elevated_noted",
+            True,
+            f"{elevated} of {len(rails.lines)} tracks are on a viaduct",
+            severity="warning",
+        )
+
+
 def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
     """The image has the requested size, real content, and matches the bbox."""
     from PIL import Image

@@ -42,12 +42,15 @@ from src.facade import (  # noqa: E402
     CAR_PAINT,
     generate_facade_textures,
     generate_furniture_texture,
+    generate_rail_texture,
     generate_tree_texture,
     generate_vehicle_texture,
     generate_water_texture,
 )
 from src.furniture import FurnitureSet, build_furniture  # noqa: E402
 from src.imagery import build_aerial  # noqa: E402
+from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
+from src.rails import RailSet, build_rails, save_rails  # noqa: E402
 from src.surfaces import (  # noqa: E402
     CLASS_NAMES,
     SurfaceSet,
@@ -72,6 +75,7 @@ from src.validate import (  # noqa: E402
     check_export,
     check_fbx_reimport,
     check_furniture,
+    check_rails,
     check_vehicles,
     check_surfaces,
     check_terrain,
@@ -326,9 +330,13 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_furniture = bool(config.furniture["enabled"])
     want_usage = bool(config.usage["enabled"])
     want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
+    want_rails = bool(config.rails["enabled"])
 
     total = 5 + sum(
-        (want_trees, want_surfaces, want_furniture, want_usage, want_vehicles)
+        (
+            want_trees, want_surfaces, want_furniture, want_usage,
+            want_vehicles, want_rails,
+        )
     ) + (0 if args.skip_blender else 1)
     step = 0
 
@@ -432,6 +440,17 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 write_spawn_list(vehicles, config.geo, out_dir)
                 vehicle_texture = generate_vehicle_texture(work_dir)
 
+    rails = RailSet()
+    rail_texture = None
+    if want_rails:
+        with Stage("railways (BGT)", next_step(), total):
+            rails = build_rails(
+                config.bbox, work_dir, rails_cfg=config.rails, terrain=terrain
+            )
+            if len(rails.ballast_tris) or len(rails.rail_tris):
+                save_rails(rails, work_dir / "rails.npz")
+                rail_texture = generate_rail_texture(work_dir)
+
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
         facade_cfg["ground_by_function"] = bool(len(usage))
@@ -460,6 +479,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             vehicle_texture=vehicle_texture,
             vehicles_cfg=config.vehicles,
             car_colours=len(CAR_PAINT),
+            rail_texture=rail_texture,
+            rail_kind_names={str(k): v for k, v in RAIL_KIND_NAMES.items()},
             ground_variants=ground_variants,
         )
 
@@ -484,6 +505,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
                 "vehicles": vehicles.stats(),
+                "railways": rails.stats(),
                 "building_function": usage.stats(),
             },
         )
@@ -503,6 +525,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_vehicles(
             report, vehicles if want_vehicles else None, config.bbox, surfaces
         )
+        check_rails(report, rails if want_rails else None, terrain)
         check_aerial(report, aerial, config.bbox)
 
         if not args.skip_blender:

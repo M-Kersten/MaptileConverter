@@ -178,6 +178,18 @@ DEFAULTS: dict[str, Any] = {
         "max_retries": 4,
         "max_pages": 200,
     },
+    "rails": {
+        # BGT spoor: one centreline per running track, with the function that
+        # says whether it is heavy rail, a street tram or light rail.
+        "enabled": True,
+        # How far apart points along a track may get before the ground under
+        # it stops being followed.
+        "step_m": 4.0,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+    },
     "usage": {
         # BAG building function, joined to 3DBAG on the building id.
         "enabled": True,
@@ -220,6 +232,7 @@ class PipelineConfig:
     surfaces: dict[str, Any]
     furniture: dict[str, Any]
     vehicles: dict[str, Any]
+    rails: dict[str, Any]
     usage: dict[str, Any]
     export: dict[str, Any]
     source_path: Path | None = None
@@ -246,6 +259,7 @@ class PipelineConfig:
             "surfaces": self.surfaces,
             "furniture": self.furniture,
             "vehicles": self.vehicles,
+            "rails": self.rails,
             "usage": self.usage,
             "export": self.export,
         }
@@ -370,6 +384,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         surfaces=merged["surfaces"],
         furniture=merged["furniture"],
         vehicles=merged["vehicles"],
+        rails=merged["rails"],
         usage=merged["usage"],
         export=merged["export"],
         source_path=path,

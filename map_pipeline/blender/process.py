@@ -1053,6 +1053,92 @@ def build_vehicles(scene: dict, work_dir: Path, material):
     return obj
 
 
+def build_rails(scene: dict, work_dir: Path, material):
+    """Track: a ballast bed with the two rails on it, one object per kind.
+
+    Heavy rail, tram and metro become separate objects for the same reason the
+    roads do — each is its own GameObject, so a tram route and a railway can be
+    treated differently downstream without splitting anything by hand.
+
+    The UVs were built upstream, running in metres along the track, so the
+    sleepers in the ballast texture stay evenly spaced through curves.
+    """
+    rail_file = scene.get("rails", {}).get("file")
+    if not rail_file or not (work_dir / rail_file).is_file():
+        return []
+
+    data = np.load(work_dir / rail_file)
+    if not len(data["ballast_tris"]) and not len(data["rail_tris"]):
+        return []
+
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    names = scene.get("rails", {}).get("kind_names", {})
+    # Metres of track one tile of the atlas covers.
+    tile_m = float(scene.get("rails", {}).get("tile_length_m", 2.0))
+
+    def to_local(tris):
+        if not len(tris):
+            return tris
+        out = tris.copy()
+        out[:, :, 0] -= origin_x
+        out[:, :, 1] -= origin_y
+        out[:, :, 2] -= z_offset
+        return out
+
+    ballast = to_local(data["ballast_tris"])
+    rails = to_local(data["rail_tris"])
+    ballast_kind = data["ballast_kind"]
+    rail_kind = data["rail_kind"]
+
+    # The atlas is ballast on the left half, rail steel on the right, so U is
+    # squeezed into one half or the other rather than spanning the image.
+    def atlas_uv(uv, left: bool):
+        out = uv.copy()
+        out[:, 0] = out[:, 0] * 0.46 + (0.02 if left else 0.52)
+        out[:, 1] = out[:, 1] / tile_m
+        return out
+
+    objects = []
+    for code in sorted(set(int(k) for k in np.concatenate([ballast_kind, rail_kind]))):
+        parts, uvs = [], []
+        for tris, kinds, uv, left in (
+            (ballast, ballast_kind, data["ballast_uv"], True),
+            (rails, rail_kind, data["rail_uv"], False),
+        ):
+            if not len(tris):
+                continue
+            mask = kinds == code
+            if not mask.any():
+                continue
+            parts.append(tris[mask])
+            uvs.append(atlas_uv(uv.reshape(-1, 3, 2)[mask].reshape(-1, 2), left))
+        if not parts:
+            continue
+
+        triangles = np.concatenate(parts)
+        corners = triangles.reshape(-1, 3)
+        n_triangles = len(triangles)
+        label = str(names.get(str(code), f"kind_{code}"))
+
+        objects.append(
+            build_mesh_object(
+                f"Rails_{label}",
+                corners,
+                np.arange(n_triangles * 3),
+                np.arange(0, n_triangles * 3, 3),
+                np.full(n_triangles, 3),
+                np.concatenate(uvs),
+                np.zeros(n_triangles),
+                [material],
+                shade_smooth=False,
+            )
+        )
+        log(f"rails: {label}, {n_triangles} triangles")
+
+    return objects
+
+
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
@@ -1129,6 +1215,7 @@ def copy_textures(
         ("water", "surfaces"),
         ("furniture", "furniture"),
         ("vehicle", "vehicles"),
+        ("rail", "rails"),
     ):
         name = scene.get(section, {}).get("texture")
         if name and (work_dir / name).is_file():
@@ -1230,6 +1317,13 @@ def main() -> int:
             make_textured_material(
                 "M_vehicle", extra_textures["vehicle"], roughness=0.35
             ),
+        )
+
+    if "rail" in extra_textures:
+        build_rails(
+            scene,
+            work_dir,
+            make_textured_material("M_rail", extra_textures["rail"], roughness=0.7),
         )
 
     # Report the scene bounds so a coordinate or scale error shows up in the log

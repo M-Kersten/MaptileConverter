@@ -128,6 +128,14 @@ SOURCES: tuple[Source, ...] = (
         url_path=("trees", "api_url"),
         note="boats need water surfaces on too",
     ),
+    Source(
+        id="rails",
+        label="Railways (BGT)",
+        provider="PDOK",
+        contributes="railway, tram and metro track, on its own ballast bed",
+        toggles=(("rails", "enabled"),),
+        url_path=("trees", "api_url"),
+    ),
 )
 
 BY_ID = {source.id: source for source in SOURCES}

@@ -6,7 +6,7 @@ runtime.
 
 ```
 output/<area_name>/
-├── model.fbx        terrain, roads, water, buildings, trees, furniture, cars, boats
+├── model.fbx        terrain, roads, rails, water, buildings, trees, furniture, cars, boats
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
@@ -18,6 +18,7 @@ output/<area_name>/
 ├── water.png        canal water
 ├── furniture.png    metal and wood atlas
 ├── vehicle.png      car paint, hull and timber atlas
+├── rail.png         ballast with sleepers, and rail steel
 └── ATTRIBUTION.txt  source credits
 ```
 
@@ -203,6 +204,8 @@ Other knobs worth knowing:
 | `vehicles.boats` | `true` | Moor boats between the BGT mooring posts. Needs `surfaces.water`. |
 | `vehicles.car_occupancy` | `0.72` | How full the bays are. 1 parks a car in every space. |
 | `vehicles.boat_occupancy` | `0.8` | The same for moorings. |
+| `rails.enabled` | `true` | Railway, tram and metro track from BGT `spoor`. |
+| `rails.step_m` | `4.0` | How far apart points along a track may get before the ground under it stops being followed. |
 | `usage.enabled` | `true` | BAG building function, deciding the ground storey. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
 | `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
@@ -229,6 +232,7 @@ src/trees.py       BGT tree points, heights from AHN DSM minus DTM
 src/surfaces.py    BGT water bodies and land cover
 src/furniture.py   BGT lampposts, bollards, signs and benches
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
+src/rails.py       railway, tram and metro track from BGT spoor
 src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
@@ -375,6 +379,46 @@ bollards, sign posts and benches, from BGT `paal` and `straatmeubilair`. None of
 it is structurally important, which is the point — a street with nothing on it
 reads as a model. They are simple boxes sharing one material, so a couple of
 thousand objects cost one draw call.
+
+## Railways
+
+BGT `spoor`, and the first linear dataset here. Everything else arrives as
+polygons to fill or points to stand something on; a track arrives as a
+centreline, so the geometry is built out sideways from a line rather than
+filled in from an outline. What comes back is one line per *running track*, not
+per route, so a station throat resolves into the individual tracks through the
+points: 265 of them and 17.7 km within 800 m of Utrecht Centraal.
+
+`functie` separates heavy rail from tram and light rail, and that matters
+because they are built differently. A railway sits on a raised ballast bed; a
+city tram is set flush into the street. Drawing a gravel bed down a shopping
+street would be worse than drawing nothing, so a tram gets rails and no bed, and
+the road surface underneath shows between them. Each kind is its own object —
+`Rails_train`, `Rails_tram`, `Rails_metro` — for the same reason the roads are.
+
+Three details are worth knowing:
+
+- **Sleepers are in the texture, not the geometry.** There are 38 km of track
+  within a kilometre of Utrecht Centraal, which at one sleeper per 600 mm is
+  63,000 of them. As bands in a tile repeating along the track they cost
+  nothing. The UVs run in metres along the centreline, so the spacing holds
+  through curves.
+- **The ribbon is mitred.** Using each segment's own normal would leave a notch
+  on the outside of every bend; averaging the two adjacent normals and widening
+  by `1/cos` keeps the edge continuous. The widening is capped, so a hairpin
+  cannot send a corner off to infinity.
+- **Elevated track takes its height from the AHN DSM.** A fifth of the track
+  around Utrecht Centraal is up on a viaduct, and drawing that at ground level
+  would put a railway through the street. A deck is a hard surface, so the
+  surface model sees it where the DTM — bare ground by definition — does not,
+  which makes the height a measurement rather than a guess. The reading is only
+  trusted where it is plausibly a deck: high enough above the ground to be one,
+  low enough not to be a gantry. The DSM arrives with the trees stage; without
+  it, elevated track is drawn at ground level and the run says so.
+
+Tracks are clipped to the bbox. A railway does not stop at the edge of the area
+and the BGT returns any track that touches it in full, which stretched an 800 m
+model to 1592 m across before the clip went in.
 
 ## Cars and boats
 
@@ -611,9 +655,9 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
 - **3DBAG** — 3D geoinformation research group, TU Delft, and Kadaster (CC BY 4.0)
 - **AHN** — Actueel Hoogtebestand Nederland via PDOK (CC BY 4.0)
 - **Aerial** — PDOK / Beeldmateriaal Nederland (CC BY 4.0)
-- **Trees, water, land cover, road surfaces, street furniture, parking bays
-  and mooring posts** — BGT (Basisregistratie Grootschalige Topografie) via
-  PDOK (CC BY 4.0)
+- **Trees, water, land cover, road surfaces, railway track, street furniture,
+  parking bays and mooring posts** — BGT (Basisregistratie Grootschalige
+  Topografie) via PDOK (CC BY 4.0)
 - **Building function** — BAG (Basisregistratie Adressen en Gebouwen) via PDOK
   (CC BY 4.0)
 - **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution

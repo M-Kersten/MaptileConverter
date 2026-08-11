@@ -716,6 +716,61 @@ def generate_vehicle_texture(
     return path
 
 
+def generate_rail_texture(
+    work_dir: Path, size_px: int = 256, seed: int = 63
+) -> Path:
+    """Atlas for track: ballast with sleepers on the left, rail steel right.
+
+    The sleepers live here rather than in the geometry. There are 38 km of
+    track within a kilometre of Utrecht Centraal, which at one sleeper per
+    600 mm would be 63,000 boxes; as bands in a texture repeating along the
+    track they cost nothing. The tile covers 2 m of track, so three bands put
+    them at roughly the real spacing.
+    """
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    half = size_px // 2
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+
+    # Ballast: coarse grey stone. High-frequency noise, because crushed rock
+    # is the one surface out here with no structure at all.
+    ballast = np.zeros((size_px, half, 3), dtype=np.float64)
+    ballast[:, :] = (128, 124, 118)
+    coarse = _value_noise((size_px, half), cells=max(8, half // 6), rng=rng)
+    fine = _value_noise((size_px, half), cells=max(16, half // 2), rng=rng)
+    ballast *= 1.0 + 0.42 * ((0.45 * coarse + 0.55 * fine) - 0.5)[:, :, None] * 2.0
+
+    # Sleepers across the tile: three bands over the two metres it covers.
+    sleepers = 3
+    band = max(2, int(round(size_px * 0.09)))
+    for index in range(sleepers):
+        centre = int((index + 0.5) * size_px / sleepers)
+        low, high = max(0, centre - band // 2), min(size_px, centre + band // 2)
+        timber = np.zeros((high - low, half, 3), dtype=np.float64)
+        timber[:, :] = (74, 62, 52)
+        grain = _value_noise((high - low, half), cells=max(3, half // 8), rng=rng)
+        timber *= 1.0 + 0.22 * (grain - 0.5)[:, :, None] * 2.0
+        ballast[low:high] = timber
+    canvas[:, :half] = ballast
+
+    # Rail steel: dark, with a worn bright crown along the running surface.
+    steel = np.zeros((size_px, size_px - half, 3), dtype=np.float64)
+    steel[:, :] = (86, 84, 86)
+    rust = _value_noise((size_px, size_px - half), cells=max(4, half // 6), rng=rng)
+    steel *= 1.0 + 0.20 * (rust - 0.5)[:, :, None] * 2.0
+    crown = np.linspace(0, 1, size_px - half)
+    polish = np.exp(-((crown - 0.5) ** 2) / 0.02)[None, :, None]
+    steel = steel * (1 - 0.55 * polish) + np.array([196, 198, 200]) * 0.55 * polish
+    canvas[:, half:] = steel
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "rail.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB").save(path)
+    LOG.info("wrote %s (ballast with sleepers, and rail steel, %dpx)", path.name, size_px)
+    return path
+
+
 def generate_furniture_texture(
     work_dir: Path, size_px: int = 256, seed: int = 33
 ) -> Path:
@@ -750,6 +805,7 @@ __all__ = [
     "GROUND_STYLE",
     "GROUND_STYLES",
     "generate_furniture_texture",
+    "generate_rail_texture",
     "generate_vehicle_texture",
     "generate_tree_texture",
     "generate_water_texture",

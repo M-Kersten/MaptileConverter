@@ -1243,6 +1243,177 @@ class TestRoadGeometry(unittest.TestCase):
         self.assertEqual(len(classes), 0)
 
 
+class TestRailways(unittest.TestCase):
+    """Track built sideways out of a centreline, the first linear dataset."""
+
+    @staticmethod
+    def _bbox():
+        from src.geo import BBox
+
+        return BBox(0.0, 0.0, 100.0, 100.0)
+
+    def test_a_track_running_out_of_the_area_is_trimmed(self):
+        """One line out of Utrecht CS stretched the model to 1592 m."""
+        from src.rails import clip_line_to_bbox
+
+        line = np.array([[-500.0, 50.0], [600.0, 50.0]])
+        pieces = clip_line_to_bbox(line, self._bbox())
+
+        self.assertEqual(len(pieces), 1)
+        np.testing.assert_allclose(pieces[0], [[0.0, 50.0], [100.0, 50.0]])
+
+    def test_a_track_that_leaves_and_returns_comes_back_in_pieces(self):
+        from src.rails import clip_line_to_bbox
+
+        line = np.array(
+            [[10.0, 50.0], [50.0, 150.0], [90.0, 50.0]]
+        )
+        pieces = clip_line_to_bbox(line, self._bbox())
+        self.assertEqual(len(pieces), 2)
+        for piece in pieces:
+            self.assertTrue((piece[:, 1] <= 100.0 + 1e-9).all())
+
+    def test_a_track_wholly_inside_is_untouched(self):
+        from src.rails import clip_line_to_bbox
+
+        line = np.array([[10.0, 10.0], [40.0, 40.0], [80.0, 20.0]])
+        pieces = clip_line_to_bbox(line, self._bbox())
+        self.assertEqual(len(pieces), 1)
+        np.testing.assert_allclose(pieces[0], line)
+
+    def test_a_track_wholly_outside_disappears(self):
+        from src.rails import clip_line_to_bbox
+
+        line = np.array([[200.0, 200.0], [300.0, 300.0]])
+        self.assertEqual(clip_line_to_bbox(line, self._bbox()), [])
+
+    def test_densify_keeps_the_original_vertices(self):
+        """Resampling at a fixed interval would round off the curves."""
+        from src.rails import densify
+
+        line = np.array([[0.0, 0.0], [30.0, 0.0], [30.0, 8.0]])
+        dense = densify(line, max_step=4.0)
+
+        for vertex in line:
+            self.assertTrue(
+                np.isclose(dense, vertex).all(axis=1).any(),
+                f"{vertex} was dropped",
+            )
+        steps = np.linalg.norm(np.diff(dense, axis=0), axis=1)
+        self.assertLessEqual(steps.max(), 4.0 + 1e-9)
+
+    def test_densify_leaves_a_short_line_alone(self):
+        from src.rails import densify
+
+        line = np.array([[0.0, 0.0], [2.0, 0.0]])
+        np.testing.assert_allclose(densify(line, max_step=4.0), line)
+
+    def test_the_ribbon_edge_is_continuous_round_a_bend(self):
+        """Per-segment normals would leave a notch on every curve."""
+        from src.rails import offset_normals
+
+        # A right-angle bend, the worst case rails ever present.
+        line = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]])
+        normals = offset_normals(line)
+
+        # The corner normal bisects the turn and is lengthened to reach it.
+        corner = normals[1]
+        self.assertAlmostEqual(
+            abs(corner[0]), abs(corner[1]), places=6, msg="not bisecting the turn"
+        )
+        self.assertGreater(np.linalg.norm(corner), 1.0, "no mitre widening")
+
+    def test_the_mitre_is_capped_at_a_hairpin(self):
+        from src.rails import MAX_MITER, offset_normals
+
+        line = np.array([[0.0, 0.0], [10.0, 0.0], [0.0, 0.001]])
+        normals = offset_normals(line)
+        self.assertLessEqual(np.linalg.norm(normals[1]), MAX_MITER + 1e-6)
+
+    def test_a_railway_gets_ballast_and_a_tram_does_not(self):
+        """A gravel bed down a shopping street is worse than nothing."""
+        from src.rails import (
+            KIND_TRAIN, KIND_TRAM, RailLine, RailSet, build_track_geometry,
+        )
+
+        line = np.array([[0.0, 0.0], [40.0, 0.0]])
+        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
+
+        train = RailSet(lines=[RailLine(line, KIND_TRAIN, 0)])
+        build_track_geometry(train, flat)
+        self.assertGreater(len(train.ballast_tris), 0)
+        self.assertGreater(len(train.rail_tris), 0)
+
+        tram = RailSet(lines=[RailLine(line, KIND_TRAM, 0)])
+        build_track_geometry(tram, flat)
+        self.assertEqual(len(tram.ballast_tris), 0)
+        self.assertGreater(len(tram.rail_tris), 0)
+
+    def test_the_rails_are_a_standard_gauge_apart(self):
+        from src.rails import (
+            KIND_TRAIN, PROFILES, RailLine, RailSet, build_track_geometry,
+        )
+
+        # Running due east, so the rails separate in Y.
+        line = np.array([[0.0, 0.0], [40.0, 0.0]])
+        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
+        rails = RailSet(lines=[RailLine(line, KIND_TRAIN, 0)])
+        build_track_geometry(rails, flat)
+
+        ys = rails.rail_tris.reshape(-1, 3)[:, 1]
+        gauge = PROFILES[KIND_TRAIN].gauge
+        # Two rails centred on ±gauge/2, each a few centimetres wide.
+        self.assertAlmostEqual(ys.max() + ys.min(), 0.0, places=6)
+        self.assertAlmostEqual(
+            ys.max(), gauge / 2 + PROFILES[KIND_TRAIN].rail_half_width, places=6
+        )
+
+    def test_the_rail_head_sits_above_the_ballast(self):
+        from src.rails import KIND_TRAIN, RailLine, RailSet, build_track_geometry
+
+        line = np.array([[0.0, 0.0], [40.0, 0.0]])
+        flat = lambda x, y: np.full_like(np.asarray(x, dtype=float), 5.0)  # noqa: E731
+        rails = RailSet(lines=[RailLine(line, KIND_TRAIN, 0)])
+        build_track_geometry(rails, flat)
+
+        self.assertGreater(
+            rails.rail_tris[:, :, 2].min(), rails.ballast_tris[:, :, 2].max()
+        )
+
+    def test_the_track_follows_a_slope(self):
+        from src.rails import KIND_TRAIN, RailLine, RailSet, build_track_geometry
+
+        line = np.array([[0.0, 0.0], [100.0, 0.0]])
+        ramp = lambda x, y: 0.05 * np.asarray(x, dtype=float)  # noqa: E731
+        rails = RailSet(lines=[RailLine(line, KIND_TRAIN, 0)])
+        build_track_geometry(rails, ramp, step_m=4.0)
+
+        z = rails.ballast_tris[:, :, 2]
+        self.assertGreater(z.max() - z.min(), 4.0)
+
+    def test_the_uv_runs_in_metres_so_sleepers_stay_evenly_spaced(self):
+        from src.rails import KIND_TRAIN, RailLine, RailSet, build_track_geometry
+
+        line = np.array([[0.0, 0.0], [40.0, 0.0]])
+        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
+        rails = RailSet(lines=[RailLine(line, KIND_TRAIN, 0)])
+        build_track_geometry(rails, flat)
+
+        # V is distance along the track, so it reaches the track's length.
+        self.assertAlmostEqual(rails.ballast_uv[:, 1].max(), 40.0, places=6)
+        self.assertAlmostEqual(rails.ballast_uv[:, 0].min(), 0.0, places=6)
+        self.assertAlmostEqual(rails.ballast_uv[:, 0].max(), 1.0, places=6)
+
+    def test_only_rail_functions_are_kept(self):
+        from src.rails import RAIL_FUNCTIONS
+
+        self.assertIn("trein", RAIL_FUNCTIONS)
+        self.assertIn("tram", RAIL_FUNCTIONS)
+        self.assertIn("sneltram", RAIL_FUNCTIONS)
+        # Harbour crane rails come through as niet-bgt and are not track.
+        self.assertNotIn("niet-bgt", RAIL_FUNCTIONS)
+
+
 class TestVehiclePlacement(unittest.TestCase):
     """Cars and boats are read off the structures that exist because of them."""
 
@@ -1611,7 +1782,7 @@ class TestSourceRegistry(unittest.TestCase):
         )
 
     def test_shared_hosts_are_probed_once(self):
-        """Five BGT layers behind one host must not look like five outages."""
+        """Six BGT layers behind one host must not look like six outages."""
         from src.sources import health_targets
 
         targets = health_targets(self.config)
@@ -1619,7 +1790,7 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(len(bgt), 1)
         self.assertEqual(
             set(bgt[0].split(",")),
-            {"trees", "water", "land_cover", "furniture", "vehicles"},
+            {"trees", "water", "land_cover", "furniture", "vehicles", "rails"},
         )
 
     def test_disabled_sources_are_not_checked(self):

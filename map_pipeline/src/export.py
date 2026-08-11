@@ -30,9 +30,9 @@ ATTRIBUTION = {
         "https://www.beeldmateriaal.nl"
     ),
     "bgt": (
-        "Trees, water, land cover, road surfaces, street furniture, parking "
-        "bays and mooring posts from the BGT (Basisregistratie Grootschalige "
-        "Topografie) via PDOK, CC BY 4.0."
+        "Trees, water, land cover, road surfaces, railway track, street "
+        "furniture, parking bays and mooring posts from the BGT "
+        "(Basisregistratie Grootschalige Topografie) via PDOK, CC BY 4.0."
     ),
     "bag": (
         "Building function from the BAG (Basisregistratie Adressen en "
@@ -166,6 +166,8 @@ def write_scene_description(
     furniture_cfg: dict | None = None,
     vehicle_texture: Path | None = None,
     vehicles_cfg: dict | None = None,
+    rail_texture: Path | None = None,
+    rail_kind_names: dict | None = None,
     car_colours: int = 6,
     ground_variants: int = 0,
 ) -> Path:
@@ -251,6 +253,18 @@ def write_scene_description(
                 "car_colours": int(car_colours),
             }
             if vehicle_texture is not None
+            else {}
+        ),
+        "rails": (
+            {
+                "file": "rails.npz",
+                "texture": rail_texture.name,
+                "kind_names": rail_kind_names or {},
+                # Metres of track one tile of the atlas covers, which is what
+                # puts the sleepers at roughly their real spacing.
+                "tile_length_m": 2.0,
+            }
+            if rail_texture is not None
             else {}
         ),
         "export": {
