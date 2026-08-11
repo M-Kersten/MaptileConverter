@@ -37,6 +37,7 @@ from src.export import (  # noqa: E402
     write_scene_description,
 )
 from src.http_util import preflight  # noqa: E402
+from src.sources import BY_ID, enabled_sources, health_targets  # noqa: E402
 from src.facade import (  # noqa: E402
     generate_facade_textures,
     generate_furniture_texture,
@@ -117,6 +118,7 @@ def write_timings(
     work_dir: Path,
     total_seconds: float,
     args: argparse.Namespace | None = None,
+    completed: bool = False,
 ) -> None:
     """Record what the run cost, alongside the settings that drove it."""
     payload = {
@@ -139,6 +141,9 @@ def write_timings(
             "preview": bool(args.preview) if args is not None else False,
             "skip_blender": bool(args.skip_blender) if args is not None else False,
         },
+        # A run that stopped at the preflight took seconds and did no work.
+        # Calibrating the estimate on it would drag every prediction down.
+        "completed": completed,
     }
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -280,30 +285,30 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     for warning in config.warnings:
         LOG.warning("  %s", warning)
 
-    if not args.skip_preflight:
-        # Cheaper to ask now than to find out at stage five.
-        LOG.info("checking the services this run needs")
-        services = {
-            "AHN terrain (PDOK)": str(config.terrain["wcs_url"]),
-            "aerial imagery (PDOK)": str(config.aerial["wms_url"]),
-            "buildings (3DBAG)": str(config.buildings["api_url"]),
-        }
-        if config.trees["enabled"] or config.surfaces["water"] or (
-            config.surfaces["land_cover"] or config.furniture["enabled"]
-        ):
-            services["BGT (PDOK)"] = str(config.trees["api_url"])
-        if config.usage["enabled"]:
-            services["BAG (PDOK)"] = "https://service.pdok.nl/lv/bag/wfs/v2_0"
+    active = enabled_sources(config.as_dict())
+    LOG.info("sources: %s", ", ".join(source.label for source in active))
 
-        down = preflight(services)
+    if not args.skip_preflight:
+        # Cheaper to ask now than to find out at stage five. Only the sources
+        # this run actually uses are checked, and only once per host.
+        LOG.info("checking the services this run needs")
+        targets = health_targets(config.as_dict(), active)
+        labels = {
+            url: ", ".join(
+                BY_ID[i].label for i in ids.split(",") if i in BY_ID
+            )
+            for url, ids in targets.items()
+        }
+        down = preflight({labels[url]: url for url in targets})
         if down:
             raise SystemExit(
                 "cannot start: "
                 + "; ".join(down)
                 + ". These are national open-data services, so this is normally "
                 "an outage at their end. Check https://www.pdok.nl and "
-                "https://3dbag.nl, and try again later. Run with "
-                "--skip-preflight to attempt it anyway."
+                "https://3dbag.nl, and try again later. Turn the affected "
+                "source off if it is optional, or use --skip-preflight to "
+                "attempt it anyway."
             )
 
     want_trees = bool(config.trees["enabled"])
@@ -554,16 +559,23 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     started = time.time()
+    completed = False
     try:
         code = run(config, args)
+        completed = True
     except KeyboardInterrupt:
         LOG.error("interrupted")
         return 130
     finally:
         # Written even on failure: a partial run still says what the stages
-        # that did complete actually cost on this machine.
+        # that did complete actually cost on this machine. Only a run that
+        # reached the end is used to calibrate the estimate.
         write_timings(
-            config, config.work_dir(REPO_ROOT), time.time() - started, args
+            config,
+            config.work_dir(REPO_ROOT),
+            time.time() - started,
+            args,
+            completed=completed,
         )
     LOG.info("total runtime %.1fs", time.time() - started)
     return code

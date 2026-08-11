@@ -38,6 +38,19 @@ Open <http://127.0.0.1:8765>. Search for a place or click the map, set the side
 length, press **Build model**, and watch the log. When it finishes you get the
 check results, the preview renders and download links.
 
+A **Sources** panel lists every dataset a model can be built from, each with a
+checkbox and a live status light, so you pick what goes in and see what is
+answering right now. Terrain, aerial imagery and buildings are marked required
+and cannot be unticked — without them there is no model — and if one of those is
+down the Build button is disabled with the reason given. An optional source that
+is down is only a warning: untick it and the run proceeds without it.
+
+`src/sources.py` is the single registry behind this. The pipeline reads it to
+check the services a run needs before it starts, and the UI reads it to draw the
+panel, so the two cannot drift apart. Sources sharing a host — the four BGT
+layers do — are probed once rather than four times, so one outage reads as one
+failure.
+
 The Build button carries a time estimate that updates as you change settings,
 and hovering it breaks the figure down by stage. A progress bar then follows the
 run stage by stage — the pipeline already announces every stage as
@@ -193,6 +206,7 @@ src/elevation.py   AHN WCS -> GeoTIFF -> height grid
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
 src/facade.py      generated facade, tree, water and furniture textures
+src/sources.py     the registry of datasets a model can be built from
 src/bgt.py         shared BGT client: paging, version filter, rasterising
 src/trees.py       BGT tree points, heights from AHN DSM minus DTM
 src/surfaces.py    BGT water bodies and land cover

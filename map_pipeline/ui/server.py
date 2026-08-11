@@ -90,14 +90,25 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
     area_km2 = max(width * height / 1e6, 1e-6)
     megapixels = int(payload.get("size_px", 4096)) ** 2 / 1e6
 
+    # Either a list of selected source ids, or one flag per source.
+    if "sources" in payload:
+        chosen = set(payload["sources"] or [])
+
+        def on(source_id: str) -> bool:
+            return source_id in chosen
+    else:
+
+        def on(source_id: str) -> bool:
+            return bool(payload.get(source_id, True))
+
     enabled = {
         "terrain": True,
         "aerial": True,
-        "surfaces": bool(payload.get("water", True) or payload.get("land_cover", True)),
-        "usage": bool(payload.get("usage", True)),
         "buildings": True,
-        "trees": bool(payload.get("trees", True)),
-        "furniture": bool(payload.get("furniture", True)),
+        "surfaces": on("water") or on("land_cover"),
+        "usage": on("usage"),
+        "trees": on("trees"),
+        "furniture": on("furniture"),
         "facade": True,
         "scene": True,
         "blender": True,
@@ -145,6 +156,10 @@ def measured_speed_factor() -> tuple[float, int]:
             continue
         if drivers.get("skip_blender"):
             continue  # not a comparable run
+        # Older records predate the flag; a run with no stages did no work,
+        # which is what a preflight abort looks like.
+        if not record.get("completed", bool(record.get("stages"))):
+            continue
 
         # Rebuild the settings the model takes, from what the run recorded.
         side = (drivers["area_km2"] * 1e6) ** 0.5
@@ -298,14 +313,23 @@ def build_config(payload: dict) -> dict:
             "normal_map": bool(payload.get("facade_normal_map", True)),
             "ground_floor": bool(payload.get("facade_ground_floor", True)),
         },
-        "trees": {"enabled": bool(payload.get("trees", True))},
-        "surfaces": {
-            "water": bool(payload.get("water", True)),
-            "land_cover": bool(payload.get("land_cover", True)),
-        },
-        "furniture": {"enabled": bool(payload.get("furniture", True))},
-        "usage": {"enabled": bool(payload.get("usage", True))},
     }
+
+    # Optional sources come as a list of ids from the sources panel. Older
+    # callers passing one flag per source still work.
+    sys.path.insert(0, str(REPO_ROOT))
+    from src.sources import SOURCES, apply_selection
+
+    if "sources" in payload:
+        selected = set(payload["sources"] or [])
+    else:
+        selected = {
+            source.id
+            for source in SOURCES
+            if source.required or payload.get(source.id, True)
+        }
+
+    apply_selection(config, selected)
     return config
 
 
@@ -605,46 +629,59 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"areas": list_areas()})
             return
 
-        if route == "/api/health":
-            # Checked here so a service outage is visible before committing to
-            # a run, rather than after several minutes of work.
+        if route in ("/api/sources", "/api/health"):
+            # The registry decides what a model can be built from; this adds
+            # whether each one is answering right now, so an outage is visible
+            # before committing to a run rather than after minutes of work.
             sys.path.insert(0, str(REPO_ROOT))
             from src.config import DEFAULTS
             from src.http_util import check_reachable, host_of
+            from src.sources import SOURCES, health_targets
 
-            services = {
-                "AHN terrain": DEFAULTS["terrain"]["wcs_url"],
-                "aerial imagery": DEFAULTS["aerial"]["wms_url"],
-                "3DBAG buildings": DEFAULTS["buildings"]["api_url"],
-                "BGT": DEFAULTS["trees"]["api_url"],
-                "BAG": "https://service.pdok.nl/lv/bag/wfs/v2_0",
-            }
-
-            results = {}
+            targets = health_targets(DEFAULTS)
+            health: dict[str, dict] = {}
             lock = threading.Lock()
 
-            def probe(label: str, url: str) -> None:
+            def probe(url: str) -> None:
                 ok, detail = check_reachable(url, timeout=6.0)
                 with lock:
-                    results[label] = {
-                        "ok": ok,
-                        "detail": detail,
-                        "host": host_of(url),
-                    }
+                    health[url] = {"ok": ok, "detail": detail, "host": host_of(url)}
 
+            # Several sources share a host, so each distinct URL is asked once.
             threads = [
-                threading.Thread(target=probe, args=(label, url), daemon=True)
-                for label, url in services.items()
+                threading.Thread(target=probe, args=(url,), daemon=True)
+                for url in targets
             ]
             for thread in threads:
                 thread.start()
             for thread in threads:
                 thread.join(timeout=12.0)
 
+            listed = []
+            for source in SOURCES:
+                url = source.url(DEFAULTS)
+                status = health.get(url, {"ok": None, "detail": "not checked", "host": ""})
+                listed.append(
+                    {
+                        "id": source.id,
+                        "label": source.label,
+                        "provider": source.provider,
+                        "contributes": source.contributes,
+                        "required": source.required,
+                        "note": source.note,
+                        "host": status.get("host", ""),
+                        "ok": status.get("ok"),
+                        "detail": status.get("detail", ""),
+                    }
+                )
+
             self.send_json(
                 {
-                    "services": results,
-                    "down": sorted(k for k, v in results.items() if not v["ok"]),
+                    "sources": listed,
+                    "down": sorted(s["id"] for s in listed if s["ok"] is False),
+                    "blocking": sorted(
+                        s["id"] for s in listed if s["ok"] is False and s["required"]
+                    ),
                 }
             )
             return

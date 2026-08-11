@@ -189,6 +189,25 @@ class PipelineConfig:
         """Nominal square side of the area, for metadata."""
         return 0.5 * (self.bbox.width + self.bbox.height)
 
+    def as_dict(self) -> dict[str, Any]:
+        """The resolved settings as plain nested dicts.
+
+        The source registry addresses config by key path, so it needs the
+        sections back in the shape they had in the file.
+        """
+        return {
+            "name": self.name,
+            "aerial": self.aerial,
+            "terrain": self.terrain,
+            "buildings": self.buildings,
+            "facade": self.facade,
+            "trees": self.trees,
+            "surfaces": self.surfaces,
+            "furniture": self.furniture,
+            "usage": self.usage,
+            "export": self.export,
+        }
+
     def work_dir(self, root: Path) -> Path:
         return root / "work" / self.name
 

@@ -757,6 +757,77 @@ class TestBlenderStageIsolation(unittest.TestCase):
             )
 
 
+class TestSourceRegistry(unittest.TestCase):
+    """One registry drives the preflight and the UI's source picker."""
+
+    def setUp(self):
+        import copy
+
+        from src.config import DEFAULTS
+
+        self.config = copy.deepcopy(DEFAULTS)
+
+    def test_structural_sources_cannot_be_turned_off(self):
+        from src.sources import SOURCES, apply_selection, enabled_sources
+
+        required = {s.id for s in SOURCES if s.required}
+        self.assertEqual(required, {"terrain", "aerial", "buildings"})
+
+        # Selecting nothing still leaves the three a model cannot do without.
+        apply_selection(self.config, set())
+        self.assertEqual(
+            {s.id for s in enabled_sources(self.config)}, required
+        )
+
+    def test_selection_flips_the_matching_config_keys(self):
+        from src.sources import apply_selection, enabled_sources
+
+        apply_selection(self.config, {"trees", "water"})
+        self.assertTrue(self.config["trees"]["enabled"])
+        self.assertTrue(self.config["surfaces"]["water"])
+        self.assertFalse(self.config["surfaces"]["land_cover"])
+        self.assertFalse(self.config["furniture"]["enabled"])
+        self.assertFalse(self.config["usage"]["enabled"])
+
+        self.assertEqual(
+            {s.id for s in enabled_sources(self.config)},
+            {"terrain", "aerial", "buildings", "trees", "water"},
+        )
+
+    def test_shared_hosts_are_probed_once(self):
+        """Four BGT layers behind one host must not look like four outages."""
+        from src.sources import health_targets
+
+        targets = health_targets(self.config)
+        bgt = [ids for url, ids in targets.items() if "bgt" in url]
+        self.assertEqual(len(bgt), 1)
+        self.assertEqual(
+            set(bgt[0].split(",")), {"trees", "water", "land_cover", "furniture"}
+        )
+
+    def test_disabled_sources_are_not_checked(self):
+        from src.sources import apply_selection, enabled_sources, health_targets
+
+        apply_selection(self.config, set())
+        targets = health_targets(self.config, enabled_sources(self.config))
+        joined = " ".join(targets)
+        self.assertNotIn("/bgt/", joined)
+        # "bag" is a substring of "3dbag", so match the BAG service path.
+        self.assertNotIn("/lv/bag/", joined)
+        self.assertIn("api.3dbag.nl", joined)
+        self.assertEqual(len(targets), 3)
+
+    def test_every_source_can_name_its_service(self):
+        from src.sources import SOURCES
+
+        for source in SOURCES:
+            self.assertTrue(
+                source.url(self.config).startswith("http"),
+                f"{source.id} has no service URL",
+            )
+            self.assertTrue(source.contributes, f"{source.id} says nothing")
+
+
 class TestUIServer(unittest.TestCase):
     """The UI writes a config and shells out to pipeline.py, so the translation
     from form fields to config is the part worth pinning down."""

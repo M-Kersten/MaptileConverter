@@ -72,6 +72,29 @@
   .ticks { display: flex; justify-content: space-between; color: var(--muted);
            font-size: 10px; }
 
+  /* ---------- sources ---------- */
+  .linkish { width: auto; padding: 1px 7px; font-size: 10px; background: #2b303a;
+             border-radius: 4px; margin-left: 6px; text-transform: none;
+             letter-spacing: 0; vertical-align: 1px; }
+  .srcs { display: flex; flex-direction: column; gap: 1px; }
+  .src { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
+         gap: 8px; padding: 5px 4px; border-radius: 5px; }
+  .src:hover { background: #272c34; }
+  .src input { width: auto; margin: 0; }
+  .src .name { font-size: 12.5px; line-height: 1.25; min-width: 0; }
+  .src .name b { font-weight: 600; }
+  .src .who { color: var(--muted); font-size: 10.5px; }
+  .src .dot { width: 9px; height: 9px; border-radius: 50%; background: #5a6270;
+              flex: 0 0 auto; }
+  .src .dot.up { background: var(--ok); }
+  .src .dot.down { background: var(--bad); }
+  .src .dot.checking { background: var(--warn); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  /* A required source that is down blocks the run, so it is marked out rather
+     than left looking like one red dot among several. */
+  .src.blocked { background: #3a2020; }
+  .src.off .name { opacity: .5; }
+
   /* ---------- progress ---------- */
   #progress { margin-top: 12px; }
   .pbar { height: 7px; background: #2b303a; border-radius: 4px; overflow: hidden; }
@@ -253,29 +276,18 @@
       <label for="normal">Facade normal map (relief on walls)</label>
     </div>
     <div class="inline">
-      <input type="checkbox" id="usage" checked>
-      <label for="usage">Building function from the BAG (shops vs homes)</label>
-    </div>
-    <div class="inline">
-      <input type="checkbox" id="trees" checked>
-      <label for="trees">Trees from the BGT, heights from AHN</label>
-    </div>
-    <div class="inline">
-      <input type="checkbox" id="water" checked>
-      <label for="water">Water surfaces (fixes the canal bulge)</label>
-    </div>
-    <div class="inline">
-      <input type="checkbox" id="landcover" checked>
-      <label for="landcover">Land cover: roads, green, paving</label>
-    </div>
-    <div class="inline">
-      <input type="checkbox" id="furniture" checked>
-      <label for="furniture">Street furniture: lampposts, benches</label>
-    </div>
-    <div class="inline">
       <input type="checkbox" id="preview" checked>
       <label for="preview">Render preview images</label>
     </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>
+      Sources
+      <button id="recheck" class="linkish" title="Check availability again">recheck</button>
+    </legend>
+    <div id="sources" class="srcs">checking availability&hellip;</div>
+    <div class="hint" id="sourcesNote"></div>
   </fieldset>
 
   <button class="primary" id="run">Build model</button>
@@ -707,12 +719,15 @@ let estimateTimer = null, lastEstimate = null;
 
 function settingsForEstimate() {
   const b = bbox(), q = quality();
+  const chosen = new Set(selectedSources());
   return new URLSearchParams({
     xmin: b.xmin, ymin: b.ymin, xmax: b.xmax, ymax: b.ymax,
     size_px: q.sizePx,
-    trees: $("trees").checked, water: $("water").checked,
-    land_cover: $("landcover").checked, furniture: $("furniture").checked,
-    usage: $("usage").checked, preview: $("preview").checked
+    preview: $("preview").checked,
+    // Sent per source so the estimate matches what will actually run.
+    trees: chosen.has("trees"), water: chosen.has("water"),
+    land_cover: chosen.has("land_cover"), furniture: chosen.has("furniture"),
+    usage: chosen.has("usage")
   });
 }
 
@@ -741,9 +756,7 @@ for (const id of ["aerialCm", "terrainM", "facadePx", "size", "preset"]) {
   $(id).addEventListener("input", refreshEstimate);
   $(id).addEventListener("change", refreshEstimate);
 }
-for (const id of ["trees", "water", "landcover", "furniture", "usage", "preview"]) {
-  $(id).addEventListener("change", refreshEstimate);
-}
+$("preview").addEventListener("change", refreshEstimate);
 
 /* ---------- running ---------- */
 const logEl = $("log");
@@ -804,11 +817,7 @@ $("run").onclick = async () => {
     facade_normal_map: $("normal").checked,
     facade_variants: +$("facade").value,
     facade_ground_floor: $("groundFloor").checked,
-    trees: $("trees").checked,
-    water: $("water").checked,
-    land_cover: $("landcover").checked,
-    furniture: $("furniture").checked,
-    usage: $("usage").checked,
+    sources: selectedSources(),
     clip_mode: $("clip").value,
     preview: $("preview").checked
   };
@@ -872,9 +881,11 @@ async function poll() {
 
   clearInterval(poller);
   poller = null;
-  $("run").disabled = false;
   $("cancel").style.display = "none";
   job = null;
+  // Re-enable through the sources panel, so a required source that went down
+  // mid-run keeps the button disabled.
+  renderSources();
   // The finished run is a fresh data point for the estimate.
   refreshEstimate();
 
@@ -941,21 +952,110 @@ function showResult(area) {
   $("out").innerHTML = parts.join("");
 }
 
-/* ---------- service health ---------- */
-async function checkServices() {
-  try {
-    const r = await fetch("/api/health");
-    const d = await r.json();
-    if (!d.down || !d.down.length) { $("banner").innerHTML = ""; return; }
-    const detail = d.down
-      .map(k => `${escapeHtml(k)} (${escapeHtml(d.services[k].host)}: ${escapeHtml(d.services[k].detail)})`)
-      .join("<br>");
-    $("banner").innerHTML =
-      `<div class="err"><b>Unreachable right now:</b><br>${detail}<br><br>` +
-      `These are national open-data services, so this is normally an outage at ` +
-      `their end. A build needs them, so it will fail until they are back.</div>`;
-  } catch { /* the page is still usable without this */ }
+/* ---------------------------------------------------------------------------
+   Sources.
+
+   The server owns the list; the page renders it with a checkbox and a live
+   status light each. Which sources are selected is what a run is sent, so this
+   panel is both the picker and the availability report.
+--------------------------------------------------------------------------- */
+let sourceList = [];                       // as described by the server
+const sourceOff = new Set();               // ids the user has turned off
+
+function selectedSources() {
+  return sourceList
+    .filter(s => s.required || !sourceOff.has(s.id))
+    .map(s => s.id);
 }
+
+function renderSources() {
+  const host = $("sources");
+  host.innerHTML = "";
+
+  for (const s of sourceList) {
+    const row = document.createElement("label");
+    row.className = "src";
+    row.dataset.id = s.id;
+
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = s.required || !sourceOff.has(s.id);
+    box.disabled = !!s.required;
+    box.onchange = () => {
+      if (box.checked) sourceOff.delete(s.id); else sourceOff.add(s.id);
+      // Only the state is refreshed, not the markup: rebuilding the list here
+      // would drop focus on the box that was just toggled.
+      updateSourceStates();
+      refreshEstimate();
+    };
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.innerHTML =
+      `<b>${escapeHtml(s.label)}</b>${s.required ? " <span class='who'>· required</span>" : ""}` +
+      `<div class="who">${escapeHtml(s.provider)}${
+        s.ok === false ? " · " + escapeHtml(s.detail) : ""}</div>`;
+
+    const dot = document.createElement("span");
+    dot.className = "dot";
+
+    row.append(box, name, dot);
+    row.title = `${s.contributes}\n${s.host || "?"}: ${s.detail || "not checked"}`;
+    host.appendChild(row);
+  }
+  updateSourceStates();
+}
+
+function updateSourceStates() {
+  const byId = Object.fromEntries(sourceList.map(s => [s.id, s]));
+  for (const row of document.querySelectorAll(".src")) {
+    const s = byId[row.dataset.id];
+    if (!s) continue;
+    const on = s.required || !sourceOff.has(s.id);
+    row.classList.toggle("off", !on);
+    row.classList.toggle("blocked", !!s.required && s.ok === false);
+    row.querySelector(".dot").className =
+      "dot " + (s.ok === true ? "up" : s.ok === false ? "down" : "checking");
+  }
+
+  const blocking = sourceList.filter(s => s.required && s.ok === false);
+  const optionalDown = sourceList.filter(
+    s => !s.required && s.ok === false && !sourceOff.has(s.id));
+
+  let note = "";
+  if (blocking.length) {
+    note = `<span style="color:var(--bad)">${blocking.map(s => escapeHtml(s.label)).join(", ")}
+            ${blocking.length > 1 ? "are" : "is"} required and unreachable, so a build
+            cannot run. These are national open-data services, so this is normally an
+            outage at their end.</span>`;
+  } else if (optionalDown.length) {
+    note = `<span style="color:var(--warn)">${optionalDown.map(s => escapeHtml(s.label)).join(", ")}
+            ${optionalDown.length > 1 ? "are" : "is"} unreachable. Turn
+            ${optionalDown.length > 1 ? "them" : "it"} off to build without
+            ${optionalDown.length > 1 ? "them" : "it"}.</span>`;
+  }
+  $("sourcesNote").innerHTML = note;
+  $("run").disabled = blocking.length > 0 || !!job;
+}
+
+async function checkServices() {
+  $("recheck").disabled = true;
+  try {
+    const r = await fetch("/api/sources");
+    const d = await r.json();
+    sourceList = d.sources || [];
+    renderSources();
+    // The estimate depends on the selection, and until now there was nothing
+    // to select from, so the first figure was computed against an empty list.
+    refreshEstimate();
+  } catch {
+    $("sources").textContent = "could not reach the local server";
+  } finally {
+    $("recheck").disabled = false;
+  }
+}
+
+$("recheck").onclick = () => { checkServices(); };
 
 /* ---------- start ---------- */
 fitToSelection();
