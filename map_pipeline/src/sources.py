@@ -30,6 +30,11 @@ class Source:
     fallback_url: str = ""
     required: bool = False
     note: str = ""
+    # What to ask when only checking the service is alive. A feature endpoint
+    # without a bbox asks the server to enumerate a whole national dataset:
+    # 3DBAG takes fourteen seconds to answer that, which a reachability probe
+    # reads as an outage. The collection metadata answers in three.
+    probe_url: str = ""
 
     def url(self, config: dict) -> str:
         node: Any = config
@@ -38,6 +43,9 @@ class Source:
                 return self.fallback_url
             node = node[key]
         return str(node) if self.url_path else self.fallback_url
+
+    def probe(self, config: dict) -> str:
+        return self.probe_url or self.url(config)
 
 
 # Ordered as they appear in a run.
@@ -65,6 +73,7 @@ SOURCES: tuple[Source, ...] = (
         contributes="building geometry at LoD 2.2, with real roof shapes",
         url_path=("buildings", "api_url"),
         required=True,
+        probe_url="https://api.3dbag.nl/collections/pand",
     ),
     Source(
         id="usage",
@@ -160,7 +169,7 @@ def health_targets(config: dict, sources: list[Source] | None = None) -> dict[st
     """
     targets: dict[str, list[str]] = {}
     for source in sources if sources is not None else list(SOURCES):
-        url = source.url(config)
+        url = source.probe(config)
         if url:
             targets.setdefault(url, []).append(source.id)
     return {url: ",".join(ids) for url, ids in targets.items()}

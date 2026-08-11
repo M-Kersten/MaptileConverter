@@ -312,6 +312,7 @@ def build_config(payload: dict) -> dict:
             "texture_px": int(payload.get("facade_texture_px", 512)),
             "normal_map": bool(payload.get("facade_normal_map", True)),
             "ground_floor": bool(payload.get("facade_ground_floor", True)),
+            "photo_textures": bool(payload.get("facade_photo_textures", True)),
         },
     }
 
@@ -659,7 +660,7 @@ class Handler(BaseHTTPRequestHandler):
 
             listed = []
             for source in SOURCES:
-                url = source.url(DEFAULTS)
+                url = source.probe(DEFAULTS)
                 status = health.get(url, {"ok": None, "detail": "not checked", "host": ""})
                 listed.append(
                     {

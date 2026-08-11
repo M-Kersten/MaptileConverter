@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterator, Sequence
 import numpy as np
 import requests
 
+from .facade_uv import fit_wall_u, tile_widths
 from .geo import BBox
 from .http_util import ServiceError, get_with_retry
 
@@ -59,6 +60,11 @@ class Building:
     # BAG function group, when available. Decides which ground storey the
     # building gets, and shifts its wall style.
     function: int | None = None
+    # False when 3DBAG has no believable storey count. Empty for towers,
+    # churches and halls, which is exactly what marks them out.
+    storeys_known: bool = True
+    footprint_m2: float = 0.0
+    archetype: int = 0
     # Filled in when the ground storey is split off; carries its own material.
     ground_wall_tris: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float64)
@@ -514,14 +520,27 @@ def _extract_feature(
 
     storeys = attributes.get("b3_bouwlagen")
     floors = 0
+    # Whether the building has a believable storey count at all. A church tower
+    # does not: 3DBAG leaves b3_bouwlagen empty for it, and that absence is the
+    # clearest signal in the data that a facade should not be a stack of
+    # domestic storeys. It is missing for 12% of buildings overall but for
+    # nearly every tall monument, including the Dom.
+    storeys_known = False
     if storeys is not None and int(storeys) > 0:
         # Trust the BAG storey count only when it implies a believable storey
         # height; it is occasionally set for the whole block rather than a part.
         implied = wall_height / int(storeys)
         if 2.2 <= implied <= 5.0:
             floors = int(storeys)
+            storeys_known = True
     if floors == 0:
         floors = max(1, int(round(wall_height / DEFAULT_FLOOR_HEIGHT_M)))
+
+    footprint = attributes.get("b3_opp_grond")
+    try:
+        footprint = float(footprint) if footprint is not None else 0.0
+    except (TypeError, ValueError):
+        footprint = 0.0
 
     build_year = attributes.get("oorspronkelijkbouwjaar")
     try:
@@ -538,6 +557,8 @@ def _extract_feature(
         floors=floors,
         wall_top_nap=wall_top,
         build_year=build_year,
+        storeys_known=storeys_known,
+        footprint_m2=footprint,
     )
 
 
@@ -593,6 +614,102 @@ def fetch_buildings(bbox: BBox, *, buildings_cfg: dict) -> BuildingSet:
             f"check the bbox is over built-up land and in RD New"
         )
     return result
+
+
+# Facade archetypes. Era decides the material and colour; the archetype decides
+# the composition, which is what actually makes a church stop looking like a
+# block of flats.
+ARCH_HOUSE = 0
+ARCH_APARTMENT = 1
+ARCH_OFFICE = 2
+ARCH_RETAIL = 3
+ARCH_INDUSTRIAL = 4
+ARCH_MONUMENTAL = 5
+
+ARCHETYPE_NAMES = {
+    ARCH_HOUSE: "house",
+    ARCH_APARTMENT: "apartment",
+    ARCH_OFFICE: "office",
+    ARCH_RETAIL: "retail",
+    ARCH_INDUSTRIAL: "industrial",
+    ARCH_MONUMENTAL: "monumental",
+}
+
+# BAG function groups, matching src/usage.py.
+_FN_HOME, _FN_RETAIL, _FN_OFFICE, _FN_INDUSTRY, _FN_PUBLIC = 0, 1, 2, 3, 4
+
+
+def classify_archetype(building: Building) -> int:
+    """Work out what kind of building this is, from what the registers say.
+
+    The failure this addresses is that every wall got the same grid of domestic
+    windows. The Dom tower came out as thirty-six three-metre storeys, because
+    with no storey count recorded the pipeline fell back to dividing its height
+    by three. A warehouse got the same treatment.
+
+    The signals are ordered by how much they actually tell us: an absent storey
+    count on a tall building is decisive, a huge footprint on a low building is
+    nearly so, and the BAG function settles the rest.
+    """
+    height = building.height_m
+    footprint = building.footprint_m2
+    function = building.function
+
+    # No recorded storeys and real height means a building a storey grid does
+    # not describe: a tower, spire, church or hall. That catches modern
+    # high-rises too, though, since they often carry no storey count either, so
+    # era decides between them. Both need to escape the domestic grid; only the
+    # old one wants stone and arched openings.
+    tower_like = not building.storeys_known and height >= 15.0
+    if tower_like and (not building.build_year or building.build_year < 1940):
+        return ARCH_MONUMENTAL
+
+    # A public building that is old and tall is a church or civic hall even
+    # when a storey count exists; the count tends to describe an annexe.
+    if (
+        function == _FN_PUBLIC
+        and height >= 12.0
+        and building.build_year
+        and building.build_year < 1900
+    ):
+        return ARCH_MONUMENTAL
+
+    if function == _FN_INDUSTRY:
+        return ARCH_INDUSTRIAL
+
+    # Big and low is a shed, whatever it is registered as: sports halls,
+    # depots and supermarkets all read the same way from outside.
+    if footprint >= 2000.0 and building.floors <= 3:
+        return ARCH_INDUSTRIAL
+
+    if function == _FN_RETAIL:
+        return ARCH_RETAIL
+    if function == _FN_OFFICE:
+        return ARCH_OFFICE
+    if function == _FN_HOME:
+        # A terraced house and a block of flats are both housing, and they look
+        # nothing alike. Footprint and height separate them.
+        return ARCH_HOUSE if (footprint < 250.0 and building.floors <= 4) else ARCH_APARTMENT
+
+    # Nothing recorded: fall back on shape alone. A modern tower with no
+    # function lands here rather than being called a church.
+    if tower_like or height >= 25.0 or building.floors >= 8:
+        return ARCH_APARTMENT
+    return ARCH_HOUSE
+
+
+def assign_archetypes(buildings: BuildingSet) -> dict[str, int]:
+    """Classify every building and report the spread."""
+    counts: dict[str, int] = {}
+    for building in buildings.buildings:
+        building.archetype = classify_archetype(building)
+        name = ARCHETYPE_NAMES[building.archetype]
+        counts[name] = counts.get(name, 0) + 1
+    LOG.info(
+        "building archetypes: %s",
+        ", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])),
+    )
+    return counts
 
 
 def _footprint_center(building: Building) -> tuple[float, float]:
@@ -782,9 +899,16 @@ def apply_ground_floor_split(
 ) -> int:
     """Separate each building's ground storey from the storeys above it."""
     split_count = 0
+    kept_whole = 0
 
     for building in buildings.buildings:
         if len(building.wall_tris) == 0:
+            continue
+        # A church does not have a shopfront and a warehouse does not have a
+        # front door with a bay window beside it. Both are one tall volume, so
+        # they keep their wall in one piece and get their own composition.
+        if building.archetype in (ARCH_MONUMENTAL, ARCH_INDUSTRIAL):
+            kept_whole += 1
             continue
         # Nothing to split on a single-storey building: it is all ground floor.
         if building.wall_height_m <= ground_floor_height_m * 1.2:
@@ -801,18 +925,30 @@ def apply_ground_floor_split(
         building.wall_tris = upper
         split_count += 1
 
-    LOG.info("split the ground storey off %d buildings", split_count)
+    LOG.info(
+        "split the ground storey off %d buildings, left %d whole "
+        "(churches, halls and sheds)",
+        split_count,
+        kept_whole,
+    )
     return split_count
 
 
 def save_buildings(
-    buildings: BuildingSet, path: Path, style_index: np.ndarray | None = None
+    buildings: BuildingSet,
+    path: Path,
+    style_index: np.ndarray | None = None,
+    facade_cfg: dict | None = None,
 ) -> Path:
     """Write the building set to a compact npz for the Blender stage.
 
     Triangles are stored as one soup per surface class with a per-triangle
     building index. That keeps the Blender side to array slicing instead of
     CityJSON parsing.
+
+    Facade U is fitted here too, for the same reason: it is numpy the Blender
+    stage would otherwise have to carry, and the answer does not depend on
+    which origin the geometry is later shifted to.
     """
     wall_chunks, roof_chunks, ground_chunks = [], [], []
     wall_owner, roof_owner, ground_owner = [], [], []
@@ -843,18 +979,42 @@ def save_buildings(
     if style_index is None:
         style_index = np.zeros(len(buildings.buildings), dtype=np.int32)
 
+    walls, wall_ids = stack(wall_chunks), stack_ids(wall_owner)
+    grounds, ground_ids = stack(ground_chunks), stack_ids(ground_owner)
+
+    # The ground storey and the wall above it are two halves of one facade, so
+    # they are fitted in a single pass. Fitting them apart would leave a
+    # shopfront whose divisions miss the windows directly above it.
+    archetypes = np.array([b.archetype for b in buildings.buildings], dtype=np.int32)
+    tile_width = tile_widths(archetypes, facade_cfg or {"tile_width_m": 4.0})
+    fitted_u = fit_wall_u(
+        np.concatenate([walls, grounds], axis=0),
+        np.concatenate([wall_ids, ground_ids]),
+        tile_width,
+    )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
         style_index=np.asarray(style_index, dtype=np.int32),
-        wall_tris=stack(wall_chunks),
-        wall_building=stack_ids(wall_owner),
+        wall_tris=walls,
+        wall_building=wall_ids,
+        wall_u=fitted_u[: len(walls) * 3],
         roof_tris=stack(roof_chunks),
         roof_building=stack_ids(roof_owner),
-        ground_wall_tris=stack(ground_chunks),
-        ground_wall_building=stack_ids(ground_owner),
+        ground_wall_tris=grounds,
+        ground_wall_building=ground_ids,
+        ground_wall_u=fitted_u[len(walls) * 3 :],
         build_year=np.array(
             [b.build_year or 0 for b in buildings.buildings], dtype=np.int32
+        ),
+        archetype=np.array(
+            [b.archetype for b in buildings.buildings], dtype=np.int32
+        ),
+        # Monumental buildings have no storeys to divide, so the Blender stage
+        # maps their walls in one piece instead of stacking window rows.
+        storeys_known=np.array(
+            [1 if b.storeys_known else 0 for b in buildings.buildings], dtype=np.int32
         ),
         # 1 selects the shopfront ground storey, 0 the residential one. Only
         # retail and public buildings get a shopfront; everything else, and
@@ -903,6 +1063,7 @@ def build_buildings(
     facade_variants: int = 1,
     ground_floor_height_m: float | None = None,
     usage=None,
+    facade_cfg: dict | None = None,
 ) -> BuildingSet:
     """Fetch, clean, ground, and cache the buildings for `bbox`."""
     result = fetch_buildings(bbox, buildings_cfg=buildings_cfg)
@@ -933,11 +1094,6 @@ def build_buildings(
             skirt_m=float(buildings_cfg["ground_skirt_m"]),
         )
 
-    # Split before saving: the ground storey has to be its own geometry to
-    # carry its own material.
-    if ground_floor_height_m:
-        apply_ground_floor_split(result, ground_floor_height_m)
-
     if usage is not None and len(usage):
         matched = 0
         for building in result.buildings:
@@ -949,14 +1105,28 @@ def build_buildings(
             "matched BAG function to %d of %d buildings", matched, len(result.buildings)
         )
 
-    from .facade import style_for_building
+    # Archetypes are needed before the split, because they decide which
+    # buildings get one at all.
+    assign_archetypes(result)
+
+    # Split before saving: the ground storey has to be its own geometry to
+    # carry its own material.
+    if ground_floor_height_m:
+        apply_ground_floor_split(result, ground_floor_height_m)
+
+    from .facade import style_for_archetype, style_for_building
+
+    def slot(building: Building) -> int:
+        # An archetype with its own composition wins; otherwise era decides.
+        special = style_for_archetype(building.archetype, facade_variants)
+        if special is not None:
+            return special
+        return style_for_building(
+            building.height_m, building.build_year, facade_variants
+        )
 
     style_index = np.array(
-        [
-            style_for_building(b.height_m, b.build_year, facade_variants)
-            for b in result.buildings
-        ],
-        dtype=np.int32,
+        [slot(b) for b in result.buildings], dtype=np.int32
     )
     years = [b.build_year for b in result.buildings if b.build_year]
     if years:
@@ -968,7 +1138,12 @@ def build_buildings(
             max(years),
         )
 
-    save_buildings(result, work_dir / "buildings.npz", style_index=style_index)
+    save_buildings(
+        result,
+        work_dir / "buildings.npz",
+        style_index=style_index,
+        facade_cfg=facade_cfg,
+    )
     return result
 
 

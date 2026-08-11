@@ -42,6 +42,18 @@ class FacadeStyle:
     # be the same height and look nothing alike.
     era_until: int = 3000
     label: str = ""
+    # Round the window head. A church or a warehouse arch is the single
+    # clearest cue that a wall is not a stack of domestic storeys.
+    arch: float = 0.0
+    # Draw the horizontal band between storeys. Off for buildings that have no
+    # storeys to divide.
+    storey_band: bool = True
+    # Metres of wall one tile covers. Wide for industrial bays, narrow for a
+    # house front.
+    tile_width_m: float = 4.0
+    # Metres of wall one tile covers vertically. Only used where the facade is
+    # not divided into storeys.
+    tile_height_m: float = 0.0
 
 
 # Ordered oldest to newest. A building picks the first style whose era covers
@@ -113,6 +125,48 @@ STYLES: tuple[FacadeStyle, ...] = (
         grain=0.03,
     ),
 )
+
+# Two compositions that the era styles get badly wrong, because both describe
+# buildings without ordinary storeys.
+#
+# A church or tower has one tall volume with arched openings, not a stack of
+# three-metre rows. Before this the Dom came out as thirty-six storeys of
+# domestic windows. A shed has a handful of large bays and long blank walls.
+EXTRA_STYLES: dict[str, FacadeStyle] = {
+    "monumental": FacadeStyle(
+        name="monumental",
+        label="church, tower or civic hall: stone with arched openings",
+        wall_rgb=(150, 142, 124),
+        trim_rgb=(196, 190, 176),
+        glass_rgb=(48, 54, 58),
+        windows_across=2,
+        window_width_frac=0.22,
+        window_height_frac=0.60,
+        sill_frac=0.16,
+        grain=0.13,
+        arch=0.85,
+        storey_band=False,
+        # One tile spans a whole bay of a church wall, not a storey.
+        tile_width_m=7.0,
+        tile_height_m=9.0,
+    ),
+    "industrial": FacadeStyle(
+        name="industrial",
+        label="shed or depot: wide bays, mostly blank wall",
+        wall_rgb=(158, 158, 154),
+        trim_rgb=(188, 190, 190),
+        glass_rgb=(96, 108, 112),
+        windows_across=1,
+        window_width_frac=0.46,
+        window_height_frac=0.34,
+        sill_frac=0.42,
+        grain=0.05,
+        storey_band=False,
+        tile_width_m=9.0,
+        tile_height_m=6.0,
+    ),
+}
+
 
 # The ground storey is what makes a street read as a street: shopfronts and
 # doors rather than another row of the same windows. It is a separate material
@@ -202,7 +256,10 @@ RELIEF_DEPTH = 0.035
 
 
 def render_facade_layers(
-    style: FacadeStyle, size_px: int, seed: int = 0
+    style: FacadeStyle,
+    size_px: int,
+    seed: int = 0,
+    base: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Render one storey of facade as ``(rgb, relief)``.
 
@@ -210,25 +267,42 @@ def render_facade_layers(
     and the storey band runs along the bottom edge, so repeating the image in U
     and V produces a continuous wall. The relief channel drives the normal map,
     so both come out of the same geometry and stay in register.
+
+    ``base`` replaces the flat colour and its noise with a photograph of real
+    masonry, already tiled to this style's tile. Everything drawn on top of the
+    wall — the windows, the band, the sills — is the same either way, because
+    those are the parts a photograph of a blank wall cannot supply.
     """
     rng = np.random.default_rng(seed)
     height = width = size_px
 
     canvas = np.zeros((height, width, 3), dtype=np.float64)
-    canvas[:, :] = style.wall_rgb
     relief = np.full((height, width), RELIEF_WALL, dtype=np.float64)
 
-    # Wall grain.
-    noise = _value_noise((height, width), cells=max(4, size_px // 32), rng=rng)
-    fine = _value_noise((height, width), cells=max(8, size_px // 8), rng=rng)
-    combined = 0.65 * noise + 0.35 * fine
-    canvas *= 1.0 + style.grain * (combined - 0.5)[:, :, None] * 2.0
+    if base is not None:
+        canvas[:, :] = base[:height, :width]
+    else:
+        canvas[:, :] = style.wall_rgb
+        # Wall grain, standing in for the masonry a photograph would show.
+        noise = _value_noise((height, width), cells=max(4, size_px // 32), rng=rng)
+        fine = _value_noise((height, width), cells=max(8, size_px // 8), rng=rng)
+        combined = 0.65 * noise + 0.35 * fine
+        canvas *= 1.0 + style.grain * (combined - 0.5)[:, :, None] * 2.0
+
+    # The wall as it stands before anything is cut into it. Restoring from this
+    # rather than from the flat colour is what lets an arched head keep the
+    # masonry around its curve.
+    wall_layer = canvas.copy()
 
     # Storey band along the bottom edge, which becomes the line between floors.
-    band_px = max(2, int(round(0.055 * height)))
-    canvas[:band_px, :] = _shade(style.wall_rgb, 0.80)
-    canvas[band_px : band_px + max(1, band_px // 2), :] = _shade(style.wall_rgb, 1.10)
-    relief[:band_px, :] = RELIEF_BAND
+    if style.storey_band:
+        band_px = max(2, int(round(0.055 * height)))
+        # Shading the wall in place keeps the band made of the same brick,
+        # instead of laying a flat stripe over a photograph.
+        canvas[:band_px, :] = np.clip(canvas[:band_px, :] * 0.80, 0, 255)
+        lip = band_px + max(1, band_px // 2)
+        canvas[band_px:lip, :] = np.clip(canvas[band_px:lip, :] * 1.10, 0, 255)
+        relief[:band_px, :] = RELIEF_BAND
 
     # Windows.
     cell_width = width / style.windows_across
@@ -249,6 +323,30 @@ def render_facade_layers(
         y0, y1 = max(0, y0), min(height, y1)
         if x1 - x0 < 3 or y1 - y0 < 3:
             continue
+
+        # A rounded head turns a domestic window into a church or warehouse
+        # opening. The arch occupies the top of the opening, and everything
+        # outside its curve stays wall.
+        arch_mask = None
+        if style.arch > 0:
+            span = x1 - x0
+            rise = int(round(style.arch * span * 0.5))
+            head = min(y1, y0 + int(round(win_h)))
+            arch_top = head
+            arch_base = max(y0, head - rise)
+            if arch_base < arch_top:
+                rows = np.arange(arch_base, arch_top)[:, None]
+                cols = np.arange(x0, x1)[None, :]
+                centre_x = (x0 + x1 - 1) * 0.5
+                radius = span * 0.5
+                # Measured from the centre of the springing line: the opening
+                # is the half-disc above it, so it is full width where the
+                # curve starts and closes to nothing at the crown. Row 0 of
+                # this array is the bottom of the tile, so dy grows upwards.
+                dy = (rows - arch_base) / max(1, arch_top - arch_base)
+                dx = np.abs(cols - centre_x) / max(1e-6, radius)
+                outside = (dx ** 2 + dy ** 2) > 1.0
+                arch_mask = (arch_base, arch_top, outside)
 
         # Frame first, then glass inset into it.
         canvas[y0:y1, x0:x1] = style.trim_rgb
@@ -274,7 +372,9 @@ def render_facade_layers(
             mid = (gx0 + gx1) // 2
             canvas[gy0:gy1, mid : mid + frame_px] = style.trim_rgb
             relief[gy0:gy1, mid : mid + frame_px] = RELIEF_FRAME
-        if gy1 - gy0 > 8 * frame_px:
+        # An arched opening is one tall light. A crossbar through it splits the
+        # arch off and makes it read as a disc sitting on a rectangle.
+        if gy1 - gy0 > 8 * frame_px and not style.arch:
             mid = (gy0 + gy1) // 2
             canvas[mid : mid + frame_px, gx0:gx1] = style.trim_rgb
             relief[mid : mid + frame_px, gx0:gx1] = RELIEF_FRAME
@@ -283,6 +383,20 @@ def render_facade_layers(
         sill_y0 = max(0, y0 - max(1, frame_px))
         canvas[sill_y0:y0, x0:x1] = _shade(style.trim_rgb, 0.88)
         relief[sill_y0:y0, x0:x1] = RELIEF_SILL
+
+        # Put the wall back outside the arch, so the opening reads as rounded
+        # rather than as a rectangle with a curve drawn on it.
+        if arch_mask is not None:
+            arch_base, arch_top, outside = arch_mask
+            block = canvas[arch_base:arch_top, x0:x1]
+            wall = wall_layer[arch_base:arch_top, x0:x1]
+            canvas[arch_base:arch_top, x0:x1] = np.where(
+                outside[:, :, None], wall, block
+            )
+            relief_block = relief[arch_base:arch_top, x0:x1]
+            relief[arch_base:arch_top, x0:x1] = np.where(
+                outside, RELIEF_WALL, relief_block
+            )
 
     return np.clip(canvas, 0, 255).astype(np.uint8), relief
 
@@ -309,6 +423,34 @@ def relief_to_normal_map(relief: np.ndarray, depth: float = RELIEF_DEPTH) -> np.
     normal /= np.linalg.norm(normal, axis=-1, keepdims=True)
 
     return np.clip((normal * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
+
+
+def wall_styles(n_variants: int) -> list[FacadeStyle]:
+    """Wall styles in slot order: the eras, then the archetype specials.
+
+    The extras go last so their indices stay put when the number of era
+    variants changes.
+    """
+    return list(STYLES[:n_variants]) + [
+        EXTRA_STYLES["monumental"],
+        EXTRA_STYLES["industrial"],
+    ]
+
+
+def style_for_archetype(archetype: int, n_variants: int) -> int | None:
+    """Slot for an archetype that needs its own composition, else None.
+
+    Only the two the era styles get wrong are special-cased. Housing, offices
+    and shops are all stacks of storeys, so era is the better predictor for
+    them and they keep it.
+    """
+    # Matches src/buildings.py.
+    ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
+    if archetype == ARCH_MONUMENTAL:
+        return n_variants
+    if archetype == ARCH_INDUSTRIAL:
+        return n_variants + 1
+    return None
 
 
 def style_for_building(
@@ -338,6 +480,35 @@ def style_for_height(height_m: float, n_variants: int) -> int:
     return style_for_building(height_m, None, n_variants)
 
 
+def _wall_bases(
+    styles: list[FacadeStyle], size_px: int, work_dir: Path, facade_cfg: dict
+) -> dict[int, np.ndarray]:
+    """Photographed masonry per style, when the run is asked for it.
+
+    How much wall one tile covers vertically is what decides the brick scale,
+    and it differs by style: an ordinary storey, or a whole church bay.
+    """
+    if not bool(facade_cfg.get("photo_textures", True)):
+        return {}
+
+    from .textures import load_wall_bases
+
+    storey = float(facade_cfg.get("floor_height_m", 3.0))
+    ground = float(facade_cfg.get("ground_floor_height_m", 3.6))
+    heights = [
+        style.tile_height_m
+        or (ground if style.name.startswith("ground") else storey)
+        for style in styles
+    ]
+    return load_wall_bases(
+        styles,
+        size_px,
+        work_dir,
+        tile_heights=heights,
+        tint_strength=float(facade_cfg.get("photo_tint", 0.6)),
+    )
+
+
 def generate_facade_textures(
     work_dir: Path, *, facade_cfg: dict
 ) -> list[tuple[Path, Path | None]]:
@@ -357,7 +528,7 @@ def generate_facade_textures(
     seed = int(facade_cfg["seed"])
     want_normal = bool(facade_cfg.get("normal_map", True))
 
-    styles = list(STYLES[:variants])
+    styles = wall_styles(variants)
     ground_styles: list[FacadeStyle] = []
     if bool(facade_cfg.get("ground_floor", True)):
         # Both ground variants are written when building function is available,
@@ -370,15 +541,21 @@ def generate_facade_textures(
         styles.extend(ground_styles)
     single_ground = len(ground_styles) == 1
 
+    bases = _wall_bases(styles, size_px, work_dir, facade_cfg)
+
     paths: list[tuple[Path, Path | None]] = []
     for index, style in enumerate(styles):
-        pixels, relief = render_facade_layers(style, size_px, seed=seed + index)
+        pixels, relief = render_facade_layers(
+            style, size_px, seed=seed + index, base=bases.get(index)
+        )
 
         if style.name.startswith("ground"):
             # With nothing to choose between, the one ground storey is just
             # "ground" rather than being labelled with a function it does not
             # actually know.
             stem = "facade_ground" if single_ground else f"facade_{style.name}"
+        elif style.name in EXTRA_STYLES:
+            stem = f"facade_{index:02d}_{style.name}"
         elif variants == 1:
             stem = "facade"
         else:

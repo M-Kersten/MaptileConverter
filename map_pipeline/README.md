@@ -177,9 +177,15 @@ Other knobs worth knowing:
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `facade.variants` | `1` | `1` gives exactly two materials. Up to `5` assigns a style by construction year. |
-| `facade.ground_floor` | `true` | Split walls at the first-floor line and give the ground storey its own material. |
+| `facade.variants` | `1` | How many era styles to assign by construction year, up to `5`. The monumental and industrial styles are always present on top of these. |
+| `facade.ground_floor` | `true` | Split walls at the first-floor line and give the ground storey its own material. Churches and sheds are left whole. |
 | `facade.ground_floor_height_m` | `3.6` | Where that cut sits above each building's own ground level. |
+| `facade.photo_textures` | `true` | Photographed CC0 masonry under the generated windows, downloaded once and cached in `work/_textures/`. |
+| `facade.photo_tint` | `0.6` | How far each photograph is pulled towards its era colour. `0` keeps it as shot, `1` lands it exactly on the palette. |
+| `facade.monumental_tile_m` | `7.0` | Bay width for churches, towers and civic halls. |
+| `facade.monumental_bay_m` | `9.0` | Bay height for the same — a church bay, not a storey. |
+| `facade.industrial_tile_m` | `9.0` | Bay width for sheds and depots. |
+| `facade.industrial_bay_m` | `6.0` | Bay height for the same. |
 | `trees.enabled` | `true` | Fetch BGT trees and give them AHN heights. |
 | `trees.geometry` | `true` | Also bake low-poly tree meshes into the FBX. `trees.json` is written either way. |
 | `trees.crown_search_m` | `3.0` | Radius the canopy height is taken as a maximum over. |
@@ -206,6 +212,8 @@ src/elevation.py   AHN WCS -> GeoTIFF -> height grid
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
 src/facade.py      generated facade, tree, water and furniture textures
+src/facade_uv.py   fitting whole window bays across each wall face
+src/textures.py    photographed CC0 wall surfaces, fetched once and cached
 src/sources.py     the registry of datasets a model can be built from
 src/bgt.py         shared BGT client: paging, version filter, rasterising
 src/trees.py       BGT tree points, heights from AHN DSM minus DTM
@@ -364,10 +372,23 @@ Two materials, by default.
 normalised to the aerial bbox. It goes on the terrain *and* on the roof surfaces,
 so roofs pick up real photo texture for free and buildings blend into the ground.
 
-**`M_facade`** carries a generated facade. Wall UVs are in metres: U runs along
-the wall divided by `tile_width_m`, V counts storeys from the building's own
-ground level. The storey height is `wall_height / floors`, so the top row of
-windows finishes flush with the eaves instead of being cut in half.
+**`M_facade`** carries a generated facade. V counts storeys from the base of the
+wall, at a storey height of `wall_height / storeys`, so the top row of windows
+finishes flush with the eaves instead of being cut in half. Where a ground
+storey has been split off, V is measured from the first-floor line rather than
+from the ground, so the bottom row starts on a storey line too.
+
+**Every wall face gets a whole number of window bays.** U is not a fixed number
+of metres per tile. Each flat face of each building is measured, its bay count
+rounded, and the tile stretched slightly to fit, so both corners land on a tile
+edge. This is most of what makes a generated facade look designed rather than
+papered: at a fixed 4 m tile a 5.4 m Dutch house front shows one window and a
+second sliced in half by the party wall. Now it gets one bay of 5.4 m or two of
+2.7 m. Faces too narrow for even one bay — the return of a bay window, a
+chamfered corner — are centred on the tile seam, which is the blank pier between
+windows, so a half-metre sliver shows brick rather than a squashed window. The
+ground storey is fitted in the same pass as the wall above it, so a shopfront's
+divisions line up with the windows over it. `src/facade_uv.py`.
 
 **The facade follows the building's era, not its height.** 3DBAG carries an
 original construction year on every building — 100% coverage in practice, ranging
@@ -376,6 +397,31 @@ better than height does. A 1890s canal house and a 1970s office block can be the
 same height and look nothing alike. Five styles run from pre-1920 brick with
 tall narrow windows, through interbellum brick, post-war plaster, and 1975-2000
 panel, to contemporary glass. Height is only the fallback when a year is missing.
+
+**Two kinds of building are not a stack of storeys, and get their own
+composition.** A church has one tall volume with arched openings; dividing its
+height by three metres turned the Dom into thirty-six rows of domestic windows.
+A warehouse has a handful of large bays and long blank walls. Each building is
+classified from its height, footprint, storey count and BAG function into one of
+six archetypes — house, apartment, office, retail, industrial, monumental — and
+the two that the era styles get wrong are routed to their own style, tile width
+and bay height. Neither gets a ground-storey split: a cathedral has no
+shopfront. Over Utrecht centre that is about 5% monumental and 4% industrial.
+Classification is `classify_archetype` in `src/buildings.py`; the extra styles
+are `EXTRA_STYLES` in `src/facade.py`.
+
+**The wall under the windows is a photograph.** The generated layout gets the
+bay spacing, storey lines and window proportions right, but its wall was value
+noise, and at street level value noise reads as noise rather than as brick. One
+CC0 texture per style — from [Poly Haven](https://polyhaven.com) — is downloaded
+once, cached under `work/_textures/`, tiled to the real size the asset publishes
+so the bricks come out at 210 mm rather than at whatever fills the tile, and
+tinted towards the style's colour so the era palette survives. The windows,
+frames, sills and storey bands are still drawn on top, because those are the
+parts a photograph of a blank wall cannot supply. CC0 means no attribution
+obligation travels into whatever the model ends up in. A run with no network
+falls back to the procedural wall and says so; set `facade.photo_textures` to
+`false` to stay fully procedural. `src/textures.py`.
 
 **`M_facade_ground`** is the ground storey: shopfronts and doors rather than
 another row of the same windows. A repeating grid of identical storeys is the
@@ -472,3 +518,7 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
   Grootschalige Topografie) via PDOK (CC BY 4.0)
 - **Building function** — BAG (Basisregistratie Adressen en Gebouwen) via PDOK
   (CC BY 4.0)
+- **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution
+  is required for these; they are credited because it is the decent thing, and
+  listed here so you know nothing in the model carries an obligation you did not
+  choose.

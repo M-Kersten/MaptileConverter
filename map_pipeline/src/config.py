@@ -88,6 +88,19 @@ DEFAULTS: dict[str, Any] = {
         # repeating grid. Walls are cut at this height to carry it.
         "ground_floor": True,
         "ground_floor_height_m": 3.6,
+        # Buildings without ordinary storeys get their own spacing. A church
+        # bay and a warehouse bay are both much larger than a domestic one.
+        "monumental_tile_m": 7.0,
+        "monumental_bay_m": 9.0,
+        "industrial_tile_m": 9.0,
+        "industrial_bay_m": 6.0,
+        # Photographed masonry under the generated windows, from Poly Haven
+        # (CC0). Downloaded once and cached under work/_textures, so only the
+        # first run needs the network; set false to stay fully procedural.
+        "photo_textures": True,
+        # How far the photograph is pulled towards the era's colour. 0 keeps
+        # the photograph as shot, 1 lands it exactly on the palette.
+        "photo_tint": 0.6,
     },
     "trees": {
         "enabled": True,

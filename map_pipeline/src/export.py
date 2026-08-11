@@ -37,6 +37,10 @@ ATTRIBUTION = {
         "Building function from the BAG (Basisregistratie Adressen en "
         "Gebouwen) via PDOK, CC BY 4.0."
     ),
+    "textures": (
+        "Wall surfaces under the generated facades from Poly Haven (CC0, no "
+        "attribution required). https://polyhaven.com"
+    ),
 }
 
 
@@ -200,6 +204,10 @@ def write_scene_description(
             "ground_floor_height_m": float(
                 facade_cfg.get("ground_floor_height_m", 3.6)
             ),
+            "monumental_tile_m": float(facade_cfg.get("monumental_tile_m", 7.0)),
+            "monumental_bay_m": float(facade_cfg.get("monumental_bay_m", 9.0)),
+            "industrial_tile_m": float(facade_cfg.get("industrial_tile_m", 9.0)),
+            "industrial_bay_m": float(facade_cfg.get("industrial_bay_m", 6.0)),
         },
         "trees": (
             {"file": "trees.npz", "texture": tree_texture.name}
@@ -255,6 +263,7 @@ def write_attribution(out_dir: Path) -> Path:
         f"Aerial:    {ATTRIBUTION['aerial']}",
         f"BGT:       {ATTRIBUTION['bgt']}",
         f"BAG:       {ATTRIBUTION['bag']}",
+        f"Textures:  {ATTRIBUTION['textures']}",
         "",
         "Keep this notice with the model when you redistribute it.",
         "",

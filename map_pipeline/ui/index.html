@@ -276,6 +276,12 @@
       <label for="normal">Facade normal map (relief on walls)</label>
     </div>
     <div class="inline">
+      <input type="checkbox" id="photoTextures" checked>
+      <label for="photoTextures">
+        Photographed brick and stone (CC0, downloaded once)
+      </label>
+    </div>
+    <div class="inline">
       <input type="checkbox" id="preview" checked>
       <label for="preview">Render preview images</label>
     </div>
@@ -817,6 +823,7 @@ $("run").onclick = async () => {
     facade_normal_map: $("normal").checked,
     facade_variants: +$("facade").value,
     facade_ground_floor: $("groundFloor").checked,
+    facade_photo_textures: $("photoTextures").checked,
     sources: selectedSources(),
     clip_mode: $("clip").value,
     preview: $("preview").checked

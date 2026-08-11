@@ -351,40 +351,23 @@ def build_terrain(scene: dict, work_dir: Path, material) -> object:
 
 
 def wall_uvs(
+    u: np.ndarray,
     triangles: np.ndarray,
     building_index: np.ndarray,
-    ground_z_local: np.ndarray,
+    base_z: np.ndarray,
     floor_height: np.ndarray,
-    tile_width_m: float,
 ) -> np.ndarray:
-    """UVs that keep facade windows on storey lines.
+    """Pair a fitted U with a V that counts storeys from the wall's base.
 
-    U runs along the wall in metres, so window spacing stays constant however
-    wide the wall is. V counts storeys from the building's own ground level,
-    using an effective storey height of ``height / floors`` so the top storey
-    finishes flush with the roof instead of being cut mid-window.
+    V uses an effective storey height of ``height / storeys`` so the top storey
+    finishes flush with the eaves instead of being cut mid-window, and measures
+    from ``base_z`` rather than from the ground, so a wall sitting on top of a
+    split-off ground storey still starts its first row of windows on a line.
     """
-    edge1 = triangles[:, 1] - triangles[:, 0]
-    edge2 = triangles[:, 2] - triangles[:, 0]
-    normals = np.cross(edge1, edge2)
-
-    # Horizontal tangent of the wall: the normal rotated 90 degrees about Z.
-    tangent = np.column_stack([normals[:, 1], -normals[:, 0]])
-    lengths = np.linalg.norm(tangent, axis=1)
-    # Near-horizontal faces have no meaningful tangent; project along +X.
-    degenerate = lengths < 1e-9
-    tangent[degenerate] = [1.0, 0.0]
-    lengths[degenerate] = 1.0
-    tangent /= lengths[:, None]
-
-    # Broadcast the per-triangle frame across the triangle's three corners.
-    tangent_per_corner = np.repeat(tangent, 3, axis=0)
-    ground_per_corner = np.repeat(ground_z_local[building_index], 3)
-    floor_per_corner = np.repeat(floor_height[building_index], 3)
-
     corners = triangles.reshape(-1, 3)
-    u = (corners[:, :2] * tangent_per_corner).sum(axis=1) / tile_width_m
-    v = (corners[:, 2] - ground_per_corner) / floor_per_corner
+    base_per_corner = np.repeat(base_z[building_index], 3)
+    floor_per_corner = np.repeat(floor_height[building_index], 3)
+    v = (corners[:, 2] - base_per_corner) / floor_per_corner
     return np.column_stack([u, v])
 
 
@@ -441,12 +424,57 @@ def build_buildings(
         raise SystemExit("buildings.npz holds no triangles")
 
     ground_z_local = ground_z_nap - z_offset
-    # An effective storey height makes the top storey finish flush with the top
-    # of the wall rather than being clipped mid-window.
-    effective_floor = np.where(
-        floors > 0, wall_height_m / np.maximum(floors, 1), float(facade_cfg["floor_height_m"])
+    nominal_floor = float(facade_cfg["floor_height_m"])
+    ground_floor_m = float(facade_cfg.get("ground_floor_height_m", 3.6))
+
+    archetype = (
+        data["archetype"]
+        if "archetype" in data.files
+        else np.zeros(len(ground_z_nap), dtype=np.int32)
     )
-    effective_floor = np.clip(effective_floor, 1.5, 8.0)
+    # Matches src/buildings.py.
+    ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
+    special = (archetype == ARCH_MONUMENTAL) | (archetype == ARCH_INDUSTRIAL)
+
+    # Which buildings actually had a ground storey taken off them. A church and
+    # a warehouse keep their wall whole, so their base is still the ground.
+    was_split = (
+        has_ground & ~special & (wall_height_m > ground_floor_m * 1.2)
+        if has_ground
+        else np.zeros(len(ground_z_nap), dtype=bool)
+    )
+    cut_m = np.where(was_split, ground_floor_m, 0.0)
+    wall_base_z = ground_z_local + cut_m
+    # What is left for the storeys above the shopfront.
+    upper_height = np.maximum(wall_height_m - cut_m, 0.1)
+
+    # An effective storey height makes the top storey finish flush with the top
+    # of the wall rather than being clipped mid-window, and measuring from the
+    # first-floor line means the bottom row starts on one too.
+    storeys = np.where(was_split, floors - 1.0, floors)
+    storeys = np.maximum(storeys, 1.0)
+    # A storey of one metre or four means the storey count is wrong, not the
+    # height; fall back to dividing by the nominal storey and refit, so the top
+    # of the wall still lands on a line.
+    implausible = (upper_height / storeys < 1.8) | (upper_height / storeys > 6.0)
+    storeys = np.where(
+        implausible, np.maximum(1.0, np.round(upper_height / nominal_floor)), storeys
+    )
+    effective_floor = np.clip(upper_height / storeys, 1.5, 8.0)
+
+    # A church or hall has no storeys to stack, so its wall is divided into a
+    # few tall bays instead. Dividing its height by three is what turned the
+    # Dom into thirty-six rows of domestic windows.
+    if special.any():
+        bay_height = np.where(
+            archetype == ARCH_INDUSTRIAL,
+            float(facade_cfg.get("industrial_bay_m", 6.0)),
+            float(facade_cfg.get("monumental_bay_m", 9.0)),
+        )
+        # One tile per bay, with the bay count rounded so the top of the wall
+        # lands on a tile edge.
+        bays = np.maximum(1.0, np.round(wall_height_m / bay_height))
+        effective_floor = np.where(special, wall_height_m / bays, effective_floor)
 
     materials = list(facade_materials) + [aerial_material]
     aerial_slot = len(facade_materials)
@@ -462,11 +490,11 @@ def build_buildings(
     if n_walls:
         uv_chunks.append(
             wall_uvs(
+                data["wall_u"],
                 walls,
                 wall_owner,
-                ground_z_local,
+                wall_base_z,
                 effective_floor,
-                float(facade_cfg["tile_width_m"]),
             )
         )
     if n_roofs:
@@ -476,16 +504,14 @@ def build_buildings(
     if n_grounds:
         # The ground storey gets exactly one tile vertically, so the shopfront
         # spans it instead of repeating inside it.
-        storey = np.full(
-            len(ground_z_local), float(facade_cfg.get("ground_floor_height_m", 3.6))
-        )
+        storey = np.full(len(ground_z_local), ground_floor_m)
         uv_chunks.append(
             wall_uvs(
+                data["ground_wall_u"],
                 grounds,
                 ground_owner,
                 ground_z_local,
                 storey,
-                float(facade_cfg["tile_width_m"]),
             )
         )
     uvs = np.concatenate(uv_chunks, axis=0)

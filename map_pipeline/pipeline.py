@@ -371,6 +371,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 else None
             ),
             usage=usage if len(usage) else None,
+            facade_cfg=config.facade,
         )
 
     trees = TreeSet()

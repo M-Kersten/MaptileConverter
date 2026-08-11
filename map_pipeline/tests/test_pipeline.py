@@ -240,6 +240,272 @@ class TestGroundFloorSplit(unittest.TestCase):
         self.assertLess(self._area(lower[:1]), self._area(lower[1:]))
 
 
+class TestArchetypes(unittest.TestCase):
+    """What a building is decides its facade, where its era cannot."""
+
+    @staticmethod
+    def _building(**kwargs):
+        from src.buildings import Building
+
+        defaults = dict(
+            identifier="NL.IMBAG.Pand.0001",
+            wall_tris=np.zeros((0, 3, 3)),
+            roof_tris=np.zeros((0, 3, 3)),
+            ground_z_nap=0.0,
+            roof_max_nap=10.0,
+            wall_top_nap=10.0,
+            floors=3,
+        )
+        defaults.update(kwargs)
+        return Building(**defaults)
+
+    def test_a_church_is_monumental(self):
+        """The Dom: 104 m, built 1382, and no storey count in the BAG."""
+        from src.buildings import ARCH_MONUMENTAL, classify_archetype
+
+        dom = self._building(
+            roof_max_nap=104.3,
+            wall_top_nap=104.3,
+            build_year=1382,
+            storeys_known=False,
+            footprint_m2=1100.0,
+        )
+        self.assertEqual(classify_archetype(dom), ARCH_MONUMENTAL)
+
+    def test_a_modern_tower_is_not_monumental(self):
+        """Height alone must not make something historic."""
+        from src.buildings import ARCH_MONUMENTAL, classify_archetype
+
+        tower = self._building(
+            roof_max_nap=90.0,
+            wall_top_nap=90.0,
+            build_year=2017,
+            storeys_known=False,
+            footprint_m2=900.0,
+        )
+        self.assertNotEqual(classify_archetype(tower), ARCH_MONUMENTAL)
+
+    def test_a_wide_low_building_is_industrial(self):
+        from src.buildings import ARCH_INDUSTRIAL, classify_archetype
+
+        shed = self._building(
+            roof_max_nap=8.0,
+            wall_top_nap=8.0,
+            build_year=1995,
+            footprint_m2=4200.0,
+        )
+        self.assertEqual(classify_archetype(shed), ARCH_INDUSTRIAL)
+
+    def test_a_small_home_is_a_house(self):
+        from src.buildings import ARCH_HOUSE, classify_archetype
+
+        house = self._building(
+            roof_max_nap=9.0,
+            wall_top_nap=7.0,
+            build_year=1912,
+            function=0,
+            footprint_m2=78.0,
+        )
+        self.assertEqual(classify_archetype(house), ARCH_HOUSE)
+
+    def test_a_large_home_is_an_apartment_block(self):
+        from src.buildings import ARCH_APARTMENT, classify_archetype
+
+        block = self._building(
+            roof_max_nap=28.0,
+            wall_top_nap=28.0,
+            build_year=1975,
+            function=0,
+            footprint_m2=900.0,
+        )
+        self.assertEqual(classify_archetype(block), ARCH_APARTMENT)
+
+    def test_the_special_archetypes_get_their_own_style_slots(self):
+        from src.facade import style_for_archetype, wall_styles
+
+        self.assertIsNone(style_for_archetype(0, 5))  # house: era decides
+        self.assertEqual(style_for_archetype(5, 5), 5)  # monumental
+        self.assertEqual(style_for_archetype(4, 5), 6)  # industrial
+
+        styles = wall_styles(5)
+        self.assertEqual(len(styles), 7)
+        self.assertEqual(styles[5].name, "monumental")
+        self.assertEqual(styles[6].name, "industrial")
+
+    def test_slots_stay_put_when_the_era_count_changes(self):
+        """Blender addresses these by index, so they cannot shift about."""
+        from src.facade import style_for_archetype, wall_styles
+
+        for variants in (1, 3, 5):
+            styles = wall_styles(variants)
+            self.assertEqual(
+                styles[style_for_archetype(5, variants)].name, "monumental"
+            )
+            self.assertEqual(
+                styles[style_for_archetype(4, variants)].name, "industrial"
+            )
+
+    def test_a_church_keeps_its_wall_whole(self):
+        """A cathedral has no shopfront to split off."""
+        from src.buildings import (
+            ARCH_HOUSE,
+            ARCH_MONUMENTAL,
+            BuildingSet,
+            apply_ground_floor_split,
+        )
+
+        wall = np.array([[[0, 0, 0], [6, 0, 0], [0, 0, 20]]], dtype=float)
+        church = self._building(
+            wall_tris=wall.copy(), roof_max_nap=20.0, wall_top_nap=20.0
+        )
+        church.archetype = ARCH_MONUMENTAL
+        house = self._building(
+            wall_tris=wall.copy(), roof_max_nap=20.0, wall_top_nap=20.0
+        )
+        house.archetype = ARCH_HOUSE
+
+        apply_ground_floor_split(BuildingSet([church, house], lod="2.2"), 3.6)
+
+        self.assertEqual(len(church.ground_wall_tris), 0)
+        self.assertEqual(len(church.wall_tris), 1)
+        self.assertGreater(len(house.ground_wall_tris), 0)
+
+
+class TestBayFitting(unittest.TestCase):
+    """Every wall face must end on a tile edge, not through a window."""
+
+    @staticmethod
+    def _wall(x0, x1, height=9.0, y=0.0):
+        """Two triangles making a rectangular wall facing -Y."""
+        a, b = [x0, y, 0.0], [x1, y, 0.0]
+        c, d = [x1, y, height], [x0, y, height]
+        return np.array([[a, b, c], [a, c, d]], dtype=float)
+
+    def test_a_house_front_gets_a_whole_number_of_bays(self):
+        from src.facade_uv import fit_wall_u
+
+        # 5.4 m front on a 4 m tile: fixed tiling would cut a window in half.
+        walls = self._wall(0.0, 5.4)
+        u = fit_wall_u(walls, np.zeros(len(walls), dtype=np.int32), np.array([4.0]))
+
+        self.assertAlmostEqual(u.min(), 0.0, places=9)
+        span = u.max() - u.min()
+        self.assertAlmostEqual(span, round(span), places=9)
+        self.assertGreaterEqual(span, 1.0)
+
+    def test_every_face_of_a_real_range_of_widths_lands_on_an_edge(self):
+        from src.facade_uv import fit_wall_u
+
+        rng = np.random.default_rng(4)
+        widths = rng.uniform(3.0, 40.0, 60)
+        walls, owners = [], []
+        for index, width in enumerate(widths):
+            # Spread them out so each is its own face.
+            walls.append(self._wall(0.0, width, y=index * 20.0))
+            owners.append(np.full(2, index, dtype=np.int32))
+
+        u = fit_wall_u(
+            np.concatenate(walls), np.concatenate(owners), np.full(len(widths), 4.0)
+        )
+        per_face = u.reshape(len(widths), -1)
+        for index, row in enumerate(per_face):
+            span = row.max() - row.min()
+            self.assertAlmostEqual(
+                span, round(span), places=8, msg=f"wall {widths[index]:.2f} m"
+            )
+
+    def test_bays_stay_close_to_the_requested_width(self):
+        from src.facade_uv import fit_wall_u
+
+        for width in (4.4, 7.9, 12.3, 25.1):
+            walls = self._wall(0.0, width)
+            u = fit_wall_u(walls, np.zeros(2, dtype=np.int32), np.array([4.0]))
+            bays = u.max() - u.min()
+            self.assertAlmostEqual(width / bays, 4.0, delta=1.0)
+
+    def test_a_sliver_shows_wall_rather_than_a_squashed_window(self):
+        """A 0.4 m return must not have a whole window stretched over it."""
+        from src.facade_uv import fit_wall_u
+
+        walls = self._wall(0.0, 0.4)
+        u = fit_wall_u(walls, np.zeros(2, dtype=np.int32), np.array([4.0]))
+
+        # Centred on the tile seam, which is the pier between windows.
+        self.assertLess(abs(u.min() + u.max()), 1e-9)
+        self.assertLess(u.max() - u.min(), 0.2)
+
+    def test_the_ground_storey_agrees_with_the_wall_above_it(self):
+        from src.buildings import split_walls_at_height
+        from src.facade_uv import fit_wall_u
+
+        walls = self._wall(0.0, 13.7)
+        lower, upper = split_walls_at_height(walls, np.full(len(walls), 3.6))
+
+        combined = np.concatenate([upper, lower])
+        owners = np.zeros(len(combined), dtype=np.int32)
+        u = fit_wall_u(combined, owners, np.array([4.0]))
+
+        upper_u = u[: len(upper) * 3]
+        lower_u = u[len(upper) * 3 :]
+        self.assertAlmostEqual(upper_u.min(), lower_u.min(), places=9)
+        self.assertAlmostEqual(upper_u.max(), lower_u.max(), places=9)
+
+    def test_the_result_does_not_depend_on_where_the_origin_is(self):
+        """It is computed in RD and consumed in local metres."""
+        from src.facade_uv import fit_wall_u
+
+        walls = self._wall(0.0, 9.3)
+        owners = np.zeros(2, dtype=np.int32)
+        tile = np.array([4.0])
+
+        shifted = walls + np.array([136500.0, 455500.0, 12.0])
+        np.testing.assert_allclose(
+            fit_wall_u(walls, owners, tile), fit_wall_u(shifted, owners, tile), atol=1e-9
+        )
+
+    def test_the_sides_of_a_building_are_separate_faces(self):
+        from src.facade_uv import wall_face_ids
+
+        front = self._wall(0.0, 8.0, y=0.0)
+        back = self._wall(0.0, 8.0, y=6.0)
+        side = np.array(
+            [[[0, 0, 0], [0, 6, 0], [0, 6, 9]], [[0, 0, 0], [0, 6, 9], [0, 0, 9]]],
+            dtype=float,
+        )
+        walls = np.concatenate([front, back, side])
+        _, count = wall_face_ids(walls, np.zeros(len(walls), dtype=np.int32))
+        self.assertEqual(count, 3)
+
+    def test_one_wall_stays_one_face_however_it_was_triangulated(self):
+        from src.facade_uv import wall_face_ids
+
+        walls = np.concatenate(
+            [self._wall(0.0, 4.0), self._wall(4.0, 9.0), self._wall(9.0, 11.0)]
+        )
+        _, count = wall_face_ids(walls, np.zeros(len(walls), dtype=np.int32))
+        self.assertEqual(count, 1)
+
+    def test_the_same_wall_on_two_buildings_stays_two_faces(self):
+        """A terrace is a row of houses, not one continuous ribbon."""
+        from src.facade_uv import wall_face_ids
+
+        walls = np.concatenate([self._wall(0.0, 5.4), self._wall(5.4, 10.8)])
+        owners = np.array([0, 0, 1, 1], dtype=np.int32)
+        _, count = wall_face_ids(walls, owners)
+        self.assertEqual(count, 2)
+
+    def test_tile_width_follows_the_archetype(self):
+        from src.facade_uv import tile_widths
+
+        cfg = {
+            "tile_width_m": 4.0,
+            "monumental_tile_m": 7.0,
+            "industrial_tile_m": 9.0,
+        }
+        widths = tile_widths(np.array([0, 4, 5]), cfg)
+        np.testing.assert_allclose(widths, [4.0, 9.0, 7.0])
+
+
 class TestEraStyles(unittest.TestCase):
     def test_build_year_picks_the_era(self):
         from src.facade import STYLES, style_for_building
@@ -624,7 +890,9 @@ class TestFacade(unittest.TestCase):
                 "ground_floor": False,
             }
             pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
-            self.assertEqual(len(pairs), 1)
+            # One era variant, plus the monumental and industrial styles that
+            # every run carries.
+            self.assertEqual(len(pairs), 3)
             colour, normal = pairs[0]
             self.assertTrue(colour.is_file())
             self.assertIsNotNone(normal)
@@ -646,8 +914,142 @@ class TestFacade(unittest.TestCase):
                 "ground_floor": True,
             }
             pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
-            self.assertEqual(len(pairs), 3)  # two wall variants plus the ground
+            # Two era variants, the two archetype styles, then the ground.
+            self.assertEqual(len(pairs), 5)
             self.assertEqual(pairs[-1][0].name, "facade_ground.png")
+
+
+class TestPhotoTextures(unittest.TestCase):
+    """Photographed masonry under the generated windows."""
+
+    def test_every_style_has_a_texture_mapped(self):
+        from src.facade import GROUND_STYLES, STYLES, wall_styles
+        from src.textures import WALL_TEXTURES
+
+        for style in wall_styles(len(STYLES)) + list(GROUND_STYLES):
+            self.assertIn(style.name, WALL_TEXTURES, f"{style.name} has no surface")
+
+    def test_a_texture_is_tiled_to_its_real_world_size(self):
+        """Bricks at the wrong scale are the first thing the eye catches."""
+        from src.textures import _tile_to
+
+        # A photograph with one white row, so repeats are countable.
+        photo = np.zeros((100, 100, 3), dtype=np.float64)
+        photo[0, :] = 255
+
+        # A 3 m photograph over a 6 m tile has to repeat twice.
+        tiled = _tile_to(photo, 200, repeats_x=1.0, repeats_y=2.0)
+        white_rows = np.flatnonzero(tiled[:, 0, 0] > 128)
+        self.assertEqual(len(white_rows), 2)
+
+    def test_tinting_moves_the_colour_but_keeps_the_grain(self):
+        from src.textures import _tint
+
+        rng = np.random.default_rng(3)
+        photo = rng.uniform(40, 210, (64, 64, 3))
+        tinted = _tint(photo, (150, 90, 70), strength=1.0)
+
+        np.testing.assert_allclose(
+            tinted.reshape(-1, 3).mean(axis=0), (150, 90, 70), atol=6.0
+        )
+        # Detail survives exactly: each channel is only rescaled, so every
+        # brick, joint and stain stays where it was.
+        for channel in range(3):
+            self.assertGreater(
+                np.corrcoef(
+                    photo[:, :, channel].ravel(), tinted[:, :, channel].ravel()
+                )[0, 1],
+                0.9999,
+            )
+
+    def test_no_tint_leaves_the_photograph_alone(self):
+        from src.textures import _tint
+
+        photo = np.full((8, 8, 3), 120.0)
+        np.testing.assert_array_equal(_tint(photo, (10, 200, 30), 0.0), photo)
+
+    def test_a_missing_style_falls_back_rather_than_failing(self):
+        from src.facade import FacadeStyle
+        from src.textures import TextureUnavailable, wall_base
+
+        unknown = FacadeStyle(
+            name="not_a_real_style",
+            wall_rgb=(1, 2, 3), trim_rgb=(1, 2, 3), glass_rgb=(1, 2, 3),
+            windows_across=1, window_width_frac=0.2, window_height_frac=0.5,
+            sill_frac=0.2, grain=0.1,
+        )
+        with self.assertRaises(TextureUnavailable):
+            wall_base(unknown, 64, Path("/nonexistent/work/area"),
+                      tile_width_m=4.0, tile_height_m=3.0)
+
+    def test_a_base_replaces_the_wall_but_not_the_windows(self):
+        from src.facade import STYLES, render_facade_layers
+
+        style = STYLES[0]
+        base = np.zeros((64, 64, 3), dtype=np.float64)
+        base[:, :] = (10, 200, 10)  # unmistakable green
+
+        pixels, _ = render_facade_layers(style, 64, seed=1, base=base)
+        greenest = pixels[:, :, 1].astype(int) - pixels[:, :, 0].astype(int)
+        self.assertGreater(greenest.max(), 100, "the photograph is not showing")
+        # The glass is still drawn on top, so not everything is green.
+        self.assertLess(greenest.min(), 20)
+
+    def test_photo_textures_can_be_turned_off(self):
+        from src.facade import _wall_bases, wall_styles
+
+        self.assertEqual(
+            _wall_bases(wall_styles(1), 64, Path("/tmp"), {"photo_textures": False}),
+            {},
+        )
+
+
+class TestArchedOpenings(unittest.TestCase):
+    """A rounded head is the clearest sign a wall is not a stack of storeys."""
+
+    @staticmethod
+    def _monumental():
+        from src.facade import EXTRA_STYLES
+
+        return EXTRA_STYLES["monumental"]
+
+    def test_the_arch_is_widest_at_the_springing_and_closes_at_the_crown(self):
+        from src.facade import render_facade_layers
+
+        style = self._monumental()
+        pixels, relief = render_facade_layers(style, 256, seed=1)
+
+        # Glass sits deepest in the relief, so it marks the opening.
+        opening = relief < 0.35
+        rows = np.flatnonzero(opening.any(axis=1))
+        self.assertTrue(len(rows) > 10, "no opening was drawn")
+
+        widths = opening.sum(axis=1)[rows]
+        # Row 0 is the bottom of the tile, so the last rows are the crown.
+        self.assertGreater(
+            widths[: len(widths) // 3].mean(),
+            widths[-3:].mean(),
+            "the arch is upside down: it narrows towards the sill, not the head",
+        )
+
+    def test_the_crown_is_narrower_than_the_opening_below_it(self):
+        from src.facade import render_facade_layers
+
+        _, relief = render_facade_layers(self._monumental(), 256, seed=1)
+        opening = relief < 0.35
+        rows = np.flatnonzero(opening.any(axis=1))
+        top_row, mid_row = rows[-1], rows[len(rows) // 2]
+        self.assertLess(opening[top_row].sum(), opening[mid_row].sum())
+
+    def test_an_unarched_style_has_square_openings(self):
+        from src.facade import STYLES, render_facade_layers
+
+        _, relief = render_facade_layers(STYLES[0], 256, seed=1)
+        opening = relief < 0.35
+        rows = np.flatnonzero(opening.any(axis=1))
+        widths = opening.sum(axis=1)[rows]
+        # Every row of a rectangular window is the same width.
+        self.assertEqual(len(set(widths.tolist())), 1)
 
 
 class TestConfig(unittest.TestCase):
@@ -825,7 +1227,25 @@ class TestSourceRegistry(unittest.TestCase):
                 source.url(self.config).startswith("http"),
                 f"{source.id} has no service URL",
             )
+            self.assertTrue(
+                source.probe(self.config).startswith("http"),
+                f"{source.id} has nothing to probe",
+            )
             self.assertTrue(source.contributes, f"{source.id} says nothing")
+
+    def test_reachability_does_not_ask_for_the_whole_national_dataset(self):
+        """A feature endpoint with no bbox enumerates the country.
+
+        3DBAG takes fourteen seconds to answer that and the probe gives up
+        after six, so the check reported an outage on a service that was up.
+        """
+        from src.sources import BY_ID, health_targets
+
+        buildings = BY_ID["buildings"]
+        self.assertTrue(buildings.url(self.config).endswith("/items"))
+        self.assertFalse(buildings.probe(self.config).endswith("/items"))
+
+        self.assertIn(buildings.probe(self.config), health_targets(self.config))
 
 
 class TestUIServer(unittest.TestCase):
