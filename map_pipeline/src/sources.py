@@ -116,6 +116,18 @@ SOURCES: tuple[Source, ...] = (
         toggles=(("furniture", "enabled"),),
         url_path=("trees", "api_url"),
     ),
+    Source(
+        id="vehicles",
+        label="Cars and boats (BGT)",
+        provider="PDOK",
+        contributes=(
+            "cars laid out in the parking bays, boats moored between the "
+            "mooring posts"
+        ),
+        toggles=(("vehicles", "cars"), ("vehicles", "boats")),
+        url_path=("trees", "api_url"),
+        note="boats need water surfaces on too",
+    ),
 )
 
 BY_ID = {source.id: source for source in SOURCES}

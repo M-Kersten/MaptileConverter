@@ -6,16 +6,18 @@ runtime.
 
 ```
 output/<area_name>/
-├── model.fbx        terrain, water, buildings, trees, street furniture
+├── model.fbx        terrain, water, buildings, trees, furniture, cars, boats
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
+├── vehicles.json    car and boat positions and headings, same idea
 ├── landcover.png    surface class per pixel, registered to the same bbox
 ├── landcover.json   what the class values mean
 ├── facade*.png      generated facade textures, referenced by the FBX
 ├── tree.png         bark and foliage atlas
 ├── water.png        canal water
 ├── furniture.png    metal and wood atlas
+├── vehicle.png      car paint, hull and timber atlas
 └── ATTRIBUTION.txt  source credits
 ```
 
@@ -194,6 +196,10 @@ Other knobs worth knowing:
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
 | `furniture.enabled` | `true` | Lampposts, bollards, sign posts and benches. |
+| `vehicles.cars` | `true` | Lay cars out in the BGT parking bays. |
+| `vehicles.boats` | `true` | Moor boats between the BGT mooring posts. Needs `surfaces.water`. |
+| `vehicles.car_occupancy` | `0.72` | How full the bays are. 1 parks a car in every space. |
+| `vehicles.boat_occupancy` | `0.8` | The same for moorings. |
 | `usage.enabled` | `true` | BAG building function, deciding the ground storey. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
 | `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
@@ -219,6 +225,7 @@ src/bgt.py         shared BGT client: paging, version filter, rasterising
 src/trees.py       BGT tree points, heights from AHN DSM minus DTM
 src/surfaces.py    BGT water bodies and land cover
 src/furniture.py   BGT lampposts, bollards, signs and benches
+src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
@@ -296,8 +303,9 @@ terrain. Cutting a building open would show its inside; a water surface is flat,
 so trimming it costs nothing.
 
 **Land cover** comes from three more BGT collections: `wegdeel`, plus vegetated
-and unvegetated terrain. Over the demo area that classifies about 63% of the
-ground as road, green, paved, unpaved or water. It leaves in two forms:
+and unvegetated terrain, with `ondersteunendwaterdeel` for quays. Over the demo
+area that classifies about 46% of the ground into eleven classes. It leaves in
+two forms:
 
 - `landcover.png` and `landcover.json` — a class map registered to the same
   bbox as `aerial.png`, for driving materials or walkable/drivable logic
@@ -309,6 +317,18 @@ ground as road, green, paved, unpaved or water. It leaves in two forms:
   where the photo has none. `surfaces.detail_strength` controls it; 0 turns it
   off.
 
+**Roads are not one class.** The BGT knows what every road surface is for and
+what it is made of, and a Dutch street is unrecognisable without both: the
+carriageway is brick as often as asphalt, the cycle path beside it is red, and
+the footpath is grey tiles. `wegdeel.functie` and `plus_fysiek_voorkomen`
+separate carriageway, brick street, cycle path, footpath, parking bay and tram
+lane, each with its own tint and grain. Over Utrecht centre brick carriageway
+(6.8%) actually outnumbers asphalt (5.5%), and footpath is the largest class at
+17% because the old centre is mostly pedestrianised. Road parts overlap at
+junctions and kerbs, so they are painted in an explicit order — broad surfaces
+first, the things cut out of them last — rather than in whatever order the API
+returned them.
+
 ## Street furniture
 
 About 2000 poles and 200 pieces of furniture per square kilometre: lampposts,
@@ -316,6 +336,44 @@ bollards, sign posts and benches, from BGT `paal` and `straatmeubilair`. None of
 it is structurally important, which is the point — a street with nothing on it
 reads as a model. They are simple boxes sharing one material, so a couple of
 thousand objects cost one draw call.
+
+## Cars and boats
+
+Neither is a dataset. Nobody publishes where cars are parked or boats are
+moored. But the BGT publishes the two structures that exist *because* of them,
+and those turn out to be enough — which is why the result lands on the real
+kerbs and the real canals instead of being scattered plausibly.
+
+**Parking bays.** `wegdeel` carries `functie = parkeervlak`, one polygon per run
+of bays. Over Utrecht centre the median bay is 11 m long and 2.6 m across, which
+is a parallel bay holding two cars. The polygon's own shape decides how the cars
+in it are oriented, because it has to: a strip 2.6 m across can only hold cars
+end to end, one 5 m across can only hold them side by side, and anything wider
+is a car park and gets rows. Cars are placed on the bay's long axis at a 5.6 m
+pitch, tested against the polygon rather than its bounding box — bays bend round
+corners and step around trees, and a car placed on the box ends up in the road.
+Not every bay is full, so `vehicles.car_occupancy` leaves gaps.
+
+**Mooring posts.** `waterinrichtingselement_punt` carries `plus_type =
+meerpaal`. The median gap between neighbouring posts over the same area is
+6.7 m, which is a boat, because that is exactly what the spacing is for. Each
+post links to its nearest neighbour in range and a hull goes between them —
+nearest-only, because linking every pair inside the range lays a third boat
+across a run of three, overlapping the two real ones. Posts stand at the water's
+edge, so the boat is walked outwards from the line between them until both
+gunwales are over water, and a post with water on neither side is left alone.
+Boats float at the level of the water body they are in, which has to be per body
+because levels across one area span metres.
+
+Both leave as geometry in the FBX and as `vehicles.json`, a spawn list with
+position, heading and size, so real vehicle models can replace the boxes. Cars
+that fall outside the bbox are dropped: a bay straddling the edge comes back
+whole, and unlike a building — where cutting one opens a hole in its wall — a
+car has nothing to cut and one parked out over the void is simply wrong.
+
+Four checks cover the part that could silently go wrong: that boats are inside a
+water polygon, that their heights match a real water level, that cars are on
+ground, and that nothing landed outside the area.
 
 ## Building function
 
@@ -514,8 +572,9 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
 - **3DBAG** — 3D geoinformation research group, TU Delft, and Kadaster (CC BY 4.0)
 - **AHN** — Actueel Hoogtebestand Nederland via PDOK (CC BY 4.0)
 - **Aerial** — PDOK / Beeldmateriaal Nederland (CC BY 4.0)
-- **Trees, water, land cover, street furniture** — BGT (Basisregistratie
-  Grootschalige Topografie) via PDOK (CC BY 4.0)
+- **Trees, water, land cover, road surfaces, street furniture, parking bays
+  and mooring posts** — BGT (Basisregistratie Grootschalige Topografie) via
+  PDOK (CC BY 4.0)
 - **Building function** — BAG (Basisregistratie Adressen en Gebouwen) via PDOK
   (CC BY 4.0)
 - **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution

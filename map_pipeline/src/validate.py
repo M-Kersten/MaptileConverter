@@ -324,6 +324,75 @@ def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
     )
 
 
+def check_vehicles(report: CheckReport, vehicles, bbox: BBox, surfaces=None) -> None:
+    """Cars are on land and boats are on water, at the right height.
+
+    Both are placed from proxies rather than from a register of vehicles, so
+    the checks are about whether the proxy held: a boat that came out on a
+    street means a mooring post was matched to the wrong side.
+    """
+    from .vehicles import KIND_BOAT, KIND_CAR, points_in_ring
+
+    if vehicles is None or not len(vehicles):
+        report.add("vehicles_present", True, "no vehicles", severity="warning")
+        return
+
+    xs, ys = vehicles.xy[:, 0], vehicles.xy[:, 1]
+    report.add(
+        "vehicles_present",
+        True,
+        ", ".join(
+            f"{value} {key}"
+            for key, value in vehicles.stats().items()
+            if key.endswith("s") and value
+        ),
+    )
+    report.add(
+        "vehicles_inside_bbox",
+        bool(
+            (xs >= bbox.xmin).all() and (xs <= bbox.xmax).all()
+            and (ys >= bbox.ymin).all() and (ys <= bbox.ymax).all()
+        ),
+        "every vehicle is inside the bbox",
+    )
+
+    cars = vehicles.kind == KIND_CAR
+    if cars.any():
+        report.add(
+            "cars_upright_on_ground",
+            bool(np.isfinite(vehicles.z_nap[cars]).all()),
+            f"{int(cars.sum())} cars between "
+            f"{vehicles.z_nap[cars].min():.2f} and "
+            f"{vehicles.z_nap[cars].max():.2f} m NAP",
+        )
+
+    boats = vehicles.kind == KIND_BOAT
+    if boats.any() and surfaces is not None and surfaces.water:
+        rings = [
+            body.rings[0][:, :2] for body in surfaces.water if len(body.rings)
+        ]
+        afloat = 0
+        for index in np.flatnonzero(boats):
+            point = vehicles.xy[index][None, :]
+            if any(points_in_ring(point, ring)[0] for ring in rings):
+                afloat += 1
+        report.add(
+            "boats_are_on_water",
+            afloat == int(boats.sum()),
+            f"{afloat} of {int(boats.sum())} boats sit inside a water body",
+        )
+
+        levels = {round(body.level_nap, 2) for body in surfaces.water}
+        boat_levels = np.unique(np.round(vehicles.z_nap[boats], 2))
+        report.add(
+            "boats_at_water_level",
+            all(level in levels for level in boat_levels),
+            f"boat heights {vehicles.z_nap[boats].min():.2f} to "
+            f"{vehicles.z_nap[boats].max():.2f} m NAP, all matching a "
+            f"water body's own level",
+        )
+
+
 def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
     """The image has the requested size, real content, and matches the bbox."""
     from PIL import Image

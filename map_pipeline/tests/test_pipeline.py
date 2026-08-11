@@ -1052,6 +1052,223 @@ class TestArchedOpenings(unittest.TestCase):
         self.assertEqual(len(set(widths.tolist())), 1)
 
 
+class TestRoadClasses(unittest.TestCase):
+    """A Dutch street is brick, and its cycle path is red. Both matter."""
+
+    def test_function_decides_the_class(self):
+        from src.surfaces import (
+            CLASS_CYCLE, CLASS_FOOTPATH, CLASS_PARKING, CLASS_ROAD,
+            CLASS_TRANSIT, road_class,
+        )
+
+        self.assertEqual(road_class("rijbaan lokale weg", "asfalt"), CLASS_ROAD)
+        self.assertEqual(road_class("fietspad", "asfalt"), CLASS_CYCLE)
+        self.assertEqual(road_class("voetpad", ""), CLASS_FOOTPATH)
+        self.assertEqual(road_class("voetpad op trap", ""), CLASS_FOOTPATH)
+        self.assertEqual(road_class("OV-baan", "asfalt"), CLASS_TRANSIT)
+        self.assertEqual(road_class("parkeervlak", "asfalt"), CLASS_PARKING)
+
+    def test_a_brick_carriageway_is_told_apart_from_asphalt(self):
+        from src.surfaces import CLASS_ROAD, CLASS_ROAD_BRICK, road_class
+
+        self.assertEqual(
+            road_class("rijbaan lokale weg", "gebakken klinkers"), CLASS_ROAD_BRICK
+        )
+        self.assertEqual(
+            road_class("rijbaan lokale weg", "betonstraatstenen"), CLASS_ROAD_BRICK
+        )
+        self.assertEqual(road_class("rijbaan lokale weg", "asfalt"), CLASS_ROAD)
+
+    def test_a_cycle_path_is_red_whatever_it_is_made_of(self):
+        from src.surfaces import CLASS_CYCLE, road_class
+
+        self.assertEqual(road_class("fietspad", "gebakken klinkers"), CLASS_CYCLE)
+
+    def test_an_unknown_function_falls_back_to_carriageway(self):
+        from src.surfaces import CLASS_ROAD, road_class
+
+        self.assertEqual(road_class("", ""), CLASS_ROAD)
+        self.assertEqual(road_class("iets nieuws", ""), CLASS_ROAD)
+
+    def test_narrow_surfaces_paint_over_the_broad_ones(self):
+        """Junctions overlap, so the order cannot be whatever the API returned."""
+        from src.surfaces import (
+            CLASS_CYCLE, CLASS_FOOTPATH, CLASS_ROAD, _paint_rank,
+        )
+
+        self.assertLess(_paint_rank(CLASS_ROAD), _paint_rank(CLASS_CYCLE))
+        self.assertLess(_paint_rank(CLASS_CYCLE), _paint_rank(CLASS_FOOTPATH))
+
+
+class TestVehiclePlacement(unittest.TestCase):
+    """Cars and boats are read off the structures that exist because of them."""
+
+    @staticmethod
+    def _rect(cx, cy, length, width, angle=0.0):
+        half_l, half_w = length / 2, width / 2
+        corners = np.array(
+            [[-half_l, -half_w], [half_l, -half_w], [half_l, half_w], [-half_l, half_w]]
+        )
+        rotation = np.array(
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        )
+        return corners @ rotation.T + np.array([cx, cy])
+
+    def test_the_long_axis_of_a_rotated_bay_is_found(self):
+        from src.vehicles import principal_axes
+
+        ring = self._rect(0, 0, 20.0, 2.5, angle=np.radians(30))
+        long_axis, _, along, across = principal_axes(ring)
+
+        self.assertAlmostEqual(along, 20.0, places=6)
+        self.assertAlmostEqual(across, 2.5, places=6)
+        self.assertAlmostEqual(
+            abs(np.degrees(np.arctan2(long_axis[1], long_axis[0]))) % 180, 30.0, places=4
+        )
+
+    def test_point_in_polygon(self):
+        from src.vehicles import points_in_ring
+
+        ring = self._rect(0, 0, 10.0, 4.0)
+        points = np.array([[0.0, 0.0], [4.9, 1.9], [5.1, 0.0], [0.0, 2.1]])
+        np.testing.assert_array_equal(
+            points_in_ring(points, ring), [True, True, False, False]
+        )
+
+    def test_a_narrow_bay_parks_cars_nose_to_tail(self):
+        from src.vehicles import cars_in_bay
+
+        # 22 m of kerbside bay, 2.4 m deep, running east-west.
+        ring = self._rect(0, 0, 22.0, 2.4)
+        placed = cars_in_bay(ring, np.random.default_rng(1), occupancy=1.0)
+
+        self.assertGreaterEqual(len(placed), 3)
+        for _, _, heading in placed:
+            # Aligned with the bay, so along +x.
+            self.assertAlmostEqual(np.sin(heading), 0.0, places=1)
+
+    def test_a_deep_bay_parks_cars_nose_in(self):
+        from src.vehicles import cars_in_bay
+
+        # 22 m long, 5 m deep: cars face across it, not along it.
+        ring = self._rect(0, 0, 22.0, 5.0)
+        placed = cars_in_bay(ring, np.random.default_rng(2), occupancy=1.0)
+
+        self.assertGreaterEqual(len(placed), 6)
+        for _, _, heading in placed:
+            self.assertAlmostEqual(abs(np.cos(heading)), 0.0, places=1)
+
+    def test_no_car_is_placed_outside_the_bay(self):
+        from src.vehicles import cars_in_bay, points_in_ring
+
+        ring = self._rect(5.0, -3.0, 18.0, 2.6, angle=np.radians(65))
+        placed = cars_in_bay(ring, np.random.default_rng(3), occupancy=1.0)
+
+        self.assertTrue(placed)
+        # Jitter can nudge a centre just over the line; a car length cannot.
+        centres = np.array([[x, y] for x, y, _ in placed])
+        distances = np.linalg.norm(centres - ring.mean(axis=0), axis=1)
+        self.assertLess(distances.max(), 9.0)
+
+    def test_a_bay_too_small_for_a_car_gets_none(self):
+        from src.vehicles import cars_in_bay
+
+        self.assertEqual(
+            cars_in_bay(self._rect(0, 0, 2.0, 2.0), np.random.default_rng(4),
+                        occupancy=1.0),
+            [],
+        )
+
+    def test_occupancy_leaves_gaps(self):
+        from src.vehicles import cars_in_bay
+
+        ring = self._rect(0, 0, 200.0, 2.4)
+        full = cars_in_bay(ring, np.random.default_rng(5), occupancy=1.0)
+        half = cars_in_bay(ring, np.random.default_rng(5), occupancy=0.5)
+        self.assertGreater(len(full), len(half))
+
+    def test_a_chain_of_posts_gives_one_boat_per_gap(self):
+        """Not one per pair: that would lay a third boat over the other two."""
+        from src.vehicles import _nearest_links
+
+        posts = np.array([[0.0, 0.0], [7.0, 0.0], [14.0, 0.0]])
+        self.assertEqual(_nearest_links(posts, 3.5, 18.0), [(0, 1), (1, 2)])
+
+    def test_posts_too_far_apart_are_not_a_mooring(self):
+        from src.vehicles import _nearest_links
+
+        posts = np.array([[0.0, 0.0], [90.0, 0.0]])
+        self.assertEqual(_nearest_links(posts, 3.5, 18.0), [])
+
+    def test_a_boat_goes_on_the_water_side_of_its_posts(self):
+        from src.vehicles import boats_between_posts
+
+        # Canal occupying y in [0, 12]; posts along its southern edge.
+        canal = np.array([[-50.0, 0.0], [50.0, 0.0], [50.0, 12.0], [-50.0, 12.0]])
+        posts = np.array([[0.0, 0.2], [8.0, 0.2]])
+
+        placed = boats_between_posts(
+            posts, [canal], np.random.default_rng(6), occupancy=1.0
+        )
+        self.assertEqual(len(placed), 1)
+        x, y, heading, length, beam = placed[0]
+        self.assertGreater(y, 0.0, "the boat was put on the bank, not the water")
+        self.assertAlmostEqual(x, 4.0, places=1)
+        self.assertAlmostEqual(np.sin(heading), 0.0, places=6)
+        self.assertAlmostEqual(length, 8.0 * 0.85, places=6)
+
+    def test_a_boat_floats_clear_of_the_bank(self):
+        """Testing only the centre left the inboard gunwale up on the quay."""
+        from src.vehicles import _float_clear_of_bank, points_in_ring
+
+        canal = np.array([[-50.0, 0.0], [50.0, 0.0], [50.0, 12.0], [-50.0, 12.0]])
+        beam = 3.0
+        centre = _float_clear_of_bank(
+            np.array([0.0, 0.0]), np.array([0.0, 1.0]), beam, [canal]
+        )
+        self.assertIsNotNone(centre)
+        inboard = centre - np.array([0.0, beam * 0.5])
+        outboard = centre + np.array([0.0, beam * 0.5])
+        self.assertTrue(points_in_ring(inboard[None, :], canal)[0])
+        self.assertTrue(points_in_ring(outboard[None, :], canal)[0])
+
+    def test_posts_with_no_water_get_no_boat(self):
+        from src.vehicles import boats_between_posts
+
+        posts = np.array([[0.0, 0.0], [8.0, 0.0]])
+        self.assertEqual(
+            boats_between_posts(posts, [], np.random.default_rng(7), occupancy=1.0),
+            [],
+        )
+
+    def test_the_spawn_list_heading_is_a_unity_rotation(self):
+        """Held anticlockwise from east; Unity wants clockwise from north."""
+        import json
+
+        from src.geo import BBox, GeoContext
+        from src.vehicles import KIND_CAR, VehicleSet, write_spawn_list
+
+        vehicles = VehicleSet(
+            xy=np.array([[136500.0, 455500.0]]),
+            z_nap=np.array([2.0]),
+            # Pointing north: 90 degrees anticlockwise from east.
+            heading=np.array([np.pi / 2]),
+            length=np.array([4.3]),
+            width=np.array([1.8]),
+            kind=np.array([KIND_CAR], dtype=np.int32),
+            colour=np.array([0], dtype=np.int32),
+        )
+        geo = GeoContext.from_bbox(BBox(136000, 455000, 137000, 456000))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_spawn_list(vehicles, geo, Path(tmp))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        record = payload["vehicles"][0]
+        self.assertEqual(record["kind"], "car")
+        self.assertAlmostEqual(record["heading_deg"], 0.0, places=3)
+
+
 class TestCentringCheck(unittest.TestCase):
     """A lopsided model is not an off-origin model."""
 
@@ -1251,14 +1468,15 @@ class TestSourceRegistry(unittest.TestCase):
         )
 
     def test_shared_hosts_are_probed_once(self):
-        """Four BGT layers behind one host must not look like four outages."""
+        """Five BGT layers behind one host must not look like five outages."""
         from src.sources import health_targets
 
         targets = health_targets(self.config)
         bgt = [ids for url, ids in targets.items() if "bgt" in url]
         self.assertEqual(len(bgt), 1)
         self.assertEqual(
-            set(bgt[0].split(",")), {"trees", "water", "land_cover", "furniture"}
+            set(bgt[0].split(",")),
+            {"trees", "water", "land_cover", "furniture", "vehicles"},
         )
 
     def test_disabled_sources_are_not_checked(self):

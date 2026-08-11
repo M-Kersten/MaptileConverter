@@ -647,6 +647,75 @@ def generate_water_texture(work_dir: Path, size_px: int = 512, seed: int = 21) -
     return path
 
 
+# Car paint, picked to look like a Dutch street rather than a showroom: mostly
+# grey, white and black, with a few colours among them.
+CAR_PAINT: tuple[tuple[int, int, int], ...] = (
+    (188, 190, 194),   # silver
+    (232, 232, 230),   # white
+    (48, 50, 54),      # near-black
+    (72, 88, 118),     # blue
+    (128, 44, 42),     # dark red
+    (94, 104, 96),     # dark green
+)
+
+
+def generate_vehicle_texture(
+    work_dir: Path, size_px: int = 256, seed: int = 51
+) -> Path:
+    """Atlas for cars, boats and mooring posts.
+
+    The top half is one patch per car colour; the bottom half is hull white on
+    the left and weathered timber on the right. One image means a few hundred
+    vehicles cost a single draw call, and the car colours cost nothing extra
+    because they are UV offsets rather than materials.
+    """
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+    half = size_px // 2
+
+    # Row 0 of the array is the bottom of the tile: hull and post live here.
+    hull = np.zeros((half, half, 3), dtype=np.float64)
+    hull[:, :] = (206, 208, 206)
+    grime = _value_noise((half, half), cells=max(3, half // 12), rng=rng)
+    hull *= 1.0 + 0.14 * (grime - 0.5)[:, :, None] * 2.0
+    canvas[:half, :half] = hull
+
+    timber = np.zeros((half, size_px - half, 3), dtype=np.float64)
+    timber[:, :] = (92, 78, 64)
+    streak = _value_noise((half, size_px - half), cells=max(4, half // 5), rng=rng)
+    timber *= 1.0 + 0.28 * (streak - 0.5)[:, :, None] * 2.0
+    canvas[:half, half:] = timber
+
+    # Car colours across the upper row.
+    patch = size_px / len(CAR_PAINT)
+    for index, colour in enumerate(CAR_PAINT):
+        x0 = int(round(index * patch))
+        x1 = int(round((index + 1) * patch))
+        block = np.zeros((size_px - half, x1 - x0, 3), dtype=np.float64)
+        block[:, :] = colour
+        # Just enough variation that a row of the same colour is not flat.
+        speckle = _value_noise(
+            (size_px - half, x1 - x0), cells=max(2, (x1 - x0) // 8), rng=rng
+        )
+        block *= 1.0 + 0.07 * (speckle - 0.5)[:, :, None] * 2.0
+        canvas[half:, x0:x1] = block
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "vehicle.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8)[::-1], mode="RGB").save(
+        path, format="PNG"
+    )
+    LOG.info(
+        "wrote %s (%d car colours, hull and timber, %dpx)",
+        path.name,
+        len(CAR_PAINT),
+        size_px,
+    )
+    return path
+
+
 def generate_furniture_texture(
     work_dir: Path, size_px: int = 256, seed: int = 33
 ) -> Path:
@@ -677,9 +746,11 @@ def generate_furniture_texture(
 
 
 __all__ = [
+    "CAR_PAINT",
     "GROUND_STYLE",
     "GROUND_STYLES",
     "generate_furniture_texture",
+    "generate_vehicle_texture",
     "generate_tree_texture",
     "generate_water_texture",
     "RELIEF_DEPTH",

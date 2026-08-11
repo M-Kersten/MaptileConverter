@@ -36,24 +36,105 @@ CLASS_GREEN = 2
 CLASS_PAVED = 3
 CLASS_UNPAVED = 4
 CLASS_WATER = 5
+# The BGT knows what every road surface is for and what it is made of, and a
+# Dutch street is unrecognisable without that: the carriageway is brick as
+# often as asphalt, the cycle path beside it is red, and the footpath is grey
+# tiles. Collapsing all of it into one "road" class threw away the single most
+# characteristic thing about the ground here.
+CLASS_ROAD_BRICK = 6
+CLASS_CYCLE = 7
+CLASS_FOOTPATH = 8
+CLASS_PARKING = 9
+CLASS_TRANSIT = 10
+CLASS_QUAY = 11
 
 CLASS_NAMES = {
     CLASS_NONE: "unclassified",
-    CLASS_ROAD: "road",
+    CLASS_ROAD: "road_asphalt",
     CLASS_GREEN: "green",
     CLASS_PAVED: "paved",
     CLASS_UNPAVED: "unpaved",
     CLASS_WATER: "water",
+    CLASS_ROAD_BRICK: "road_brick",
+    CLASS_CYCLE: "cycle_path",
+    CLASS_FOOTPATH: "footpath",
+    CLASS_PARKING: "parking",
+    CLASS_TRANSIT: "transit_lane",
+    CLASS_QUAY: "quay",
 }
 
 # Tint and grain used to give each surface class some texture of its own on top
 # of the photo. Kept subtle: the aerial still has to be the thing you see.
+# `cells` is roughly how many grain features fit per metre, so brick paving is
+# fine-grained and asphalt is not.
 CLASS_DETAIL = {
     CLASS_ROAD: {"tint": (74, 76, 80), "grain": 0.55, "cells": 3.0},
     CLASS_GREEN: {"tint": (86, 116, 62), "grain": 0.85, "cells": 1.1},
     CLASS_PAVED: {"tint": (128, 124, 118), "grain": 0.60, "cells": 1.6},
     CLASS_UNPAVED: {"tint": (132, 118, 96), "grain": 0.70, "cells": 1.3},
+    CLASS_ROAD_BRICK: {"tint": (118, 92, 78), "grain": 0.70, "cells": 6.0},
+    # Dutch cycle paths are red asphalt, and nothing else in the street is.
+    CLASS_CYCLE: {"tint": (124, 66, 54), "grain": 0.45, "cells": 3.0},
+    CLASS_FOOTPATH: {"tint": (140, 138, 134), "grain": 0.55, "cells": 5.0},
+    CLASS_PARKING: {"tint": (96, 94, 94), "grain": 0.60, "cells": 4.0},
+    CLASS_TRANSIT: {"tint": (82, 80, 84), "grain": 0.50, "cells": 2.4},
+    CLASS_QUAY: {"tint": (120, 114, 106), "grain": 0.65, "cells": 2.0},
 }
+
+# BGT `functie` on a wegdeel, mapped to what the surface actually is. Matched
+# by substring because the vocabulary is finer than this ("rijbaan lokale weg",
+# "rijbaan regionale weg", "voetpad op trap" and so on).
+ROAD_FUNCTIONS: tuple[tuple[str, int], ...] = (
+    ("parkeervlak", CLASS_PARKING),
+    ("fietspad", CLASS_CYCLE),
+    ("voetpad", CLASS_FOOTPATH),
+    ("voetgangersgebied", CLASS_FOOTPATH),
+    ("ov-baan", CLASS_TRANSIT),
+    ("spoorbaan", CLASS_TRANSIT),
+    ("rijbaan", CLASS_ROAD),
+    ("inrit", CLASS_ROAD),
+)
+
+# Materials that make a carriageway brick rather than asphalt. Only these two
+# classes change with the material; a cycle path is red whatever it is made of.
+BRICK_MATERIALS = ("klinker", "sierbestrating", "betonstraatstenen", "tegels")
+
+
+# Broad surfaces first, the things that sit on top of them last. A parking bay
+# is cut out of a carriageway and a footpath runs along its edge, so both have
+# to win where the polygons overlap.
+PAINT_ORDER: tuple[int, ...] = (
+    CLASS_ROAD,
+    CLASS_ROAD_BRICK,
+    CLASS_TRANSIT,
+    CLASS_PARKING,
+    CLASS_CYCLE,
+    CLASS_FOOTPATH,
+)
+
+
+def _paint_rank(code: int) -> int:
+    return PAINT_ORDER.index(code) if code in PAINT_ORDER else -1
+
+
+def road_class(functie: str, material: str) -> int:
+    """Which surface class one BGT road part belongs to."""
+    functie = (functie or "").strip().lower()
+    material = (material or "").strip().lower()
+
+    code = CLASS_ROAD
+    for token, mapped in ROAD_FUNCTIONS:
+        if token in functie:
+            code = mapped
+            break
+
+    # A brick carriageway is the default residential street here, not an
+    # exception, so it is worth telling apart from asphalt.
+    if code in (CLASS_ROAD, CLASS_PARKING) and any(
+        token in material for token in BRICK_MATERIALS
+    ):
+        return CLASS_ROAD_BRICK
+    return code
 
 
 @dataclass
@@ -266,6 +347,7 @@ def build_surfaces(
         layers = [
             ("onbegroeidterreindeel", CLASS_PAVED, "fysiek_voorkomen"),
             ("begroeidterreindeel", CLASS_GREEN, "fysiek_voorkomen"),
+            ("ondersteunendwaterdeel", CLASS_QUAY, "type"),
             ("wegdeel", CLASS_ROAD, "fysiek_voorkomen"),
         ]
         for collection, code, class_field in layers:
@@ -275,31 +357,39 @@ def build_surfaces(
             result.stats_by_collection[collection] = stats.summary()
             result.counts[f"{collection}_count"] = stats.current_features
 
-            groups: list[list[np.ndarray]] = []
-            unpaved: list[list[np.ndarray]] = []
+            # Rings gathered per class, so one collection can paint several.
+            by_class: dict[int, list[list[np.ndarray]]] = {}
             for feature in features:
-                physical = str(
-                    (feature.get("properties") or {}).get("fysiek_voorkomen") or ""
-                )
-                target = (
-                    unpaved
-                    if code == CLASS_PAVED and "onverhard" in physical
-                    else groups
-                )
-                target.extend(polygon_rings(feature.get("geometry")))
+                properties = feature.get("properties") or {}
+                physical = str(properties.get("fysiek_voorkomen") or "")
 
-            if groups:
-                rasterize_rings(
-                    groups, flip_bounds, class_grid.shape, out=class_grid, value=code
+                if collection == "wegdeel":
+                    target = road_class(
+                        str(properties.get("functie") or ""),
+                        str(properties.get("plus_fysiek_voorkomen") or physical),
+                    )
+                elif code == CLASS_PAVED and "onverhard" in physical:
+                    target = CLASS_UNPAVED
+                else:
+                    target = code
+
+                by_class.setdefault(target, []).extend(
+                    polygon_rings(feature.get("geometry"))
                 )
-            if unpaved:
-                rasterize_rings(
-                    unpaved,
-                    flip_bounds,
-                    class_grid.shape,
-                    out=class_grid,
-                    value=CLASS_UNPAVED,
-                )
+
+            # Explicit order, not dict order: road parts overlap at junctions
+            # and kerbs, and whichever painted last would otherwise depend on
+            # the order the API happened to return features in.
+            for target in sorted(by_class, key=_paint_rank):
+                rings = by_class[target]
+                if rings:
+                    rasterize_rings(
+                        rings,
+                        flip_bounds,
+                        class_grid.shape,
+                        out=class_grid,
+                        value=target,
+                    )
 
         # Water last: it wins over anything a road or terrain polygon claimed.
         if result.water:
@@ -328,6 +418,10 @@ def build_surfaces(
             )
         result.water_bed = np.flipud(bed)
 
+    # Outside the water block, and guarded: land cover and water are
+    # independently switchable, so this ran on a None grid whenever water was
+    # on and land cover was off.
+    if result.class_grid is not None:
         fractions = {
             CLASS_NAMES[code]: float((result.class_grid == code).mean())
             for code in CLASS_NAMES

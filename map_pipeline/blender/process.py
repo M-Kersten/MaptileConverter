@@ -822,6 +822,173 @@ def build_furniture(scene: dict, work_dir: Path, material):
     return obj
 
 
+def _hull(cx, cy, cz, length, beam, depth, freeboard, spin):
+    """A boat hull: a box with the bow drawn to a point, as (verts, faces).
+
+    Six vertices a side rather than four. A rectangular boat reads as a crate,
+    and the taper is the whole difference between the two at the distance
+    anyone will actually look at these from.
+    """
+    half_l, half_b = length * 0.5, beam * 0.5
+    # Bow at +X, stern at -X. The waterline sits at z = 0.
+    outline = np.array(
+        [
+            [half_l, 0.0],            # stem
+            [half_l * 0.55, half_b],  # shoulder
+            [-half_l, half_b * 0.85], # transom corner
+            [-half_l, -half_b * 0.85],
+            [half_l * 0.55, -half_b],
+        ]
+    )
+    n = len(outline)
+    lower = np.column_stack([outline * 0.72, np.full(n, -depth)])
+    upper = np.column_stack([outline, np.full(n, freeboard)])
+    corners = np.vstack([lower, upper])
+
+    cos_a, sin_a = np.cos(spin), np.sin(spin)
+    spun = corners.copy()
+    spun[:, 0] = corners[:, 0] * cos_a - corners[:, 1] * sin_a
+    spun[:, 1] = corners[:, 0] * sin_a + corners[:, 1] * cos_a
+    spun += np.array([cx, cy, cz])
+
+    faces = []
+    for i in range(n):
+        j = (i + 1) % n
+        faces.append([i, j, n + j])
+        faces.append([i, n + j, n + i])
+    # Deck and bottom, fanned from the first vertex.
+    for i in range(1, n - 1):
+        faces.append([n, n + i, n + i + 1])
+        faces.append([0, i + 1, i])
+    return spun, np.array(faces, dtype=np.int64)
+
+
+def build_vehicles(scene: dict, work_dir: Path, material):
+    """Parked cars, moored boats and the posts they are tied to.
+
+    All three share one material and one mesh, so a few hundred of them cost
+    one draw call. The car atlas carries several body colours, because a street
+    where every car is the same colour looks worse than no cars at all.
+    """
+    vehicle_file = scene.get("vehicles", {}).get("file")
+    if not vehicle_file or not (work_dir / vehicle_file).is_file():
+        return None
+
+    data = np.load(work_dir / vehicle_file)
+    xy = data["xy"]
+    if len(xy) == 0:
+        return None
+
+    z_nap = data["z_nap"]
+    heading = data["heading"]
+    lengths = data["length"]
+    widths = data["width"]
+    kinds = data["kind"]
+    colours = data["colour"]
+
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    cfg = scene.get("vehicles", {})
+    car_height = float(cfg.get("car_height_m", 1.5))
+    n_colours = max(1, int(cfg.get("car_colours", 6)))
+
+    # The atlas is one row of car colours over a row holding hull and post.
+    # Sampling the middle of each patch keeps bilinear filtering off the seams.
+    def car_uv(slot: int) -> np.ndarray:
+        return np.array([(slot + 0.5) / n_colours, 0.75])
+
+    hull_uv = np.array([0.25, 0.25])
+    post_uv = np.array([0.75, 0.25])
+
+    vertices: list[np.ndarray] = []
+    faces: list[np.ndarray] = []
+    uvs: list[np.ndarray] = []
+    offset = 0
+
+    for index in range(len(xy)):
+        x = float(xy[index, 0]) - origin_x
+        y = float(xy[index, 1]) - origin_y
+        base = float(z_nap[index]) - z_offset
+        kind = int(kinds[index])
+        spin = float(heading[index])
+        length = float(lengths[index])
+        width = float(widths[index])
+
+        pieces = []
+        if kind == 0:  # car: body with a cabin set back on it
+            uv = car_uv(int(colours[index]) % n_colours)
+            body_h = car_height * 0.52
+            pieces.append(
+                (_box(x, y, base + body_h / 2, length, width, body_h, spin), uv)
+            )
+            # The cabin sits behind centre, which is what makes a box read as
+            # having a bonnet and therefore a front.
+            cabin_h = car_height - body_h
+            back_x = x - np.cos(spin) * length * 0.10
+            back_y = y - np.sin(spin) * length * 0.10
+            pieces.append(
+                (
+                    _box(
+                        back_x, back_y, base + body_h + cabin_h / 2,
+                        length * 0.52, width * 0.88, cabin_h, spin,
+                    ),
+                    uv,
+                )
+            )
+        elif kind == 1:  # boat: hull at the waterline, with a low cabin
+            draft = min(0.55, width * 0.35)
+            freeboard = max(0.35, width * 0.30)
+            pieces.append(
+                (_hull(x, y, base, length, width, draft, freeboard, spin), hull_uv)
+            )
+            if length > 6.0:
+                back_x = x - np.cos(spin) * length * 0.15
+                back_y = y - np.sin(spin) * length * 0.15
+                pieces.append(
+                    (
+                        _box(
+                            back_x, back_y, base + freeboard + 0.35,
+                            length * 0.34, width * 0.62, 0.7, spin,
+                        ),
+                        hull_uv,
+                    )
+                )
+        else:  # mooring post
+            pieces.append((_box(x, y, base + 0.45, 0.22, 0.22, 1.4, spin), post_uv))
+
+        for (piece_verts, piece_faces), uv in pieces:
+            vertices.append(piece_verts)
+            faces.append(piece_faces + offset)
+            uvs.append(np.tile(uv, (len(piece_faces) * 3, 1)))
+            offset += len(piece_verts)
+
+    if not vertices:
+        return None
+
+    all_vertices = np.vstack(vertices)
+    all_faces = np.vstack(faces)
+    all_uvs = np.vstack(uvs)
+    n_triangles = len(all_faces)
+
+    obj = build_mesh_object(
+        "Vehicles",
+        all_vertices,
+        all_faces.reshape(-1),
+        np.arange(0, n_triangles * 3, 3),
+        np.full(n_triangles, 3),
+        all_uvs,
+        np.zeros(n_triangles),
+        [material],
+        shade_smooth=False,
+    )
+    counts = np.bincount(kinds, minlength=3)
+    log(
+        f"vehicles: {counts[0]} cars, {counts[1]} boats, {counts[2]} mooring "
+        f"posts, {n_triangles} triangles"
+    )
+    return obj
+
+
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
@@ -897,6 +1064,7 @@ def copy_textures(
         ("tree", "trees"),
         ("water", "surfaces"),
         ("furniture", "furniture"),
+        ("vehicle", "vehicles"),
     ):
         name = scene.get(section, {}).get("texture")
         if name and (work_dir / name).is_file():
@@ -980,6 +1148,16 @@ def main() -> int:
             work_dir,
             make_textured_material(
                 "M_furniture", extra_textures["furniture"], roughness=0.55
+            ),
+        )
+
+    if "vehicle" in extra_textures:
+        # Car paint is the one glossy thing out here.
+        build_vehicles(
+            scene,
+            work_dir,
+            make_textured_material(
+                "M_vehicle", extra_textures["vehicle"], roughness=0.35
             ),
         )
 

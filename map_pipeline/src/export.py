@@ -30,8 +30,9 @@ ATTRIBUTION = {
         "https://www.beeldmateriaal.nl"
     ),
     "bgt": (
-        "Trees, water, land cover and street furniture from the BGT "
-        "(Basisregistratie Grootschalige Topografie) via PDOK, CC BY 4.0."
+        "Trees, water, land cover, road surfaces, street furniture, parking "
+        "bays and mooring posts from the BGT (Basisregistratie Grootschalige "
+        "Topografie) via PDOK, CC BY 4.0."
     ),
     "bag": (
         "Building function from the BAG (Basisregistratie Adressen en "
@@ -162,6 +163,9 @@ def write_scene_description(
     furniture_texture: Path | None = None,
     surfaces_cfg: dict | None = None,
     furniture_cfg: dict | None = None,
+    vehicle_texture: Path | None = None,
+    vehicles_cfg: dict | None = None,
+    car_colours: int = 6,
     ground_variants: int = 0,
 ) -> Path:
     """Write scene.json: everything the Blender stage needs, and nothing else.
@@ -232,6 +236,16 @@ def write_scene_description(
                 "bench_length_m": float(furniture_cfg.get("bench_length_m", 1.8)),
             }
             if furniture_texture is not None
+            else {}
+        ),
+        "vehicles": (
+            {
+                "file": "vehicles.npz",
+                "texture": vehicle_texture.name,
+                "car_height_m": float((vehicles_cfg or {}).get("car_height_m", 1.5)),
+                "car_colours": int(car_colours),
+            }
+            if vehicle_texture is not None
             else {}
         ),
         "export": {

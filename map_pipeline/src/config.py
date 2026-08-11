@@ -151,6 +151,22 @@ DEFAULTS: dict[str, Any] = {
         "bollard_height_m": 0.9,
         "bench_length_m": 1.8,
     },
+    "vehicles": {
+        # Nobody publishes where cars are parked or boats are moored, but the
+        # BGT publishes the parking bays and the mooring posts, which is the
+        # same information one step back.
+        "cars": True,
+        "boats": True,
+        # Not every bay holds a car and not every pair of posts holds a boat.
+        "car_occupancy": 0.72,
+        "boat_occupancy": 0.8,
+        "car_height_m": 1.5,
+        "seed": 1807,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+    },
     "usage": {
         # BAG building function, joined to 3DBAG on the building id.
         "enabled": True,
@@ -192,6 +208,7 @@ class PipelineConfig:
     trees: dict[str, Any]
     surfaces: dict[str, Any]
     furniture: dict[str, Any]
+    vehicles: dict[str, Any]
     usage: dict[str, Any]
     export: dict[str, Any]
     source_path: Path | None = None
@@ -217,6 +234,7 @@ class PipelineConfig:
             "trees": self.trees,
             "surfaces": self.surfaces,
             "furniture": self.furniture,
+            "vehicles": self.vehicles,
             "usage": self.usage,
             "export": self.export,
         }
@@ -340,6 +358,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         trees=merged["trees"],
         surfaces=merged["surfaces"],
         furniture=merged["furniture"],
+        vehicles=merged["vehicles"],
         usage=merged["usage"],
         export=merged["export"],
         source_path=path,

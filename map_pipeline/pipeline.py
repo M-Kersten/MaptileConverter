@@ -39,9 +39,11 @@ from src.export import (  # noqa: E402
 from src.http_util import preflight  # noqa: E402
 from src.sources import BY_ID, enabled_sources, health_targets  # noqa: E402
 from src.facade import (  # noqa: E402
+    CAR_PAINT,
     generate_facade_textures,
     generate_furniture_texture,
     generate_tree_texture,
+    generate_vehicle_texture,
     generate_water_texture,
 )
 from src.furniture import FurnitureSet, build_furniture  # noqa: E402
@@ -54,6 +56,12 @@ from src.surfaces import (  # noqa: E402
 )
 from src.trees import TreeSet, build_trees, write_tree_list  # noqa: E402
 from src.usage import UsageSet, fetch_usage  # noqa: E402
+from src.vehicles import (  # noqa: E402
+    VehicleSet,
+    build_vehicles,
+    save_vehicles,
+    write_spawn_list,
+)
 from src.validate import (  # noqa: E402
     CheckReport,
     check_aerial,
@@ -63,6 +71,7 @@ from src.validate import (  # noqa: E402
     check_export,
     check_fbx_reimport,
     check_furniture,
+    check_vehicles,
     check_surfaces,
     check_terrain,
     check_trees,
@@ -315,9 +324,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_surfaces = bool(config.surfaces["water"] or config.surfaces["land_cover"])
     want_furniture = bool(config.furniture["enabled"])
     want_usage = bool(config.usage["enabled"])
+    want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
 
     total = 5 + sum(
-        (want_trees, want_surfaces, want_furniture, want_usage)
+        (want_trees, want_surfaces, want_furniture, want_usage, want_vehicles)
     ) + (0 if args.skip_blender else 1)
     step = 0
 
@@ -405,6 +415,22 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             if len(furniture):
                 furniture_texture = generate_furniture_texture(work_dir)
 
+    vehicles = VehicleSet()
+    vehicle_texture = None
+    if want_vehicles:
+        with Stage("cars and boats (BGT)", next_step(), total):
+            vehicles = build_vehicles(
+                config.bbox,
+                work_dir,
+                vehicles_cfg=config.vehicles,
+                terrain_sampler=terrain.sample,
+                surfaces=surfaces if want_surfaces else None,
+            )
+            if len(vehicles):
+                save_vehicles(vehicles, work_dir / "vehicles.npz")
+                write_spawn_list(vehicles, config.geo, out_dir)
+                vehicle_texture = generate_vehicle_texture(work_dir)
+
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
         facade_cfg["ground_by_function"] = bool(len(usage))
@@ -429,6 +455,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             furniture_texture=furniture_texture,
             surfaces_cfg=config.surfaces,
             furniture_cfg=config.furniture,
+            vehicle_texture=vehicle_texture,
+            vehicles_cfg=config.vehicles,
+            car_colours=len(CAR_PAINT),
             ground_variants=ground_variants,
         )
 
@@ -452,6 +481,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             extra={
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
+                "vehicles": vehicles.stats(),
                 "building_function": usage.stats(),
             },
         )
@@ -468,6 +498,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
+        check_vehicles(
+            report, vehicles if want_vehicles else None, config.bbox, surfaces
+        )
         check_aerial(report, aerial, config.bbox)
 
         if not args.skip_blender:
