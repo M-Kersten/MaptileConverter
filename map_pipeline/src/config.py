@@ -131,6 +131,17 @@ DEFAULTS: dict[str, Any] = {
         # one into a bulge. BGT outlines replace the guesswork.
         "water": True,
         "land_cover": True,
+        # Roads as their own geometry, one object per surface class, so they
+        # carry their own material and their own layer in Unity instead of
+        # being pixels in the terrain's texture.
+        "road_geometry": True,
+        # How far the road surface floats above the terrain, to keep the two
+        # from fighting for the same depth.
+        "road_lift_m": 0.06,
+        # How far a flat road triangle may miss the ground under it before it
+        # gets split. Earcut leaves slivers over 100 m long, and one that size
+        # cuts straight through a canal bank.
+        "road_drape_tolerance_m": 0.08,
         # How far the bed is sunk below the water surface.
         "water_depth_m": 1.2,
         # Grain mixed into the aerial per surface class, to counter how mushy

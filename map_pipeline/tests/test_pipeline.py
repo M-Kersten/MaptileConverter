@@ -1100,6 +1100,149 @@ class TestRoadClasses(unittest.TestCase):
         self.assertLess(_paint_rank(CLASS_CYCLE), _paint_rank(CLASS_FOOTPATH))
 
 
+class TestRoadGeometry(unittest.TestCase):
+    """Roads leave as their own objects, draped on the ground they run over."""
+
+    @staticmethod
+    def _slope(gradient=0.02):
+        """A terrain sampler with a slope and a canal-sized dip across it."""
+
+        def sample(x, y):
+            x = np.asarray(x, dtype=float)
+            y = np.asarray(y, dtype=float)
+            return gradient * x + 3.0 * np.sin(x / 22.0) * np.cos(y / 18.0)
+
+        return sample
+
+    def test_bisecting_halves_the_longest_edge_and_keeps_the_area(self):
+        from src.surfaces import _bisect_longest
+
+        triangle = np.array([[[0.0, 0.0], [100.0, 0.0], [0.0, 10.0]]])
+        halves = _bisect_longest(triangle)
+
+        self.assertEqual(len(halves), 2)
+
+        def area(tri):
+            a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
+            return 0.5 * np.abs(
+                np.cross(b - a, c - a)
+            )
+
+        self.assertAlmostEqual(float(area(halves).sum()), float(area(triangle)[0]))
+
+        def longest_edge(tris):
+            return max(
+                np.linalg.norm(tris[:, (k + 1) % 3] - tris[:, k], axis=1).max()
+                for k in range(3)
+            )
+
+        self.assertLess(longest_edge(halves), longest_edge(triangle))
+
+    def test_bisecting_keeps_the_winding(self):
+        """A flipped child would face down and light wrongly."""
+        from src.surfaces import _bisect_longest
+
+        triangle = np.array([[[0.0, 0.0], [80.0, 0.0], [0.0, 10.0]]])
+        halves = _bisect_longest(triangle)
+        for tri in halves:
+            cross = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+            self.assertGreater(cross, 0.0)
+
+    def test_a_long_flat_triangle_is_split_until_it_follows_the_ground(self):
+        from src.surfaces import drape_to_terrain
+
+        sampler = self._slope()
+        # 160 m across a sine-shaped dip: exactly the case earcut produces.
+        triangle = np.array([[[0.0, 0.0], [160.0, 0.0], [0.0, 40.0]]])
+
+        before = np.abs(
+            sampler(np.array([160 / 3]), np.array([40 / 3]))
+            - sampler(triangle[0, :, 0], triangle[0, :, 1]).mean()
+        )
+        self.assertGreater(before[0], 0.5, "the test case is not actually hard")
+
+        draped = drape_to_terrain(triangle, sampler, tolerance_m=0.08)
+        centroid = draped.mean(axis=1)
+        error = np.abs(centroid[:, 2] - sampler(centroid[:, 0], centroid[:, 1]))
+        self.assertLess(error.max(), 0.081)
+
+    def test_corners_land_exactly_on_the_ground(self):
+        from src.surfaces import drape_to_terrain
+
+        sampler = self._slope()
+        triangles = np.array([[[0.0, 0.0], [30.0, 5.0], [10.0, 25.0]]])
+        draped = drape_to_terrain(triangles, sampler, tolerance_m=0.08)
+
+        corners = draped.reshape(-1, 3)
+        np.testing.assert_allclose(
+            corners[:, 2], sampler(corners[:, 0], corners[:, 1]), atol=1e-9
+        )
+
+    def test_flat_ground_needs_no_subdivision(self):
+        """Adaptive, not uniform: a flat street must stay cheap."""
+        from src.surfaces import drape_to_terrain
+
+        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
+        triangles = np.array([[[0.0, 0.0], [200.0, 0.0], [0.0, 200.0]]])
+        draped = drape_to_terrain(triangles, flat, tolerance_m=0.08)
+        self.assertEqual(len(draped), 1)
+
+    def test_each_class_becomes_its_own_geometry(self):
+        from src.surfaces import (
+            CLASS_CYCLE, CLASS_ROAD, RoadPart, triangulate_roads,
+        )
+
+        square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
+        parts = [
+            RoadPart([square], CLASS_ROAD),
+            RoadPart([square + np.array([20.0, 0.0])], CLASS_CYCLE),
+        ]
+        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
+        triangles, classes = triangulate_roads(parts, flat, lift_m=0.06)
+
+        self.assertGreater(len(triangles), 0)
+        self.assertEqual(set(classes.tolist()), {CLASS_ROAD, CLASS_CYCLE})
+        self.assertEqual(len(triangles), len(classes))
+
+    def test_the_road_surface_is_lifted_clear_of_the_terrain(self):
+        """Sharing a depth with the terrain is what makes surfaces flicker."""
+        from src.surfaces import CLASS_ROAD, RoadPart, triangulate_roads
+
+        square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
+        flat = lambda x, y: np.full_like(np.asarray(x, dtype=float), 3.0)  # noqa: E731
+        triangles, _ = triangulate_roads(
+            [RoadPart([square], CLASS_ROAD)], flat, lift_m=0.06
+        )
+        np.testing.assert_allclose(triangles[:, :, 2], 3.06, atol=1e-9)
+
+    def test_a_hole_in_a_road_polygon_stays_a_hole(self):
+        from src.surfaces import CLASS_ROAD, RoadPart, triangulate_roads
+
+        outer = np.array([[0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0]])
+        hole = np.array([[10.0, 10.0], [10.0, 20.0], [20.0, 20.0], [20.0, 10.0]])
+        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
+
+        triangles, _ = triangulate_roads(
+            [RoadPart([outer, hole], CLASS_ROAD)], flat, lift_m=0.0
+        )
+        area = 0.5 * np.abs(
+            np.cross(
+                triangles[:, 1, :2] - triangles[:, 0, :2],
+                triangles[:, 2, :2] - triangles[:, 0, :2],
+            )
+        ).sum()
+        # 900 for the square, less the 100 the hole takes out.
+        self.assertAlmostEqual(area, 800.0, places=6)
+
+    def test_no_roads_gives_empty_arrays_rather_than_failing(self):
+        from src.surfaces import triangulate_roads
+
+        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
+        triangles, classes = triangulate_roads([], flat)
+        self.assertEqual(len(triangles), 0)
+        self.assertEqual(len(classes), 0)
+
+
 class TestVehiclePlacement(unittest.TestCase):
     """Cars and boats are read off the structures that exist because of them."""
 

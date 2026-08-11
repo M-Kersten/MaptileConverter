@@ -148,8 +148,22 @@ class WaterBody:
 
 
 @dataclass
+class RoadPart:
+    """One road polygon, kept as geometry rather than only as raster class."""
+
+    rings: list[np.ndarray]
+    surface_class: int
+
+
+@dataclass
 class SurfaceSet:
     water: list[WaterBody] = field(default_factory=list)
+    roads: list[RoadPart] = field(default_factory=list)
+    # Filled once the terrain is known, since the road surface follows it.
+    road_tris: np.ndarray = field(default_factory=lambda: np.zeros((0, 3, 3)))
+    road_tri_class: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int32)
+    )
     class_grid: np.ndarray | None = None  # (n, n) uint8 on the terrain grid
     # (n, n) float, NaN off water: how far down the bed goes under each body.
     water_bed: np.ndarray | None = None
@@ -359,6 +373,9 @@ def build_surfaces(
 
             # Rings gathered per class, so one collection can paint several.
             by_class: dict[int, list[list[np.ndarray]]] = {}
+            want_geometry = collection == "wegdeel" and bool(
+                surfaces_cfg.get("road_geometry", True)
+            )
             for feature in features:
                 properties = feature.get("properties") or {}
                 physical = str(properties.get("fysiek_voorkomen") or "")
@@ -373,9 +390,26 @@ def build_surfaces(
                 else:
                     target = code
 
-                by_class.setdefault(target, []).extend(
-                    polygon_rings(feature.get("geometry"))
-                )
+                groups = polygon_rings(feature.get("geometry"))
+                by_class.setdefault(target, []).extend(groups)
+
+                if want_geometry:
+                    # A tunnel drawn on the surface is simply wrong. Bridges
+                    # are kept: the DTM under a canal is interpolated up to
+                    # bank level, which is about where a low Dutch bridge is.
+                    try:
+                        level = int(properties.get("relatieve_hoogteligging") or 0)
+                    except (TypeError, ValueError):
+                        level = 0
+                    if level < 0:
+                        continue
+                    for group in groups:
+                        clipped = [
+                            clip_ring_to_bbox(ring, bbox) for ring in group
+                        ]
+                        clipped = [r for r in clipped if len(r) >= 3]
+                        if clipped:
+                            result.roads.append(RoadPart(clipped, target))
 
             # Explicit order, not dict order: road parts overlap at junctions
             # and kerbs, and whichever painted last would otherwise depend on
@@ -417,6 +451,22 @@ def build_surfaces(
                 np.isnan(bed[mask]), level, np.minimum(bed[mask], level)
             )
         result.water_bed = np.flipud(bed)
+
+    if result.roads:
+        result.road_tris, result.road_tri_class = triangulate_roads(
+            result.roads,
+            terrain.sample,
+            lift_m=float(surfaces_cfg.get("road_lift_m", 0.06)),
+            tolerance_m=float(surfaces_cfg.get("road_drape_tolerance_m", 0.08)),
+        )
+        result.counts["road_parts"] = len(result.roads)
+        result.counts["road_triangles"] = int(len(result.road_tris))
+        LOG.info(
+            "road surface: %d parts, %d triangles across %d classes",
+            len(result.roads),
+            len(result.road_tris),
+            len(np.unique(result.road_tri_class)) if len(result.road_tris) else 0,
+        )
 
     # Outside the water block, and guarded: land cover and water are
     # independently switchable, so this ran on a None grid whenever water was
@@ -477,6 +527,149 @@ def triangulate_water(bodies: list[WaterBody]) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(triangles), np.concatenate(owner)
 
 
+def _bisect_longest(triangles: np.ndarray) -> np.ndarray:
+    """Split each triangle across the midpoint of its longest edge.
+
+    Longest-edge bisection rather than a four-way split: it halves the worst
+    dimension, which is the one causing the error, and doubles the count
+    instead of quadrupling it.
+    """
+    lengths = np.stack(
+        [
+            np.linalg.norm(triangles[:, (k + 1) % 3] - triangles[:, k], axis=1)
+            for k in range(3)
+        ],
+        axis=1,
+    )
+    longest = np.argmax(lengths, axis=1)
+    rows = np.arange(len(triangles))
+
+    start = triangles[rows, longest]
+    end = triangles[rows, (longest + 1) % 3]
+    apex = triangles[rows, (longest + 2) % 3]
+    middle = 0.5 * (start + end)
+
+    # Both halves keep the parent's winding.
+    return np.concatenate(
+        [
+            np.stack([start, middle, apex], axis=1),
+            np.stack([middle, end, apex], axis=1),
+        ]
+    )
+
+
+def drape_to_terrain(
+    triangles_xy: np.ndarray,
+    sampler,
+    *,
+    tolerance_m: float = 0.08,
+    # Twelve rather than six: because only the triangles still over tolerance
+    # are split, the extra rounds cost 0.6% more geometry and clear the last
+    # 79 offenders, taking the worst error from 47 cm to the tolerance itself.
+    max_rounds: int = 12,
+) -> np.ndarray:
+    """Give flat triangles a Z that follows the ground under them.
+
+    Sampling only the corners is not enough. Earcut turns a road strip into
+    long slivers — a quarter of the edges over Utrecht are longer than 10 m and
+    the longest is 163 m — and a flat triangle that size cuts through the bank
+    of a canal by nearly two metres.
+
+    So triangles are split until a flat one no longer misses the ground beneath
+    it. The test is the error at the centroid, where a plane through the three
+    corners is exactly their mean, which makes this adaptive rather than
+    uniform: flat streets stay coarse and only the slopes get subdivided.
+
+    Splitting one triangle and not its neighbour leaves a hanging node, and so
+    a crack no wider than the tolerance. That is harmless here and only here,
+    because the terrain sits directly underneath wearing the same photograph:
+    a crack shows the ground, not a hole.
+    """
+    triangles = np.asarray(triangles_xy, dtype=np.float64)
+    if len(triangles) == 0:
+        return np.zeros((0, 3, 3))
+
+    for _ in range(max_rounds):
+        centroid = triangles.mean(axis=1)
+        corner_z = sampler(
+            triangles[:, :, 0].ravel(), triangles[:, :, 1].ravel()
+        ).reshape(-1, 3)
+        error = np.abs(corner_z.mean(axis=1) - sampler(centroid[:, 0], centroid[:, 1]))
+
+        split = error > tolerance_m
+        if not split.any():
+            break
+        triangles = np.concatenate(
+            [triangles[~split], _bisect_longest(triangles[split])]
+        )
+
+    corner_z = sampler(
+        triangles[:, :, 0].ravel(), triangles[:, :, 1].ravel()
+    ).reshape(-1, 3)
+    return np.dstack([triangles, corner_z[:, :, None]])
+
+
+def triangulate_roads(
+    roads: list[RoadPart],
+    sampler,
+    *,
+    lift_m: float = 0.06,
+    tolerance_m: float = 0.08,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Road polygons into ``(triangles, surface class)``, draped on the ground.
+
+    Triangulated here rather than in the Blender stage, for the same reason the
+    water and the buildings are: that script only gets what Blender bundles.
+    """
+    import mapbox_earcut
+
+    flat_tris: list[np.ndarray] = []
+    classes: list[np.ndarray] = []
+
+    for part in roads:
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in part.rings]
+        rings = [r for r in rings if len(r) >= 3]
+        if not rings:
+            continue
+
+        flat = np.vstack(rings)
+        ring_ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
+        try:
+            indices = mapbox_earcut.triangulate_float64(flat, ring_ends)
+        except Exception as exc:  # noqa: BLE001 - one bad outline is not fatal
+            LOG.debug("could not triangulate a road part: %s", exc)
+            continue
+        if len(indices) < 3:
+            continue
+
+        corners = flat[np.asarray(indices, dtype=np.int64)].reshape(-1, 3, 2)
+        flat_tris.append(corners)
+        classes.append(np.full(len(corners), part.surface_class, dtype=np.int32))
+
+    if not flat_tris:
+        return np.zeros((0, 3, 3)), np.zeros(0, dtype=np.int32)
+
+    # Refined per class, so the split triangles keep the class they came from.
+    out_tris: list[np.ndarray] = []
+    out_class: list[np.ndarray] = []
+    all_tris = np.concatenate(flat_tris)
+    all_class = np.concatenate(classes)
+
+    for code in np.unique(all_class):
+        draped = drape_to_terrain(
+            all_tris[all_class == code], sampler, tolerance_m=tolerance_m
+        )
+        if not len(draped):
+            continue
+        draped[:, :, 2] += lift_m
+        out_tris.append(draped)
+        out_class.append(np.full(len(draped), code, dtype=np.int32))
+
+    if not out_tris:
+        return np.zeros((0, 3, 3)), np.zeros(0, dtype=np.int32)
+    return np.concatenate(out_tris), np.concatenate(out_class)
+
+
 def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
     """Write water outlines and the class grid for the Blender stage."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -510,6 +703,10 @@ def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
         water_ring_offsets=np.asarray(ring_offsets, dtype=np.int64),
         water_ring_body=np.asarray(ring_body, dtype=np.int32),
         water_levels=np.asarray(body_levels, dtype=np.float64),
+        # Roads leave as their own geometry so they can carry their own
+        # material and sit on their own layer in Unity.
+        road_tris=surfaces.road_tris,
+        road_tri_class=surfaces.road_tri_class,
         class_grid=(
             surfaces.class_grid
             if surfaces.class_grid is not None
@@ -634,19 +831,29 @@ def blend_surface_detail(
 
 
 __all__ = [
+    "CLASS_CYCLE",
     "CLASS_DETAIL",
+    "CLASS_FOOTPATH",
     "CLASS_GREEN",
     "CLASS_NAMES",
     "CLASS_NONE",
+    "CLASS_PARKING",
     "CLASS_PAVED",
+    "CLASS_QUAY",
     "CLASS_ROAD",
+    "CLASS_ROAD_BRICK",
+    "CLASS_TRANSIT",
     "CLASS_UNPAVED",
     "CLASS_WATER",
+    "RoadPart",
     "SurfaceSet",
     "WaterBody",
     "blend_surface_detail",
     "build_surfaces",
     "clip_ring_to_bbox",
+    "drape_to_terrain",
+    "road_class",
+    "triangulate_roads",
     "triangulate_water",
     "save_surfaces",
     "write_land_cover",

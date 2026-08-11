@@ -162,6 +162,7 @@ def write_scene_description(
     water_texture: Path | None = None,
     furniture_texture: Path | None = None,
     surfaces_cfg: dict | None = None,
+    road_class_names: dict | None = None,
     furniture_cfg: dict | None = None,
     vehicle_texture: Path | None = None,
     vehicles_cfg: dict | None = None,
@@ -223,6 +224,10 @@ def write_scene_description(
                 "file": "surfaces.npz",
                 "texture": water_texture.name,
                 "water_depth_m": float(surfaces_cfg.get("water_depth_m", 1.2)),
+                "road_geometry": bool(surfaces_cfg.get("road_geometry", True)),
+                # Named so the Blender stage can label each road object with
+                # what it is rather than with a number.
+                "road_class_names": road_class_names or {},
             }
             if water_texture is not None
             else {}

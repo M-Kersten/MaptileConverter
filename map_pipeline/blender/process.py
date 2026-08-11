@@ -289,6 +289,70 @@ def build_water(scene: dict, work_dir: Path, material):
     return obj
 
 
+def build_roads(scene: dict, work_dir: Path, make_material):
+    """The road surface as its own objects, one per class.
+
+    Separate objects rather than one merged mesh, because that is what makes
+    them separately addressable downstream: each becomes its own GameObject, so
+    a carriageway can go on a drivable layer and a footpath on a walkable one
+    without splitting anything by hand. They are cheap — six at most.
+
+    Each carries its own material, textured with the aerial and projected the
+    same way the terrain is, so the road looks exactly as it did when it was
+    only pixels in the terrain's photograph. The point of the split is that the
+    material is now yours to replace.
+    """
+    data = _load_surfaces(scene, work_dir)
+    if data is None or "road_tris" not in data.files:
+        return []
+
+    triangles = data["road_tris"]
+    classes = data["road_tri_class"]
+    if len(triangles) == 0:
+        return []
+
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    names = scene.get("surfaces", {}).get("road_class_names", {})
+
+    local = triangles.copy()
+    local[:, :, 0] -= origin_x
+    local[:, :, 1] -= origin_y
+    local[:, :, 2] -= z_offset
+
+    objects = []
+    for code in sorted(set(int(c) for c in classes)):
+        part = local[classes == code]
+        if not len(part):
+            continue
+        corners = part.reshape(-1, 3)
+        n_triangles = len(part)
+        label = str(names.get(str(code), f"class_{code}"))
+        # The class names already say "road_asphalt", and Roads_road_asphalt
+        # reads badly in a hierarchy.
+        if label.startswith("road_"):
+            label = label[len("road_") :]
+
+        objects.append(
+            build_mesh_object(
+                f"Roads_{label}",
+                corners,
+                np.arange(n_triangles * 3),
+                np.arange(0, n_triangles * 3, 3),
+                np.full(n_triangles, 3),
+                # The same top-down projection the terrain uses, so the photo
+                # lines up across the join.
+                planar_uv(corners[:, :2], scene["aerial"]["bbox_local"]),
+                np.zeros(n_triangles),
+                [make_material(f"M_road_{label}")],
+                shade_smooth=False,
+            )
+        )
+        log(f"roads: {label}, {n_triangles} triangles")
+
+    return objects
+
+
 def build_terrain(scene: dict, work_dir: Path, material) -> object:
     """Grid mesh from the AHN heights, draped with the aerial photo."""
     data = np.load(work_dir / scene["terrain"]["file"])
@@ -1122,6 +1186,13 @@ def main() -> int:
     ]
 
     build_terrain(scene, work_dir, aerial_material)
+    # Roads sit just above the terrain, each class its own object, so they can
+    # be given their own material and their own layer downstream.
+    build_roads(
+        scene,
+        work_dir,
+        lambda name: make_textured_material(name, aerial_texture, roughness=0.85),
+    )
     build_buildings(
         scene, work_dir, facade_materials, aerial_material, ground_materials
     )

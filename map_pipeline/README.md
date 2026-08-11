@@ -6,7 +6,7 @@ runtime.
 
 ```
 output/<area_name>/
-├── model.fbx        terrain, water, buildings, trees, furniture, cars, boats
+├── model.fbx        terrain, roads, water, buildings, trees, furniture, cars, boats
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
@@ -192,6 +192,9 @@ Other knobs worth knowing:
 | `trees.geometry` | `true` | Also bake low-poly tree meshes into the FBX. `trees.json` is written either way. |
 | `trees.crown_search_m` | `3.0` | Radius the canopy height is taken as a maximum over. |
 | `surfaces.water` | `true` | Replace the interpolated canal bulge with real water surfaces. |
+| `surfaces.road_geometry` | `true` | Build roads as their own objects, one per class, instead of only as raster class. |
+| `surfaces.road_lift_m` | `0.06` | How far the road surface floats above the terrain, so the two do not fight for depth. |
+| `surfaces.road_drape_tolerance_m` | `0.08` | How far a flat road triangle may miss the ground before it is split. |
 | `surfaces.land_cover` | `true` | Classify the ground and export the class map. |
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
@@ -316,6 +319,42 @@ two forms:
   matched to what each surface actually is puts high-frequency texture back
   where the photo has none. `surfaces.detail_strength` controls it; 0 turns it
   off.
+
+**Roads are their own layer.** `surfaces.road_geometry` builds the road surface
+as geometry rather than leaving it as pixels in the terrain's photograph — one
+object per class, so the FBX arrives with `Roads_asphalt`, `Roads_brick`,
+`Roads_cycle_path`, `Roads_footpath`, `Roads_parking` and `Roads_transit_lane`
+as separate GameObjects, each carrying its own material. That is what makes them
+separately addressable: a carriageway can go on a drivable layer and a footpath
+on a walkable one without splitting anything by hand.
+
+Nothing about the look changes by default. Each road material is the aerial
+photo under the same top-down projection the terrain uses, so the surface is
+pixel-identical to what it replaced — including road markings and crossings,
+which a tiling texture would lose. The point of the split is that the material
+is now yours to replace.
+
+Two details make it work:
+
+- **The road surface is draped, not flat.** Earcut turns a road strip into long
+  slivers — a quarter of the edges over Utrecht are longer than 10 m and the
+  longest is 163 m — and sampling the ground only at their corners left one
+  cutting through a canal bank by 1.86 m. Triangles are now split until a flat
+  one no longer misses the ground beneath it, testing the error at the centroid
+  where a plane through the corners is exactly their mean. It is adaptive, not
+  uniform: flat streets stay coarse and only slopes get subdivided, which costs
+  9% more geometry rather than several times as much, and takes 0.2 s. The worst
+  error over the demo area drops from 1.86 m to the 8 cm tolerance. A check
+  asserts it.
+- **It floats 6 cm above the terrain**, so the two do not fight for the same
+  depth. Splitting one triangle and not its neighbour leaves a hanging node and
+  so a crack no wider than the tolerance, which is harmless here and only here:
+  the terrain sits directly underneath wearing the same photograph, so a crack
+  shows the ground rather than a hole.
+
+Tunnels (`relatieve_hoogteligging` below zero) are left out — a tunnel drawn on
+the surface is simply wrong. Bridges are kept, because the DTM under a canal is
+interpolated up to bank level, which is about where a low Dutch bridge sits.
 
 **Roads are not one class.** The BGT knows what every road surface is for and
 what it is made of, and a Dutch street is unrecognisable without both: the

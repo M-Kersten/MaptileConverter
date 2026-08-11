@@ -299,6 +299,34 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
             severity="warning",
         )
 
+    if len(surfaces.road_tris):
+        from .surfaces import CLASS_NAMES
+
+        classes = np.unique(surfaces.road_tri_class)
+        report.add(
+            "road_surface_present",
+            True,
+            f"{len(surfaces.road_tris)} triangles across "
+            + ", ".join(CLASS_NAMES.get(int(c), str(c)) for c in classes),
+        )
+
+        # The reason this check exists: earcut leaves slivers over 100 m long,
+        # and a flat one that size cut through a canal bank by 1.86 m before
+        # the refinement went in. The corners are exact by construction, so
+        # the centroid is where a flat triangle misses the ground.
+        centroid = surfaces.road_tris.mean(axis=1)
+        ground = terrain.sample(centroid[:, 0], centroid[:, 1])
+        error = np.abs(centroid[:, 2] - ground)
+        # Generous against the 8 cm the refinement targets, so this catches a
+        # broken drape rather than an unlucky triangle.
+        report.add(
+            "road_surface_follows_terrain",
+            bool((error < 0.5).all()),
+            f"road surface sits {np.median(error):.3f} m above the ground at "
+            f"the median and never more than {error.max():.2f} m (it is lifted "
+            f"deliberately, to stop it fighting the terrain for depth)",
+        )
+
 
 def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
     """Street furniture is inside the area and standing on the ground."""

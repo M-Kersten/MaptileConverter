@@ -49,6 +49,7 @@ from src.facade import (  # noqa: E402
 from src.furniture import FurnitureSet, build_furniture  # noqa: E402
 from src.imagery import build_aerial  # noqa: E402
 from src.surfaces import (  # noqa: E402
+    CLASS_NAMES,
     SurfaceSet,
     blend_surface_detail,
     build_surfaces,
@@ -454,6 +455,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             water_texture=water_texture,
             furniture_texture=furniture_texture,
             surfaces_cfg=config.surfaces,
+            road_class_names={str(k): v for k, v in CLASS_NAMES.items()},
             furniture_cfg=config.furniture,
             vehicle_texture=vehicle_texture,
             vehicles_cfg=config.vehicles,
