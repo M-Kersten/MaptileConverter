@@ -1052,6 +1052,60 @@ class TestArchedOpenings(unittest.TestCase):
         self.assertEqual(len(set(widths.tolist())), 1)
 
 
+class TestCentringCheck(unittest.TestCase):
+    """A lopsided model is not an off-origin model."""
+
+    @staticmethod
+    def _centre_of(overhang_near: float, overhang_far: float, bbox: float = 1000.0):
+        """The model bounds a given overhang produces, as (centre, span)."""
+        low = -bbox / 2 - overhang_near
+        high = bbox / 2 + overhang_far
+        return 0.5 * (low + high), high - low
+
+    def test_a_symmetric_overhang_is_centred(self):
+        from src.validate import _centring_tolerance
+
+        centre, span = self._centre_of(40.0, 40.0)
+        self.assertAlmostEqual(centre, 0.0)
+        self.assertLessEqual(abs(centre), _centring_tolerance(span, 1000.0))
+
+    def test_all_the_overhang_on_one_side_still_passes(self):
+        """One long warehouse near an edge is enough to do this."""
+        from src.validate import _centring_tolerance
+
+        centre, span = self._centre_of(80.0, 0.0)
+        self.assertAlmostEqual(centre, -40.0)
+        self.assertLessEqual(abs(centre), _centring_tolerance(span, 1000.0))
+
+    def test_the_reported_failure_would_now_pass(self):
+        """31 m off centre, which the old fixed 30 m limit rejected."""
+        from src.validate import _centring_tolerance
+
+        centre, span = self._centre_of(70.0, 7.8)
+        self.assertAlmostEqual(centre, -31.1)
+        self.assertLessEqual(abs(centre), _centring_tolerance(span, 1000.0))
+
+    def test_a_wrong_origin_is_still_caught(self):
+        """It shifts the model without changing its span, so it cannot hide."""
+        from src.validate import _centring_tolerance
+
+        # Terrain displaced 200 m east: same span, badly off centre.
+        span = 1000.0
+        self.assertGreater(200.0, _centring_tolerance(span, 1000.0))
+
+    def test_a_small_offset_is_caught_when_there_is_no_overhang_to_spend(self):
+        from src.validate import _centring_tolerance
+
+        # Nothing hangs over, so almost nothing is allowed.
+        self.assertLess(_centring_tolerance(1000.0, 1000.0), 1.5)
+
+    def test_the_tolerance_never_exceeds_what_the_span_check_allows(self):
+        from src.validate import _centring_tolerance
+
+        # model_span caps the overhang at 120 m, so this caps out near 60.
+        self.assertLess(_centring_tolerance(1120.0, 1000.0), 62.0)
+
+
 class TestConfig(unittest.TestCase):
     def test_shipped_config_loads(self):
         config = load_config(REPO_ROOT / "config.json")

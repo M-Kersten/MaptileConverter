@@ -412,11 +412,38 @@ def check_export(
             f"{bbox.width:.0f} x {bbox.height:.0f} m bbox "
             f"(edge buildings are kept whole)",
         )
+        allowed_x = _centring_tolerance(span_x, bbox.width)
+        allowed_y = _centring_tolerance(span_y, bbox.height)
         report.add(
             "model_centred_on_origin",
-            abs(center_x) < 30.0 and abs(center_y) < 30.0,
-            f"model centre at ({center_x:.1f}, {center_y:.1f}) m from origin",
+            abs(center_x) <= allowed_x and abs(center_y) <= allowed_y,
+            f"model centre at ({center_x:.1f}, {center_y:.1f}) m from origin, "
+            f"within the {allowed_x:.1f} x {allowed_y:.1f} m the overhang allows",
         )
+
+
+def _centring_tolerance(span: float, bbox_size: float) -> float:
+    """How far off centre the model may sit, given how far it overhangs.
+
+    The terrain always covers the bbox exactly, so the model's bounding box
+    always contains it and can only ever be *larger*. That makes the offset an
+    identity rather than a free parameter::
+
+        centre = (overhang_far - overhang_near) / 2
+
+    which is at most half the total overhang, reached when every metre of it is
+    on one side. Buildings are kept whole when their centroid is inside the
+    bbox, so one long warehouse near an edge is enough to put it there.
+
+    A fixed limit was wrong twice over. It failed runs that were merely
+    lopsided — 120 m of overhang is allowed by ``model_span``, which permits a
+    60 m offset, while this check stopped at 30 — and it was far too lax about
+    the fault it exists to catch. A wrong origin shifts the model without
+    changing its span, so it leaves no overhang to spend, and the tolerance
+    collapses to nothing. That is exactly the sensitivity wanted here.
+    """
+    # A metre of slack for floating point and for the ground skirt.
+    return 0.5 * max(span - bbox_size, 0.0) + 1.0
 
 
 def check_fbx_reimport(report: CheckReport, fbx_path: Path, bbox: BBox) -> None:
@@ -481,12 +508,15 @@ def check_fbx_reimport(report: CheckReport, fbx_path: Path, bbox: BBox) -> None:
         0.0 < span_z < 250.0,
         f"vertical span {span_z:.1f} m",
     )
+    center_x = 0.5 * (max(xs) + min(xs))
+    center_y = 0.5 * (max(ys) + min(ys))
+    allowed_x = _centring_tolerance(span_x, bbox.width)
+    allowed_y = _centring_tolerance(span_y, bbox.height)
     report.add(
         "fbx_reimport_centred",
-        abs(0.5 * (max(xs) + min(xs))) < 40.0
-        and abs(0.5 * (max(ys) + min(ys))) < 40.0,
-        f"centre at ({0.5 * (max(xs) + min(xs)):.1f}, "
-        f"{0.5 * (max(ys) + min(ys)):.1f}) m",
+        abs(center_x) <= allowed_x and abs(center_y) <= allowed_y,
+        f"centre at ({center_x:.1f}, {center_y:.1f}) m, within the "
+        f"{allowed_x:.1f} x {allowed_y:.1f} m the overhang allows",
     )
 
 
