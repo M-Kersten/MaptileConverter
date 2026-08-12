@@ -156,9 +156,21 @@ def get_with_retry(
                 )
             elif not response.ok:
                 # 4xx other than 429 will not fix itself; fail immediately.
+                #
+                # An OGC service puts the reason in an ExceptionText buried
+                # under about 400 characters of XML preamble, so printing the
+                # first 400 characters of the body reliably cut off the one
+                # sentence worth reading. A 4000 px AHN request reported
+                # "...<ows:ExceptionText>msWCS" and stopped there, hiding that
+                # the service caps a coverage at 4000 px.
+                detail = (
+                    extract_service_exception(response.content)
+                    if looks_like_xml(response.content)
+                    else response.text[:400]
+                )
                 raise ServiceError(
                     f"{description} failed with HTTP {response.status_code}: "
-                    f"{response.text[:400]}"
+                    f"{detail}"
                 )
             elif expect_binary and looks_like_xml(response.content):
                 message = extract_service_exception(response.content)

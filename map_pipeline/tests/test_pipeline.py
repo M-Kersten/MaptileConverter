@@ -41,7 +41,7 @@ from src.geo import (  # noqa: E402
     wgs84_bbox_to_rd,
 )
 from src.http_util import extract_service_exception, looks_like_xml  # noqa: E402
-from src.imagery import _tile_edges  # noqa: E402
+from src.geo import tile_edges  # noqa: E402
 
 RUN_NETWORK = "--offline" not in sys.argv
 
@@ -744,7 +744,7 @@ class TestElevation(unittest.TestCase):
 class TestImagery(unittest.TestCase):
     def test_tiles_cover_every_pixel_exactly_once(self):
         for total, cap in ((4096, 2000), (8192, 2000), (1000, 2000), (2500, 2500)):
-            spans = _tile_edges(total, cap)
+            spans = tile_edges(total, cap)
             self.assertEqual(spans[0][0], 0)
             self.assertEqual(spans[-1][1], total)
             for a, b in zip(spans, spans[1:]):
@@ -1050,6 +1050,93 @@ class TestArchedOpenings(unittest.TestCase):
         widths = opening.sum(axis=1)[rows]
         # Every row of a rectangular window is the same width.
         self.assertEqual(len(set(widths.tolist())), 1)
+
+
+class TestCoverageTiling(unittest.TestCase):
+    """The AHN WCS caps a coverage at 4000 px, so a large area needs tiles."""
+
+    def test_a_small_area_is_one_request(self):
+        from src.elevation import MAX_COVERAGE_PX
+        from src.geo import tile_edges
+
+        # 1 km at 0.5 m is 2000 px, well inside the cap.
+        self.assertEqual(tile_edges(2000, MAX_COVERAGE_PX), [(0, 2000)])
+
+    def test_the_reported_three_kilometre_area_splits_two_by_two(self):
+        from src.elevation import MAX_COVERAGE_PX
+        from src.geo import tile_edges
+
+        # 3 km at 0.5 m is 6000 px, which is what the service refused.
+        spans = tile_edges(6000, MAX_COVERAGE_PX)
+        self.assertEqual(spans, [(0, 3000), (3000, 6000)])
+
+    def test_tiles_are_contiguous_and_cover_everything(self):
+        from src.geo import tile_edges
+
+        for total in (1, 999, 4000, 4001, 6000, 25000):
+            spans = tile_edges(total, 4000)
+            self.assertEqual(spans[0][0], 0)
+            self.assertEqual(spans[-1][1], total)
+            for (_, end), (start, _) in zip(spans, spans[1:]):
+                self.assertEqual(end, start, "a gap or an overlap between tiles")
+            for start, end in spans:
+                self.assertLessEqual(end - start, 4000)
+
+    def test_the_split_is_even_rather_than_leaving_a_sliver(self):
+        from src.geo import tile_edges
+
+        spans = tile_edges(4100, 4000)
+        widths = [end - start for start, end in spans]
+        self.assertEqual(widths, [2050, 2050])
+
+    def test_tile_bounds_land_on_whole_pixels(self):
+        """A boundary mid-pixel would be rounded differently either side."""
+        from src.geo import BBox, tile_edges
+
+        bbox = BBox(77632.59, 433641.39, 80632.59, 436641.39)
+        resolution = 0.5
+        columns = int(round(bbox.width / resolution))
+
+        edges = []
+        for start, end in tile_edges(columns, 4000):
+            left = bbox.xmin + start * resolution
+            right = bbox.xmin + end * resolution
+            # Each tile spans a whole number of source cells.
+            self.assertAlmostEqual((right - left) / resolution % 1.0, 0.0, places=9)
+            edges.append((left, right))
+
+        # And they join exactly, with no gap for a seam to appear in.
+        self.assertAlmostEqual(edges[0][1], edges[1][0], places=9)
+        self.assertAlmostEqual(edges[-1][1], bbox.xmax, places=9)
+
+
+class TestServiceExceptionDetail(unittest.TestCase):
+    """The reason a request was refused must survive into the error."""
+
+    def test_the_ogc_exception_text_is_not_cut_off_by_the_xml_preamble(self):
+        from src.http_util import extract_service_exception, looks_like_xml
+
+        # The body the AHN WCS actually returned, preamble and all.
+        body = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<ows:ExceptionReport xmlns:ows="http://www.opengis.net/ows/2.0" '
+            b'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.0.1" '
+            b'xml:lang="en-US" xsi:schemaLocation="http://www.opengis.net/ows/2.0 '
+            b'http://schemas.opengis.net/ows/2.0/owsExceptionReport.xsd">\n'
+            b'  <ows:Exception exceptionCode="InvalidParameterValue" locator="size">\n'
+            b"    <ows:ExceptionText>msWCSGetCoverage20(): WCS server error. "
+            b"Raster size out of range, width and height of resulting coverage "
+            b"must be no more than MAXSIZE=4000.</ows:ExceptionText>\n"
+            b"  </ows:Exception>\n</ows:ExceptionReport>\n"
+        )
+        self.assertTrue(looks_like_xml(body))
+
+        # Truncating the body at 400 characters stopped at "msWCS", which is
+        # what hid the limit.
+        self.assertNotIn("MAXSIZE", body.decode()[:400])
+
+        detail = extract_service_exception(body)
+        self.assertIn("MAXSIZE=4000", detail)
 
 
 class TestRoadClasses(unittest.TestCase):

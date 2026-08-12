@@ -15,12 +15,13 @@ explicitly or it poisons every average it touches.
 from __future__ import annotations
 
 import logging
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from .geo import BBox, build_grid_coords
+from .geo import BBox, tile_edges, build_grid_coords
 from .http_util import ServiceError, get_with_retry
 
 LOG = logging.getLogger(__name__)
@@ -35,6 +36,14 @@ MIN_PLAUSIBLE_NAP = -25.0
 MAX_PLAUSIBLE_NAP = 400.0
 
 COVERAGE_IDS = {"DTM": "dtm_05m", "DSM": "dsm_05m"}
+
+# MapServer refuses a coverage larger than this per side, and the limit is not
+# in the capabilities document, so it can only be learned by being refused:
+#   "Raster size out of range, width and height of resulting coverage must be
+#    no more than MAXSIZE=4000."
+# At the 0.5 m AHN that caps a single request at 2000 m; measured as inclusive,
+# 4000 px answers and 4001 does not. Anything larger is fetched in tiles.
+MAX_COVERAGE_PX = 4000
 
 
 @dataclass
@@ -105,6 +114,7 @@ def fetch_dtm_geotiff(
     *,
     wcs_url: str,
     ahn_model: str = "DTM",
+    resolution_m: float = 0.5,
     timeout: float = 300.0,
     max_retries: int = 4,
     verify_capabilities: bool = True,
@@ -130,6 +140,45 @@ def fetch_dtm_geotiff(
                     f"available: {', '.join(available)}"
                 )
 
+    columns = int(round(bbox.width / resolution_m))
+    rows = int(round(bbox.height / resolution_m))
+
+    if columns <= MAX_COVERAGE_PX and rows <= MAX_COVERAGE_PX:
+        LOG.info("requesting AHN %s for %s", coverage_id, bbox)
+        content = _get_coverage(
+            bbox,
+            wcs_url=wcs_url,
+            coverage_id=coverage_id,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(content)
+        LOG.info("wrote %s (%.1f MB)", out_path, len(content) / 1e6)
+        return out_path
+
+    return _fetch_mosaic(
+        bbox,
+        out_path,
+        wcs_url=wcs_url,
+        coverage_id=coverage_id,
+        resolution_m=resolution_m,
+        columns=columns,
+        rows=rows,
+        timeout=timeout,
+        max_retries=max_retries,
+    )
+
+
+def _get_coverage(
+    bbox: BBox,
+    *,
+    wcs_url: str,
+    coverage_id: str,
+    timeout: float,
+    max_retries: int,
+) -> bytes:
+    """One GetCoverage call, returning the GeoTIFF bytes."""
     params = {
         "SERVICE": "WCS",
         "VERSION": "2.0.1",
@@ -144,7 +193,6 @@ def fetch_dtm_geotiff(
         ],
     }
 
-    LOG.info("requesting AHN %s for %s", coverage_id, bbox)
     response = get_with_retry(
         wcs_url,
         params=params,
@@ -159,10 +207,112 @@ def fetch_dtm_geotiff(
             f"AHN WCS returned {len(response.content)} bytes that are not a TIFF "
             f"(content-type {response.headers.get('content-type')!r})"
         )
+    return response.content
+
+
+def _fetch_mosaic(
+    bbox: BBox,
+    out_path: Path,
+    *,
+    wcs_url: str,
+    coverage_id: str,
+    resolution_m: float,
+    columns: int,
+    rows: int,
+    timeout: float,
+    max_retries: int,
+) -> Path:
+    """Fetch a coverage too large for one request, in pieces.
+
+    The service honours the requested bounds exactly and returns
+    ``span / resolution`` pixels, so tiles split on whole pixels butt up with
+    no seam and no overlap. Splitting in pixel space rather than in metres is
+    what guarantees that: a boundary at an arbitrary coordinate would land
+    mid-pixel and each side would round it differently.
+    """
+    import rasterio
+    from rasterio.transform import from_origin
+    from rasterio.windows import Window
+
+    col_spans = tile_edges(columns, MAX_COVERAGE_PX)
+    row_spans = tile_edges(rows, MAX_COVERAGE_PX)
+    LOG.info(
+        "AHN %s over %s needs %dx%d px, past the %d px the service allows; "
+        "fetching as %dx%d tiles",
+        coverage_id,
+        bbox,
+        columns,
+        rows,
+        MAX_COVERAGE_PX,
+        len(col_spans),
+        len(row_spans),
+    )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(response.content)
-    LOG.info("wrote %s (%.1f MB)", out_path, len(response.content) / 1e6)
+    profile = None
+    total = len(col_spans) * len(row_spans)
+    done = 0
+
+    with tempfile.TemporaryDirectory() as scratch:
+        pieces = []
+        for row_index, (row_start, row_end) in enumerate(row_spans):
+            for col_index, (col_start, col_end) in enumerate(col_spans):
+                # Rows run north-down, so the first row is at the top.
+                tile = BBox(
+                    bbox.xmin + col_start * resolution_m,
+                    bbox.ymax - row_end * resolution_m,
+                    bbox.xmin + col_end * resolution_m,
+                    bbox.ymax - row_start * resolution_m,
+                )
+                content = _get_coverage(
+                    tile,
+                    wcs_url=wcs_url,
+                    coverage_id=coverage_id,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                )
+                path = Path(scratch) / f"tile_{row_index}_{col_index}.tif"
+                path.write_bytes(content)
+                pieces.append((path, row_start, col_start))
+                done += 1
+                LOG.info(
+                    "  AHN tile %d/%d (%d x %d px)",
+                    done,
+                    total,
+                    col_end - col_start,
+                    row_end - row_start,
+                )
+
+        with rasterio.open(pieces[0][0]) as first:
+            profile = first.profile.copy()
+
+        profile.update(
+            width=columns,
+            height=rows,
+            transform=from_origin(bbox.xmin, bbox.ymax, resolution_m, resolution_m),
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            compress="deflate",
+        )
+
+        with rasterio.open(out_path, "w", **profile) as mosaic:
+            for path, row_start, col_start in pieces:
+                with rasterio.open(path) as tile:
+                    mosaic.write(
+                        tile.read(1),
+                        1,
+                        window=Window(col_start, row_start, tile.width, tile.height),
+                    )
+
+    LOG.info(
+        "wrote %s (%.1f MB, %d x %d px from %d tiles)",
+        out_path,
+        out_path.stat().st_size / 1e6,
+        columns,
+        rows,
+        total,
+    )
     return out_path
 
 
@@ -347,6 +497,7 @@ def build_terrain(
         tif_path,
         wcs_url=str(terrain_cfg["wcs_url"]),
         ahn_model=ahn_model,
+        resolution_m=resolution,
         timeout=float(terrain_cfg["timeout_s"]),
         max_retries=int(terrain_cfg["max_retries"]),
     )

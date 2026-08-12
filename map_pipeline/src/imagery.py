@@ -23,7 +23,7 @@ from pathlib import Path
 
 import requests
 
-from .geo import BBox
+from .geo import BBox, tile_edges
 from .http_util import ServiceError, get_with_retry
 
 LOG = logging.getLogger(__name__)
@@ -113,13 +113,6 @@ def resolve_layer_name(
     )
 
 
-def _tile_edges(total_px: int, max_px: int) -> list[tuple[int, int]]:
-    """Split `total_px` into contiguous spans of at most `max_px` pixels."""
-    n_tiles = max(1, -(-total_px // max_px))
-    edges = [round(i * total_px / n_tiles) for i in range(n_tiles + 1)]
-    return [(edges[i], edges[i + 1]) for i in range(n_tiles)]
-
-
 def _allow_large_images() -> None:
     """Lift Pillow's decompression-bomb guard.
 
@@ -153,8 +146,8 @@ def fetch_aerial_wms(
     _allow_large_images()
     from PIL import Image
 
-    cols = _tile_edges(size_px, max_request_px)
-    rows = _tile_edges(size_px, max_request_px)
+    cols = tile_edges(size_px, max_request_px)
+    rows = tile_edges(size_px, max_request_px)
     LOG.info(
         "fetching aerial %dpx as %dx%d WMS tiles (service caps requests at 2500px)",
         size_px,

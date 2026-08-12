@@ -164,6 +164,10 @@ def _load_ndsm(
             dataset.bounds.right,
             dataset.bounds.top,
         )
+        # Taken from the raster rather than from config, so the DSM request is
+        # split into exactly the same tiles the DTM was and the two grids line
+        # up cell for cell.
+        resolution = float(dataset.res[0])
 
     dsm_path = work_dir / "ahn_dsm.tif"
     fetch_dtm_geotiff(
@@ -171,6 +175,7 @@ def _load_ndsm(
         dsm_path,
         wcs_url=str(trees_cfg["wcs_url"]),
         ahn_model="DSM",
+        resolution_m=resolution,
         timeout=float(trees_cfg["timeout_s"]),
         max_retries=int(trees_cfg["max_retries"]),
         verify_capabilities=False,

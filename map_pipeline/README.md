@@ -170,6 +170,25 @@ are also capped at 2048 by default, so raise *Max Size* on `aerial.png` or none
 of this is visible. A terrain over 65k vertices needs a 32-bit index buffer,
 which Unity sets automatically.
 
+**The services cap a single response, so large areas are fetched in pieces.**
+Both caps are handled automatically and neither limits how big an area you can
+build; they only decide how many requests it takes.
+
+| Service | Cap per request | What that is on the ground |
+| --- | --- | --- |
+| Aerial WMS | 2500 px | requested in ≤2000 px tiles |
+| AHN WCS | 4000 px | 2000 m at the 0.5 m AHN |
+
+The AHN limit is not in its capabilities document — it can only be learned by
+being refused — so it is a constant here, verified as inclusive: 4000 px is
+answered and 4001 is not. A 3 km area needs 6000 px and arrives as 2×2 tiles.
+Tiles are split in pixel space rather than in metres, which is what makes them
+join exactly: the service honours requested bounds to the millimetre and
+returns `span / resolution` pixels, so a boundary at an arbitrary coordinate
+would land mid-pixel and each side would round it differently. Measured across
+the join on a 3 km area, the height difference between neighbouring cells is
+*smaller* than between ordinary neighbouring cells nearby, so there is no seam.
+
 The facade normal map is the one quality lever that is not about resolution: it
 gives window reveals, sills and storey bands real relief under a moving light.
 It costs one small extra texture and survives FBX as the material's bump slot.

@@ -238,6 +238,19 @@ class GeoContext:
         return tf.transform(x, y)
 
 
+def tile_edges(total_px: int, max_px: int) -> list[tuple[int, int]]:
+    """Split `total_px` into contiguous spans of at most `max_px` pixels.
+
+    Both PDOK services this pipeline reads from cap the size of a single
+    response — the aerial WMS at 2500 px, the AHN WCS at 4000 — so both have to
+    ask for large areas in pieces. Splitting evenly rather than taking full
+    tiles and a remainder keeps the last piece from being a sliver.
+    """
+    n_tiles = max(1, -(-total_px // max_px))
+    edges = [round(i * total_px / n_tiles) for i in range(n_tiles + 1)]
+    return [(edges[i], edges[i + 1]) for i in range(n_tiles)]
+
+
 def build_grid_coords(bbox: BBox, n: int):
     """RD coordinates of an ``n x n`` vertex grid spanning the bbox.
 
@@ -259,6 +272,7 @@ def format_warnings(warnings: Iterable[str], prefix: str = "  - ") -> str:
 
 
 __all__ = [
+    "tile_edges",
     "BBox",
     "GeoContext",
     "RD_CRS",
