@@ -65,8 +65,7 @@ CLASS_NAMES = {
 
 # Tint and grain used to give each surface class some texture of its own on top
 # of the photo. Kept subtle: the aerial still has to be the thing you see.
-# `cells` is roughly how many grain features fit per metre, so brick paving is
-# fine-grained and asphalt is not.
+# `cells` is metres per grain feature, so a smaller number is a finer grain.
 CLASS_DETAIL = {
     CLASS_ROAD: {"tint": (74, 76, 80), "grain": 0.55, "cells": 3.0},
     CLASS_GREEN: {"tint": (86, 116, 62), "grain": 0.85, "cells": 1.1},
@@ -759,6 +758,33 @@ def write_land_cover(
     return [png, legend]
 
 
+# The noise fields are smooth by construction, so generating them larger than
+# this buys nothing: they are tiled across the photo instead.
+DETAIL_NOISE_PX = 512
+# Features across the coarse field. The fine field carries three times as many,
+# matching what the per-class fields used to do.
+DETAIL_NOISE_CELLS = 64
+# Rows blended at a time. Peak memory is this many rows of float32 RGB rather
+# than the whole photo in float64, which is the difference between 90 MB and
+# 6 GB on a 16k image.
+DETAIL_STRIP_PX = 512
+
+
+def _sample_tiled(
+    field: np.ndarray, rows: np.ndarray, columns: np.ndarray, scale: float
+) -> np.ndarray:
+    """Read a tiling noise field over an image block, repeating it as needed.
+
+    ``scale`` is how many image pixels one field pixel covers, so the grain
+    keeps its size on the ground however large the area is.
+    """
+    size = field.shape[0]
+    step = max(scale, 1e-6)
+    row_index = np.floor(rows / step).astype(np.int64) % size
+    col_index = np.floor(columns / step).astype(np.int64) % size
+    return field[np.ix_(row_index, col_index)]
+
+
 def blend_surface_detail(
     aerial_path: Path,
     surfaces: SurfaceSet,
@@ -784,50 +810,93 @@ def blend_surface_detail(
     from .imagery import _allow_large_images
 
     _allow_large_images()
-    with Image.open(aerial_path) as image:
-        pixels = np.asarray(image.convert("RGB")).astype(np.float64)
-
-    height, width = pixels.shape[:2]
     rng = np.random.default_rng(seed)
 
-    # Class grid is south-up and low resolution; match the image orientation
-    # and size by nearest-neighbour, which keeps class edges crisp.
-    classes = np.flipud(surfaces.class_grid)
-    row_index = (np.arange(height) * classes.shape[0] // height).clip(
-        0, classes.shape[0] - 1
-    )
-    col_index = (np.arange(width) * classes.shape[1] // width).clip(
-        0, classes.shape[1] - 1
-    )
-    class_map = classes[np.ix_(row_index, col_index)]
-
+    with Image.open(aerial_path) as opened:
+        image = opened.convert("RGB")
+    width, height = image.size
     metres_per_px = bbox.width / width
-    touched = False
 
-    for code, detail in CLASS_DETAIL.items():
-        mask = class_map == code
-        if not mask.any():
-            continue
+    # Two noise fields, generated once at a bounded size and reused by every
+    # class. They tile, so they are repeated across the image rather than
+    # generated to fit it: the field only ever holds `cells` features across,
+    # so making it as large as the photo is pure waste. Generating one pair per
+    # class at full size was costing 20 full-image fields — four minutes and
+    # 2.7 GB apiece at 8192 px, and worse than linearly above that, which is
+    # what made a large area look like a hang.
+    coarse = _value_noise(
+        (DETAIL_NOISE_PX, DETAIL_NOISE_PX), cells=DETAIL_NOISE_CELLS, rng=rng
+    )
+    fine = _value_noise(
+        (DETAIL_NOISE_PX, DETAIL_NOISE_PX), cells=DETAIL_NOISE_CELLS * 3, rng=rng
+    )
 
-        # Noise cell size in metres, converted to the texture's own grid.
-        cells = max(8, int(width * metres_per_px / detail["cells"]))
-        cells = min(cells, 2048)
-        noise = _value_noise((height, width), cells=cells, rng=rng)
-        fine = _value_noise((height, width), cells=min(cells * 3, 4096), rng=rng)
-        combined = (0.6 * noise + 0.4 * fine - 0.5)[:, :, None]
+    classes = np.flipud(surfaces.class_grid)
+    present = {
+        code for code in CLASS_DETAIL if bool((surfaces.class_grid == code).any())
+    }
+    if not present:
+        return False
 
-        tint = np.asarray(detail["tint"], dtype=np.float64)
-        amount = strength * detail["grain"]
-        # Nudge toward the class tint, then modulate brightness with the grain.
-        blended = pixels * (1 - amount * 0.35) + tint * (amount * 0.35)
-        blended = blended * (1.0 + amount * combined * 1.6)
-        pixels[mask] = blended[mask]
-        touched = True
+    columns = np.arange(width)
+    col_class = (columns * classes.shape[1] // width).clip(0, classes.shape[1] - 1)
 
-    if touched:
-        Image.fromarray(np.clip(pixels, 0, 255).astype(np.uint8)).save(aerial_path)
-        LOG.info("blended per-surface detail into %s", aerial_path.name)
-    return touched
+    strips = -(-height // DETAIL_STRIP_PX)
+    LOG.info(
+        "blending detail for %d surface classes into %d x %d px, in %d strips",
+        len(present),
+        width,
+        height,
+        strips,
+    )
+
+    for strip_index in range(strips):
+        top = strip_index * DETAIL_STRIP_PX
+        bottom = min(height, top + DETAIL_STRIP_PX)
+        rows = np.arange(top, bottom)
+
+        block = np.asarray(image.crop((0, top, width, bottom)), dtype=np.float32)
+        row_class = (rows * classes.shape[0] // height).clip(0, classes.shape[0] - 1)
+        class_map = classes[np.ix_(row_class, col_class)]
+
+        for code in present:
+            mask = class_map == code
+            if not mask.any():
+                continue
+            detail = CLASS_DETAIL[code]
+
+            # Feature size held in metres rather than as a fraction of the
+            # image, so the grain stays the same size on the ground whether the
+            # area is one kilometre or twenty. One feature spans
+            # DETAIL_NOISE_PX / DETAIL_NOISE_CELLS pixels of the field, and has
+            # to come out as detail["cells"] metres on the ground.
+            feature_px = DETAIL_NOISE_PX / DETAIL_NOISE_CELLS
+            scale = detail["cells"] / (metres_per_px * feature_px)
+            grain = (
+                0.6 * _sample_tiled(coarse, rows, columns, scale)
+                + 0.4 * _sample_tiled(fine, rows, columns, scale)
+                - 0.5
+            )[:, :, None]
+
+            tint = np.asarray(detail["tint"], dtype=np.float32)
+            amount = float(strength * detail["grain"])
+            # Nudge toward the class tint, then modulate brightness with grain.
+            blended = block * (1 - amount * 0.35) + tint * (amount * 0.35)
+            blended = blended * (1.0 + amount * grain * 1.6)
+            block[mask] = blended[mask]
+
+        image.paste(
+            Image.fromarray(np.clip(block, 0, 255).astype(np.uint8), mode="RGB"),
+            (0, top),
+        )
+        # A big area spends minutes here, and silence is what made this look
+        # like a hang rather than like work.
+        if strips > 8 and (strip_index + 1) % 8 == 0:
+            LOG.info("  detail blend %d/%d strips", strip_index + 1, strips)
+
+    image.save(aerial_path)
+    LOG.info("blended per-surface detail into %s", aerial_path.name)
+    return True
 
 
 __all__ = [

@@ -1139,6 +1139,133 @@ class TestServiceExceptionDetail(unittest.TestCase):
         self.assertIn("MAXSIZE=4000", detail)
 
 
+class TestDetailBlend(unittest.TestCase):
+    """The detail pass has to stay affordable as the area grows."""
+
+    @staticmethod
+    def _scene(px: int, side_m: float):
+        from PIL import Image
+
+        from src.geo import BBox
+        from src.surfaces import SurfaceSet
+
+        rng = np.random.default_rng(5)
+        image = Image.fromarray(
+            (rng.random((px, px, 3)) * 255).astype(np.uint8), mode="RGB"
+        )
+        grid = rng.integers(0, 12, (65, 65)).astype(np.uint8)
+        return image, SurfaceSet(class_grid=grid), BBox(0, 0, side_m, side_m)
+
+    def test_the_grain_keeps_its_size_on_the_ground_whatever_the_area(self):
+        """It used to be a fraction of the image, so it grew with the area."""
+        from src.surfaces import (
+            CLASS_DETAIL, CLASS_ROAD, DETAIL_NOISE_CELLS, DETAIL_NOISE_PX,
+        )
+
+        feature_px = DETAIL_NOISE_PX / DETAIL_NOISE_CELLS
+        wanted = CLASS_DETAIL[CLASS_ROAD]["cells"]
+
+        for side_m, px in ((600.0, 3072), (3000.0, 4096), (20000.0, 8192)):
+            metres_per_px = side_m / px
+            scale = wanted / (metres_per_px * feature_px)
+            on_ground = feature_px * scale * metres_per_px
+            self.assertAlmostEqual(on_ground, wanted, places=6)
+
+    def test_a_tiling_field_repeats_rather_than_running_out(self):
+        from src.surfaces import _sample_tiled
+
+        field = np.arange(16, dtype=np.float64).reshape(4, 4)
+        rows = np.arange(16)
+        columns = np.arange(16)
+        sampled = _sample_tiled(field, rows, columns, scale=1.0)
+
+        self.assertEqual(sampled.shape, (16, 16))
+        # Wraps every four pixels at this scale.
+        np.testing.assert_array_equal(sampled[:4, :4], sampled[4:8, 4:8])
+
+    def test_sampling_stretches_the_field_by_the_scale(self):
+        from src.surfaces import _sample_tiled
+
+        field = np.arange(16, dtype=np.float64).reshape(4, 4)
+        sampled = _sample_tiled(field, np.arange(8), np.arange(8), scale=2.0)
+        # Each field pixel now covers two image pixels.
+        self.assertEqual(sampled[0, 0], sampled[0, 1])
+        self.assertEqual(sampled[0, 0], sampled[1, 0])
+        self.assertNotEqual(sampled[0, 0], sampled[0, 2])
+
+    def test_strips_leave_no_seam(self):
+        """Sampling by absolute coordinate is what keeps strips continuous."""
+        from PIL import Image
+
+        from src.surfaces import DETAIL_STRIP_PX, blend_surface_detail
+
+        image, surfaces, bbox = self._scene(px=1024, side_m=600.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "aerial.png"
+            image.save(path)
+            blend_surface_detail(path, surfaces, bbox, strength=0.22)
+            blended = np.asarray(Image.open(path).convert("RGB")).astype(float)
+
+        def row_jump(row):
+            return np.abs(blended[row] - blended[row - 1]).mean()
+
+        boundaries = [
+            row_jump(r) for r in range(DETAIL_STRIP_PX, blended.shape[0], DETAIL_STRIP_PX)
+        ]
+        ordinary = [row_jump(r) for r in range(5, blended.shape[0] - 5, 13)]
+        self.assertTrue(boundaries)
+        self.assertLessEqual(max(boundaries), np.percentile(ordinary, 99))
+
+    def test_the_photo_is_changed_gently(self):
+        from PIL import Image
+
+        from src.surfaces import blend_surface_detail
+
+        image, surfaces, bbox = self._scene(px=512, side_m=600.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "aerial.png"
+            image.save(path)
+            before = np.asarray(Image.open(path).convert("RGB")).astype(int)
+            blend_surface_detail(path, surfaces, bbox, strength=0.22)
+            after = np.asarray(Image.open(path).convert("RGB")).astype(int)
+
+        change = np.abs(after - before).mean()
+        self.assertGreater(change, 0.1, "the blend did nothing")
+        self.assertLess(change, 20.0, "the blend overwhelmed the photo")
+
+    def test_zero_strength_leaves_the_photo_alone(self):
+        from PIL import Image
+
+        from src.surfaces import blend_surface_detail
+
+        image, surfaces, bbox = self._scene(px=256, side_m=600.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "aerial.png"
+            image.save(path)
+            before = np.asarray(Image.open(path).convert("RGB"))
+            self.assertFalse(
+                blend_surface_detail(path, surfaces, bbox, strength=0.0)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(Image.open(path).convert("RGB")), before
+            )
+
+    def test_no_land_cover_is_not_an_error(self):
+        from PIL import Image
+
+        from src.geo import BBox
+        from src.surfaces import SurfaceSet, blend_surface_detail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "aerial.png"
+            Image.new("RGB", (64, 64)).save(path)
+            self.assertFalse(
+                blend_surface_detail(
+                    path, SurfaceSet(), BBox(0, 0, 600, 600), strength=0.22
+                )
+            )
+
+
 class TestRoadClasses(unittest.TestCase):
     """A Dutch street is brick, and its cycle path is red. Both matter."""
 
