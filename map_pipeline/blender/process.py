@@ -1139,6 +1139,61 @@ def build_rails(scene: dict, work_dir: Path, material):
     return objects
 
 
+def build_structures(scene: dict, work_dir: Path, material):
+    """Bridge decks, the piers under them, and tunnels below the ground.
+
+    One object per kind, so a deck can be given a drivable collider and a pier
+    cannot, and so the tunnel is selectable on its own.
+    """
+    structures_file = scene.get("structures", {}).get("file")
+    if not structures_file or not (work_dir / structures_file).is_file():
+        return []
+
+    data = np.load(work_dir / structures_file)
+    triangles = data["tris"]
+    if len(triangles) == 0:
+        return []
+
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    names = scene.get("structures", {}).get("kind_names", {})
+
+    local = triangles.copy()
+    local[:, :, 0] -= origin_x
+    local[:, :, 1] -= origin_y
+    local[:, :, 2] -= z_offset
+    kinds = data["tri_kind"]
+
+    objects = []
+    for code in sorted(set(int(k) for k in kinds)):
+        part = local[kinds == code]
+        if not len(part):
+            continue
+        corners = part.reshape(-1, 3)
+        n_triangles = len(part)
+        label = str(names.get(str(code), f"kind_{code}"))
+
+        # Metre UVs: a deck and a tunnel wall both want a tiling concrete, not
+        # a photo stretched over them.
+        uvs = np.column_stack([corners[:, 0] / 6.0, corners[:, 1] / 6.0])
+        objects.append(
+            build_mesh_object(
+                f"Structures_{label}",
+                corners,
+                np.arange(n_triangles * 3),
+                np.arange(0, n_triangles * 3, 3),
+                np.full(n_triangles, 3),
+                uvs,
+                np.zeros(n_triangles),
+                [material],
+                shade_smooth=False,
+            )
+        )
+        log(f"structures: {label}, {n_triangles} triangles")
+
+    return objects
+
+
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
@@ -1216,6 +1271,7 @@ def copy_textures(
         ("furniture", "furniture"),
         ("vehicle", "vehicles"),
         ("rail", "rails"),
+        ("structure", "structures"),
     ):
         name = scene.get(section, {}).get("texture")
         if name and (work_dir / name).is_file():
@@ -1324,6 +1380,15 @@ def main() -> int:
             scene,
             work_dir,
             make_textured_material("M_rail", extra_textures["rail"], roughness=0.7),
+        )
+
+    if "structure" in extra_textures:
+        build_structures(
+            scene,
+            work_dir,
+            make_textured_material(
+                "M_structure", extra_textures["structure"], roughness=0.8
+            ),
         )
 
     # Report the scene bounds so a coordinate or scale error shows up in the log

@@ -178,6 +178,31 @@ DEFAULTS: dict[str, Any] = {
         "max_retries": 4,
         "max_pages": 200,
     },
+    "structures": {
+        # Bridges and tunnels: the parts of the ground that are not the ground.
+        "bridges": True,
+        "tunnels": True,
+        # A deck floats this far over its measured height, so it does not fight
+        # the road riding on it for the same depth.
+        "deck_lift_m": 0.05,
+        # Used only when the surface model has no reading over a deck, which is
+        # rare. A Dutch road bridge clears what it crosses by about this much.
+        "fallback_clearance_m": 5.0,
+        # Nothing measures how deep a tunnel runs, and no open dataset carries
+        # it, so this profile is drawn rather than surveyed: portals at ground
+        # level, ramping down to this depth in between. The Maastunnel road
+        # deck sits about 20 m under the Maas.
+        "tunnel_depth_m": 18.0,
+        "tunnel_ramp_m": 350.0,
+        # Side walls up to ground level, so a tunnel reads as a cutting rather
+        # than as a road floating underground. No ceiling, deliberately: a
+        # roofed tunnel is invisible in the model it was added to.
+        "tunnel_walls": True,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+    },
     "rails": {
         # BGT spoor: one centreline per running track, with the function that
         # says whether it is heavy rail, a street tram or light rail.
@@ -233,6 +258,7 @@ class PipelineConfig:
     furniture: dict[str, Any]
     vehicles: dict[str, Any]
     rails: dict[str, Any]
+    structures: dict[str, Any]
     usage: dict[str, Any]
     export: dict[str, Any]
     source_path: Path | None = None
@@ -260,6 +286,7 @@ class PipelineConfig:
             "furniture": self.furniture,
             "vehicles": self.vehicles,
             "rails": self.rails,
+            "structures": self.structures,
             "usage": self.usage,
             "export": self.export,
         }
@@ -385,6 +412,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         furniture=merged["furniture"],
         vehicles=merged["vehicles"],
         rails=merged["rails"],
+        structures=merged["structures"],
         usage=merged["usage"],
         export=merged["export"],
         source_path=path,

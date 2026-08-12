@@ -6,7 +6,8 @@ runtime.
 
 ```
 output/<area_name>/
-├── model.fbx        terrain, roads, rails, water, buildings, trees, furniture, cars, boats
+├── model.fbx        terrain, roads, rails, bridges, tunnels, water, buildings,
+│                    trees, furniture, cars, boats
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
@@ -19,6 +20,7 @@ output/<area_name>/
 ├── furniture.png    metal and wood atlas
 ├── vehicle.png      car paint, hull and timber atlas
 ├── rail.png         ballast with sleepers, and rail steel
+├── structure.png    concrete for decks, piers and tunnel walls
 └── ATTRIBUTION.txt  source credits
 ```
 
@@ -241,6 +243,11 @@ Other knobs worth knowing:
 | `vehicles.boat_occupancy` | `0.8` | The same for moorings. |
 | `rails.enabled` | `true` | Railway, tram and metro track from BGT `spoor`. |
 | `rails.step_m` | `4.0` | How far apart points along a track may get before the ground under it stops being followed. |
+| `structures.bridges` | `true` | Bridge decks and piers from BGT `overbruggingsdeel`, heights read off the AHN surface model. |
+| `structures.tunnels` | `true` | Tunnels from BGT `tunneldeel`, on a constructed depth profile. |
+| `structures.tunnel_depth_m` | `18.0` | How deep the drawn profile goes. Nothing measures this; see below. |
+| `structures.tunnel_ramp_m` | `350.0` | How long the descent from each portal is. |
+| `structures.tunnel_walls` | `true` | Side walls up to ground level, so a tunnel reads as a cutting. No ceiling: a roofed tunnel is invisible. |
 | `usage.enabled` | `true` | BAG building function, deciding the ground storey. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
 | `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
@@ -268,6 +275,7 @@ src/surfaces.py    BGT water bodies and land cover
 src/furniture.py   BGT lampposts, bollards, signs and benches
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
+src/structures.py  bridge decks and piers, and tunnels below ground
 src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
@@ -414,6 +422,42 @@ bollards, sign posts and benches, from BGT `paal` and `straatmeubilair`. None of
 it is structurally important, which is the point — a street with nothing on it
 reads as a model. They are simple boxes sharing one material, so a couple of
 thousand objects cost one draw call.
+
+## Bridges and tunnels
+
+The parts of the ground that are not the ground. Until now both were dropped:
+tunnels skipped outright, bridges draped onto the surface, which sank the
+Erasmusbrug into the Maas. They need opposite treatment, because the data for
+them is not symmetrical.
+
+**A bridge can be measured.** BGT `overbruggingsdeel` comes split into `dek` and
+`pijler` — the deck and the piers holding it up, as separate polygons — and a
+deck is a hard surface, so the AHN *surface* model sees it where the terrain
+model, which is bare ground by definition, does not. Over a square kilometre of
+the Maas the DSM returns a reading on all seventeen decks. The height is a
+median over each deck rather than a point sample, because the DSM also caught
+the railings, the gantries and whatever was driving across when it was flown.
+Piers are extruded from the deck down to whatever they stand on.
+
+**The road on a bridge rides its deck.** Draping it on the terrain left the deck
+at its real height with its own carriageway lying on the water. Elevated road
+parts (`relatieve_hoogteligging` above zero) now take one robust height per BGT
+part — not a surface to chase, because refining a road mesh against a raster of
+whatever the lidar hit drove it from 35k triangles to 510k and put one
+carriageway 95 m up. Where no plausible deck reading exists, the part is draped
+on the ground like any other road and the run says how many.
+
+**A tunnel cannot be measured.** Nothing looks down and sees the Maastunnel. The
+BGT gives its footprint and the carriageway inside it, and an ordinal level of
+-1, but no depth in metres exists in any open dataset. So the profile here is
+**constructed**: portals at ground level, ramping down over `tunnel_ramp_m` to
+`tunnel_depth_m`, along the tunnel's own long axis — which is the only part of
+it that comes from the data. Over the Maastunnel that puts the road at −22 m NAP
+mid-river against a real figure of about −20. It is the one piece of geometry in
+this pipeline that is drawn rather than measured, and `metadata.json` says so.
+
+Tunnels get side walls but no ceiling, deliberately: a roofed tunnel is
+invisible in the model it was just added to.
 
 ## Railways
 
@@ -690,9 +734,9 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
 - **3DBAG** — 3D geoinformation research group, TU Delft, and Kadaster (CC BY 4.0)
 - **AHN** — Actueel Hoogtebestand Nederland via PDOK (CC BY 4.0)
 - **Aerial** — PDOK / Beeldmateriaal Nederland (CC BY 4.0)
-- **Trees, water, land cover, road surfaces, railway track, street furniture,
-  parking bays and mooring posts** — BGT (Basisregistratie Grootschalige
-  Topografie) via PDOK (CC BY 4.0)
+- **Trees, water, land cover, road surfaces, railway track, bridges, tunnels,
+  street furniture, parking bays and mooring posts** — BGT (Basisregistratie
+  Grootschalige Topografie) via PDOK (CC BY 4.0)
 - **Building function** — BAG (Basisregistratie Adressen en Gebouwen) via PDOK
   (CC BY 4.0)
 - **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution

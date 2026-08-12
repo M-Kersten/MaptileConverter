@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402
-from src.elevation import build_terrain  # noqa: E402
+from src.elevation import build_terrain, ensure_dsm, raster_sampler  # noqa: E402
 from src.export import (  # noqa: E402
     build_metadata,
     write_attribution,
@@ -43,6 +43,7 @@ from src.facade import (  # noqa: E402
     generate_facade_textures,
     generate_furniture_texture,
     generate_rail_texture,
+    generate_structure_texture,
     generate_tree_texture,
     generate_vehicle_texture,
     generate_water_texture,
@@ -51,6 +52,12 @@ from src.furniture import FurnitureSet, build_furniture  # noqa: E402
 from src.imagery import build_aerial  # noqa: E402
 from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
 from src.rails import RailSet, build_rails, save_rails  # noqa: E402
+from src.structures import KIND_NAMES as STRUCTURE_KIND_NAMES  # noqa: E402
+from src.structures import (  # noqa: E402
+    StructureSet,
+    build_structures,
+    save_structures,
+)
 from src.surfaces import (  # noqa: E402
     CLASS_NAMES,
     SurfaceSet,
@@ -76,6 +83,7 @@ from src.validate import (  # noqa: E402
     check_fbx_reimport,
     check_furniture,
     check_rails,
+    check_structures,
     check_vehicles,
     check_surfaces,
     check_terrain,
@@ -331,11 +339,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_usage = bool(config.usage["enabled"])
     want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
     want_rails = bool(config.rails["enabled"])
+    want_structures = bool(
+        config.structures["bridges"] or config.structures["tunnels"]
+    )
 
     total = 5 + sum(
         (
             want_trees, want_surfaces, want_furniture, want_usage,
-            want_vehicles, want_rails,
+            want_vehicles, want_rails, want_structures,
         )
     ) + (0 if args.skip_blender else 1)
     step = 0
@@ -355,11 +366,26 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     water_texture = None
     if want_surfaces:
         with Stage("ground surfaces (BGT water and land cover)", next_step(), total):
+            # A road on a bridge takes its height from the surface model, so
+            # that has to be here before the road geometry is built.
+            deck_dsm = None
+            if bool(config.surfaces.get("road_geometry", True)):
+                bridge_dsm = ensure_dsm(
+                    terrain.bbox,
+                    work_dir,
+                    wcs_url=str(config.terrain["wcs_url"]),
+                    resolution_m=float(config.terrain["resolution_m"]),
+                    timeout=float(config.terrain["timeout_s"]),
+                    max_retries=int(config.terrain["max_retries"]),
+                )
+                deck_dsm = raster_sampler(bridge_dsm) if bridge_dsm else None
+
             surfaces = build_surfaces(
                 config.bbox,
                 work_dir,
                 surfaces_cfg=config.surfaces,
                 terrain=terrain,
+                deck_sampler=deck_dsm,
             )
             if surfaces.class_grid is not None:
                 write_land_cover(surfaces, config.bbox, out_dir)
@@ -451,6 +477,32 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 save_rails(rails, work_dir / "rails.npz")
                 rail_texture = generate_rail_texture(work_dir)
 
+    structures = StructureSet()
+    structure_texture = None
+    if want_structures:
+        with Stage("bridges and tunnels (BGT)", next_step(), total):
+            # A bridge deck is a hard surface the surface model sees, so its
+            # height is measured rather than guessed. Fetched here only if the
+            # trees stage has not already brought it in.
+            dsm_path = ensure_dsm(
+                terrain.bbox,
+                work_dir,
+                wcs_url=str(config.terrain["wcs_url"]),
+                resolution_m=float(config.terrain["resolution_m"]),
+                timeout=float(config.terrain["timeout_s"]),
+                max_retries=int(config.terrain["max_retries"]),
+            )
+            structures = build_structures(
+                config.bbox,
+                work_dir,
+                structures_cfg=config.structures,
+                terrain=terrain,
+                dsm_sampler=raster_sampler(dsm_path) if dsm_path else None,
+            )
+            if len(structures.tris):
+                save_structures(structures, work_dir / "structures.npz")
+                structure_texture = generate_structure_texture(work_dir)
+
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
         facade_cfg["ground_by_function"] = bool(len(usage))
@@ -481,6 +533,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             car_colours=len(CAR_PAINT),
             rail_texture=rail_texture,
             rail_kind_names={str(k): v for k, v in RAIL_KIND_NAMES.items()},
+            structure_texture=structure_texture,
+            structure_kind_names={
+                str(k): v for k, v in STRUCTURE_KIND_NAMES.items()
+            },
             ground_variants=ground_variants,
         )
 
@@ -506,6 +562,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 "street_furniture": furniture.stats(),
                 "vehicles": vehicles.stats(),
                 "railways": rails.stats(),
+                "structures": {
+                    **structures.stats(),
+                    "deck_heights_from": "AHN DSM, median over each deck",
+                    "tunnel_depth": (
+                        "constructed, not surveyed: no open dataset carries "
+                        "Dutch tunnel depths"
+                    ),
+                },
                 "building_function": usage.stats(),
             },
         )
@@ -526,6 +590,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             report, vehicles if want_vehicles else None, config.bbox, surfaces
         )
         check_rails(report, rails if want_rails else None, terrain)
+        check_structures(
+            report, structures if want_structures else None, terrain
+        )
         check_aerial(report, aerial, config.bbox)
 
         if not args.skip_blender:

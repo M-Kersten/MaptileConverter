@@ -716,6 +716,37 @@ def generate_vehicle_texture(
     return path
 
 
+def generate_structure_texture(
+    work_dir: Path, size_px: int = 256, seed: int = 77
+) -> Path:
+    """Concrete for bridge decks, piers and tunnel walls.
+
+    One tiling surface rather than four: everything here is cast concrete, and
+    telling a deck from a pier is what the separate objects are for.
+    """
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+    canvas[:, :] = (150, 148, 144)
+
+    broad = _value_noise((size_px, size_px), cells=max(3, size_px // 64), rng=rng)
+    grit = _value_noise((size_px, size_px), cells=max(12, size_px // 6), rng=rng)
+    canvas *= 1.0 + 0.16 * (broad - 0.5)[:, :, None] * 2.0
+    canvas *= 1.0 + 0.10 * (grit - 0.5)[:, :, None] * 2.0
+
+    # Shutter lines, the one thing that says cast concrete rather than stone.
+    for offset in range(0, size_px, max(8, size_px // 4)):
+        band = max(1, size_px // 128)
+        canvas[offset : offset + band, :] *= 0.92
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "structure.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB").save(path)
+    LOG.info("wrote %s (concrete, %dpx)", path.name, size_px)
+    return path
+
+
 def generate_rail_texture(
     work_dir: Path, size_px: int = 256, seed: int = 63
 ) -> Path:
@@ -806,6 +837,7 @@ __all__ = [
     "GROUND_STYLES",
     "generate_furniture_texture",
     "generate_rail_texture",
+    "generate_structure_texture",
     "generate_vehicle_texture",
     "generate_tree_texture",
     "generate_water_texture",

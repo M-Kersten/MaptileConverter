@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from .geo import BBox, tile_edges, build_grid_coords
-from .http_util import ServiceError, get_with_retry
+from .http_util import ServiceError, get_with_retry, short_error
 
 LOG = logging.getLogger(__name__)
 
@@ -168,6 +168,78 @@ def fetch_dtm_geotiff(
         timeout=timeout,
         max_retries=max_retries,
     )
+
+
+def raster_sampler(path: Path):
+    """Nearest-cell lookup into a GeoTIFF, with nodata as NaN.
+
+    Bridges and elevated railways both need to ask the surface model how high
+    something is, and a deck is a hard surface the DSM sees where the DTM — the
+    bare ground by definition — has a hole.
+    """
+    import rasterio
+
+    with rasterio.open(path) as dataset:
+        band = dataset.read(1).astype(np.float64)
+        left, bottom, right, top = (
+            dataset.bounds.left,
+            dataset.bounds.bottom,
+            dataset.bounds.right,
+            dataset.bounds.top,
+        )
+    height, width = band.shape
+    band = np.where(band < NODATA_CUTOFF, band, np.nan)
+
+    def sample(x, y):
+        x = np.atleast_1d(np.asarray(x, dtype=np.float64))
+        y = np.atleast_1d(np.asarray(y, dtype=np.float64))
+        columns = np.clip(
+            ((x - left) / max(right - left, 1e-9) * width).astype(np.int64), 0, width - 1
+        )
+        # Raster rows run north-down.
+        rows = np.clip(
+            ((top - y) / max(top - bottom, 1e-9) * height).astype(np.int64),
+            0,
+            height - 1,
+        )
+        return band[rows, columns]
+
+    return sample
+
+
+def ensure_dsm(
+    bbox: BBox,
+    work_dir: Path,
+    *,
+    wcs_url: str,
+    resolution_m: float = 0.5,
+    timeout: float = 300.0,
+    max_retries: int = 4,
+) -> Path | None:
+    """The surface model over this area, fetched only if it is not already there.
+
+    One file per area, shared by whoever needs it: the trees stage subtracts it
+    from the terrain for canopy heights, and bridges and elevated track read
+    deck heights straight off it.
+    """
+    path = work_dir / "ahn_dsm.tif"
+    if path.is_file():
+        return path
+    try:
+        fetch_dtm_geotiff(
+            bbox,
+            path,
+            wcs_url=wcs_url,
+            ahn_model="DSM",
+            resolution_m=resolution_m,
+            timeout=timeout,
+            max_retries=max_retries,
+            verify_capabilities=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - a missing DSM is a fallback, not a failure
+        LOG.warning("could not fetch the AHN surface model (%s)", short_error(exc))
+        return None
+    return path
 
 
 def _get_coverage(
@@ -597,5 +669,7 @@ __all__ = [
     "TerrainResult",
     "build_terrain",
     "discover_coverages",
+    "ensure_dsm",
     "fetch_dtm_geotiff",
+    "raster_sampler",
 ]

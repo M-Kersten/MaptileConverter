@@ -129,6 +129,17 @@ SOURCES: tuple[Source, ...] = (
         note="boats need water surfaces on too",
     ),
     Source(
+        id="structures",
+        label="Bridges and tunnels (BGT)",
+        provider="PDOK",
+        contributes=(
+            "bridge decks and the piers under them, and tunnels below ground"
+        ),
+        toggles=(("structures", "bridges"), ("structures", "tunnels")),
+        url_path=("trees", "api_url"),
+        note="deck heights come from the AHN surface model",
+    ),
+    Source(
         id="rails",
         label="Railways (BGT)",
         provider="PDOK",

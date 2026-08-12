@@ -69,6 +69,8 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     "vehicles":           {"c": 0.5, "a": 14.0, "m": 0.0},
     # One collection, and empty over most of a city.
     "rails":              {"c": 0.3, "a": 4.0,  "m": 0.0},
+    # Two collections, plus the surface model when trees are off.
+    "structures":         {"c": 0.5, "a": 6.0,  "m": 0.0},
     "facade":             {"c": 1.0, "a": 0.0,  "m": 0.0},
     "scene":              {"c": 0.3, "a": 0.0,  "m": 0.0},
     "blender":            {"c": 2.0, "a": 8.0,  "m": 0.0},
@@ -115,6 +117,7 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
         "furniture": on("furniture"),
         "vehicles": on("vehicles"),
         "rails": on("rails"),
+        "structures": on("structures"),
         "facade": True,
         "scene": True,
         "blender": True,

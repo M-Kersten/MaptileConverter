@@ -1278,6 +1278,184 @@ class TestDetailBlend(unittest.TestCase):
             )
 
 
+class TestStructures(unittest.TestCase):
+    """Bridges are measured; tunnels are drawn. Both have to be marked."""
+
+    @staticmethod
+    def _square(cx=0.0, cy=0.0, side=20.0):
+        h = side / 2
+        return np.array(
+            [[cx - h, cy - h], [cx + h, cy - h], [cx + h, cy + h], [cx - h, cy + h]]
+        )
+
+    def test_a_ring_and_its_heights_stay_in_step(self):
+        """A closed ring repeats its first point; dropping only one crashed."""
+        from src.structures import extrude_ring
+
+        closed = np.vstack([self._square(), self._square()[:1]])
+        heights = np.arange(len(closed), dtype=float)
+        walls = extrude_ring(closed, 10.0, heights)
+        self.assertGreater(len(walls), 0)
+
+    def test_mismatched_heights_are_refused_rather_than_broadcast(self):
+        from src.structures import extrude_ring
+
+        with self.assertRaises(ValueError):
+            extrude_ring(self._square(), 10.0, np.zeros(99))
+
+    def test_a_wall_spans_from_top_to_bottom(self):
+        from src.structures import extrude_ring
+
+        walls = extrude_ring(self._square(), 12.0, 2.0)
+        z = walls[:, :, 2]
+        self.assertAlmostEqual(float(z.max()), 12.0)
+        self.assertAlmostEqual(float(z.min()), 2.0)
+
+    def test_a_deck_takes_the_median_of_what_the_dsm_sees(self):
+        """The DSM over a bridge also holds railings and passing lorries."""
+        from src.structures import deck_height
+
+        def sampler(x, y):
+            readings = np.full(len(np.atleast_1d(x)), 9.0)
+            # A gantry and a lorry, which a mean would follow and a median not.
+            readings[::7] = 40.0
+            return readings
+
+        self.assertAlmostEqual(
+            deck_height([self._square()], sampler, ground=0.0), 9.0, places=6
+        )
+
+    def test_a_deck_below_the_ground_it_crosses_is_not_a_deck(self):
+        from src.structures import deck_height
+
+        low = lambda x, y: np.full(len(np.atleast_1d(x)), 1.0)  # noqa: E731
+        self.assertIsNone(deck_height([self._square()], low, ground=8.0))
+
+    def test_a_deck_with_no_reading_returns_nothing(self):
+        from src.structures import deck_height
+
+        nothing = lambda x, y: np.full(len(np.atleast_1d(x)), np.nan)  # noqa: E731
+        self.assertIsNone(deck_height([self._square()], nothing, ground=0.0))
+
+    def test_a_mast_is_not_mistaken_for_a_deck(self):
+        from src.structures import MAX_DECK_NAP, deck_height
+
+        mast = lambda x, y: np.full(  # noqa: E731
+            len(np.atleast_1d(x)), MAX_DECK_NAP + 20.0
+        )
+        self.assertIsNone(deck_height([self._square()], mast, ground=0.0))
+
+    def test_the_tunnel_is_level_with_the_ground_at_its_portals(self):
+        from src.structures import tunnel_depth_profile
+
+        # A 2 km tunnel running east-west.
+        along = np.linspace(0, 2000, 201)
+        points = np.column_stack([along, np.zeros_like(along)])
+        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
+
+        self.assertAlmostEqual(float(depth[0]), 0.0, places=6)
+        self.assertAlmostEqual(float(depth[-1]), 0.0, places=6)
+
+    def test_the_tunnel_reaches_its_full_depth_in_the_middle(self):
+        from src.structures import tunnel_depth_profile
+
+        along = np.linspace(0, 2000, 201)
+        points = np.column_stack([along, np.zeros_like(along)])
+        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
+
+        self.assertAlmostEqual(float(depth.max()), 18.0, places=6)
+        # The deepest point is in the middle, not at an end.
+        self.assertGreater(float(depth[len(depth) // 2]), 17.9)
+
+    def test_the_descent_has_no_kink_in_it(self):
+        """Smoothstep, so the road eases into the ramp."""
+        from src.structures import tunnel_depth_profile
+
+        along = np.linspace(0, 2000, 401)
+        points = np.column_stack([along, np.zeros_like(along)])
+        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
+
+        slope = np.diff(depth)
+        # The gradient changes smoothly rather than stepping.
+        self.assertLess(float(np.abs(np.diff(slope)).max()), 0.05)
+
+    def test_a_short_tunnel_still_reaches_its_depth(self):
+        from src.structures import tunnel_depth_profile
+
+        along = np.linspace(0, 80, 41)
+        points = np.column_stack([along, np.zeros_like(along)])
+        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
+        self.assertGreater(float(depth.max()), 17.0)
+        self.assertAlmostEqual(float(depth[0]), 0.0, places=6)
+
+
+class TestBridgeRoads(unittest.TestCase):
+    """A carriageway on a bridge has to ride its deck, not the ground."""
+
+    @staticmethod
+    def _part(level, cx=0.0):
+        from src.surfaces import CLASS_ROAD, RoadPart
+
+        ring = np.array(
+            [[cx, 0.0], [cx + 20.0, 0.0], [cx + 20.0, 10.0], [cx, 10.0]]
+        )
+        return RoadPart([ring], CLASS_ROAD, level)
+
+    def test_a_road_on_a_bridge_is_lifted_to_its_deck(self):
+        from src.surfaces import triangulate_roads
+
+        ground = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
+        deck = lambda x, y: np.full(len(np.atleast_1d(x)), 12.0)  # noqa: E731
+
+        tris, _, levels = triangulate_roads(
+            [self._part(1)], ground, lift_m=0.06, deck_sampler=deck
+        )
+        self.assertGreater(len(tris), 0)
+        np.testing.assert_allclose(tris[:, :, 2], 12.06, atol=1e-6)
+        self.assertTrue((levels > 0).all())
+
+    def test_a_road_at_grade_still_follows_the_ground(self):
+        from src.surfaces import triangulate_roads
+
+        ground = lambda x, y: np.full(len(np.atleast_1d(x)), 3.0)  # noqa: E731
+        deck = lambda x, y: np.full(len(np.atleast_1d(x)), 12.0)  # noqa: E731
+
+        tris, _, levels = triangulate_roads(
+            [self._part(0)], ground, lift_m=0.06, deck_sampler=deck
+        )
+        np.testing.assert_allclose(tris[:, :, 2], 3.06, atol=1e-6)
+        self.assertTrue((levels == 0).all())
+
+    def test_an_unmeasurable_bridge_road_is_draped_rather_than_flattened(self):
+        """Flattening to the ground's median put half of it underground."""
+        from src.surfaces import triangulate_roads
+
+        # A sloping ground, and a surface model with nothing to say.
+        ground = lambda x, y: 0.2 * np.atleast_1d(np.asarray(x, dtype=float))  # noqa: E731
+        blank = lambda x, y: np.full(len(np.atleast_1d(x)), np.nan)  # noqa: E731
+
+        tris, _, levels = triangulate_roads(
+            [self._part(1)], ground, lift_m=0.06, deck_sampler=blank
+        )
+        corners = tris.reshape(-1, 3)
+        above = corners[:, 2] - ground(corners[:, 0], corners[:, 1])
+        self.assertTrue((above > 0).all(), "part of it ended up underground")
+        # And it is reported as being at grade, because that is where it is.
+        self.assertTrue((levels == 0).all())
+
+    def test_a_reading_far_too_high_is_not_a_deck(self):
+        from src.surfaces import triangulate_roads
+
+        ground = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
+        # A tower block beside the bridge, not the bridge.
+        tower = lambda x, y: np.full(len(np.atleast_1d(x)), 95.0)  # noqa: E731
+
+        tris, _, _ = triangulate_roads(
+            [self._part(1)], ground, lift_m=0.06, deck_sampler=tower
+        )
+        self.assertLess(float(tris[:, :, 2].max()), 5.0)
+
+
 class TestRoadClasses(unittest.TestCase):
     """A Dutch street is brick, and its cycle path is red. Both matter."""
 
@@ -1422,7 +1600,7 @@ class TestRoadGeometry(unittest.TestCase):
             RoadPart([square + np.array([20.0, 0.0])], CLASS_CYCLE),
         ]
         flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
-        triangles, classes = triangulate_roads(parts, flat, lift_m=0.06)
+        triangles, classes, _ = triangulate_roads(parts, flat, lift_m=0.06)
 
         self.assertGreater(len(triangles), 0)
         self.assertEqual(set(classes.tolist()), {CLASS_ROAD, CLASS_CYCLE})
@@ -1434,7 +1612,7 @@ class TestRoadGeometry(unittest.TestCase):
 
         square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
         flat = lambda x, y: np.full_like(np.asarray(x, dtype=float), 3.0)  # noqa: E731
-        triangles, _ = triangulate_roads(
+        triangles, _, _ = triangulate_roads(
             [RoadPart([square], CLASS_ROAD)], flat, lift_m=0.06
         )
         np.testing.assert_allclose(triangles[:, :, 2], 3.06, atol=1e-9)
@@ -1446,7 +1624,7 @@ class TestRoadGeometry(unittest.TestCase):
         hole = np.array([[10.0, 10.0], [10.0, 20.0], [20.0, 20.0], [20.0, 10.0]])
         flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
 
-        triangles, _ = triangulate_roads(
+        triangles, _, _ = triangulate_roads(
             [RoadPart([outer, hole], CLASS_ROAD)], flat, lift_m=0.0
         )
         area = 0.5 * np.abs(
@@ -1462,7 +1640,7 @@ class TestRoadGeometry(unittest.TestCase):
         from src.surfaces import triangulate_roads
 
         flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
-        triangles, classes = triangulate_roads([], flat)
+        triangles, classes, _ = triangulate_roads([], flat)
         self.assertEqual(len(triangles), 0)
         self.assertEqual(len(classes), 0)
 
@@ -2006,7 +2184,7 @@ class TestSourceRegistry(unittest.TestCase):
         )
 
     def test_shared_hosts_are_probed_once(self):
-        """Six BGT layers behind one host must not look like six outages."""
+        """Seven BGT layers behind one host must not look like seven outages."""
         from src.sources import health_targets
 
         targets = health_targets(self.config)
@@ -2014,7 +2192,8 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(len(bgt), 1)
         self.assertEqual(
             set(bgt[0].split(",")),
-            {"trees", "water", "land_cover", "furniture", "vehicles", "rails"},
+            {"trees", "water", "land_cover", "furniture", "vehicles", "rails",
+             "structures"},
         )
 
     def test_disabled_sources_are_not_checked(self):

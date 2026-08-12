@@ -314,7 +314,15 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
         # and a flat one that size cut through a canal bank by 1.86 m before
         # the refinement went in. The corners are exact by construction, so
         # the centroid is where a flat triangle misses the ground.
-        centroid = surfaces.road_tris.mean(axis=1)
+        # Only the roads that should be on the ground. A carriageway on a
+        # bridge deliberately is not, and asserting otherwise failed the moment
+        # bridges started carrying their own roads.
+        at_grade = (
+            surfaces.road_tri_level <= 0
+            if len(surfaces.road_tri_level) == len(surfaces.road_tris)
+            else np.ones(len(surfaces.road_tris), dtype=bool)
+        )
+        centroid = surfaces.road_tris[at_grade].mean(axis=1)
         ground = terrain.sample(centroid[:, 0], centroid[:, 1])
         error = np.abs(centroid[:, 2] - ground)
         # Generous against the 8 cm the refinement targets, so this catches a
@@ -326,6 +334,18 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
             f"the median and never more than {error.max():.2f} m (it is lifted "
             f"deliberately, to stop it fighting the terrain for depth)",
         )
+
+        elevated = ~at_grade
+        if elevated.any():
+            high = surfaces.road_tris[elevated].reshape(-1, 3)
+            over = high[:, 2] - terrain.sample(high[:, 0], high[:, 1])
+            report.add(
+                "bridge_roads_ride_their_decks",
+                bool((over > 0.0).all()),
+                f"{int(elevated.sum())} road triangles on bridges, running "
+                f"{over.min():.2f} to {over.max():.2f} m above the ground "
+                f"they cross",
+            )
 
 
 def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
@@ -445,14 +465,23 @@ def check_rails(report: CheckReport, rails, terrain) -> None:
         return
 
     # Every rail head must sit above the bed it runs on, or the track is
-    # inside out.
+    # inside out. Compared per kind: a street tram has no ballast at all and
+    # runs at road level, so against the global minimum it looked as though it
+    # were under the ballast of an elevated railway somewhere else entirely.
+    inverted = []
+    for kind, name in KIND_NAMES.items():
+        beds = rails.ballast_tris[rails.ballast_kind == kind]
+        heads = rails.rail_tris[rails.rail_kind == kind]
+        if not len(beds) or not len(heads):
+            continue
+        if heads[:, :, 2].min() < beds[:, :, 2].min():
+            inverted.append(name)
     report.add(
         "rails_above_ballast",
-        bool(
-            not len(rails.ballast_tris)
-            or rails.rail_tris[:, :, 2].min() >= rails.ballast_tris[:, :, 2].min()
-        ),
-        "rail heads sit above the ballast they run on",
+        not inverted,
+        "rail heads sit above the ballast they run on"
+        if not inverted
+        else f"rails are below their own ballast on: {', '.join(inverted)}",
     )
 
     # The gauge is the one dimension a viewer will notice being wrong, and it
@@ -482,6 +511,87 @@ def check_rails(report: CheckReport, rails, terrain) -> None:
             True,
             f"{elevated} of {len(rails.lines)} tracks are on a viaduct",
             severity="warning",
+        )
+
+
+def check_structures(report: CheckReport, structures, terrain) -> None:
+    """Bridges are above what they cross; tunnels are below it."""
+    from .structures import (
+        KIND_DECK, KIND_PIER, KIND_TUNNEL_ROAD, KIND_TUNNEL_WALL,
+    )
+
+    if structures is None or not len(structures):
+        report.add(
+            "structures_present", True, "no bridges or tunnels here",
+            severity="warning",
+        )
+        return
+
+    report.add(
+        "structures_present",
+        True,
+        f"{structures.count_of(KIND_DECK)} decks, "
+        f"{structures.count_of(KIND_PIER)} piers, "
+        f"{structures.count_of(KIND_TUNNEL_ROAD)} tunnel parts",
+    )
+
+    measured = int(structures.counts.get("decks_measured_from_dsm", 0))
+    guessed = int(structures.counts.get("decks_without_a_reading", 0))
+    if measured or guessed:
+        report.add(
+            "deck_heights_measured",
+            guessed == 0,
+            f"{measured} decks took their height from the surface model, "
+            f"{guessed} fell back to the ordinal level",
+            severity="warning",
+        )
+
+    if not len(structures.tris):
+        return
+
+    decks = structures.tri_kind == KIND_DECK
+    if decks.any():
+        z = structures.tris[decks][:, :, 2]
+        centre = structures.tris[decks].reshape(-1, 3)
+        ground = terrain.sample(centre[:, 0], centre[:, 1])
+        # The reason this exists: draping a deck on the terrain sank the
+        # Erasmusbrug into the Maas.
+        above = float((centre[:, 2] >= ground - 0.5).mean())
+        report.add(
+            "decks_above_the_ground_they_cross",
+            above > 0.98,
+            f"{100 * above:.1f}% of deck geometry sits at or above the terrain "
+            f"under it, spanning {z.min():.2f} to {z.max():.2f} m NAP",
+        )
+
+    tunnels = (structures.tri_kind == KIND_TUNNEL_ROAD)
+    if tunnels.any():
+        corners = structures.tris[tunnels].reshape(-1, 3)
+        ground = terrain.sample(corners[:, 0], corners[:, 1])
+        below = ground - corners[:, 2]
+        report.add(
+            "tunnel_runs_below_the_ground",
+            bool((below >= -0.5).all()),
+            f"tunnel road runs {below.min():.2f} to {below.max():.2f} m below "
+            f"the surface (a drawn profile, not a survey)",
+        )
+        # Portals have to reach daylight, or the tunnel is a sealed box.
+        report.add(
+            "tunnel_reaches_its_portals",
+            float(below.min()) < 1.0,
+            f"shallowest tunnel point is {below.min():.2f} m down, so the "
+            f"ramps meet the surface",
+        )
+
+    walls = structures.tri_kind == KIND_TUNNEL_WALL
+    if walls.any() and tunnels.any():
+        report.add(
+            "tunnel_walls_reach_the_road",
+            bool(
+                structures.tris[walls][:, :, 2].min()
+                <= structures.tris[tunnels][:, :, 2].min() + 0.5
+            ),
+            "tunnel walls run down to the road they enclose",
         )
 
 

@@ -30,8 +30,8 @@ ATTRIBUTION = {
         "https://www.beeldmateriaal.nl"
     ),
     "bgt": (
-        "Trees, water, land cover, road surfaces, railway track, street "
-        "furniture, parking bays and mooring posts from the BGT "
+        "Trees, water, land cover, road surfaces, railway track, bridges, "
+        "tunnels, street furniture, parking bays and mooring posts from the BGT "
         "(Basisregistratie Grootschalige Topografie) via PDOK, CC BY 4.0."
     ),
     "bag": (
@@ -168,6 +168,8 @@ def write_scene_description(
     vehicles_cfg: dict | None = None,
     rail_texture: Path | None = None,
     rail_kind_names: dict | None = None,
+    structure_texture: Path | None = None,
+    structure_kind_names: dict | None = None,
     car_colours: int = 6,
     ground_variants: int = 0,
 ) -> Path:
@@ -265,6 +267,15 @@ def write_scene_description(
                 "tile_length_m": 2.0,
             }
             if rail_texture is not None
+            else {}
+        ),
+        "structures": (
+            {
+                "file": "structures.npz",
+                "texture": structure_texture.name,
+                "kind_names": structure_kind_names or {},
+            }
+            if structure_texture is not None
             else {}
         ),
         "export": {
