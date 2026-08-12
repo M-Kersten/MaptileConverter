@@ -105,7 +105,8 @@ def principal_axes(ring: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, flo
 
     along = centred @ long_axis
     across = centred @ short_axis
-    return long_axis, short_axis, float(along.ptp()), float(across.ptp())
+    # np.ptp rather than the array method: NumPy 2.0 removed ndarray.ptp().
+    return long_axis, short_axis, float(np.ptp(along)), float(np.ptp(across))
 
 
 def points_in_ring(points: np.ndarray, ring: np.ndarray) -> np.ndarray:

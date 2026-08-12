@@ -46,6 +46,18 @@ from src.geo import tile_edges  # noqa: E402
 RUN_NETWORK = "--offline" not in sys.argv
 
 
+
+def cross2d(a: np.ndarray, b: np.ndarray):
+    """Z component of the cross product of 2-D vectors.
+
+    NumPy 2.0 deprecated passing 2-D vectors to np.cross and will remove it,
+    so the determinant is spelled out rather than relying on that path.
+    """
+    a = np.asarray(a)
+    b = np.asarray(b)
+    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+
 class TestGeo(unittest.TestCase):
     def test_bbox_rejects_inverted(self):
         with self.assertRaises(ValueError):
@@ -1338,9 +1350,7 @@ class TestRoadGeometry(unittest.TestCase):
 
         def area(tri):
             a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
-            return 0.5 * np.abs(
-                np.cross(b - a, c - a)
-            )
+            return 0.5 * np.abs(cross2d(b - a, c - a))
 
         self.assertAlmostEqual(float(area(halves).sum()), float(area(triangle)[0]))
 
@@ -1359,7 +1369,7 @@ class TestRoadGeometry(unittest.TestCase):
         triangle = np.array([[[0.0, 0.0], [80.0, 0.0], [0.0, 10.0]]])
         halves = _bisect_longest(triangle)
         for tri in halves:
-            cross = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+            cross = cross2d(tri[1] - tri[0], tri[2] - tri[0])
             self.assertGreater(cross, 0.0)
 
     def test_a_long_flat_triangle_is_split_until_it_follows_the_ground(self):
@@ -1440,7 +1450,7 @@ class TestRoadGeometry(unittest.TestCase):
             [RoadPart([outer, hole], CLASS_ROAD)], flat, lift_m=0.0
         )
         area = 0.5 * np.abs(
-            np.cross(
+            cross2d(
                 triangles[:, 1, :2] - triangles[:, 0, :2],
                 triangles[:, 2, :2] - triangles[:, 0, :2],
             )

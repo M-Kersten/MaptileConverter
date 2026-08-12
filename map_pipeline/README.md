@@ -108,6 +108,22 @@ python tests/test_pipeline.py            # includes live checks against PDOK/3DB
 python tests/test_pipeline.py --offline  # pure logic only
 ```
 
+**Run the tests against both NumPy majors before trusting a change.** NumPy 2
+removed a pile of long-deprecated API, and a pipeline developed on 1.x will
+import cleanly and then fail deep inside a run on a machine with 2.x —
+`ndarray.ptp()` did exactly that, hours into a large build. Passing on one
+major says nothing about the other:
+
+```bash
+python -m venv .np2 --system-site-packages
+.np2/bin/pip install --upgrade "numpy>=2"
+.np2/bin/python -W error::DeprecationWarning -m unittest discover -s tests
+```
+
+`-W error::DeprecationWarning` is the part that earns its keep: it catches what
+NumPy has scheduled for removal rather than what it has already removed. Two-
+dimensional `np.cross` is on that list today.
+
 ## Configuration
 
 `config.json` carries the interesting bits; everything else has a default in

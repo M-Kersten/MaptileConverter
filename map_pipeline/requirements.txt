@@ -4,6 +4,9 @@
 #   conda install -c conda-forge rasterio
 requests>=2.31
 rasterio>=1.3
+# NumPy 2 removed a pile of long-deprecated API, including ndarray.ptp(),
+# which this pipeline used. Both major versions work and the test suite is run
+# against both; see the README.
 numpy>=1.24
 pyproj>=3.5
 mapbox_earcut>=1.0
