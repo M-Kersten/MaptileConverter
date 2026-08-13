@@ -2039,6 +2039,156 @@ class TestCentringCheck(unittest.TestCase):
         self.assertLess(_centring_tolerance(1120.0, 1000.0), 62.0)
 
 
+class TestConstrainedTriangulation(unittest.TestCase):
+    """The triangulator that lets mesh edges follow real features."""
+
+    @staticmethod
+    def _audit(t):
+        """Signed area, worst edge use count, and lost constraints."""
+        p, tri = t.points, t.triangles
+        a, b, c = p[tri[:, 0]], p[tri[:, 1]], p[tri[:, 2]]
+        area = 0.5 * (
+            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+        )
+        counts: dict = {}
+        for x, y, z in tri:
+            for u, v in ((x, y), (y, z), (z, x)):
+                key = frozenset((int(u), int(v)))
+                counts[key] = counts.get(key, 0) + 1
+        return float(area.sum()), max(counts.values()), len(t.missing_constraints())
+
+    @staticmethod
+    def _square(n, seed=11, side=100.0):
+        rng = np.random.default_rng(seed)
+        corners = [[0, 0], [side, 0], [side, side], [0, side]]
+        return np.vstack([corners, rng.random((n, 2)) * side])
+
+    def test_a_square_is_two_triangles(self):
+        from src.cdt import triangulate
+
+        t = triangulate(np.array([[0, 0], [10, 0], [10, 10], [0, 10]], float))
+        self.assertEqual(t.triangle_count, 2)
+
+    def test_the_result_tiles_the_convex_hull_exactly(self):
+        """Too little is a hole, too much is an overlap; both read as a tear."""
+        from src.cdt import triangulate
+
+        for n in (50, 200, 600):
+            area, worst_edge, lost = self._audit(triangulate(self._square(n)))
+            self.assertAlmostEqual(area, 10000.0, places=6)
+            self.assertLessEqual(worst_edge, 2)
+            self.assertEqual(lost, 0)
+
+    def test_the_super_triangle_has_to_be_far_away(self):
+        """A close one makes real hull triangles genuinely non-Delaunay.
+
+        They then never get built, and the mesh quietly loses slivers along the
+        edge of the bbox: 5 triangles and 1.3% of the area, with no error and
+        no failed invariant anywhere to notice it.
+        """
+        from src.cdt import SUPER_TRIANGLE_SPAN
+
+        self.assertGreaterEqual(SUPER_TRIANGLE_SPAN, 100.0)
+
+    def test_a_constraint_survives_as_an_edge(self):
+        from src.cdt import triangulate
+
+        # Two points straddle the diagonal, so Delaunay would never pick it.
+        pts = np.array(
+            [[0, 0], [10, 0], [10, 10], [0, 10], [5, 4.9], [5, 5.1]], float
+        )
+        t = triangulate(pts, np.array([[0, 2]]))
+        self.assertIn(frozenset((0, 2)), t.edges())
+        area, worst_edge, lost = self._audit(t)
+        self.assertAlmostEqual(area, 100.0, places=9)
+        self.assertLessEqual(worst_edge, 2)
+        self.assertEqual(lost, 0)
+
+    def test_a_concave_footprint_keeps_every_edge(self):
+        """The pocket left by a removed constraint is routinely not convex."""
+        from src.cdt import triangulate
+
+        ring = np.array(
+            [[30, 30], [70, 30], [70, 45], [55, 45], [55, 70], [30, 70]], float
+        )
+        rng = np.random.default_rng(11)
+        pts = np.vstack(
+            [[[0, 0], [100, 0], [100, 100], [0, 100]], ring, rng.random((600, 2)) * 100]
+        )
+        seg = np.array([[4 + i, 4 + (i + 1) % len(ring)] for i in range(len(ring))])
+        t = triangulate(pts, seg)
+        for x, y in seg:
+            self.assertIn(frozenset((int(x), int(y))), t.edges())
+        area, worst_edge, lost = self._audit(t)
+        self.assertAlmostEqual(area, 10000.0, places=6)
+        self.assertLessEqual(worst_edge, 2)
+        self.assertEqual(lost, 0)
+
+    def test_a_constraint_running_through_a_vertex_is_split(self):
+        """BGT outlines share corners and plenty of them are collinear."""
+        from src.cdt import triangulate
+
+        pts = np.array(
+            [[0, 0], [10, 0], [10, 10], [0, 10], [2, 0], [5, 0], [8, 0], [5, 5]], float
+        )
+        t = triangulate(pts, np.array([[0, 1]]))
+        area, worst_edge, lost = self._audit(t)
+        self.assertAlmostEqual(area, 100.0, places=9)
+        self.assertLessEqual(worst_edge, 2)
+        self.assertEqual(lost, 0)
+        # The whole run 0-4-5-6-1 has to be edges, not just the ends.
+        for pair in ((0, 4), (4, 5), (5, 6), (6, 1)):
+            self.assertIn(frozenset(pair), t.edges())
+
+    def test_crossing_constraints_are_refused_rather_than_mangled(self):
+        from src.cdt import triangulate
+
+        pts = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], float)
+        with self.assertRaises(RuntimeError) as caught:
+            triangulate(pts, np.array([[0, 2], [1, 3]]))
+        self.assertIn("cross", str(caught.exception))
+
+    def test_many_disjoint_footprints(self):
+        """The shape of the real job: thousands of rings on scattered points."""
+        from src.cdt import triangulate
+
+        rng = np.random.default_rng(5)
+        side, cells = 1000.0, 20
+        pts = [[0, 0], [side, 0], [side, side], [0, side]]
+        segs = []
+        step = side / cells
+        for i in range(cells):
+            for j in range(cells):
+                x0, y0 = i * step + step * 0.2, j * step + step * 0.2
+                base = len(pts)
+                pts.extend(
+                    [
+                        [x0, y0],
+                        [x0 + step * 0.55, y0],
+                        [x0 + step * 0.55, y0 + step * 0.45],
+                        [x0, y0 + step * 0.45],
+                    ]
+                )
+                segs.extend([[base + k, base + (k + 1) % 4] for k in range(4)])
+        pts.extend((rng.random((cells * cells * 4, 2)) * (side - 2) + 1).tolist())
+        t = triangulate(np.array(pts, float), np.array(segs))
+        area, worst_edge, lost = self._audit(t)
+        self.assertAlmostEqual(area, side * side, places=5)
+        self.assertLessEqual(worst_edge, 2)
+        self.assertEqual(lost, 0)
+
+    def test_welding_merges_shared_corners(self):
+        from src.cdt import weld
+
+        pts = np.array([[0, 0], [1, 0], [0, 0], [1, 0], [5, 5]], float)
+        kept, mapping = weld(pts)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(mapping[0], mapping[2])
+        self.assertEqual(mapping[1], mapping[3])
+        self.assertTrue(np.allclose(kept[mapping], pts))
+
+
 class TestBag3dTiles(unittest.TestCase):
     """The way round an api.3dbag.nl outage."""
 
