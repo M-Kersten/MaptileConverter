@@ -211,6 +211,24 @@ def _load_surfaces(scene: dict, work_dir: Path):
     return np.load(work_dir / surface_file)
 
 
+def _water_bed_grid(scene: dict, work_dir: Path, shape=None) -> np.ndarray | None:
+    """The per-body bed level on the terrain grid, or None if there is none.
+
+    One level per water body, worked out upstream: levels across an area differ
+    by metres, so a single shared bed would sit above the surface of the lowest
+    canal and poke straight through it.
+    """
+    data = _load_surfaces(scene, work_dir)
+    if data is None or "water_bed" not in data.files:
+        return None
+    bed = data["water_bed"]
+    if bed.size == 0 or not np.isfinite(bed).any():
+        return None
+    if shape is not None and bed.shape != shape:
+        return None
+    return bed
+
+
 def _sink_water_bed(
     scene: dict, work_dir: Path, heights: np.ndarray, n: int
 ) -> np.ndarray:
@@ -221,26 +239,43 @@ def _sink_water_bed(
     be. Left alone that mound pokes straight through the water surface, so the
     grid inside a water outline is set to a flat bed below its level.
     """
-    data = _load_surfaces(scene, work_dir)
-    if data is None or "water_bed" not in data.files:
-        return heights
-
-    # One bed level per water body, worked out upstream: levels across an area
-    # differ by metres, so a single shared bed would sit above the surface of
-    # the lowest canal and poke straight through it.
-    bed = data["water_bed"]
-    if bed.size == 0 or bed.shape != heights.shape:
+    bed = _water_bed_grid(scene, work_dir, heights.shape)
+    if bed is None:
         return heights
 
     water = np.isfinite(bed)
-    if not water.any():
-        return heights
-
     out = heights.copy()
     out[water] = np.minimum(out[water], bed[water])
     log(
         f"terrain: sank {int(water.sum())} cells to water beds between "
         f"{np.nanmin(bed):.2f} and {np.nanmax(bed):.2f} m NAP"
+    )
+    return out
+
+
+def _sink_mesh_water_bed(
+    scene: dict, work_dir: Path, columns: np.ndarray, rows: np.ndarray, z: np.ndarray
+) -> np.ndarray:
+    """The same sinking, applied to the vertices of the simplified mesh.
+
+    The mesh keeps its vertices in grid column and row, so the bed is still a
+    plain lookup. Only vertices inside an outline move, which leaves the
+    triangles that straddle a bank tilted from the quay down to the bed -- the
+    same shape the grid version produced, drawn with fewer vertices.
+    """
+    bed_grid = _water_bed_grid(scene, work_dir)
+    if bed_grid is None:
+        return z
+
+    bed = bed_grid[rows, columns]
+    water = np.isfinite(bed)
+    if not water.any():
+        return z
+    out = z.copy()
+    out[water] = np.minimum(out[water], bed[water])
+    log(
+        f"terrain: sank {int(water.sum())} mesh vertices to water beds between "
+        f"{np.nanmin(bed_grid):.2f} and {np.nanmax(bed_grid):.2f} m NAP"
     )
     return out
 
@@ -353,12 +388,65 @@ def build_roads(scene: dict, work_dir: Path, make_material):
     return objects
 
 
+def _build_terrain_mesh(
+    scene: dict, work_dir: Path, material, xs, ys, mesh_file: str
+) -> object:
+    """Terrain from the adaptive triangulation instead of the full grid.
+
+    Vertices arrive as grid column, row and height, so they land on exactly the
+    coordinates the grid mesh used -- the simplification decided which of those
+    points to keep, not where they are.
+    """
+    data = np.load(work_dir / mesh_file)
+    vertices = data["vertices"].astype(np.float64)
+    triangles = data["triangles"].astype(np.int64)
+
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    columns = vertices[:, 0].astype(np.int64)
+    rows = vertices[:, 1].astype(np.int64)
+    z = _sink_mesh_water_bed(scene, work_dir, columns, rows, vertices[:, 2])
+
+    points = np.column_stack(
+        [xs[columns] - origin_x, ys[rows] - origin_y, z - z_offset]
+    )
+
+    n_faces = len(triangles)
+    loop_vertex_indices = triangles.ravel()
+    loop_starts = np.arange(0, n_faces * 3, 3)
+    loop_totals = np.full(n_faces, 3)
+    uvs = planar_uv(points[loop_vertex_indices][:, :2], scene["aerial"]["bbox_local"])
+
+    obj = build_mesh_object(
+        "Terrain",
+        points,
+        loop_vertex_indices,
+        loop_starts,
+        loop_totals,
+        uvs,
+        np.zeros(n_faces),
+        [material],
+        shade_smooth=True,
+    )
+    full = 2 * (len(xs) - 1) ** 2
+    log(
+        f"terrain: {len(points)} vertices, {n_faces} triangles "
+        f"({100.0 * n_faces / full:.1f}% of the {len(xs)}x{len(ys)} grid), "
+        f"within {float(data['tolerance_m']):.2f} m of it"
+    )
+    return obj
+
+
 def build_terrain(scene: dict, work_dir: Path, material) -> object:
     """Grid mesh from the AHN heights, draped with the aerial photo."""
     data = np.load(work_dir / scene["terrain"]["file"])
     heights = data["heights"].astype(np.float64)
     xs = data["xs"]
     ys = data["ys"]
+
+    mesh_file = scene["terrain"].get("mesh_file")
+    if mesh_file and (work_dir / mesh_file).is_file():
+        return _build_terrain_mesh(scene, work_dir, material, xs, ys, mesh_file)
 
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])

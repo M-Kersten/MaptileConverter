@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .geo import BBox, GeoContext, parse_bbox, validate_bbox
+from .terrain_mesh import is_grid_size, next_grid_size
 
 LOG = logging.getLogger(__name__)
 
@@ -49,6 +50,14 @@ DEFAULTS: dict[str, Any] = {
         # nodata. Filling is a normal part of the job, not an error path.
         "max_nodata_fraction": 0.95,
         "smooth_iterations": 1,
+        # How far the terrain mesh may stray from the height grid, in metres.
+        # Above zero the regular grid is replaced by a triangulation that keeps
+        # its vertices where the ground moves and drops them where it does not,
+        # which is most of a Dutch bbox. 0.10 m is roughly AHN's own vertical
+        # accuracy (5 cm systematic plus 5 cm stochastic), so at the default
+        # the mesh gives up nothing the source could resolve in the first
+        # place. Set to 0 for the old full grid.
+        "simplify_tolerance_m": 0.10,
     },
     "buildings": {
         "lod": "2.2",
@@ -350,6 +359,26 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError(
             f"terrain.mesh_vertices_per_side must be at least 2, got {n}"
         )
+
+    tolerance = float(merged["terrain"].get("simplify_tolerance_m", 0.0) or 0.0)
+    if tolerance < 0:
+        raise ValueError(
+            f"terrain.simplify_tolerance_m cannot be negative, got {tolerance}"
+        )
+    merged["terrain"]["simplify_tolerance_m"] = tolerance
+    if tolerance > 0 and not is_grid_size(n):
+        # The bisection hierarchy needs every hypotenuse midpoint to land on a
+        # grid point, which only holds for 2**k + 1. Rounding up rather than
+        # down because the extra rows are source detail for the simplifier to
+        # choose from, and it discards whatever it does not need anyway.
+        snapped = next_grid_size(n)
+        LOG.info(
+            "terrain.mesh_vertices_per_side %d -> %d, the next size the "
+            "adaptive mesh can subdivide",
+            n,
+            snapped,
+        )
+        n = snapped
     merged["terrain"]["mesh_vertices_per_side"] = n
 
     # Both dials have a ceiling set by the source data. Past it you are

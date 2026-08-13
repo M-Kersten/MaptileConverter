@@ -2039,6 +2039,189 @@ class TestCentringCheck(unittest.TestCase):
         self.assertLess(_centring_tolerance(1120.0, 1000.0), 62.0)
 
 
+class TestTerrainMesh(unittest.TestCase):
+    """The adaptive terrain mesh must still be the ground, and still be a mesh."""
+
+    @staticmethod
+    def _grid(n=129):
+        return np.mgrid[0:n, 0:n].astype(np.float64)  # rows, cols
+
+    @staticmethod
+    def _edge_use(mesh):
+        t = mesh.triangles
+        edges = np.sort(
+            np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]]), axis=1
+        )
+        _, counts = np.unique(edges, axis=0, return_counts=True)
+        return counts
+
+    @staticmethod
+    def _covered_area(mesh):
+        corners = mesh.vertices[mesh.triangles][:, :, :2]
+        a = corners[:, 1] - corners[:, 0]
+        b = corners[:, 2] - corners[:, 0]
+        return 0.5 * float((a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]).sum())
+
+    def test_a_plane_costs_two_triangles(self):
+        """The whole point: flat ground should not be paid for twice."""
+        from src.terrain_mesh import build_rtin
+
+        rows, cols = self._grid()
+        mesh = build_rtin(0.01 * cols + 0.02 * rows + 3.0, tolerance_m=1e-9)
+        self.assertEqual(mesh.triangle_count, 2)
+        self.assertEqual(mesh.vertex_count, 4)
+        self.assertLess(mesh.max_error_m, 1e-9)
+
+    def test_zero_tolerance_keeps_every_grid_vertex(self):
+        """Nothing may be dropped silently when nothing was asked to be."""
+        from src.terrain_mesh import build_rtin
+
+        n = 65
+        rng = np.random.default_rng(7)
+        mesh = build_rtin(rng.normal(0.0, 1.0, (n, n)), tolerance_m=0.0)
+        self.assertEqual(mesh.vertex_count, n * n)
+        self.assertEqual(mesh.triangle_count, 2 * (n - 1) ** 2)
+        self.assertEqual(mesh.max_error_m, 0.0)
+
+    def test_detail_lands_on_the_step_and_nowhere_else(self):
+        from src.terrain_mesh import build_rtin
+
+        n = 129
+        rows, cols = self._grid(n)
+        mesh = build_rtin(np.where(cols > 64, 5.0, 0.0), tolerance_m=0.05)
+        self.assertLess(mesh.triangle_count, 0.05 * 2 * (n - 1) ** 2)
+        # Every vertex kept should be near the step, not out on the flat.
+        distance = np.abs(mesh.vertices[:, 0] - 64.5)
+        self.assertGreater(float((distance < 3.0).mean()), 0.5)
+
+    def test_the_mesh_is_watertight(self):
+        """A T-junction reads as a tear in Unity, not as a wrong height."""
+        from src.terrain_mesh import build_rtin
+
+        n = 129
+        rows, cols = self._grid(n)
+        height = np.sin(cols / 9.0) * np.cos(rows / 13.0) * 2.0
+        mesh = build_rtin(height, tolerance_m=0.1)
+        counts = self._edge_use(mesh)
+        # Interior edges are shared by exactly two triangles, boundary by one.
+        self.assertEqual(set(np.unique(counts).tolist()), {1, 2})
+        self.assertEqual(int((counts == 1).sum()) % 2, 0)
+
+    def test_the_mesh_tiles_the_bbox_exactly(self):
+        """Covering too little is a hole; too much is an overlap."""
+        from src.terrain_mesh import build_rtin
+
+        n = 129
+        rows, cols = self._grid(n)
+        mesh = build_rtin(np.sin(cols / 7.0) + np.cos(rows / 11.0), tolerance_m=0.2)
+        self.assertAlmostEqual(self._covered_area(mesh), (n - 1) ** 2, places=6)
+
+    def test_every_triangle_faces_up(self):
+        from src.terrain_mesh import build_rtin
+
+        n = 65
+        rows, cols = self._grid(n)
+        mesh = build_rtin(np.sin(cols / 5.0) * 3.0, tolerance_m=0.15)
+        corners = mesh.vertices[mesh.triangles][:, :, :2]
+        a = corners[:, 1] - corners[:, 0]
+        b = corners[:, 2] - corners[:, 0]
+        self.assertTrue((a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0] > 0).all())
+
+    def test_the_returned_grid_is_the_mesh(self):
+        """Everything downstream drapes on this grid, so it has to agree."""
+        from src.terrain_mesh import build_rtin
+
+        n = 65
+        rows, cols = self._grid(n)
+        mesh = build_rtin(np.sin(cols / 6.0) * 2.0 + rows * 0.01, tolerance_m=0.2)
+        kept = mesh.vertices[:, [1, 0]].astype(int)  # row, column
+        self.assertTrue(
+            np.allclose(mesh.heights[kept[:, 0], kept[:, 1]], mesh.vertices[:, 2])
+        )
+        # Grid points that were dropped must sit on the plane of the triangle
+        # that swallowed them, which is what makes the grid a stand-in for the
+        # mesh rather than an approximation of it.
+        self.assertLessEqual(mesh.max_error_m, 0.2 * 3.0)
+
+    def test_a_grid_that_cannot_be_bisected_is_refused(self):
+        """Rounding it silently would move the bbox."""
+        from src.terrain_mesh import build_rtin
+
+        with self.assertRaises(ValueError) as caught:
+            build_rtin(np.zeros((100, 100)), tolerance_m=0.1)
+        self.assertIn("2**k + 1", str(caught.exception))
+
+    def test_grid_sizes_round_up_to_something_bisectable(self):
+        from src.terrain_mesh import is_grid_size, next_grid_size
+
+        self.assertTrue(all(is_grid_size(n) for n in (3, 5, 9, 129, 257, 513)))
+        self.assertFalse(any(is_grid_size(n) for n in (2, 4, 100, 256, 500)))
+        self.assertEqual(next_grid_size(257), 257)
+        self.assertEqual(next_grid_size(258), 513)
+        self.assertEqual(next_grid_size(200), 257)
+
+    def test_config_snaps_the_grid_when_simplification_is_on(self):
+        from src.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "bbox": {
+                            "xmin": 136000,
+                            "ymin": 455000,
+                            "xmax": 137000,
+                            "ymax": 456000,
+                        },
+                        "terrain": {
+                            "mesh_vertices_per_side": 400,
+                            "simplify_tolerance_m": 0.1,
+                        },
+                    }
+                )
+            )
+            config = load_config(path)
+            self.assertEqual(config.terrain["mesh_vertices_per_side"], 513)
+
+    def test_turning_simplification_off_leaves_the_grid_alone(self):
+        from src.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "bbox": {
+                            "xmin": 136000,
+                            "ymin": 455000,
+                            "xmax": 137000,
+                            "ymax": 456000,
+                        },
+                        "terrain": {
+                            "mesh_vertices_per_side": 400,
+                            "simplify_tolerance_m": 0,
+                        },
+                    }
+                )
+            )
+            config = load_config(path)
+            self.assertEqual(config.terrain["mesh_vertices_per_side"], 400)
+
+    def test_real_terrain_loses_far_more_triangles_than_height(self):
+        """The trade this whole thing exists to make."""
+        from src.terrain_mesh import build_rtin
+
+        n = 257
+        rows, cols = self._grid(n)
+        # A polder with a dike across it: flat almost everywhere, one ridge.
+        height = 0.4 * np.exp(-(((cols - 150.0) / 6.0) ** 2)) * 8.0
+        height += 0.02 * rows
+        mesh = build_rtin(height, tolerance_m=0.1)
+        self.assertLess(mesh.triangle_count, 0.1 * 2 * (n - 1) ** 2)
+        self.assertLess(mesh.mean_error_m, 0.02)
+
+
 class TestConfig(unittest.TestCase):
     def test_shipped_config_loads(self):
         config = load_config(REPO_ROOT / "config.json")
@@ -2304,6 +2487,38 @@ class TestUIServer(unittest.TestCase):
         self.assertEqual(loaded.terrain["mesh_vertices_per_side"], 1025)
         self.assertEqual(loaded.facade["texture_px"], 2048)
         self.assertFalse(loaded.facade["normal_map"])
+
+    def test_the_terrain_mesh_slider_reaches_the_config(self):
+        config = self.server.build_config(
+            {
+                "name": "q",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                "mesh_vertices": 513,
+                "simplify_tolerance_m": 0.25,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+        self.assertEqual(loaded.terrain["simplify_tolerance_m"], 0.25)
+
+    def test_the_slider_can_turn_simplification_off(self):
+        """Zero has to survive the round trip, or the control does nothing."""
+        config = self.server.build_config(
+            {
+                "name": "q",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                "mesh_vertices": 500,
+                "simplify_tolerance_m": 0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+        self.assertEqual(loaded.terrain["simplify_tolerance_m"], 0.0)
+        self.assertEqual(loaded.terrain["mesh_vertices_per_side"], 500)
 
     def test_estimate_grows_with_area_pixels_and_features(self):
         estimate = self.server.estimate_seconds

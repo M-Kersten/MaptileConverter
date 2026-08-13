@@ -139,6 +139,56 @@ def check_terrain(report: CheckReport, terrain, bbox: BBox) -> None:
         f"grid spans {grid_span_x:.3f} m against a {bbox.width:.3f} m bbox",
     )
 
+    check_terrain_mesh(report, getattr(terrain, "mesh", None), bbox)
+
+
+# The nested error bound is measured at hypotenuse midpoints, and a vertex can
+# sit on a hypotenuse whose ends were themselves moved, so the height a mesh
+# gives up is bounded by the tolerance only to within a small factor. Measured
+# at about 1.7x across real areas; this is the ceiling before it counts as a
+# defect rather than the expected slack.
+MESH_ERROR_SLACK = 3.0
+
+
+def check_terrain_mesh(report: CheckReport, mesh, bbox: BBox) -> None:
+    """The simplified terrain still describes the ground, and still tiles it."""
+    if mesh is None:
+        return
+
+    report.add(
+        "terrain_mesh_within_tolerance",
+        mesh.max_error_m <= mesh.tolerance_m * MESH_ERROR_SLACK,
+        f"worst height given up is {mesh.max_error_m:.3f} m against a "
+        f"{mesh.tolerance_m:.2f} m tolerance "
+        f"(mean {mesh.mean_error_m:.4f} m)",
+    )
+
+    # Nothing else catches a hole or a double-covered patch, and either one
+    # reads as a tear in Unity rather than as a wrong height.
+    corners = mesh.vertices[mesh.triangles][:, :, :2]
+    edge_a = corners[:, 1] - corners[:, 0]
+    edge_b = corners[:, 2] - corners[:, 0]
+    twice_area = edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]
+    cells = (mesh.grid_vertices - 1) ** 2
+    covered = 0.5 * float(twice_area.sum())
+    report.add(
+        "terrain_mesh_tiles_the_bbox",
+        abs(covered - cells) < 1e-6 * cells,
+        f"triangles cover {covered:.0f} grid cells against {cells}",
+    )
+    report.add(
+        "terrain_mesh_wound_up",
+        bool((twice_area > 0).all()),
+        f"{int((twice_area <= 0).sum())} triangles face down or are degenerate",
+    )
+    report.add(
+        "terrain_mesh_saves_vertices",
+        mesh.triangle_count < 2 * cells,
+        f"{mesh.triangle_count} triangles against {2 * cells} for the full "
+        f"grid ({100.0 * mesh.triangle_count / (2 * cells):.1f}%)",
+        severity="warning",
+    )
+
 
 def check_buildings(report: CheckReport, buildings, *, max_height_m: float) -> None:
     """Buildings exist, and every height is positive and under the ceiling."""
@@ -289,6 +339,23 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
             f"bed runs {np.nanmin(bed):.2f} to {np.nanmax(bed):.2f} m NAP "
             f"under {int(water.sum())} cells",
         )
+
+        # The bed is pushed down at mesh vertices, so a canal spanned by one
+        # big triangle would keep the mound the DTM invented over it. The
+        # mound is metres tall and the simplifier keeps what moves, so this
+        # should never bite -- but nothing else would notice if it did.
+        mesh = getattr(terrain, "mesh", None)
+        if mesh is not None:
+            columns = mesh.vertices[:, 0].astype(int)
+            rows = mesh.vertices[:, 1].astype(int)
+            inside = int(np.isfinite(bed[rows, columns]).sum())
+            expected = water.mean() * len(mesh.vertices) * 0.2
+            report.add(
+                "water_reaches_the_terrain_mesh",
+                inside >= max(len(surfaces.water), int(expected)),
+                f"{inside} of {len(mesh.vertices)} terrain mesh vertices sit "
+                f"inside a water outline, which is what the bed sinking moves",
+            )
 
     if surfaces.class_grid is not None:
         classified = float((surfaces.class_grid > 0).mean())
@@ -807,5 +874,6 @@ __all__ = [
     "check_export",
     "check_fbx_reimport",
     "check_terrain",
+    "check_terrain_mesh",
     "write_report",
 ]

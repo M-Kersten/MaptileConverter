@@ -310,6 +310,7 @@ def build_config(payload: dict) -> dict:
             "ahn_model": payload.get("ahn_model", "DTM"),
             "resolution_m": 0.5,
             "mesh_vertices_per_side": int(payload.get("mesh_vertices", 257)),
+            "simplify_tolerance_m": float(payload.get("simplify_tolerance_m", 0.10)),
         },
         "buildings": {
             "lod": "2.2",

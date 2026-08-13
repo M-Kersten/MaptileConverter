@@ -187,7 +187,17 @@ def write_scene_description(
         "ground_z_offset_nap": float(terrain.center_z_nap),
         "bbox_rd": geo.bbox.as_list(),
         "bbox_local": local.as_list(),
-        "terrain": {"file": "terrain_grid.npz"},
+        "terrain": {
+            "file": "terrain_grid.npz",
+            # Present only when the grid was simplified. The grid stays either
+            # way: the water bed is written on it, and the mesh vertices are
+            # addressed by grid column and row.
+            **(
+                {"mesh_file": "terrain_mesh.npz"}
+                if getattr(terrain, "mesh", None) is not None
+                else {}
+            ),
+        },
         "buildings": {
             "file": "buildings.npz",
             "merge": buildings_cfg["merge"],

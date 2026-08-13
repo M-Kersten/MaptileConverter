@@ -23,6 +23,7 @@ import numpy as np
 
 from .geo import BBox, tile_edges, build_grid_coords
 from .http_util import ServiceError, get_with_retry, short_error
+from .terrain_mesh import TerrainMesh, build_rtin, save_terrain_mesh
 
 LOG = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class TerrainResult:
     geotiff_path: Path | None
     coverage_id: str
     resolution_m: float
+    mesh: "TerrainMesh | None" = None
 
     @property
     def n(self) -> int:
@@ -71,7 +73,7 @@ class TerrainResult:
 
     def stats(self) -> dict:
         h = self.heights
-        return {
+        out = {
             "min_nap": float(h.min()),
             "max_nap": float(h.max()),
             "mean_nap": float(h.mean()),
@@ -80,6 +82,9 @@ class TerrainResult:
             "nodata_fraction_raw": float(self.nodata_fraction_raw),
             "filled_fraction": float(self.filled_fraction),
         }
+        if self.mesh is not None:
+            out["mesh"] = self.mesh.stats()
+        return out
 
 
 def _coverage_id(ahn_model: str) -> str:
@@ -635,6 +640,18 @@ def build_terrain(
         100.0 * filled_fraction,
     )
 
+    # Simplify before anything reads a height off this grid. Roads, rails,
+    # trees and buildings all drape on `sample`, so replacing the grid here --
+    # rather than at the end, next to the mesh that Blender draws -- is what
+    # keeps them sitting on the surface Unity will actually show instead of on
+    # the one that was thrown away.
+    mesh = None
+    tolerance = float(terrain_cfg.get("simplify_tolerance_m", 0.0) or 0.0)
+    if tolerance > 0.0:
+        mesh = build_rtin(filled, tolerance_m=tolerance)
+        filled = mesh.heights.astype(np.float64)
+        save_terrain_mesh(mesh, work_dir / "terrain_mesh.npz")
+
     heights = filled.astype(np.float32)
     center_z = float(_bilinear_on_grid(filled, xs, ys, *bbox.center))
 
@@ -659,6 +676,7 @@ def build_terrain(
         geotiff_path=tif_path,
         coverage_id=_coverage_id(ahn_model),
         resolution_m=resolution,
+        mesh=mesh,
     )
 
 

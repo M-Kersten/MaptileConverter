@@ -239,6 +239,12 @@
     <input type="range" id="terrainM" min="0" max="4" step="1" value="1" class="slider">
     <div class="ticks"><span>coarse</span><span>0.5 m native</span></div>
 
+    <label for="terrainTol" style="margin-top:10px">
+      Terrain mesh <span class="derived" id="terrainTolDerived"></span>
+    </label>
+    <input type="range" id="terrainTol" min="0" max="4" step="1" value="2" class="slider">
+    <div class="ticks"><span>every vertex</span><span>flat ground merged</span></div>
+
     <label for="facadePx" style="margin-top:10px">
       Facade texture <span class="derived" id="facadeDerived"></span>
     </label>
@@ -621,27 +627,44 @@ const UNITY_MAX_TEXTURE = 16384; // Unity will not import a larger texture at fu
 
 const AERIAL_STEPS  = [50, 25, 12, 8, 6];        // cm per pixel
 const TERRAIN_STEPS = [8, 4, 2, 1, 0.5];         // metres between vertices
+// How far the terrain mesh may stray from the height grid. 0 keeps every grid
+// vertex; anything above drops the ones that sit on ground the neighbours
+// already describe, which over a Dutch bbox is most of them.
+const TOLERANCE_STEPS = [0, 0.05, 0.10, 0.25, 0.50];
+// Fraction of the full grid's triangles that survives, measured over built
+// areas in Utrecht and Rotterdam. Only ever an estimate: what actually
+// survives depends on how much this particular bbox moves.
+const TOLERANCE_YIELD = { 0.05: 0.28, 0.10: 0.17, 0.25: 0.08, 0.50: 0.04 };
 const FACADE_STEPS  = [256, 512, 1024, 2048];    // px per storey tile
 
 const PRESETS = {
-  draft:    { aerial: 0, terrain: 0, facade: 0, normal: false },
-  standard: { aerial: 1, terrain: 1, facade: 1, normal: true  },
-  high:     { aerial: 2, terrain: 2, facade: 2, normal: true  },
-  max:      { aerial: 3, terrain: 3, facade: 3, normal: true  }
+  draft:    { aerial: 0, terrain: 0, facade: 0, tol: 3, normal: false },
+  standard: { aerial: 1, terrain: 1, facade: 1, tol: 2, normal: true  },
+  high:     { aerial: 2, terrain: 2, facade: 2, tol: 2, normal: true  },
+  max:      { aerial: 3, terrain: 3, facade: 3, tol: 1, normal: true  }
 };
 
 function quality() {
   const side = sel.size;
   const cm = AERIAL_STEPS[+$("aerialCm").value];
   const spacing = TERRAIN_STEPS[+$("terrainM").value];
+  const tol = TOLERANCE_STEPS[+$("terrainTol").value];
 
   // Round the aerial to a multiple of 4 px: the mosaic splits it into tiles and
   // whole numbers keep every tile boundary on an exact pixel.
   let sizePx = Math.max(256, Math.round(side / (cm / 100) / 4) * 4);
   let mesh = Math.max(33, Math.round(side / spacing) + 1);
+  // The adaptive mesh subdivides by halving, so it only fits a 2^k + 1 grid.
+  // Round up to match what the pipeline will do, or the estimate shown here
+  // is not the grid that gets built.
+  if (tol > 0) {
+    let fitted = 33;
+    while (fitted < mesh) fitted = (fitted - 1) * 2 + 1;
+    mesh = fitted;
+  }
 
   return {
-    cm, spacing, sizePx, mesh,
+    cm, spacing, sizePx, mesh, tol,
     facadePx: FACADE_STEPS[+$("facadePx").value],
     aerialOver: cm < AERIAL_NATIVE_CM,
     terrainOver: spacing < TERRAIN_NATIVE_M,
@@ -660,6 +683,10 @@ function updateQuality() {
     `${q.spacing} m · ${q.mesh}² = ${(q.vertices / 1000).toFixed(0)}k verts`;
   $("terrainDerived").className = "derived" + (q.terrainOver ? " over" : "");
 
+  $("terrainTolDerived").textContent = q.tol === 0
+    ? `full grid · ${(q.vertices * 2 / 1000).toFixed(0)}k tris`
+    : `within ${q.tol} m · typically ${(q.vertices * 2 * TOLERANCE_YIELD[q.tol] / 1000).toFixed(0)}k tris`;
+
   $("facadeDerived").textContent =
     `${q.facadePx} px per storey · ${(q.facadePx / 4).toFixed(0)} px/m`;
 
@@ -674,8 +701,11 @@ function updateQuality() {
     notes.push(`Over Unity's ${UNITY_MAX_TEXTURE} px texture limit: it will be downscaled on import. Use a smaller area to keep this detail.`);
   else if (q.sizePx > 2048)
     notes.push("Unity caps imported textures at 2048 by default; raise Max Size on the texture to see this detail.");
-  if (q.vertices > 1e6)
-    notes.push(`${(q.vertices / 1e6).toFixed(1)}M terrain vertices needs a 32-bit index buffer, which Unity sets automatically on import.`);
+  const shipped = q.tol === 0 ? q.vertices : q.vertices * TOLERANCE_YIELD[q.tol];
+  if (shipped > 1e6)
+    notes.push(`${(shipped / 1e6).toFixed(1)}M terrain vertices needs a 32-bit index buffer, which Unity sets automatically on import.`);
+  if (q.tol === 0)
+    notes.push("Terrain mesh at every vertex: flat ground costs as much as a dike. One step up drops the vertices the neighbours already describe.");
 
   $("qualityNote").innerHTML = notes.map(escapeHtml).join("<br>");
   $("qualityNote").style.color = (q.aerialOver || q.terrainOver)
@@ -687,13 +717,14 @@ function applyPreset(name) {
   if (!preset) return;
   $("aerialCm").value = preset.aerial;
   $("terrainM").value = preset.terrain;
+  $("terrainTol").value = preset.tol;
   $("facadePx").value = preset.facade;
   $("normal").checked = preset.normal;
   updateQuality();
 }
 
 $("preset").addEventListener("change", () => applyPreset($("preset").value));
-for (const id of ["aerialCm", "terrainM", "facadePx"]) {
+for (const id of ["aerialCm", "terrainM", "terrainTol", "facadePx"]) {
   $(id).addEventListener("input", () => {
     $("preset").value = "custom";
     updateQuality();
@@ -760,7 +791,7 @@ function refreshEstimate() {
 }
 
 /* Anything that changes the cost changes the estimate. */
-for (const id of ["aerialCm", "terrainM", "facadePx", "size", "preset"]) {
+for (const id of ["aerialCm", "terrainM", "terrainTol", "facadePx", "size", "preset"]) {
   $(id).addEventListener("input", refreshEstimate);
   $(id).addEventListener("change", refreshEstimate);
 }
@@ -821,6 +852,7 @@ $("run").onclick = async () => {
     bbox: bbox(),
     size_px: q.sizePx,
     mesh_vertices: q.mesh,
+    simplify_tolerance_m: q.tol,
     facade_texture_px: q.facadePx,
     facade_normal_map: $("normal").checked,
     facade_variants: +$("facade").value,

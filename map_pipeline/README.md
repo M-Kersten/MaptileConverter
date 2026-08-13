@@ -182,6 +182,13 @@ interpolated. At native 0.5 m spacing that rises to 86%: you get sixteen times
 the vertices, and most of them carry reconstructed ground rather than measured
 ground. Around 1-2 m is where the extra vertices still buy real detail.
 
+**Grid spacing and mesh detail are separate dials.** Spacing decides how finely
+the ground is *measured*; `terrain.simplify_tolerance_m` decides how many
+vertices are *spent* describing what was measured. Finer spacing with the
+default tolerance costs far less than the vertex count suggests, because the
+extra rows are only kept where the ground actually moves — see
+[Terrain mesh](#terrain-mesh).
+
 **Unity has its own limits.** Textures over 16384 px cannot be imported at full
 size, which a 2 km area at native resolution would exceed. Imported textures
 are also capped at 2048 by default, so raise *Max Size* on `aerial.png` or none
@@ -255,7 +262,8 @@ Other knobs worth knowing:
 | `facade.relief_depth` | `0.035` | How far window reveals and storey bands stand out. Small on purpose: a facade is nearly flat. |
 | `buildings.clip_mode` | `centroid` | `centroid` keeps buildings whose centre is inside the bbox. `intersect` keeps every building the API returns. |
 | `buildings.merge` | `single` | One merged buildings mesh. `per_building` gives one object each. |
-| `terrain.mesh_vertices_per_side` | `257` | 257 → 66k terrain vertices. |
+| `terrain.mesh_vertices_per_side` | `257` | 257 → 66k terrain vertices before simplification. Rounded up to 2^k + 1 when simplification is on. |
+| `terrain.simplify_tolerance_m` | `0.10` | How far the terrain mesh may stray from the height grid. Drops the vertices sitting on ground their neighbours already describe, which over a Dutch bbox is most of them. `0` keeps the full grid. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
 
 ## How it fits together
@@ -331,6 +339,67 @@ nap  = local_y + ground_z_offset_nap
 without any fitting. Both get the same `ground_z_offset_nap` subtracted. Much of
 the Netherlands sits below NAP, so negative heights are normal and are never
 clamped away.
+
+## Terrain mesh
+
+A regular grid charges the same price everywhere, which over a Dutch bbox is a
+bad trade: a car park that three vertices would describe perfectly costs exactly
+as much as the canal bank next to it. `terrain.simplify_tolerance_m` replaces
+the grid with a triangulation that keeps vertices only where the ground moves.
+
+**How it decides.** Two triangles cover the bbox. Each is cut at the midpoint of
+its hypotenuse — always another grid point — and a cut only happens where the
+ground under that triangle strays further from it than the tolerance allows.
+The error driving the decision is *nested*: a triangle's error is the worst of
+its own midpoint and everything beneath it. Without that a triangle passes its
+own midpoint test while hiding a dike between two of its corners.
+
+**Why this shape and not a greedy TIN.** Two properties matter more than raw
+vertex efficiency:
+
+- **No cracks.** The error is stored per *vertex*, not per triangle, and taken
+  as the maximum over both triangles sharing a hypotenuse. Neighbours therefore
+  always agree about whether to cut it, so the mesh is watertight by
+  construction — no T-junctions to seam over, no skirts to hide them.
+- **No slivers.** Every triangle is a right isoceles triangle on a grid
+  diagonal, so they all have the same three angles. Greedy point insertion gets
+  fewer triangles for the same error and hands you long thin wedges for it,
+  which normals and lightmaps do not enjoy.
+
+Measured over 600 m of central Utrecht, against the 131,072 triangles of the
+full 257² grid:
+
+| Tolerance | Triangles | Share of the grid | Worst height given up |
+| --- | --- | --- | --- |
+| 0.02 m | 54,750 | 41.8% | 0.03 m |
+| 0.05 m | 30,700 | 23.4% | 0.08 m |
+| **0.10 m** (default) | **18,584** | **14.2%** | **0.17 m** |
+| 0.25 m | 8,922 | 6.8% | 0.44 m |
+| 0.50 m | 4,467 | 3.4% | 0.87 m |
+
+The default is 0.10 m because that is roughly AHN's own vertical accuracy — 5 cm
+systematic plus 5 cm stochastic — so it gives up nothing the source could
+resolve in the first place. Set it to `0` for the old full grid.
+
+**The worst error runs to about 1.7× the tolerance, not 1.0×.** A vertex can sit
+on a hypotenuse whose own ends were moved, so the deviations compose. The bound
+is a budget, not a guarantee; `terrain_mesh_within_tolerance` allows 3× before
+calling it a defect.
+
+**Simplification happens before anything drapes on the ground.** Roads, rails,
+trees, buildings and water levels all read heights through the same sampler, and
+that sampler is switched to the simplified surface inside `build_terrain`. Doing
+it later — next to the mesh Blender actually draws — would leave every one of
+them sitting on a surface that was thrown away, and roads only float 6 cm.
+
+**The grid does not go away.** It is still written, still classified for land
+cover, and still carries the water bed. Mesh vertices are addressed by grid
+column and row, which is what lets the bed be read straight off a vertex.
+
+**The grid side has to be 2^k + 1.** Halving is the only way the hierarchy
+subdivides, so every hypotenuse midpoint has to land on a grid point. Sizes that
+do not fit are rounded *up* — the extra rows are source detail for the
+simplifier to choose from, and it discards whatever it does not need.
 
 ## Ground surfaces
 
