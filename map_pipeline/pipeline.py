@@ -36,8 +36,13 @@ from src.export import (  # noqa: E402
     write_metadata,
     write_scene_description,
 )
-from src.http_util import preflight  # noqa: E402
-from src.sources import BY_ID, enabled_sources, health_targets  # noqa: E402
+from src.http_util import host_of, probe_targets  # noqa: E402
+from src.sources import (  # noqa: E402
+    BY_ID,
+    down_sources,
+    enabled_sources,
+    health_targets,
+)
 from src.facade import (  # noqa: E402
     CAR_PAINT,
     generate_facade_textures,
@@ -314,18 +319,47 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         # Cheaper to ask now than to find out at stage five. Only the sources
         # this run actually uses are checked, and only once per host.
         LOG.info("checking the services this run needs")
-        targets = health_targets(config.as_dict(), active)
+        settings = config.as_dict()
+        targets = health_targets(settings, active)
+        backups = {
+            url
+            for source in active
+            for url in source.probes(settings)[1:]
+        }
         labels = {
-            url: ", ".join(
-                BY_ID[i].label for i in ids.split(",") if i in BY_ID
-            )
+            url: ", ".join(BY_ID[i].label for i in ids.split(",") if i in BY_ID)
+            + (" [backup]" if url in backups else "")
             for url, ids in targets.items()
         }
-        down = preflight({labels[url]: url for url in targets})
-        if down:
+        results = probe_targets(labels)
+        reachable = {url: ok for url, (ok, _) in results.items()}
+        # A source with a second service behind it is not down until both are.
+        # Aborting on the first would stop runs that the fallback would have
+        # finished, which is most of what 3DBAG's API outages used to cost.
+        blocked = down_sources(settings, reachable, active)
+        for source in active:
+            urls = source.probes(settings)
+            if (
+                len(urls) > 1
+                and source not in blocked
+                and not reachable.get(urls[0], False)
+            ):
+                LOG.warning(
+                    "%s: %s is not answering, so this run will use %s instead",
+                    source.label,
+                    host_of(urls[0]),
+                    host_of(urls[1]),
+                )
+                # Already established, so do not make the stage rediscover it.
+                # The stage keeps its own probe for --skip-preflight runs.
+                if source.id == "buildings":
+                    config.buildings["sources"] = [
+                        s for s in config.buildings["sources"] if s != "api"
+                    ] or ["tiles"]
+        if blocked:
             raise SystemExit(
                 "cannot start: "
-                + "; ".join(down)
+                + "; ".join(f"{s.label} has no service answering" for s in blocked)
                 + ". These are national open-data services, so this is normally "
                 "an outage at their end. Check https://www.pdok.nl and "
                 "https://3dbag.nl, and try again later. Turn the affected "

@@ -62,6 +62,22 @@ DEFAULTS: dict[str, Any] = {
     "buildings": {
         "lod": "2.2",
         "api_url": "https://api.3dbag.nl/collections/pand/items",
+        # 3DBAG publishes the same LoD2.2 data twice, on two separate services.
+        # api.3dbag.nl is the one that goes down, so a run that cannot reach it
+        # falls through to the static CityJSON tiles on data.3dbag.nl instead of
+        # failing. Put "tiles" first to skip the API entirely; the tiles are
+        # cached across areas and runs, so a warm cache needs no network.
+        "sources": ["api", "tiles"],
+        "tiles_url": "https://data.3dbag.nl/{version}/tiles",
+        "tiles_index_url": "https://data.3dbag.nl/api/BAG3D/wfs",
+        # 3DBAG keeps every dated release and publishes no "latest" alias, so
+        # this is bumped by hand. Releases are listed at 3dbag.nl/en/download.
+        "tiles_version": "v20250903",
+        # A short knock on the API before committing the full timeout budget:
+        # without it a dead API costs timeout x retries before the fallback
+        # gets a turn, which is long enough that people kill the run instead.
+        "probe_url": "https://api.3dbag.nl/collections/pand",
+        "probe_timeout_s": 8.0,
         "page_limit": 500,
         "timeout_s": 180,
         "max_retries": 4,

@@ -35,6 +35,10 @@ class Source:
     # 3DBAG takes fourteen seconds to answer that, which a reachability probe
     # reads as an outage. The collection metadata answers in three.
     probe_url: str = ""
+    # A second service carrying the same data, which the stage falls back to on
+    # its own. The source is only down when neither answers -- treating the
+    # first as decisive would abort runs that would have finished.
+    backup_probe_url: str = ""
 
     def url(self, config: dict) -> str:
         node: Any = config
@@ -46,6 +50,10 @@ class Source:
 
     def probe(self, config: dict) -> str:
         return self.probe_url or self.url(config)
+
+    def probes(self, config: dict) -> tuple[str, ...]:
+        """Every URL that would satisfy this source, best first."""
+        return tuple(u for u in (self.probe(config), self.backup_probe_url) if u)
 
 
 # Ordered as they appear in a run.
@@ -74,6 +82,10 @@ SOURCES: tuple[Source, ...] = (
         url_path=("buildings", "api_url"),
         required=True,
         probe_url="https://api.3dbag.nl/collections/pand",
+        # The API being down is not the same as the buildings being
+        # unavailable: the identical LoD2.2 data is published as static tiles
+        # on a different host, and the run falls through to those on its own.
+        backup_probe_url="https://data.3dbag.nl/api/BAG3D/wfs",
     ),
     Source(
         id="usage",
@@ -200,10 +212,25 @@ def health_targets(config: dict, sources: list[Source] | None = None) -> dict[st
     """
     targets: dict[str, list[str]] = {}
     for source in sources if sources is not None else list(SOURCES):
-        url = source.probe(config)
-        if url:
+        for url in source.probes(config):
             targets.setdefault(url, []).append(source.id)
     return {url: ",".join(ids) for url, ids in targets.items()}
+
+
+def down_sources(
+    config: dict, reachable: dict[str, bool], sources: list[Source] | None = None
+) -> list[Source]:
+    """The sources with nothing left to fall back on.
+
+    A source with a backup is only down when both are, which is the difference
+    between "3DBAG's API is down" and "you cannot build buildings today".
+    """
+    out = []
+    for source in sources if sources is not None else list(SOURCES):
+        urls = source.probes(config)
+        if urls and not any(reachable.get(url, False) for url in urls):
+            out.append(source)
+    return out
 
 
 __all__ = [
@@ -211,6 +238,7 @@ __all__ = [
     "SOURCES",
     "Source",
     "apply_selection",
+    "down_sources",
     "enabled_sources",
     "health_targets",
 ]

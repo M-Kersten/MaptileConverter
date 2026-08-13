@@ -87,6 +87,8 @@
   .src .dot { width: 9px; height: 9px; border-radius: 50%; background: #5a6270;
               flex: 0 0 auto; }
   .src .dot.up { background: var(--ok); }
+  /* Up, but on the second service. The run works; it is worth seeing anyway. */
+  .src .dot.degraded { background: var(--warn); }
   .src .dot.down { background: var(--bad); }
   .src .dot.checking { background: var(--warn); animation: pulse 1s infinite; }
   @keyframes pulse { 50% { opacity: .35; } }
@@ -1035,7 +1037,8 @@ function renderSources() {
     name.innerHTML =
       `<b>${escapeHtml(s.label)}</b>${s.required ? " <span class='who'>· required</span>" : ""}` +
       `<div class="who">${escapeHtml(s.provider)}${
-        s.ok === false ? " · " + escapeHtml(s.detail) : ""}</div>`;
+        s.ok === false ? " · " + escapeHtml(s.detail) :
+        s.degraded ? " · on the backup service" : ""}</div>`;
 
     const dot = document.createElement("span");
     dot.className = "dot";
@@ -1056,7 +1059,8 @@ function updateSourceStates() {
     row.classList.toggle("off", !on);
     row.classList.toggle("blocked", !!s.required && s.ok === false);
     row.querySelector(".dot").className =
-      "dot " + (s.ok === true ? "up" : s.ok === false ? "down" : "checking");
+      "dot " + (s.ok === true ? (s.degraded ? "degraded" : "up")
+                : s.ok === false ? "down" : "checking");
   }
 
   const blocking = sourceList.filter(s => s.required && s.ok === false);

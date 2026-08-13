@@ -261,6 +261,9 @@ Other knobs worth knowing:
 | `facade.normal_map` | `true` | Write a normal map beside each facade texture. |
 | `facade.relief_depth` | `0.035` | How far window reveals and storey bands stand out. Small on purpose: a facade is nearly flat. |
 | `buildings.clip_mode` | `centroid` | `centroid` keeps buildings whose centre is inside the bbox. `intersect` keeps every building the API returns. |
+| `buildings.sources` | `["api", "tiles"]` | Which of 3DBAG's two services to try, in order. `["tiles"]` skips the flaky API entirely. See [When 3DBAG is down](#when-3dbag-is-down). |
+| `buildings.tiles_version` | `v20250903` | Which dated 3DBAG release the static tiles come from. Bumped by hand; releases are listed at 3dbag.nl/en/download. |
+| `buildings.probe_timeout_s` | `8.0` | How long to knock on the API before giving up and using the tiles. |
 | `buildings.merge` | `single` | One merged buildings mesh. `per_building` gives one object each. |
 | `terrain.mesh_vertices_per_side` | `257` | 257 → 66k terrain vertices before simplification. Rounded up to 2^k + 1 when simplification is on. |
 | `terrain.simplify_tolerance_m` | `0.10` | How far the terrain mesh may stray from the height grid. Drops the vertices sitting on ground their neighbours already describe, which over a Dutch bbox is most of them. `0` keeps the full grid. |
@@ -339,6 +342,61 @@ nap  = local_y + ground_z_offset_nap
 without any fitting. Both get the same `ground_z_offset_nap` subtracted. Much of
 the Netherlands sits below NAP, so negative heights are normal and are never
 clamped away.
+
+## When 3DBAG is down
+
+`api.3dbag.nl` is the least reliable service the pipeline depends on, and
+buildings are not optional, so an outage there used to stop a run dead. It no
+longer does: 3DBAG publishes the same LoD2.2 data twice, on two separate hosts.
+
+| | Service | What it is |
+| --- | --- | --- |
+| `api` | `api.3dbag.nl` | OGC API Features, paged, returns exactly the bbox |
+| `tiles` | `data.3dbag.nl` | static gzipped CityJSON tiles plus a WFS tile index |
+
+`buildings.sources` is the order to try them in, default `["api", "tiles"]`.
+Whatever the first one raises is logged and the next one gets a turn.
+
+**The API is knocked on before it is trusted.** With `timeout_s` at 180 and four
+retries, a dead API costs twelve minutes before the fallback would get a turn —
+long enough that people kill the run instead of letting it recover itself. An
+8-second probe decides first. The preflight does the same check even earlier and
+takes the API out of the chain for the whole run when it does not answer, so the
+stage does not rediscover it.
+
+**A source with a backup is not down until both are.** The preflight and the
+UI's source panel both treat 3DBAG as available when either host answers; the
+panel shows an amber dot and "on the backup service" so it is visible without
+being alarming. Only both being unreachable blocks a run.
+
+**Tiles are cached above the area directory**, in `work/_bag3d/<version>/`,
+so every area anyone builds shares them. That is the part that helps a team
+most: the first Rotterdam build downloads about 10 MB of tiles, and every
+neighbouring area after that needs no network for buildings at all.
+
+**A tile covers far more than your bbox.** 3DBAG tiles are a quadtree split by
+building density — a 600 m bbox pulls in 6 tiles holding 5,683 buildings to keep
+1,229. Every `Building` carries a `geographicalExtent`, and skipping the ones
+that cannot reach the bbox before touching any geometry takes the parse from
+70 s to 20 s.
+
+Measured over the Utrecht Dom bbox during a real API outage: 6 tiles, 10.3 MB,
+**1,229 buildings — the same count the API returns**, in 35 s cold and 20 s with
+the cache warm.
+
+**The tiles are a dated release.** 3DBAG keeps every release and publishes no
+`latest` alias, and the WFS does not advertise which one it indexes, so
+`buildings.tiles_version` is pinned and bumped by hand. If the index and the
+release drift apart every tile 404s, and the run says so and names the setting.
+`metadata.json` records which service actually answered, and its version, so a
+model built during an outage can be told apart from one built the week before.
+
+To skip the API entirely — worth it if your team hits outages often, since the
+cache makes repeat runs faster than the API anyway:
+
+```json
+"buildings": { "sources": ["tiles"] }
+```
 
 ## Terrain mesh
 

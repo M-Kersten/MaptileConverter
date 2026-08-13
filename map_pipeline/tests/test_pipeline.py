@@ -2039,6 +2039,88 @@ class TestCentringCheck(unittest.TestCase):
         self.assertLess(_centring_tolerance(1120.0, 1000.0), 62.0)
 
 
+class TestBag3dTiles(unittest.TestCase):
+    """The way round an api.3dbag.nl outage."""
+
+    def test_a_tile_id_becomes_its_path(self):
+        from src.bag3d_tiles import tile_url
+
+        self.assertEqual(
+            tile_url(
+                "10/490/596",
+                base_url="https://data.3dbag.nl/{version}/tiles",
+                version="v20250903",
+            ),
+            "https://data.3dbag.nl/v20250903/tiles/10/490/596/"
+            "10-490-596.city.json.gz",
+        )
+
+    def test_a_malformed_tile_id_is_refused(self):
+        from src.bag3d_tiles import tile_url
+
+        with self.assertRaises(ValueError):
+            tile_url("10/490", base_url="x/{version}", version="v1")
+
+    def test_the_cache_is_shared_between_areas(self):
+        """The point of it: one build warms the cache for the next."""
+        from src.bag3d_tiles import cache_dir_for
+
+        dom = cache_dir_for(Path("work/utrecht_dom"), "v20250903")
+        cs = cache_dir_for(Path("work/utrecht_cs"), "v20250903")
+        self.assertEqual(dom, cs)
+        self.assertEqual(dom.name, "v20250903")
+
+    def test_versions_do_not_share_a_cache(self):
+        from src.bag3d_tiles import cache_dir_for
+
+        self.assertNotEqual(
+            cache_dir_for(Path("work/a"), "v20250903"),
+            cache_dir_for(Path("work/a"), "v20241216"),
+        )
+
+    def test_buildings_outside_the_bbox_are_skipped_on_their_extent(self):
+        """A tile covers far more than the bbox; parsing it all is the cost."""
+        from src.bag3d_tiles import _extent_misses
+        from src.geo import BBox
+
+        bbox = BBox(136000, 455000, 137000, 456000)
+        inside = [136400, 455400, 0.0, 136420, 455430, 12.0]
+        overlapping = [136990, 455400, 0.0, 137400, 455430, 12.0]
+        east = [137200, 455400, 0.0, 137300, 455430, 12.0]
+        south = [136400, 454000, 0.0, 136420, 454500, 12.0]
+        self.assertFalse(_extent_misses(inside, bbox))
+        self.assertFalse(_extent_misses(overlapping, bbox))
+        self.assertTrue(_extent_misses(east, bbox))
+        self.assertTrue(_extent_misses(south, bbox))
+        # No extent means it cannot be ruled out, so it has to be parsed.
+        self.assertFalse(_extent_misses(None, bbox))
+
+    def test_an_unknown_source_name_is_refused(self):
+        from src.buildings import fetch_buildings
+        from src.geo import BBox
+
+        with self.assertRaises(ValueError) as caught:
+            fetch_buildings(
+                BBox(136000, 455000, 137000, 456000),
+                buildings_cfg={"lod": "2.2", "sources": ["api", "smoke-signal"]},
+            )
+        self.assertIn("smoke-signal", str(caught.exception))
+
+    def test_the_default_order_tries_the_api_then_the_tiles(self):
+        from src.config import DEFAULTS
+
+        self.assertEqual(DEFAULTS["buildings"]["sources"], ["api", "tiles"])
+
+    def test_the_shared_vertex_array_is_used_as_given(self):
+        """Decoding a tile's vertices once per building costs more than the
+        download, so _extract_feature has to accept them pre-decoded."""
+        import inspect
+
+        from src.buildings import _extract_feature
+
+        self.assertIn("vertices", inspect.signature(_extract_feature).parameters)
+
+
 class TestTerrainMesh(unittest.TestCase):
     """The adaptive terrain mesh must still be the ground, and still be a mesh."""
 
@@ -2389,7 +2471,36 @@ class TestSourceRegistry(unittest.TestCase):
         # "bag" is a substring of "3dbag", so match the BAG service path.
         self.assertNotIn("/lv/bag/", joined)
         self.assertIn("api.3dbag.nl", joined)
-        self.assertEqual(len(targets), 3)
+        # Terrain, aerial, and both of the buildings services.
+        self.assertIn("data.3dbag.nl", joined)
+        self.assertEqual(len(targets), 4)
+
+    def test_the_3dbag_api_being_down_does_not_block_a_run(self):
+        """It is the outage the fallback exists for, so it must not abort."""
+        from src.sources import BY_ID, down_sources
+
+        buildings = BY_ID["buildings"]
+        api, tiles = buildings.probes(self.config)
+        blocked = down_sources(self.config, {api: False, tiles: True}, [buildings])
+        self.assertEqual(blocked, [])
+
+    def test_both_3dbag_services_down_does_block(self):
+        from src.sources import BY_ID, down_sources
+
+        buildings = BY_ID["buildings"]
+        api, tiles = buildings.probes(self.config)
+        blocked = down_sources(self.config, {api: False, tiles: False}, [buildings])
+        self.assertEqual([s.id for s in blocked], ["buildings"])
+
+    def test_a_source_with_one_service_still_blocks_on_it(self):
+        from src.sources import BY_ID, down_sources
+
+        terrain = BY_ID["terrain"]
+        self.assertEqual(len(terrain.probes(self.config)), 1)
+        blocked = down_sources(
+            self.config, {terrain.probes(self.config)[0]: False}, [terrain]
+        )
+        self.assertEqual([s.id for s in blocked], ["terrain"])
 
     def test_every_source_can_name_its_service(self):
         from src.sources import SOURCES

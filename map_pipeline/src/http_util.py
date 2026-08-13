@@ -218,22 +218,42 @@ def check_reachable(url: str, timeout: float = 8.0) -> tuple[bool, str]:
         return False, short_error(exc)
 
 
-def preflight(services: dict[str, str], timeout: float = 8.0) -> list[str]:
-    """Check every service a run needs, and report the ones that are down.
+def probe_targets(
+    targets: dict[str, str], timeout: float = 8.0
+) -> dict[str, tuple[bool, str]]:
+    """Ask every service whether it is up. Takes URL -> label, returns URL -> result.
 
     The buildings stage runs fifth, after several minutes of terrain, imagery
     and BGT work. Discovering there that 3DBAG is offline wastes all of it, so
     the services are checked first, which costs a couple of seconds.
+
+    Keyed by URL in both directions on purpose. A source can have two services
+    behind it, and both then carry the same label: keying the input by label
+    silently drops one of them, which leaves the caller certain that a service
+    it never asked about is down.
     """
-    down: list[str] = []
-    for label, url in services.items():
+    results: dict[str, tuple[bool, str]] = {}
+    for url, label in targets.items():
         ok, detail = check_reachable(url, timeout)
+        results[url] = (ok, detail)
         if ok:
             LOG.info("  %-28s reachable (%s)", label, detail)
         else:
-            LOG.error("  %-28s UNREACHABLE (%s)", label, detail)
-            down.append(f"{label} at {host_of(url)}: {detail}")
-    return down
+            LOG.warning("  %-28s UNREACHABLE (%s)", label, detail)
+    return results
+
+
+def preflight(services: dict[str, str], timeout: float = 8.0) -> list[str]:
+    """Check every service a run needs, and report the ones that are down.
+
+    Takes label -> URL, for callers with one service per label.
+    """
+    results = probe_targets({url: label for label, url in services.items()}, timeout)
+    return [
+        f"{label} at {host_of(url)}: {results[url][1]}"
+        for label, url in services.items()
+        if not results[url][0]
+    ]
 
 
 def retry_call(
@@ -271,6 +291,7 @@ __all__ = [
     "is_unreachable",
     "looks_like_xml",
     "preflight",
+    "probe_targets",
     "retry_call",
     "short_error",
 ]

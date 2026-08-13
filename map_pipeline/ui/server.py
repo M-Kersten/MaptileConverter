@@ -673,8 +673,21 @@ class Handler(BaseHTTPRequestHandler):
 
             listed = []
             for source in SOURCES:
-                url = source.probe(DEFAULTS)
-                status = health.get(url, {"ok": None, "detail": "not checked", "host": ""})
+                # A source can have a second service carrying the same data, so
+                # it is only down when none of them answers. Reporting the first
+                # one as decisive would show a blocking outage for a run that
+                # would have finished on the fallback.
+                urls = source.probes(DEFAULTS)
+                answering = next(
+                    (u for u in urls if health.get(u, {}).get("ok")), None
+                )
+                chosen = answering or (urls[0] if urls else "")
+                status = health.get(
+                    chosen, {"ok": None, "detail": "not checked", "host": ""}
+                )
+                detail = status.get("detail", "")
+                if answering and len(urls) > 1 and answering != urls[0]:
+                    detail = f"{detail} (via the backup service)"
                 listed.append(
                     {
                         "id": source.id,
@@ -685,7 +698,10 @@ class Handler(BaseHTTPRequestHandler):
                         "note": source.note,
                         "host": status.get("host", ""),
                         "ok": status.get("ok"),
-                        "detail": status.get("detail", ""),
+                        "detail": detail,
+                        "degraded": bool(
+                            answering and len(urls) > 1 and answering != urls[0]
+                        ),
                     }
                 )
 

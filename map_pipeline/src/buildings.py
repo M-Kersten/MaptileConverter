@@ -29,7 +29,12 @@ import requests
 
 from .facade_uv import fit_wall_u, tile_widths
 from .geo import BBox
-from .http_util import ServiceError, get_with_retry
+from .http_util import (
+    ServiceError,
+    check_reachable,
+    get_with_retry,
+    short_error,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -107,6 +112,11 @@ class BuildingSet:
     triangulation_failures: int = 0
     pages_fetched: int = 0
     lod: str = "2.2"
+    # Which of 3DBAG's two services actually answered. Worth recording: the
+    # tiles are a dated release while the API tracks the current one, so a
+    # model built during an outage can differ from one built the week before.
+    source: str = "api"
+    source_version: str = ""
 
     def __len__(self) -> int:
         return len(self.buildings)
@@ -121,6 +131,8 @@ class BuildingSet:
             "height_max_m": round(float(max(heights)), 2) if heights else 0.0,
             "height_mean_m": round(float(np.mean(heights)), 2) if heights else 0.0,
             "pages_fetched": self.pages_fetched,
+            "source": self.source,
+            **({"source_version": self.source_version} if self.source_version else {}),
             "skipped_no_geometry": self.skipped_no_geometry,
             "skipped_degenerate": self.skipped_degenerate,
             "degenerate_source_surfaces": self.degenerate_surfaces,
@@ -396,14 +408,24 @@ def _pick_geometry(city_object: dict, lod: str) -> dict | None:
 
 
 def _extract_feature(
-    feature: dict, transform: dict, lod: str, counters: BuildingSet
+    feature: dict,
+    transform: dict,
+    lod: str,
+    counters: BuildingSet,
+    vertices: np.ndarray | None = None,
 ) -> Building | None:
-    """Turn one CityJSONFeature into a :class:`Building`."""
+    """Turn one CityJSONFeature into a :class:`Building`.
+
+    ``vertices`` is for callers that already decoded them. A downloaded tile
+    holds one vertex array for every building in it, and decoding that array
+    once per building would cost more than the download did.
+    """
     city_objects = feature.get("CityObjects", {})
     if not city_objects:
         return None
 
-    vertices = decode_vertices(feature.get("vertices", []), transform)
+    if vertices is None:
+        vertices = decode_vertices(feature.get("vertices", []), transform)
     if len(vertices) == 0:
         counters.skipped_no_geometry += 1
         return None
@@ -562,7 +584,89 @@ def _extract_feature(
     )
 
 
-def fetch_buildings(bbox: BBox, *, buildings_cfg: dict) -> BuildingSet:
+def fetch_buildings(
+    bbox: BBox, *, buildings_cfg: dict, work_dir: Path | None = None
+) -> BuildingSet:
+    """Fetch every 3DBAG building over `bbox`, from whichever source answers.
+
+    3DBAG publishes the same LoD2.2 data twice: through ``api.3dbag.nl``, and
+    as static CityJSON tiles on ``data.3dbag.nl``. They are separate services,
+    and the API is the one that goes down. ``buildings.sources`` is the order
+    to try them in; whatever a source raises is logged and the next one is
+    tried, so an outage on one of them is not an outage for the pipeline.
+    """
+    sources = buildings_cfg.get("sources") or ["api", "tiles"]
+    sources = [str(s).strip().lower() for s in sources]
+    unknown = [s for s in sources if s not in ("api", "tiles")]
+    if unknown:
+        raise ValueError(
+            f"buildings.sources has {unknown}; expected 'api' and/or 'tiles'"
+        )
+
+    failures: list[str] = []
+    for index, source in enumerate(sources):
+        remaining = sources[index + 1 :]
+        try:
+            if source == "api":
+                if remaining and not _api_answers(buildings_cfg):
+                    failures.append("api: did not answer the preflight probe")
+                    continue
+                return _fetch_from_api(bbox, buildings_cfg)
+            if work_dir is None:
+                failures.append("tiles: no work directory to cache them in")
+                continue
+            return _fetch_from_tiles(bbox, work_dir, buildings_cfg)
+        except ServiceError as exc:
+            LOG.warning("3DBAG over %s failed: %s", source, short_error(exc))
+            failures.append(f"{source}: {short_error(exc)}")
+
+    raise ServiceError(
+        "every 3DBAG source failed. "
+        + "; ".join(failures)
+        + ". Both are the same dataset from the same project, so this is "
+        "usually a network problem at your end rather than an outage."
+    )
+
+
+def _api_answers(buildings_cfg: dict) -> bool:
+    """A short knock on the API before committing the full timeout budget.
+
+    Without this a dead API costs timeout x retries -- twelve minutes on the
+    defaults -- before the fallback gets a turn, which is long enough that
+    people kill the run instead of waiting for it to recover itself.
+    """
+    probe = str(
+        buildings_cfg.get("probe_url") or "https://api.3dbag.nl/collections/pand"
+    )
+    timeout = float(buildings_cfg.get("probe_timeout_s", 8.0))
+    ok, detail = check_reachable(probe, timeout=timeout)
+    if not ok:
+        LOG.warning(
+            "3DBAG API did not answer within %.0fs (%s); using the static "
+            "tiles instead",
+            timeout,
+            detail,
+        )
+    return ok
+
+
+def _fetch_from_tiles(bbox: BBox, work_dir: Path, buildings_cfg: dict) -> BuildingSet:
+    from .bag3d_tiles import DEFAULT_INDEX_URL, DEFAULT_TILE_URL, DEFAULT_VERSION
+    from .bag3d_tiles import fetch_buildings_from_tiles
+
+    return fetch_buildings_from_tiles(
+        bbox,
+        work_dir,
+        lod=str(buildings_cfg["lod"]),
+        base_url=str(buildings_cfg.get("tiles_url") or DEFAULT_TILE_URL),
+        index_url=str(buildings_cfg.get("tiles_index_url") or DEFAULT_INDEX_URL),
+        version=str(buildings_cfg.get("tiles_version") or DEFAULT_VERSION),
+        timeout=float(buildings_cfg["timeout_s"]),
+        max_retries=int(buildings_cfg["max_retries"]),
+    )
+
+
+def _fetch_from_api(bbox: BBox, buildings_cfg: dict) -> BuildingSet:
     """Fetch and parse every 3DBAG building intersecting `bbox`."""
     lod = str(buildings_cfg["lod"])
     result = BuildingSet(lod=lod)
@@ -1066,7 +1170,9 @@ def build_buildings(
     facade_cfg: dict | None = None,
 ) -> BuildingSet:
     """Fetch, clean, ground, and cache the buildings for `bbox`."""
-    result = fetch_buildings(bbox, buildings_cfg=buildings_cfg)
+    result = fetch_buildings(
+        bbox, buildings_cfg=buildings_cfg, work_dir=work_dir
+    )
 
     result, note = filter_to_bbox(
         result, bbox, str(buildings_cfg["clip_mode"]).strip().lower()
