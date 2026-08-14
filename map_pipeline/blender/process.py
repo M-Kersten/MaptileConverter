@@ -448,6 +448,23 @@ def _build_terrain_mesh(
     return obj
 
 
+def _terrain_summary() -> dict:
+    """Vertex and face counts of the terrain as built, for the checks to read."""
+    obj = bpy.context.scene.objects.get("Terrain")
+    if obj is None or obj.type != "MESH":
+        return {}
+    mesh = obj.data
+    quads = sum(1 for polygon in mesh.polygons if len(polygon.vertices) == 4)
+    return {
+        "vertices": len(mesh.vertices),
+        "faces": len(mesh.polygons),
+        "quads": quads,
+        # A grid is quads, every adaptive mesh is triangles. One number tells
+        # you which of the two the model actually contains.
+        "triangles": len(mesh.polygons) - quads,
+    }
+
+
 def build_terrain(scene: dict, work_dir: Path, material) -> object:
     """Grid mesh from the AHN heights, draped with the aerial photo."""
     data = np.load(work_dir / scene["terrain"]["file"])
@@ -1515,6 +1532,11 @@ def main() -> int:
         },
         "objects": [obj.name for obj in bpy.context.scene.objects],
         "materials": [m.name for m in bpy.data.materials],
+        # What the terrain actually came out as. Every check upstream reads the
+        # mesh the Python stages built in memory, which says nothing about what
+        # this script drew: a scene.json missing its mesh_file shipped the
+        # plain grid for weeks with every terrain check passing.
+        "terrain": _terrain_summary(),
     }
     (work_dir / "blender_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"

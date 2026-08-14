@@ -189,12 +189,15 @@ def write_scene_description(
         "bbox_local": local.as_list(),
         "terrain": {
             "file": "terrain_grid.npz",
-            # Present only when the grid was simplified. The grid stays either
-            # way: the water bed is written on it, and the mesh vertices are
-            # addressed by grid column and row.
+            # Present whenever a mesh was built, by either route. Both write
+            # the same file; the file itself says which addressing it uses.
+            # Checking only `mesh` here is what silently shipped the plain
+            # grid for every run that used breaklines, because those set
+            # `constrained` instead and left `mesh` as None.
             **(
                 {"mesh_file": "terrain_mesh.npz"}
                 if getattr(terrain, "mesh", None) is not None
+                or getattr(terrain, "constrained", None) is not None
                 else {}
             ),
         },

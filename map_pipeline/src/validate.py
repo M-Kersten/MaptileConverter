@@ -745,6 +745,46 @@ def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
         )
 
 
+def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
+    """The terrain in the model is the one the pipeline meant to build.
+
+    Every other terrain check reads the mesh held in memory, which says nothing
+    about what the Blender stage drew. When scene.json lost its mesh_file the
+    model shipped the plain grid and all of them still passed, because they
+    were never looking at the model.
+    """
+    summary_path = work_dir / "blender_summary.json"
+    if not summary_path.is_file():
+        return
+    try:
+        built = (json.loads(summary_path.read_text(encoding="utf-8")) or {}).get(
+            "terrain"
+        ) or {}
+    except (OSError, ValueError):
+        return
+    if not built:
+        return
+
+    intended = getattr(terrain, "constrained", None) or getattr(terrain, "mesh", None)
+    if intended is None:
+        report.add(
+            "terrain_built_as_planned",
+            built.get("quads", 0) > 0,
+            f"no mesh was asked for, and the model has {built.get('quads', 0)} "
+            f"grid quads",
+        )
+        return
+
+    report.add(
+        "terrain_built_as_planned",
+        int(built.get("triangles", 0)) == int(intended.triangle_count)
+        and int(built.get("quads", 0)) == 0,
+        f"the model contains {built.get('triangles', 0)} terrain triangles and "
+        f"{built.get('quads', 0)} quads, against the {intended.triangle_count} "
+        f"triangles that were built for it",
+    )
+
+
 def check_export(
     report: CheckReport,
     out_dir: Path,
@@ -911,6 +951,7 @@ __all__ = [
     "check_bbox",
     "check_buildings",
     "check_buildings_on_terrain",
+    "check_built_terrain",
     "check_export",
     "check_fbx_reimport",
     "check_terrain",

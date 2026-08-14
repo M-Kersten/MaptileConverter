@@ -87,6 +87,7 @@ from src.validate import (  # noqa: E402
     check_bbox,
     check_buildings,
     check_buildings_on_terrain,
+    check_built_terrain,
     check_export,
     check_fbx_reimport,
     check_furniture,
@@ -714,6 +715,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             report, buildings, max_height_m=float(config.buildings["max_height_m"])
         )
         check_buildings_on_terrain(report, buildings, terrain)
+        check_built_terrain(report, work_dir, terrain)
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
