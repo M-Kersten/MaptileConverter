@@ -266,6 +266,9 @@ Other knobs worth knowing:
 | `buildings.probe_timeout_s` | `8.0` | How long to knock on the API before giving up and using the tiles. |
 | `buildings.merge` | `single` | One merged buildings mesh. `per_building` gives one object each. |
 | `terrain.mesh_vertices_per_side` | `257` | 257 → 66k terrain vertices before simplification. Rounded up to 2^k + 1 when simplification is on. |
+| `terrain.breaklines` | roads, water, land cover, buildings | Which outlines the terrain folds along. Empty falls back to the bisection mesh. |
+| `terrain.breakline_simplify_m` | `0.15` | How far a simplified outline may stray from the surveyed one. |
+| `terrain.contour_interval_m` | `0.5` | Contour spacing. `0` leaves contours out and roughly halves the mesh. |
 | `terrain.simplify_tolerance_m` | `0.10` | How far the terrain mesh may stray from the height grid. Drops the vertices sitting on ground their neighbours already describe, which over a Dutch bbox is most of them. `0` keeps the full grid. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
 
@@ -399,6 +402,60 @@ cache makes repeat runs faster than the API anyway:
 ```
 
 ## Terrain mesh
+
+The terrain folds along the features the ground actually has: a canal bank, a
+kerb, a building footprint and a contour are all real edge loops you can select
+and drag in Blender, not a patch of triangles that happens to be dense there.
+
+**Why the grid could not do this.** A grid puts its edges on grid lines and the
+bisection mesh below puts them on grid diagonals. A bank runs along neither. No
+amount of extra detail fixes that -- it only makes a finer staircase.
+
+**Breaklines.** `src/breaklines.py` collects the lines the mesh has to fold
+along and `src/cdt.py` triangulates so that every one of them survives as an
+edge. Over 600 m of central Utrecht:
+
+| Source | Segments |
+| --- | --- |
+| BGT roads (`wegdeel`) | 1,498 |
+| BGT unpaved (`onbegroeidterreindeel`) | 1,068 |
+| Building footprints (`pand`) | 1,398 |
+| BGT green (`begroeidterreindeel`) | 492 |
+| BGT water (`waterdeel`) | 22 |
+| Contours off the DTM, 0.5 m apart | 16,593 |
+| The bbox edge | 1 |
+
+Contours dominate the count and are the one source that follows the ground
+rather than something drawn on it. `terrain.contour_interval_m: 0` leaves them
+out and roughly halves the mesh.
+
+**The BGT is already a planar partition**, which is what makes this cheap:
+adjacent polygons repeat their shared corners exactly, so 77k raw outline
+vertices weld down to 38k. Nothing has to be stitched.
+
+**Nothing may cross.** No triangulation can honour two constraints that cross,
+so every segment is cut at every intersection first. BGT outlines never cross
+each other; contours cross roads and water constantly -- 12,061 crossings over
+that same 600 m. Splitting has to be repeated, because welding afterwards is
+what merges the two copies of a shared intersection and also drags a cut that
+landed a millimetre from an endpoint back onto it, undoing the split.
+
+**Then it refines.** Breaklines say nothing about the ground between them, so
+the mesh is built, the triangles that stray further than
+`terrain.simplify_tolerance_m` from the height grid get a point dropped inside
+them, and it is rebuilt. Probes sit strictly inside the triangle on purpose: an
+edge midpoint is the obvious place to check and is usually *on* a breakline,
+which is the one place a point must not go.
+
+Result over that 600 m bbox: 63,612 vertices, 126,525 triangles, 60,400
+breakline edges, covering the bbox to within 1e-6, in about 25 s of a 138 s run.
+
+**Roads still float above it.** They are separate objects with their own
+materials, and they share the terrain's edges rather than being part of it, so
+the 6 cm lift is raised just enough to clear how far the mesh strays from the
+grid the roads were draped on.
+
+## Adaptive terrain mesh (no breaklines)
 
 A regular grid charges the same price everywhere, which over a Dutch bbox is a
 bad trade: a car park that three vertices would describe perfectly costs exactly

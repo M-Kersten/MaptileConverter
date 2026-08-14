@@ -2189,6 +2189,102 @@ class TestConstrainedTriangulation(unittest.TestCase):
         self.assertTrue(np.allclose(kept[mapping], pts))
 
 
+class TestBreaklines(unittest.TestCase):
+    """The lines the terrain has to fold along."""
+
+    def test_simplification_keeps_the_shape(self):
+        from src.breaklines import douglas_peucker
+
+        ring = np.array(
+            [[0, 0], [1, 0.001], [2, 0], [3, 0.002], [4, 0], [4, 4], [0, 4]], float
+        )
+        thin = douglas_peucker(ring, 0.15)
+        self.assertLess(len(thin), len(ring))
+        # The corners are the shape; only the wobble along the straight goes.
+        for corner in ([0, 0], [4, 0], [4, 4], [0, 4]):
+            self.assertTrue(np.isclose(thin, corner).all(axis=1).any())
+
+    def test_a_ring_is_cut_at_the_bbox(self):
+        from src.breaklines import clip_ring_segments
+        from src.geo import BBox
+
+        pieces = clip_ring_segments(
+            np.array([[-5, 5], [15, 5]], float), BBox(0, 0, 10, 10)
+        )
+        self.assertEqual(len(pieces), 1)
+        self.assertTrue(np.allclose(pieces[0], [[0, 5], [10, 5]]))
+
+    def test_a_ring_that_leaves_and_returns_comes_back_in_pieces(self):
+        from src.breaklines import clip_ring_segments
+        from src.geo import BBox
+
+        ring = np.array([[1, 1], [1, 9], [-5, 9], [-5, 1], [9, 1], [9, 9]], float)
+        pieces = clip_ring_segments(ring, BBox(0, 0, 10, 10))
+        self.assertGreaterEqual(len(pieces), 2)
+
+    def test_contours_come_out_at_the_right_heights(self):
+        from src.breaklines import contour_lines
+
+        n = 33
+        _, cols = np.mgrid[0:n, 0:n].astype(float)
+        axis = np.arange(n, dtype=float)
+        segs = contour_lines(cols * 0.25, axis, axis, interval_m=1.0)
+        self.assertGreater(len(segs), 0)
+        # A ramp of 0.25 m per cell crosses a whole metre every four cells.
+        levels = sorted({round(float(s[0][0]) * 0.25, 3) for s in segs})
+        self.assertEqual(levels, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+
+    def test_flat_ground_has_no_contours(self):
+        from src.breaklines import contour_lines
+
+        axis = np.arange(9, dtype=float)
+        self.assertEqual(contour_lines(np.zeros((9, 9)), axis, axis), [])
+
+    def test_crossing_segments_are_cut_apart(self):
+        """The triangulator refuses crossings, so they cannot reach it."""
+        from src.breaklines import split_crossings
+
+        pts = np.array([[0, 0], [10, 10], [0, 10], [10, 0]], float)
+        out_pts, out_segs = split_crossings(pts, np.array([[0, 1], [2, 3]]))
+        self.assertEqual(len(out_segs), 4)
+        self.assertEqual(len(out_pts), 6)
+        # Both new points sit on the crossing, which is the middle.
+        self.assertTrue(np.allclose(out_pts[4], [5, 5]))
+        self.assertTrue(np.allclose(out_pts[5], [5, 5]))
+
+    def test_segments_that_only_touch_are_left_alone(self):
+        from src.breaklines import split_crossings
+
+        pts = np.array([[0, 0], [10, 0], [5, 0], [5, 5]], float)
+        _, out = split_crossings(pts, np.array([[0, 1], [2, 3]]))
+        self.assertEqual(len(out), 2)
+
+    def test_the_bbox_edge_is_always_a_breakline(self):
+        """Otherwise the mesh ends wherever the outlines happened to."""
+        from src.breaklines import build_breaklines
+        from src.geo import BBox
+
+        lines = build_breaklines(BBox(0, 0, 10, 10), rings_by_source={})
+        self.assertEqual(lines.counts["bbox"], 1)
+        self.assertGreaterEqual(len(lines.segments), 4)
+
+    def test_everything_reaches_the_triangulator_as_an_edge(self):
+        from src.breaklines import build_breaklines
+        from src.cdt import triangulate
+        from src.geo import BBox
+
+        bbox = BBox(0, 0, 100, 100)
+        rings = {
+            "water": [np.array([[20, 20], [80, 20], [80, 40], [20, 40], [20, 20]], float)],
+            "roads": [np.array([[0, 60], [100, 60], [100, 70], [0, 70], [0, 60]], float)],
+        }
+        lines = build_breaklines(bbox, rings_by_source=rings, simplify_m=0.05)
+        result = triangulate(
+            lines.points, lines.segments, origin=tuple(bbox.center)
+        )
+        self.assertEqual(result.missing_constraints(), set())
+
+
 class TestBag3dTiles(unittest.TestCase):
     """The way round an api.3dbag.nl outage."""
 

@@ -23,7 +23,11 @@ import numpy as np
 
 from .geo import BBox, tile_edges, build_grid_coords
 from .http_util import ServiceError, get_with_retry, short_error
-from .terrain_mesh import TerrainMesh, build_rtin, save_terrain_mesh
+from .terrain_mesh import (
+    TerrainMesh,
+    build_rtin,
+    save_terrain_mesh,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -62,6 +66,7 @@ class TerrainResult:
     coverage_id: str
     resolution_m: float
     mesh: "TerrainMesh | None" = None
+    constrained: "ConstrainedMesh | None" = None
 
     @property
     def n(self) -> int:
@@ -84,6 +89,8 @@ class TerrainResult:
         }
         if self.mesh is not None:
             out["mesh"] = self.mesh.stats()
+        if self.constrained is not None:
+            out["mesh"] = self.constrained.stats()
         return out
 
 
@@ -554,6 +561,7 @@ def build_terrain(
     work_dir: Path,
     *,
     terrain_cfg: dict,
+    breakline_rings: dict | None = None,
 ) -> TerrainResult:
     """Fetch AHN for `bbox` and turn it into a clean NxN height grid."""
     import rasterio
@@ -646,8 +654,29 @@ def build_terrain(
     # keeps them sitting on the surface Unity will actually show instead of on
     # the one that was thrown away.
     mesh = None
+    constrained = None
     tolerance = float(terrain_cfg.get("simplify_tolerance_m", 0.0) or 0.0)
-    if tolerance > 0.0:
+    if breakline_rings:
+        from .terrain_mesh import build_constrained, save_constrained_mesh
+
+        constrained = build_constrained(
+            bbox,
+            filled,
+            xs,
+            ys,
+            rings_by_source=breakline_rings,
+            tolerance_m=max(tolerance, 0.01),
+            simplify_m=float(terrain_cfg.get("breakline_simplify_m", 0.15)),
+            contour_interval_m=float(terrain_cfg.get("contour_interval_m", 0.5)),
+        )
+        save_constrained_mesh(
+            constrained, work_dir / "terrain_mesh.npz", bbox.center
+        )
+        # The grid is left alone here on purpose. Mesh vertices take their
+        # height from it, so anything else draped on it lands on the same
+        # surface wherever the two share a vertex -- which, along every road
+        # and water edge, is everywhere that matters.
+    elif tolerance > 0.0:
         mesh = build_rtin(filled, tolerance_m=tolerance)
         filled = mesh.heights.astype(np.float64)
         save_terrain_mesh(mesh, work_dir / "terrain_mesh.npz")
@@ -677,6 +706,7 @@ def build_terrain(
         coverage_id=_coverage_id(ahn_model),
         resolution_m=resolution,
         mesh=mesh,
+        constrained=constrained,
     )
 
 

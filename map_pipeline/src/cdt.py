@@ -64,6 +64,8 @@ class Triangulation:
     triangles: np.ndarray  # (m, 3) int32, counter-clockwise
     constrained: set  # frozensets of two point indices
     origin: tuple[float, float] = (0.0, 0.0)
+    # Constraints dropped because they crossed one already in place.
+    skipped: int = 0
 
     @property
     def point_count(self) -> int:
@@ -409,7 +411,7 @@ def _crossed_triangles(mesh: _Mesh, a: int, b: int) -> tuple[list, list, list]:
             start, left0, right0 = t, v, u
             break
     if start < 0:
-        raise RuntimeError(f"no triangle at vertex {a} faces {b}")
+        raise _Unplaceable(f"no triangle at vertex {a} faces {b}")
 
     crossed = [start]
     left, right = [a, left0], [a, right0]
@@ -419,7 +421,7 @@ def _crossed_triangles(mesh: _Mesh, a: int, b: int) -> tuple[list, list, list]:
             raise _CrossingConstraints(a, b, u, v)
         n = mesh.nbr[t][mesh.tri[t].index(_third(mesh.tri[t], u, v))]
         if n < 0:
-            raise RuntimeError("a constraint ran off the edge of the triangulation")
+            raise _Unplaceable("a constraint ran off the edge of the triangulation")
         far = _third(mesh.tri[n], u, v)
         if far == b:
             crossed.append(n)
@@ -437,7 +439,7 @@ def _crossed_triangles(mesh: _Mesh, a: int, b: int) -> tuple[list, list, list]:
             v = far
         t = n
     else:
-        raise RuntimeError("the walk along a constraint did not reach its end")
+        raise _Unplaceable("the walk along a constraint did not reach its end")
 
     left.append(b)
     right.append(b)
@@ -456,7 +458,20 @@ def _between(mesh: _Mesh, a: int, b: int, w: int) -> bool:
     return 0.0 < t < dx * dx + dy * dy
 
 
-class _CrossingConstraints(RuntimeError):
+class _ConstraintProblem(RuntimeError):
+    """A required edge could not be put in. Skippable when the caller allows."""
+
+
+class _Unplaceable(_ConstraintProblem):
+    """The walk could not start or could not finish.
+
+    Degenerate geometry rather than a logic error: a vertex sitting exactly on
+    the line of a constraint but outside it leaves no triangle whose wedge
+    strictly contains the far end.
+    """
+
+
+class _CrossingConstraints(_ConstraintProblem):
     """Two required edges cross, which no triangulation can satisfy."""
 
     def __init__(self, a, b, u, v):
@@ -467,9 +482,16 @@ class _CrossingConstraints(RuntimeError):
         )
 
 
-def _apply_constraints(mesh: _Mesh, segments: np.ndarray) -> int:
-    """Force every segment to appear as an edge. Returns how many were recovered."""
-    recovered = 0
+def _apply_constraints(mesh: _Mesh, segments: np.ndarray, skip_crossing: bool) -> int:
+    """Force every segment to appear as an edge. Returns how many were skipped.
+
+    With `skip_crossing`, a segment that crosses one already recovered is
+    dropped rather than raised over. Breakline input is split at its own
+    crossings first, but a cut landing a hair from an endpoint survives that,
+    and a whole run is not worth losing over a few contour segments meeting at
+    a millimetre.
+    """
+    skipped = 0
     pending = [(int(a), int(b)) for a, b in segments]
     while pending:
         a, b = pending.pop()
@@ -481,7 +503,13 @@ def _apply_constraints(mesh: _Mesh, segments: np.ndarray) -> int:
         if _edge_exists(mesh, a, b):
             mesh.constrained.add(key)
             continue
-        crossed, left, right = _crossed_triangles(mesh, a, b)
+        try:
+            crossed, left, right = _crossed_triangles(mesh, a, b)
+        except _ConstraintProblem:
+            if not skip_crossing:
+                raise
+            skipped += 1
+            continue
         if left is None:
             # The segment runs through vertex `crossed`; constrain both halves.
             pending.append((a, crossed))
@@ -501,8 +529,7 @@ def _apply_constraints(mesh: _Mesh, segments: np.ndarray) -> int:
             wound.append((x, z, y) if area < 0 else (x, y, z))
         _retriangulate(mesh, crossed, wound)
         mesh.constrained.add(key)
-        recovered += 1
-    return recovered
+    return skipped
 
 
 def triangulate(
@@ -510,6 +537,7 @@ def triangulate(
     segments: np.ndarray | None = None,
     *,
     origin: tuple[float, float] | None = None,
+    skip_crossing: bool = False,
 ) -> Triangulation:
     """Delaunay triangulation of `points` in which every `segment` is an edge.
 
@@ -548,8 +576,17 @@ def triangulate(
     for index in _hilbert_order(local):
         hint = _insert_point(mesh, int(index), hint)
 
+    skipped = 0
     if segments is not None and len(segments):
-        _apply_constraints(mesh, np.asarray(segments, dtype=np.int64))
+        skipped = _apply_constraints(
+            mesh, np.asarray(segments, dtype=np.int64), skip_crossing
+        )
+        if skipped:
+            LOG.warning(
+                "%d of %d constraints crossed another and were dropped",
+                skipped,
+                len(segments),
+            )
 
     kept = []
     for t in range(len(mesh.tri)):
@@ -567,6 +604,7 @@ def triangulate(
         triangles=np.asarray(kept, dtype=np.int32).reshape(-1, 3),
         constrained={frozenset((int(x), int(y))) for x, y in mesh.constrained},
         origin=(float(origin[0]), float(origin[1])),
+        skipped=skipped,
     )
 
 

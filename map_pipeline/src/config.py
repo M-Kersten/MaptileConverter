@@ -58,6 +58,18 @@ DEFAULTS: dict[str, Any] = {
         # the mesh gives up nothing the source could resolve in the first
         # place. Set to 0 for the old full grid.
         "simplify_tolerance_m": 0.10,
+        # Fold the terrain along real features instead of along grid diagonals,
+        # so a canal bank or a kerb is an edge loop you can select in Blender
+        # rather than a staircase of triangles that happens to be dense there.
+        # Empty turns it off and leaves the bisection mesh.
+        "breaklines": ["water", "roads", "unpaved", "green", "buildings"],
+        # How far a simplified outline may stray from the surveyed one. The BGT
+        # carries vertices centimetres apart along a visibly straight kerb.
+        "breakline_simplify_m": 0.15,
+        # Contour spacing. 0 leaves contours out; they are the only breaklines
+        # that follow the ground rather than something drawn on it, and also
+        # the ones that cost the most triangles.
+        "contour_interval_m": 0.5,
     },
     "buildings": {
         "lod": "2.2",

@@ -403,13 +403,25 @@ def _build_terrain_mesh(
 
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
-    columns = vertices[:, 0].astype(np.int64)
-    rows = vertices[:, 1].astype(np.int64)
+    if bool(data.get("grid_indexed", np.array(False))):
+        # The bisection mesh addresses its vertices by grid column and row.
+        columns = vertices[:, 0].astype(np.int64)
+        rows = vertices[:, 1].astype(np.int64)
+        x = xs[columns] - origin_x
+        y = ys[rows] - origin_y
+    else:
+        # The constrained mesh puts its vertices wherever the breaklines run,
+        # already relative to the bbox centre, so only the height needs moving.
+        x = vertices[:, 0]
+        y = vertices[:, 1]
+        columns = np.clip(
+            np.searchsorted(xs - origin_x, x), 0, len(xs) - 1
+        ).astype(np.int64)
+        rows = np.clip(np.searchsorted(ys - origin_y, y), 0, len(ys) - 1).astype(
+            np.int64
+        )
     z = _sink_mesh_water_bed(scene, work_dir, columns, rows, vertices[:, 2])
-
-    points = np.column_stack(
-        [xs[columns] - origin_x, ys[rows] - origin_y, z - z_offset]
-    )
+    points = np.column_stack([x, y, z - z_offset])
 
     n_faces = len(triangles)
     loop_vertex_indices = triangles.ravel()
@@ -431,8 +443,7 @@ def _build_terrain_mesh(
     full = 2 * (len(xs) - 1) ** 2
     log(
         f"terrain: {len(points)} vertices, {n_faces} triangles "
-        f"({100.0 * n_faces / full:.1f}% of the {len(xs)}x{len(ys)} grid), "
-        f"within {float(data['tolerance_m']):.2f} m of it"
+        f"({100.0 * n_faces / full:.1f}% of the {len(xs)}x{len(ys)} grid)"
     )
     return obj
 

@@ -27,6 +27,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from src.bgt import use_cache as bgt_cache  # noqa: E402
+from src.breaklines import fetch_outline_rings  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402
 from src.elevation import build_terrain, ensure_dsm, raster_sampler  # noqa: E402
@@ -391,7 +393,39 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         return step
 
     with Stage("terrain (AHN DTM)", next_step(), total):
-        terrain = build_terrain(config.bbox, work_dir, terrain_cfg=config.terrain)
+        # Cache BGT responses under this run. The terrain mesh reads outlines
+        # here to fold along, and the surfaces stage reads the same collections
+        # again a few steps later; without the cache that is paid for twice.
+        bgt_cache(work_dir)
+        breakline_rings = None
+        wanted_lines = list(config.terrain.get("breaklines") or [])
+        if wanted_lines:
+            breakline_rings = fetch_outline_rings(
+                config.bbox,
+                sources=wanted_lines,
+                page_limit=int(config.surfaces["page_limit"]),
+                timeout=float(config.surfaces["timeout_s"]),
+                max_retries=int(config.surfaces["max_retries"]),
+                max_pages=int(config.surfaces["max_pages"]),
+            )
+        terrain = build_terrain(
+            config.bbox,
+            work_dir,
+            terrain_cfg=config.terrain,
+            breakline_rings=breakline_rings,
+        )
+        if terrain.constrained is not None:
+            # Roads float just above the ground so the two do not fight for
+            # depth. The mesh can stray from the grid the roads are draped on,
+            # so the lift has to clear that or the terrain pokes through.
+            clearance = round(min(terrain.constrained.max_error_m, 0.2) + 0.02, 3)
+            if clearance > float(config.surfaces["road_lift_m"]):
+                LOG.info(
+                    "raising surfaces.road_lift_m to %.3f m to clear the "
+                    "terrain mesh",
+                    clearance,
+                )
+                config.surfaces["road_lift_m"] = clearance
 
     with Stage("aerial imagery (PDOK)", next_step(), total):
         aerial = build_aerial(config.bbox, work_dir, aerial_cfg=config.aerial)

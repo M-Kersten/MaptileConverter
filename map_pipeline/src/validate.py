@@ -140,6 +140,46 @@ def check_terrain(report: CheckReport, terrain, bbox: BBox) -> None:
     )
 
     check_terrain_mesh(report, getattr(terrain, "mesh", None), bbox)
+    check_constrained_mesh(report, getattr(terrain, "constrained", None), bbox)
+
+
+def check_constrained_mesh(report: CheckReport, mesh, bbox: BBox) -> None:
+    """The terrain folds along real features, and still tiles the area."""
+    if mesh is None:
+        return
+
+    corners = mesh.vertices[mesh.triangles][:, :, :2]
+    a = corners[:, 1] - corners[:, 0]
+    b = corners[:, 2] - corners[:, 0]
+    twice_area = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    covered = 0.5 * float(twice_area.sum())
+    want = bbox.width * bbox.height
+    report.add(
+        "terrain_mesh_tiles_the_bbox",
+        abs(covered - want) < 1e-6 * want,
+        f"triangles cover {covered:.1f} m2 of a {want:.0f} m2 bbox",
+    )
+    report.add(
+        "terrain_mesh_wound_up",
+        bool((twice_area > 0).all()),
+        f"{int((twice_area <= 0).sum())} triangles face down or are degenerate",
+    )
+
+    # The whole point: an edge where the ground has one. Without this the mesh
+    # is just a Delaunay triangulation of some points and nothing folds.
+    report.add(
+        "terrain_folds_along_features",
+        mesh.breakline_edges > 0,
+        f"{mesh.breakline_edges} breakline edges from "
+        f"{', '.join(f'{k} {v}' for k, v in mesh.counts.items() if v)}",
+    )
+    report.add(
+        "terrain_mesh_follows_the_ground",
+        mesh.max_error_m < max(1.0, 8.0 * mesh.tolerance_m),
+        f"worst gap between the mesh and the height grid is "
+        f"{mesh.max_error_m:.3f} m, sampled at triangle centres",
+        severity="warning",
+    )
 
 
 # The nested error bound is measured at hypotenuse midpoints, and a vertex can
@@ -874,6 +914,7 @@ __all__ = [
     "check_export",
     "check_fbx_reimport",
     "check_terrain",
+    "check_constrained_mesh",
     "check_terrain_mesh",
     "write_report",
 ]

@@ -14,8 +14,11 @@ are always sent.
 
 from __future__ import annotations
 
+import gzip
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
@@ -28,6 +31,27 @@ LOG = logging.getLogger(__name__)
 
 BGT_BASE = "https://api.pdok.nl/lv/bgt/ogc/v1/collections"
 RD_URI = "http://www.opengis.net/def/crs/EPSG/0/28992"
+
+# Where a run parks the collections it has already read. Two stages want the
+# same outlines -- the terrain mesh needs them as breaklines before anything is
+# draped, and the surfaces stage needs them again as geometry -- and the BGT is
+# slow enough per collection that reading it twice is worth avoiding. Also
+# means a re-run over the same area starts instantly.
+CACHE_DIRNAME = "_bgt"
+_cache_dir: Path | None = None
+
+
+def use_cache(work_dir: Path | None) -> None:
+    """Point the collection cache at a run's work directory, or turn it off."""
+    global _cache_dir
+    _cache_dir = None if work_dir is None else Path(work_dir) / CACHE_DIRNAME
+
+
+def _cache_path(collection: str, bbox: BBox) -> Path | None:
+    if _cache_dir is None:
+        return None
+    key = f"{bbox.xmin:.1f}_{bbox.ymin:.1f}_{bbox.xmax:.1f}_{bbox.ymax:.1f}"
+    return _cache_dir / f"{collection}_{key}.json.gz"
 
 
 def collection_url(collection: str) -> str:
@@ -129,6 +153,14 @@ def fetch_current(
     max_pages: int = 200,
 ) -> tuple[list[dict], FetchStats]:
     """Read one collection and keep only the current version of each object."""
+    cached = _cache_path(collection, bbox)
+    if cached is not None and cached.is_file():
+        with gzip.open(cached, "rt", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        stats = FetchStats(collection=collection, **stored["stats"])
+        LOG.info("%s (cached)", stats.summary())
+        return stored["features"], stats
+
     stats = FetchStats(collection=collection)
     features: list[dict] = []
     seen_ids: set[str] = set()
@@ -164,6 +196,24 @@ def fetch_current(
 
     stats.current_features = len(features)
     LOG.info("%s", stats.summary())
+    if cached is not None:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        staging = cached.with_suffix(cached.suffix + ".part")
+        with gzip.open(staging, "wt", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "features": features,
+                    "stats": {
+                        "pages": stats.pages,
+                        "raw_features": stats.raw_features,
+                        "current_features": stats.current_features,
+                        "superseded_dropped": stats.superseded_dropped,
+                        "classes": stats.classes,
+                    },
+                },
+                handle,
+            )
+        staging.replace(cached)
     return features, stats
 
 
