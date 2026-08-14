@@ -833,13 +833,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local web UI for the map pipeline.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="open the page in a browser once the server is listening",
+    )
     args = parser.parse_args(argv)
 
     for note in check_environment():
         print(f"warning: {note}", file=sys.stderr)
 
+    # Bind before opening the browser, or the page races the socket and the
+    # first thing a new user sees is a connection error.
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"map pipeline UI on http://{args.host}:{args.port}")
+    url = f"http://{args.host}:{args.port}"
+    if args.open:
+        import threading
+        import webbrowser
+
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    print(f"map pipeline UI on {url}")
     print("press Ctrl+C to stop")
     try:
         server.serve_forever()

@@ -32,11 +32,45 @@ There is a small web UI, and there is the command line. They do the same thing:
 the UI writes a config file and shells out to `pipeline.py`, so it cannot drift
 away from the CLI.
 
+### Without a terminal
+
+Colleagues who would rather not open a terminal can double-click a launcher in
+this folder:
+
+| | |
+| --- | --- |
+| Windows | **Start Map Pipeline.bat** |
+| macOS | **Start Map Pipeline.command** |
+| Linux | **start-map-pipeline.sh** |
+
+It creates a private Python environment beside itself, installs what is
+missing, starts the UI and opens the browser. Nothing is typed and nothing is
+installed system-wide; deleting the `.venv` folder undoes it completely.
+
+**The first run downloads about a gigabyte and takes several minutes.** 848 MB
+of that is Blender, which ships as a Python library here so nobody has to
+install Blender separately. Every run after that opens the page in seconds.
+
+**It needs CPython 3.11, and only 3.11.** Blender publishes its Python library
+for that version alone. On anything else pip installs the other dependencies
+happily and the run then fails minutes later at the Blender stage, with nothing
+that points at the version, so the launchers check first and send you to the
+download page instead.
+
+On macOS the first double-click is blocked by Gatekeeper because the file came
+from the internet: right-click it, choose **Open**, and confirm once.
+
+**The lightest option of all is not to install it on their machines.** The UI is
+a web page, so one person can run the launcher and share the address — start it
+with `--host 0.0.0.0` and colleagues open `http://<your-machine>:8765`. Only do
+that on a network you trust: there is no login, and anyone who can reach the
+page can start runs and read the output folder.
+
 ### The UI
 
 ```bash
 pip install -r requirements.txt
-python ui/server.py
+python ui/server.py --open
 ```
 
 Open <http://127.0.0.1:8765>. Search for a place or click the map, set the side
