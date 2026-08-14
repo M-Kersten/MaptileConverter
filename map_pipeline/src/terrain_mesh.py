@@ -381,6 +381,12 @@ def build_constrained(
     z = _bilinear(heights, xs, ys, world[:, 0], world[:, 1])
     vertices = np.column_stack([world[:, 0], world[:, 1], z])
 
+    # Checked here, where the mesh was built, rather than left to the
+    # validation stage. A tear does not announce itself downstream: the
+    # adjacency around a hole stays self-consistent, so the first sign used to
+    # be an unrelated vertex thousands of constraints later.
+    _assert_tiles(vertices, result.triangles, bbox)
+
     lost = result.missing_constraints()
     if lost:
         raise ValueError(
@@ -407,6 +413,24 @@ def build_constrained(
         mesh.max_error_m,
     )
     return mesh
+
+
+def _assert_tiles(vertices, triangles, bbox) -> None:
+    """The triangles must cover the bbox exactly once, with none facing down."""
+    corners = vertices[triangles][:, :, :2]
+    a = corners[:, 1] - corners[:, 0]
+    b = corners[:, 2] - corners[:, 0]
+    twice_area = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    want = bbox.width * bbox.height
+    covered = 0.5 * float(twice_area.sum())
+    if abs(covered - want) > 1e-6 * want:
+        raise ValueError(
+            f"the terrain mesh covers {covered:.1f} m2 of a {want:.0f} m2 "
+            f"bbox, so it has a hole or an overlap"
+        )
+    down = int((twice_area <= 0).sum())
+    if down:
+        raise ValueError(f"{down} terrain triangles face down or are degenerate")
 
 
 def _straying_triangles(vertices, triangles, heights, xs, ys, tolerance):
