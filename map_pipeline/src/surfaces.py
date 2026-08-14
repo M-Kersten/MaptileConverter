@@ -774,7 +774,15 @@ def triangulate_roads(
                 unmeasured += 1
                 continue
 
-            z = np.full((len(corners), 3, 1), level + lift_m)
+            # The deck level is one flat height for the whole part, which is
+            # right over the span and wrong at the ends: a bridge part carries
+            # its approach ramp too, and where that runs onto rising ground a
+            # flat deck sinks into it. So the road sits on the deck or on the
+            # ground, whichever is higher. That keeps the span flat, lets the
+            # ramp meet grade the way a ramp does, and leaves no vertex under
+            # the terrain it is supposed to be crossing.
+            floor = ground.reshape(len(corners), 3, 1)
+            z = np.maximum(np.full((len(corners), 3, 1), level), floor) + lift_m
             out_tris.append(np.dstack([corners, z]))
             out_class.append(
                 np.full(len(corners), part.surface_class, dtype=np.int32)

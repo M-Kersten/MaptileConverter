@@ -324,8 +324,9 @@ def _build_geometry(
         flat = _triangulate(part.rings)
         if not len(flat):
             continue
-        centre = flat.reshape(-1, 2).mean(axis=0)
-        ground = float(terrain.sample(np.array([centre[0]]), np.array([centre[1]]))[0])
+        corners = flat.reshape(-1, 2)
+        under = np.asarray(terrain.sample(corners[:, 0], corners[:, 1]))
+        ground = float(np.median(under))
 
         level = None
         if dsm_sampler is not None:
@@ -334,9 +335,12 @@ def _build_geometry(
         if level is None:
             # Nothing measured it. The ordinal level is all that is left, and
             # a Dutch road bridge clears what it crosses by about five metres.
-            level = ground + float(structures_cfg.get("fallback_clearance_m", 5.0)) * max(
-                part.level, 1
-            )
+            # Measured from the highest ground the part covers, not from its
+            # centre: a deck spanning a slope would otherwise be guessed from
+            # the middle and buried at the upper end.
+            level = float(under.max()) + float(
+                structures_cfg.get("fallback_clearance_m", 5.0)
+            ) * max(part.level, 1)
             if part.kind == KIND_DECK:
                 guessed += 1
         elif part.kind == KIND_DECK:
