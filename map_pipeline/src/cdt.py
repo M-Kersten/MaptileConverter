@@ -223,6 +223,38 @@ def _third(tri: list[int], u: int, v: int) -> int:
     raise RuntimeError(f"triangle {tri} is not incident to both {u} and {v}")
 
 
+def _patch_tiles(mesh: _Mesh, doomed: list[int], replacements: list) -> bool:
+    """Do the replacements cover exactly the ground the doomed triangles did?
+
+    Three ways they might not, all of which used to go through silently:
+
+    * a degenerate sliver, which the old code dropped on the floor -- and a
+      dropped triangle is a hole;
+    * a triangle wound the wrong way, which counts its area negative;
+    * the same directed edge twice, which means two of them overlap.
+
+    Cheap enough to run on every constraint, and it turns a corrupted mesh into
+    one skipped breakline.
+    """
+    if not replacements:
+        return False
+    before = sum(abs(mesh.orient(*mesh.tri[t])) for t in doomed)
+    after = 0.0
+    seen: set = set()
+    for x, y, z in replacements:
+        if x == y or y == z or z == x:
+            return False
+        area = mesh.orient(x, y, z)
+        if area <= AREA_EPS:
+            return False
+        after += area
+        for edge in ((x, y), (y, z), (z, x)):
+            if edge in seen:
+                return False
+            seen.add(edge)
+    return abs(after - before) <= 1e-9 * max(before, 1.0)
+
+
 def _retriangulate(mesh: _Mesh, doomed: list[int], replacements: list) -> list[int]:
     """Swap a patch of triangles for another covering the same ground.
 
@@ -267,7 +299,12 @@ def _retriangulate(mesh: _Mesh, doomed: list[int], replacements: list) -> list[i
 def _fan(mesh: _Mesh, v: int):
     """Every live triangle touching `v`, walked round rather than searched."""
     start = mesh.vt.get(v, -1)
-    if start < 0 or mesh.dead[start]:
+    # The hint is only a hint. It is set when a triangle is built and never
+    # cleared when one dies, so a patch that rebuilt this neighbourhood can
+    # leave it pointing at a slot that has since been reused for a triangle
+    # somewhere else entirely. Walking from there goes round a ring that never
+    # comes back to where it started.
+    if start < 0 or mesh.dead[start] or v not in mesh.tri[start]:
         return
     t = start
     for _ in range(4096):
@@ -279,7 +316,7 @@ def _fan(mesh: _Mesh, v: int):
         t = mesh.nbr[t][(i + 2) % 3]
         if t < 0 or t == start:
             return
-    raise RuntimeError(f"the triangles around vertex {v} do not close")
+    raise _ConstraintProblem(f"the triangles around vertex {v} do not close")
 
 
 def _edge_exists(mesh: _Mesh, a: int, b: int) -> bool:
@@ -524,9 +561,21 @@ def _apply_constraints(mesh: _Mesh, segments: np.ndarray, skip_crossing: bool) -
         wound = []
         for x, y, z in pocket:
             area = mesh.orient(x, y, z)
-            if abs(area) <= AREA_EPS:
-                continue
             wound.append((x, z, y) if area < 0 else (x, y, z))
+
+        # Check the patch before touching the mesh, never after. A pocket that
+        # does not tile the strip it replaces leaves a hole, and a hole does
+        # not announce itself: the adjacency stays self-consistent, and the
+        # first sign of it is a fan spinning round some unrelated vertex
+        # thousands of constraints later, with nothing to connect it back here.
+        if not _patch_tiles(mesh, crossed, wound):
+            if not skip_crossing:
+                raise _Unplaceable(
+                    f"the pocket for constraint {a}-{b} does not tile the "
+                    f"triangles it would replace"
+                )
+            skipped += 1
+            continue
         _retriangulate(mesh, crossed, wound)
         mesh.constrained.add(key)
     return skipped

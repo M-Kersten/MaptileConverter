@@ -2178,6 +2178,97 @@ class TestConstrainedTriangulation(unittest.TestCase):
         self.assertLessEqual(worst_edge, 2)
         self.assertEqual(lost, 0)
 
+    @staticmethod
+    def _nasty(seed, side=200.0):
+        """Thin overlapping slivers at every angle: what a kerb looks like."""
+        from src.cdt import WELD_M, weld
+
+        rng = np.random.default_rng(seed)
+        pts = [[0, 0], [side, 0], [side, side], [0, side]]
+        segs = []
+        for _ in range(60):
+            x0, y0 = rng.random(2) * (side - 20) + 5
+            angle = rng.random() * np.pi
+            d = np.array([np.cos(angle), np.sin(angle)])
+            n = np.array([-d[1], d[0]])
+            width = 10 ** rng.uniform(-1.5, 0.5)  # 3 cm to 3 m
+            length = rng.uniform(2, 30)
+            base = len(pts)
+            pts.extend(
+                [
+                    [x0, y0],
+                    [x0 + d[0] * length, y0 + d[1] * length],
+                    [x0 + d[0] * length + n[0] * width, y0 + d[1] * length + n[1] * width],
+                    [x0 + n[0] * width, y0 + n[1] * width],
+                ]
+            )
+            segs.extend([[base + k, base + (k + 1) % 4] for k in range(4)])
+        pts.extend((rng.random((400, 2)) * (side - 2) + 1).tolist())
+        welded, mapping = weld(np.array(pts, float), WELD_M)
+        segments = mapping[np.array(segs)]
+        return welded, segments[segments[:, 0] != segments[:, 1]]
+
+    @staticmethod
+    def _hull_area(points):
+        ordered = points[np.lexsort((points[:, 1], points[:, 0]))]
+
+        def half(seq):
+            out = []
+            for q in seq:
+                while len(out) >= 2 and (
+                    (out[-1][0] - out[-2][0]) * (q[1] - out[-2][1])
+                    - (out[-1][1] - out[-2][1]) * (q[0] - out[-2][0])
+                ) <= 0:
+                    out.pop()
+                out.append(q)
+            return out
+
+        hull = np.array(half(ordered)[:-1] + half(ordered[::-1])[:-1])
+        return 0.5 * abs(
+            np.dot(hull[:, 0], np.roll(hull[:, 1], -1))
+            - np.dot(hull[:, 1], np.roll(hull[:, 0], -1))
+        )
+
+    def test_degenerate_input_never_tears_the_mesh(self):
+        """A torn mesh does not announce itself.
+
+        The adjacency stays self-consistent around a hole, so the first sign is
+        a fan spinning round some unrelated vertex thousands of constraints
+        later, with nothing left to connect it back to the cause.
+        """
+        import logging
+
+        from src.cdt import triangulate
+
+        logging.disable(logging.WARNING)
+        try:
+            for seed in range(12):
+                points, segments = self._nasty(seed)
+                mesh = triangulate(points, segments, skip_crossing=True)
+                area, worst_edge, lost = self._audit(mesh)
+                self.assertAlmostEqual(area, self._hull_area(points), places=5)
+                self.assertLessEqual(worst_edge, 2)
+                self.assertEqual(lost, 0)
+        finally:
+            logging.disable(logging.NOTSET)
+
+    def test_a_patch_that_does_not_tile_is_refused(self):
+        """Checked before the mesh is touched, so a bad patch costs one edge."""
+        from src.cdt import _Mesh, _patch_tiles
+
+        px = [0.0, 4.0, 4.0, 0.0]
+        py = [0.0, 0.0, 4.0, 4.0]
+        mesh = _Mesh(px, py, real=4)
+        doomed = [mesh.add(0, 1, 2), mesh.add(0, 2, 3)]
+        self.assertTrue(_patch_tiles(mesh, doomed, [(0, 1, 3), (1, 2, 3)]))
+        # Same ground, one triangle short.
+        self.assertFalse(_patch_tiles(mesh, doomed, [(0, 1, 3)]))
+        # A repeated vertex is not a triangle.
+        self.assertFalse(_patch_tiles(mesh, doomed, [(0, 1, 1), (1, 2, 3)]))
+        # Wound the wrong way.
+        self.assertFalse(_patch_tiles(mesh, doomed, [(0, 3, 1), (1, 2, 3)]))
+        self.assertFalse(_patch_tiles(mesh, doomed, []))
+
     def test_welding_merges_shared_corners(self):
         from src.cdt import weld
 
