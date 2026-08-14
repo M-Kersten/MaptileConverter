@@ -818,13 +818,17 @@ def check_environment() -> list[str]:
     except ImportError:
         notes.append("mapbox_earcut is not installed: pip install -r requirements.txt")
 
-    if shutil.which("blender") is None:
+    # Not shutil.which: on macOS Blender is an .app bundle, so its executable
+    # is never on PATH however it was installed.
+    from pipeline import search_for_blender
+
+    if not search_for_blender():
         try:
             import bpy  # noqa: F401
         except ImportError:
             notes.append(
-                "no Blender found: pip install bpy (CPython 3.11), or put "
-                "blender on PATH"
+                "no Blender found: install it from blender.org, or "
+                "pip install bpy (CPython 3.11)"
             )
     return notes
 

@@ -2280,6 +2280,73 @@ class TestConstrainedTriangulation(unittest.TestCase):
         self.assertTrue(np.allclose(kept[mapping], pts))
 
 
+class TestFindingBlender(unittest.TestCase):
+    """Blender is installed in places PATH never mentions."""
+
+    def test_a_macos_bundle_resolves_to_its_executable(self):
+        """`--blender /Applications/Blender.app` is the obvious thing to pass
+        on a Mac, and it is a directory rather than a program."""
+        import pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "Blender.app"
+            inner = bundle / "Contents" / "MacOS" / "Blender"
+            inner.parent.mkdir(parents=True)
+            inner.write_text("#!/bin/sh\n")
+            self.assertEqual(pipeline.blender_in_bundle(bundle), inner)
+            mode, command = pipeline.find_blender(str(bundle))
+            self.assertEqual(mode, "executable")
+            self.assertEqual(command, [str(inner)])
+
+    def test_a_bundle_without_the_executable_is_not_accepted(self):
+        import pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "Blender.app"
+            bundle.mkdir()
+            self.assertIsNone(pipeline.blender_in_bundle(bundle))
+
+    def test_the_search_covers_the_places_installers_use(self):
+        import pipeline
+
+        joined = " ".join(pipeline.BLENDER_GLOBS)
+        # A macOS .app can never be found by a PATH lookup, so it has to be
+        # named explicitly; same for the Windows installer's own directory.
+        self.assertIn("/Applications/Blender.app/Contents/MacOS/Blender", joined)
+        self.assertIn("Blender*.app", joined)
+        self.assertIn("Blender Foundation", joined)
+
+    def test_the_failure_says_where_it_looked(self):
+        """The old message claimed no Blender to someone who had just installed
+        it, and named neither the bundle path nor how to point at one."""
+        import pipeline
+
+        original = pipeline.search_for_blender
+        pipeline.search_for_blender = lambda: []
+        try:
+            import builtins
+
+            real_import = builtins.__import__
+
+            def no_bpy(name, *args, **kwargs):
+                if name == "bpy":
+                    raise ImportError("no bpy")
+                return real_import(name, *args, **kwargs)
+
+            builtins.__import__ = no_bpy
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    pipeline.find_blender(None)
+            finally:
+                builtins.__import__ = real_import
+        finally:
+            pipeline.search_for_blender = original
+
+        message = str(caught.exception)
+        self.assertIn("Looked in", message)
+        self.assertIn("/Applications/Blender.app", message)
+
+
 class TestBreaklines(unittest.TestCase):
     """The lines the terrain has to fold along."""
 

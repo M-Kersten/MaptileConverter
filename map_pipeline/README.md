@@ -132,9 +132,21 @@ Blender builds the scene:
 blender --background --python blender/process.py -- --work work/<area> --out output/<area>
 ```
 
-Blender is located in this order: an explicit `--blender /path/to/blender`, then
-a `blender` on `PATH`, then the pip `bpy` module (`pip install bpy`, CPython
-3.11). All three produce the same output.
+Blender is located in this order: an explicit `--blender`, then `blender` on
+`PATH`, then the places the installers actually put it, then the pip `bpy`
+module (`pip install bpy`, CPython 3.11). All of them produce the same output.
+
+**On macOS, Blender is never on `PATH`.** It installs as `Blender.app`, and the
+executable lives inside the bundle at `Contents/MacOS/Blender`, so a `PATH`
+lookup cannot find it however it was installed — "Blender is installed" and
+"`which blender` finds it" are simply different statements there. The search
+covers `/Applications` and `~/Applications`, including versioned bundle names,
+and the same for `C:\Program Files\Blender Foundation` on Windows. If yours is
+somewhere else, pass the bundle itself:
+
+```bash
+python pipeline.py --config config.json --blender /Applications/Blender.app
+```
 
 Useful flags: `--skip-blender` runs the data stages only, `--verbose` turns on
 debug logging, `--skip-reimport-check` drops the FBX round-trip check.

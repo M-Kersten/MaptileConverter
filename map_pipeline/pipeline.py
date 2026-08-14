@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -183,28 +184,90 @@ def write_timings(
         LOG.debug("could not write timings: %s", exc)
 
 
+# Where Blender installs itself when nobody puts it on PATH, which is the
+# normal case on macOS and Windows. A macOS .app is a directory, so the
+# executable inside it can never be found by a PATH lookup however the user
+# installed it -- "I have Blender installed" and "shutil.which finds blender"
+# are simply different statements there.
+BLENDER_GLOBS = (
+    # macOS, including the versioned bundle names the installer leaves behind.
+    "/Applications/Blender.app/Contents/MacOS/Blender",
+    "/Applications/Blender*.app/Contents/MacOS/Blender",
+    "~/Applications/Blender.app/Contents/MacOS/Blender",
+    "~/Applications/Blender*.app/Contents/MacOS/Blender",
+    # Windows.
+    "C:/Program Files/Blender Foundation/Blender*/blender.exe",
+    "C:/Program Files (x86)/Steam/steamapps/common/Blender/blender.exe",
+    # Linux, for the packages that do not link into /usr/bin.
+    "/usr/share/blender/blender",
+    "/snap/bin/blender",
+    "/var/lib/flatpak/exports/bin/org.blender.Blender",
+)
+
+
+def blender_in_bundle(path: Path) -> Path | None:
+    """The executable inside a macOS .app, given the bundle.
+
+    Worth handling because ``--blender /Applications/Blender.app`` is the
+    obvious thing to pass on a Mac and is a directory, not a program.
+    """
+    if path.suffix == ".app" and path.is_dir():
+        inner = path / "Contents" / "MacOS" / "Blender"
+        return inner if inner.is_file() else None
+    return None
+
+
+def search_for_blender() -> list[str]:
+    """Every Blender this machine appears to have, best first."""
+    import glob as _glob
+
+    found: list[str] = []
+    for name in ("blender", "Blender", "blender.exe"):
+        hit = shutil.which(name)
+        if hit and hit not in found:
+            found.append(hit)
+    for pattern in BLENDER_GLOBS:
+        for hit in sorted(_glob.glob(str(Path(pattern).expanduser())), reverse=True):
+            if os.access(hit, os.X_OK) and hit not in found:
+                found.append(hit)
+    return found
+
+
 def find_blender(explicit: str | None) -> tuple[str, list[str]]:
     """Work out how to run the Blender stage.
 
     Returns the mode ("executable" or "bpy") and the command prefix.
     """
     if explicit:
-        path = Path(explicit)
+        path = Path(explicit).expanduser()
+        inner = blender_in_bundle(path)
+        if inner is not None:
+            return "executable", [str(inner)]
         if not path.is_file() and shutil.which(explicit) is None:
             raise SystemExit(f"--blender {explicit!r} is not an executable")
-        return "executable", [explicit]
+        return "executable", [str(path) if path.is_file() else explicit]
 
-    found = shutil.which("blender")
+    found = search_for_blender()
     if found:
-        return "executable", [found]
+        LOG.info("using Blender at %s", found[0])
+        return "executable", [found[0]]
 
     try:
         import bpy  # noqa: F401
     except ImportError:
+        looked = "\n  ".join(
+            [shutil.which("blender") or "PATH (blender, Blender, blender.exe)"]
+            + [str(Path(p).expanduser()) for p in BLENDER_GLOBS]
+        )
         raise SystemExit(
-            "no Blender available. Either install the pip module "
-            "(`pip install bpy`, needs CPython 3.11), or pass "
-            "--blender /path/to/blender"
+            "no Blender available. Looked in:\n  "
+            + looked
+            + "\n\nIf Blender is installed somewhere else, pass it directly -- "
+            "on a Mac the app bundle itself is fine:\n"
+            "  python pipeline.py --config config.json "
+            "--blender /Applications/Blender.app\n"
+            "Otherwise install the pip module with `pip install bpy`, which "
+            "needs CPython 3.11."
         ) from None
     return "bpy", [sys.executable]
 
