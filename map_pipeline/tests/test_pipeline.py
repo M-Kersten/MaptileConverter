@@ -12,9 +12,11 @@ Run only the offline tests:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 
 import numpy as np
@@ -3139,6 +3141,156 @@ class TestUIServer(unittest.TestCase):
         self.assertIn("finer than the 8 cm source", messages)
         self.assertIn("finer than the 0.50 m AHN source", messages)
         self.assertEqual(loaded.aerial["size_px"], 16384)
+
+
+class _PanelScan(HTMLParser):
+    """Reads the panel the way a browser does.
+
+    A regex over the markup is not good enough here: the help text is HTML in
+    an attribute, so it contains its own angle brackets and stops any
+    `<span[^>]*>` pattern in the middle of a tip.
+    """
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+            "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.ids: list[str] = []
+        self.tips: list[str | None] = []
+        self.explained: set[str] = set()
+        self.details_open: list[str] = []
+        self.step_numbers: list[str] = []
+        self.step_titles: list[str] = []
+        self._stack: list[dict] = []
+        self._collect: str | None = None
+
+    # A help marker explains whichever group it sits in directly: the <label>
+    # that names a control, or the row that holds a checkbox. Counting it
+    # against every enclosing element instead would let one "?" in a fieldset
+    # vouch for every control in it.
+    def _group(self):
+        return self._stack[-1] if self._stack else None
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        classes = (d.get("class") or "").split()
+        if "id" in d:
+            self.ids.append(d["id"])
+        if tag == "details" and "open" in d:
+            self.details_open.append(str(d))
+
+        group = self._group()
+        if "help" in classes:
+            self.tips.append(d.get("data-tip"))
+            if group:
+                group["helps"] += 1
+        if tag in ("input", "select", "textarea") and "id" in d and group:
+            group["controls"].append(d["id"])
+        if "stepnum" in classes or "steptitle" in classes:
+            self._collect = "stepnum" if "stepnum" in classes else "steptitle"
+
+        if tag not in self.VOID:
+            controls = [d["for"]] if tag == "label" and "for" in d else []
+            self._stack.append({"tag": tag, "controls": controls, "helps": 0})
+
+    def handle_data(self, data):
+        if self._collect == "stepnum":
+            self.step_numbers.append(data.strip())
+        elif self._collect == "steptitle":
+            self.step_titles.append(data.strip())
+
+    def handle_endtag(self, tag):
+        if tag in self.VOID or not self._stack:
+            return
+        self._collect = None
+        frame = self._stack.pop()
+        if frame["helps"]:
+            self.explained.update(frame["controls"])
+
+
+class TestUIPage(unittest.TestCase):
+    """The page is one file holding both the markup and the script that drives
+    it, so an edit to either can move the two apart. Nothing here renders the
+    page — these are the joins that break silently when it is rearranged."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = (REPO_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        cls.page = _PanelScan()
+        cls.page.feed(cls.html)
+
+    def test_every_element_the_script_reaches_for_exists(self):
+        """`$("x")` on a renamed element throws and stops the page dead, and
+        the browser reports it nowhere the user is going to look."""
+        wanted = set(re.findall(r'\$\("([A-Za-z0-9_-]+)"\)', self.html))
+        self.assertTrue(wanted, "found no element lookups; the pattern moved")
+        missing = sorted(wanted - set(self.page.ids))
+        self.assertEqual(missing, [], f"the script looks up ids that are gone: {missing}")
+
+    def test_no_id_is_used_twice(self):
+        """Two elements sharing an id means half the script talks to the wrong
+        one, and only sometimes."""
+        used = self.page.ids
+        repeated = sorted({i for i in used if used.count(i) > 1})
+        self.assertEqual(repeated, [], f"duplicate ids: {repeated}")
+
+    def test_every_help_marker_says_something(self):
+        """A "?" that opens an empty bubble is worse than no "?" at all."""
+        tips = self.page.tips
+        self.assertGreaterEqual(len(tips), 15, "help markers have gone missing")
+        for tip in tips:
+            self.assertIsNotNone(tip, "a help marker carries no data-tip")
+            self.assertGreater(len(tip), 40, f"a help marker only says {tip!r}")
+
+    def test_the_settings_that_matter_are_explained(self):
+        """Every control a first-time user has to answer carries its own help,
+        rather than one note at the top of the group."""
+        for control in ("q", "size", "name", "preset", "aerialCm", "terrainM",
+                        "terrainTol", "facadePx", "facade", "clip",
+                        "groundFloor", "normal", "photoTextures", "preview"):
+            self.assertIn(
+                control, self.page.explained, f"the control {control} has no help marker"
+            )
+
+    def test_the_panel_reads_as_numbered_steps(self):
+        self.assertEqual(
+            self.page.step_titles,
+            ["Choose an area", "Choose how much detail",
+             "Choose what to include", "Build"],
+        )
+        self.assertEqual(
+            self.page.step_numbers, ["1", "2", "3", "4"], "the steps are misnumbered"
+        )
+
+    def test_advanced_settings_start_folded_away(self):
+        """The point of the section is that a newcomer never has to open it."""
+        self.assertEqual(
+            self.page.details_open, [], "an advanced section ships open"
+        )
+
+    def test_every_slider_step_has_a_sentence(self):
+        """The words under a slider come from a table keyed by value. A step
+        added to one and not the other reads as a blank line."""
+        def table(name):
+            body = re.search(r"const %s = \{(.*?)\};" % name, self.html, re.S).group(1)
+            return {float(k) for k in re.findall(r"^\s*([\d.]+):", body, re.M)}
+
+        def steps(name):
+            body = re.search(r"const %s\s*= \[([^\]]+)\]" % name, self.html).group(1)
+            return {float(v) for v in body.split(",")}
+
+        for values, sentences in (
+            ("AERIAL_STEPS", "AERIAL_PLAIN"),
+            ("TERRAIN_STEPS", "TERRAIN_PLAIN"),
+            ("TOLERANCE_STEPS", "TOLERANCE_PLAIN"),
+            ("FACADE_STEPS", "FACADE_PLAIN"),
+        ):
+            self.assertEqual(
+                steps(values),
+                table(sentences),
+                f"{values} and {sentences} describe different steps",
+            )
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

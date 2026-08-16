@@ -73,16 +73,29 @@ pip install -r requirements.txt
 python ui/server.py --open
 ```
 
-Open <http://127.0.0.1:8765>. Search for a place or click the map, set the side
-length, press **Build model**, and watch the log. When it finishes you get the
-check results, the preview renders and download links.
+Open <http://127.0.0.1:8765>. The panel runs top to bottom in four numbered
+steps — **choose an area**, **choose how much detail**, **choose what to
+include**, **build** — and the defaults in all four are the ones to use. Search
+for a place or click the map, press **Build model**, and watch the log. When it
+finishes you get the check results, the preview renders and download links.
 
-A **Sources** panel lists every dataset a model can be built from, each with a
-checkbox and a live status light, so you pick what goes in and see what is
-answering right now. Terrain, aerial imagery and buildings are marked required
-and cannot be unticked — without them there is no model — and if one of those is
-down the Build button is disabled with the reason given. An optional source that
-is down is only a warning: untick it and the run proceeds without it.
+The page is written for someone who has never opened a GIS or a 3D package.
+Every setting carries a **?** that says what it does in words rather than in
+units, each slider prints a plain sentence under it — *"kerbs and small steps
+come through"* rather than *"1 m"* — and everything a first-time user should
+not have to decide is folded into a collapsed **Fine tuning** section: the
+ground triangle budget, the wall texture size, and how buildings on the edge of
+the square are treated. A closing **What you get, and how to open it** section
+names the four output files and gives the import steps for Blender and Unity.
+The technical readouts have not gone anywhere; they sit beside the plain ones,
+so the same page serves both readers.
+
+Step 3 lists every dataset a model can be built from, each with a checkbox and
+a live status light, so you pick what goes in and see what is answering right
+now. Terrain, aerial imagery and buildings are marked required and cannot be
+unticked — without them there is no model — and if one of those is down the
+Build button is disabled with the reason given. An optional source that is down
+is only a warning: untick it and the run proceeds without it.
 
 `src/sources.py` is the single registry behind this. The pipeline reads it to
 check the services a run needs before it starts, and the UI reads it to draw the

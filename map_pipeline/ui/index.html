@@ -50,6 +50,8 @@
   .inline { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
   .inline input[type=checkbox] { width: auto; }
   .inline label { margin: 0; color: var(--text); font-size: 13px; }
+  /* The flex gap already spaces these; the icon's own margin would double it. */
+  .inline .help { margin-left: 0; }
   button { cursor: pointer; background: #2b303a; }
   button:hover:not(:disabled) { background: #343a46; }
   button:disabled { opacity: .5; cursor: not-allowed; }
@@ -71,6 +73,63 @@
     border-radius: 50%; background: var(--accent); cursor: pointer; border: 0; }
   .ticks { display: flex; justify-content: space-between; color: var(--muted);
            font-size: 10px; }
+
+  /* ---------- steps and help ---------- */
+  .intro { background: var(--panel-2); border: 1px solid var(--line);
+           border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;
+           font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+  .intro b { color: var(--text); font-weight: 600; }
+  /* inline-flex, not flex: a <legend> is laid out specially and several
+     browsers still ignore a block-level display on it. */
+  .step { display: inline-flex; align-items: center; gap: 8px; }
+  .stepnum { display: inline-flex; align-items: center; justify-content: center;
+             width: 19px; height: 19px; border-radius: 50%; flex: 0 0 auto;
+             background: var(--accent); color: #07121d; font-size: 11px;
+             font-weight: 700; }
+  .steptitle { font-size: 12px; color: var(--text); font-weight: 600;
+               text-transform: none; letter-spacing: 0; }
+
+  /* A question mark that explains the control next to it. Hover, keyboard
+     focus and tap all open it, because the people this is for are as likely
+     to be on a laptop trackpad as anywhere else. */
+  .help { display: inline-flex; align-items: center; justify-content: center;
+          width: 14px; height: 14px; border-radius: 50%; margin-left: 5px;
+          background: #39414f; color: var(--text); font-size: 10px;
+          font-weight: 700; cursor: help; user-select: none;
+          vertical-align: 1px; flex: 0 0 auto; }
+  .help:hover, .help:focus, .help.open { background: var(--accent); color: #07121d; }
+  /* One bubble for the whole page, parked on <body> and positioned in script.
+     A bubble parented to the icon would be clipped the moment it opened near
+     an edge, because #panel scrolls and so clips what overflows it. */
+  #tipbox { display: none; position: fixed; z-index: 100; width: 262px;
+            background: #10131a; border: 1px solid var(--line);
+            border-radius: 7px; padding: 9px 11px; font-size: 11.5px;
+            font-weight: 400; line-height: 1.5; color: var(--text);
+            text-align: left; box-shadow: 0 8px 26px rgba(0,0,0,.55); }
+  #tipbox b { color: var(--accent); font-weight: 600; }
+
+  .plain { color: var(--muted); font-size: 11px; margin-top: 3px;
+           line-height: 1.4; }
+  details.adv { border: 1px solid var(--line); border-radius: 8px;
+                background: var(--panel-2); margin: 0 0 14px; padding: 0; }
+  details.adv > summary { cursor: pointer; padding: 9px 12px; font-size: 12px;
+                          color: var(--muted); list-style: none; }
+  details.adv > summary::-webkit-details-marker { display: none; }
+  details.adv > summary::before { content: "\25B8  "; color: var(--accent); }
+  details.adv[open] > summary::before { content: "\25BE  "; }
+  details.adv > summary:hover { color: var(--text); }
+  details.adv .inner { padding: 0 12px 12px; }
+  details.adv .inner > label:first-child { margin-top: 0; }
+  /* A details nested inside a fieldset closes the group, so it should not
+     carry the spacing that separates two groups. */
+  fieldset > details.adv { margin: 10px 0 0; }
+
+  .next { font-size: 12px; line-height: 1.55; color: var(--muted); }
+  .next b { color: var(--text); font-weight: 600; }
+  .next code { font-family: var(--mono); font-size: 11.5px; color: var(--text);
+               background: #171a1f; border-radius: 4px; padding: 1px 5px; }
+  .next p { margin: 0 0 8px; }
+  .next p:last-child { margin-bottom: 0; }
 
   /* ---------- sources ---------- */
   .linkish { width: auto; padding: 1px 7px; font-size: 10px; background: #2b303a;
@@ -191,138 +250,260 @@
 
 <div id="panel">
   <h1>Map pipeline</h1>
-  <div class="sub">3DBAG + AHN + PDOK aerial &rarr; textured FBX for Unity</div>
+  <div class="sub">A real Dutch place, as a 3D model you can open in Blender or Unity</div>
 
   <div id="banner"></div>
 
+  <div class="intro">
+    Pick a square anywhere in the Netherlands. This downloads the official open
+    data for it &mdash; the buildings, the height of the ground, the aerial
+    photograph &mdash; and builds a <b>model.fbx</b> with an <b>aerial.png</b>
+    to go on it. Everything comes out life-size in metres, standing at its real
+    height above sea level.
+    <br><br>
+    You do not need to know anything about maps or 3D modelling to use it:
+    choose a place, press <b>Build model</b>, and leave the rest alone. Every
+    setting has a <span class="help" tabindex="0" role="button"
+      aria-label="Example of a help marker"
+      data-tip="Like this one. Hover it, tap it, or reach it with the Tab key.">?</span>
+    next to it that says what it does.
+  </div>
+
   <fieldset>
-    <legend>Area</legend>
-    <label for="q">Find a place</label>
+    <legend>
+      <span class="step"><span class="stepnum">1</span><span class="steptitle">Choose an area</span></span>
+    </legend>
+
+    <label for="q">Find a place
+      <span class="help" tabindex="0" role="button" aria-label="About finding a place"
+        data-tip="Type a town, a street, a postcode or a landmark &mdash; <b>Domtoren Utrecht</b>, <b>Delft</b>, <b>3011 AA</b>. Choose a result and the square jumps there and names itself after it.">?</span>
+    </label>
     <div id="searchWrap">
       <input id="q" placeholder="Domtoren Utrecht, Delft, 3011 AA&hellip;" autocomplete="off">
       <div id="results"></div>
     </div>
-    <div class="hint">Or click the map to place the square.</div>
+    <div class="hint">
+      Or work the map directly: click to move the square, drag to pan, scroll to zoom.
+    </div>
 
     <div class="row" style="margin-top:10px">
       <div>
-        <label for="size">Side (m)</label>
+        <label for="size">Size across
+          <span class="help" tabindex="0" role="button" aria-label="About area size"
+            data-tip="How wide the square is, in metres. <b>1000 m</b> is one square kilometre, which is what this tool is tuned for. Larger areas take longer and make heavier files, and not gently: doubling the width is roughly four times the work.">?</span>
+        </label>
         <input id="size" type="number" value="1000" min="200" max="4000" step="50">
       </div>
       <div>
-        <label for="name">Name</label>
+        <label for="name">Name
+          <span class="help" tabindex="0" role="button" aria-label="About the name"
+            data-tip="Names the folder the model lands in. Letters, numbers and underscores only. Building the same name twice replaces what was there.">?</span>
+        </label>
         <input id="name" value="demo_area">
       </div>
     </div>
+    <div class="plain" id="areaPlain"></div>
 
-    <div class="kv" id="bboxInfo" style="margin-top:10px"></div>
+    <details class="adv">
+      <summary>Exact coordinates</summary>
+      <div class="inner">
+        <div class="kv" id="bboxInfo"></div>
+        <div class="plain" style="margin-top:8px">
+          RD New (EPSG:28992), the Dutch national grid. You only need these if
+          you are lining this model up against other Dutch map data.
+        </div>
+      </div>
+    </details>
   </fieldset>
 
   <fieldset>
-    <legend>Quality</legend>
-    <label for="preset">Preset</label>
+    <legend>
+      <span class="step"><span class="stepnum">2</span><span class="steptitle">Choose how much detail</span></span>
+    </legend>
+
+    <label for="preset">Detail preset
+      <span class="help" tabindex="0" role="button" aria-label="About the preset"
+        data-tip="Sets all four detail sliders at once. <b>Standard</b> is a sensible default for a square kilometre. Move any slider afterwards and this reads <b>Custom</b> &mdash; nothing has gone wrong, it just means your settings no longer match a preset.">?</span>
+    </label>
     <select id="preset">
-      <option value="draft">Draft &mdash; fast look</option>
-      <option value="standard" selected>Standard</option>
-      <option value="high">High</option>
-      <option value="max">Maximum &mdash; source native</option>
+      <option value="draft">Draft &mdash; quick test</option>
+      <option value="standard" selected>Standard &mdash; recommended</option>
+      <option value="high">High &mdash; sharper photo and ground</option>
+      <option value="max">Maximum &mdash; as fine as the data goes</option>
       <option value="custom">Custom</option>
     </select>
 
-    <label for="aerialCm" style="margin-top:12px">
-      Aerial detail <span class="derived" id="aerialDerived"></span>
+    <label for="aerialCm" style="margin-top:14px">
+      Aerial photo
+      <span class="help" tabindex="0" role="button" aria-label="About aerial photo detail"
+        data-tip="How sharp the photograph laid over the ground is. It is one big image draped across the whole square, so this is what you see looking straight down. The source photo is <b>8 cm per pixel</b>; asking for finer only enlarges it. Sharper also means a much bigger PNG.">?</span>
+      <span class="derived" id="aerialDerived"></span>
     </label>
     <input type="range" id="aerialCm" min="0" max="4" step="1" value="2" class="slider">
-    <div class="ticks"><span>coarse</span><span>8 cm native</span></div>
+    <div class="ticks"><span>coarse</span><span>as sharp as the photo</span></div>
+    <div class="plain" id="aerialPlain"></div>
 
-    <label for="terrainM" style="margin-top:10px">
-      Terrain detail <span class="derived" id="terrainDerived"></span>
+    <label for="terrainM" style="margin-top:12px">
+      Ground shape
+      <span class="help" tabindex="0" role="button" aria-label="About ground detail"
+        data-tip="How closely the ground follows the real measured heights. They come from <b>AHN</b>, a laser scan of the entire country taken from an aircraft. Finer picks up dikes, ramps, kerbs and ditches; coarser smooths them away.">?</span>
+      <span class="derived" id="terrainDerived"></span>
     </label>
     <input type="range" id="terrainM" min="0" max="4" step="1" value="1" class="slider">
-    <div class="ticks"><span>coarse</span><span>0.5 m native</span></div>
-
-    <label for="terrainTol" style="margin-top:10px">
-      Terrain mesh <span class="derived" id="terrainTolDerived"></span>
-    </label>
-    <input type="range" id="terrainTol" min="0" max="4" step="1" value="2" class="slider">
-    <div class="ticks"><span>every vertex</span><span>flat ground merged</span></div>
-
-    <label for="facadePx" style="margin-top:10px">
-      Facade texture <span class="derived" id="facadeDerived"></span>
-    </label>
-    <input type="range" id="facadePx" min="0" max="3" step="1" value="1" class="slider">
-    <div class="ticks"><span>256 px</span><span>2048 px</span></div>
+    <div class="ticks"><span>smooth</span><span>every measurement</span></div>
+    <div class="plain" id="terrainPlain"></div>
 
     <div id="qualityNote" class="hint"></div>
   </fieldset>
 
-  <fieldset>
-    <legend>Options</legend>
-    <div class="row">
-      <div>
-        <label for="facade">Facade styles</label>
-        <select id="facade">
-          <option value="5" selected>5 by build year</option>
-          <option value="1">1 (two materials)</option>
-        </select>
-      </div>
-      <div>
-        <label for="clip">Edge buildings</label>
-        <select id="clip">
-          <option value="centroid" selected>Centre inside</option>
-          <option value="intersect">Keep all</option>
-        </select>
-      </div>
-    </div>
-    <div class="hint" id="facadeNote"></div>
-    <div class="inline">
-      <input type="checkbox" id="groundFloor" checked>
-      <label for="groundFloor">Distinct ground floor (shopfronts)</label>
-    </div>
-    <div class="inline">
-      <input type="checkbox" id="normal" checked>
-      <label for="normal">Facade normal map (relief on walls)</label>
-    </div>
-    <div class="inline">
-      <input type="checkbox" id="photoTextures" checked>
-      <label for="photoTextures">
-        Photographed brick and stone (CC0, downloaded once)
+  <details class="adv">
+    <summary>Fine tuning &mdash; model weight and how buildings look</summary>
+    <div class="inner">
+      <label for="terrainTol">Ground triangles
+        <span class="help" tabindex="0" role="button" aria-label="About the ground triangle budget"
+          data-tip="How much the flat parts get thinned out. The ground is built from triangles, and flat ground barely needs any. This sets how far the model is allowed to sit from the measured height: at <b>10 cm</b> kerbs and dikes survive while a flat field collapses into a few big triangles. <b>Every point</b> keeps them all and makes a very heavy model.">?</span>
+        <span class="derived" id="terrainTolDerived"></span>
       </label>
+      <input type="range" id="terrainTol" min="0" max="4" step="1" value="2" class="slider">
+      <div class="ticks"><span>every point</span><span>lightest</span></div>
+      <div class="plain" id="terrainTolPlain"></div>
+
+      <label for="facadePx" style="margin-top:12px">Wall detail
+        <span class="help" tabindex="0" role="button" aria-label="About wall texture size"
+          data-tip="How large the generated wall image is. Nobody photographs every facade, so the tool draws windows, doors and brick to fit each building. Larger looks sharper close up and costs memory.">?</span>
+        <span class="derived" id="facadeDerived"></span>
+      </label>
+      <input type="range" id="facadePx" min="0" max="3" step="1" value="1" class="slider">
+      <div class="ticks"><span>small</span><span>large</span></div>
+      <div class="plain" id="facadePlain"></div>
+
+      <div class="row" style="margin-top:14px">
+        <div>
+          <label for="facade">Wall styles
+            <span class="help" tabindex="0" role="button" aria-label="About wall styles"
+              data-tip="The building data carries a construction year for every building. With <b>5 styles</b> a 1900 canal house gets brick and tall windows while a 2015 office gets glass. With <b>1</b> every building gets the same wall.">?</span>
+          </label>
+          <select id="facade">
+            <option value="5" selected>5, by build year</option>
+            <option value="1">1, the same everywhere</option>
+          </select>
+        </div>
+        <div>
+          <label for="clip">Buildings on the edge
+            <span class="help" tabindex="0" role="button" aria-label="About edge buildings"
+              data-tip="What to do with a building the square cuts through. <b>Whole ones only</b> keeps a building when its centre is inside, so nothing is sliced in half. <b>Anything it touches</b> keeps every building that overlaps, and those will hang over the edge.">?</span>
+          </label>
+          <select id="clip">
+            <option value="centroid" selected>Whole ones only</option>
+            <option value="intersect">Anything it touches</option>
+          </select>
+        </div>
+      </div>
+      <div class="hint" id="facadeNote"></div>
+
+      <div class="inline">
+        <input type="checkbox" id="groundFloor" checked>
+        <label for="groundFloor">Separate ground floor</label>
+        <span class="help" tabindex="0" role="button" aria-label="About the ground floor option"
+          data-tip="Gives the street-level storey its own look &mdash; shopfronts, doors and wider glass &mdash; instead of the same window grid running all the way to the pavement.">?</span>
+      </div>
+      <div class="inline">
+        <input type="checkbox" id="normal" checked>
+        <label for="normal">Relief on walls</label>
+        <span class="help" tabindex="0" role="button" aria-label="About the relief option"
+          data-tip="Makes window reveals and brick catch the light as if they had real depth, without adding a single polygon. Costs a little memory and export time. In the trade this is a <b>normal map</b>.">?</span>
+      </div>
+      <div class="inline">
+        <input type="checkbox" id="photoTextures" checked>
+        <label for="photoTextures">Photographed brick and stone</label>
+        <span class="help" tabindex="0" role="button" aria-label="About photographed materials"
+          data-tip="Lays real photographs of brick, plaster and concrete under the drawn windows, so walls have grain rather than flat colour. Free to use and downloaded once, then reused for every later build.">?</span>
+      </div>
     </div>
-    <div class="inline">
-      <input type="checkbox" id="preview" checked>
-      <label for="preview">Render preview images</label>
+  </details>
+
+  <fieldset>
+    <legend>
+      <span class="step"><span class="stepnum">3</span><span class="steptitle">Choose what to include</span></span>
+    </legend>
+    <div class="hint" style="margin: 0 0 8px">
+      The ground, the buildings and the photo are always in. These add the rest.
+      <span class="help" tabindex="0" role="button" aria-label="About sources"
+        data-tip="Each line is a public Dutch data service. The dot says whether it is answering <b>right now</b>: green is fine, amber means it is being served from a backup, red means it cannot be reached. Switch off anything you do not need and the build finishes sooner. Hover a line to see exactly what it contributes.">?</span>
+    </div>
+    <div id="sources" class="srcs">checking availability&hellip;</div>
+    <div class="hint" id="sourcesNote"></div>
+    <div style="text-align:right; margin-top:6px">
+      <button id="recheck" class="linkish" title="Check availability again">check again</button>
     </div>
   </fieldset>
 
   <fieldset>
     <legend>
-      Sources
-      <button id="recheck" class="linkish" title="Check availability again">recheck</button>
+      <span class="step"><span class="stepnum">4</span><span class="steptitle">Build</span></span>
     </legend>
-    <div id="sources" class="srcs">checking availability&hellip;</div>
-    <div class="hint" id="sourcesNote"></div>
-  </fieldset>
-
-  <button class="primary" id="run">Build model</button>
-  <div class="hint" id="estimate" style="text-align:center"></div>
-  <button class="danger" id="cancel" style="margin-top:6px; display:none">Cancel</button>
-
-  <div id="progress" style="display:none">
-    <div class="pbar"><div class="pfill" id="pfill"></div></div>
-    <div class="prow">
-      <span id="pstage">starting</span>
-      <span id="ptime"></span>
+    <div class="inline" style="margin-top:0">
+      <input type="checkbox" id="preview" checked>
+      <label for="preview">Render preview images at the end</label>
+      <span class="help" tabindex="0" role="button" aria-label="About preview images"
+        data-tip="Renders a few pictures of the finished model so you can see what you got without opening anything. Adds a little time at the end.">?</span>
     </div>
-  </div>
 
-  <fieldset style="margin-top:14px">
-    <legend>Log <span id="status"></span></legend>
-    <div id="log">Pick an area and press Build.</div>
+    <button class="primary" id="run" style="margin-top:12px">Build model</button>
+    <div class="hint" id="estimate" style="text-align:center"></div>
+    <button class="danger" id="cancel" style="margin-top:6px; display:none">Cancel</button>
+
+    <div id="progress" style="display:none">
+      <div class="pbar"><div class="pfill" id="pfill"></div></div>
+      <div class="prow">
+        <span id="pstage">starting</span>
+        <span id="ptime"></span>
+      </div>
+    </div>
   </fieldset>
+
+  <fieldset>
+    <legend>What it is doing <span id="status"></span></legend>
+    <div id="log">Nothing yet. Choose an area and press Build model.</div>
+    <div class="plain">
+      Downloading and building takes minutes, not seconds. You can leave this
+      window open and come back to it.
+    </div>
+  </fieldset>
+
+  <details class="adv">
+    <summary>What you get, and how to open it</summary>
+    <div class="inner next">
+      <p>A folder <code>output/&lt;name&gt;/</code> holding four files:</p>
+      <p>
+        <code>model.fbx</code> &mdash; the model itself: ground, buildings,
+        roads, water, trees.<br>
+        <code>aerial.png</code> &mdash; the photograph that goes on the ground.<br>
+        <code>metadata.json</code> &mdash; where in the world it sits, for
+        lining it up with other data.<br>
+        <code>ATTRIBUTION.txt</code> &mdash; the credits. Keep it with the model
+        if you pass the model on.
+      </p>
+      <p>
+        <b>Blender:</b> File &rarr; Import &rarr; FBX, and pick
+        <code>model.fbx</code>. It arrives in metres, ready to edit.
+      </p>
+      <p>
+        <b>Unity:</b> drag the folder into Assets. On the FBX set
+        <i>Scale Factor</i> to 1 and leave <i>Convert Units</i> on.
+      </p>
+      <p>
+        The centre of the square is the origin, so the model straddles 0,0.
+        Height is measured from Dutch sea level (NAP), the same as on any Dutch
+        map.
+      </p>
+    </div>
+  </details>
 
   <div id="out"></div>
 </div>
+
+<div id="tipbox"></div>
 
 <div id="map">
   <div id="tiles"></div>
@@ -490,11 +671,28 @@ function bbox() {
 
 function updateBboxInfo() {
   const b = bbox();
-  const warn = sel.size < 900 || sel.size > 1100
-    ? `\n<b style="color:#d8a339">tuned for 900-1100 m; it still runs</b>` : "";
   $("bboxInfo").innerHTML =
     `<b>bbox RD</b>  ${b.xmin}, ${b.ymin}\n          ${b.xmax}, ${b.ymax}\n` +
-    `<b>centre</b>   ${sel.x.toFixed(1)}, ${sel.y.toFixed(1)}` + warn;
+    `<b>centre</b>   ${sel.x.toFixed(1)}, ${sel.y.toFixed(1)}`;
+  updateAreaPlain();
+}
+
+/* The same square said in words, because "1000" in a box does not tell you
+   whether you have picked a city block or half a province. The size guidance
+   lives here rather than with the coordinates: the coordinates are folded away
+   by default, and a warning nobody sees is not a warning. */
+function updateAreaPlain() {
+  const km2 = (sel.size * sel.size) / 1e6;
+  const pretty = km2 >= 10 ? km2.toFixed(0) : km2.toFixed(2).replace(/\.?0+$/, "");
+  const name = $("name").value.trim() || "area";
+  const said =
+    `${Math.round(sel.size)} × ${Math.round(sel.size)} m, ${pretty} km². ` +
+    `Lands in output/${name}/`;
+  const off = sel.size < 900 || sel.size > 1100
+    ? `<br><span style="color:var(--warn)">Outside the 900–1100 m this is tuned ` +
+      `for. It still builds${sel.size > 1100 ? ", it just takes longer" : ""}.</span>`
+    : "";
+  $("areaPlain").innerHTML = escapeHtml(said) + off;
 }
 
 /* ---------- interaction ---------- */
@@ -613,6 +811,119 @@ function escapeHtml(text) {
 }
 
 /* ---------------------------------------------------------------------------
+   Help bubbles.
+
+   One bubble for the whole page, moved to whichever "?" is active and placed
+   in viewport coordinates. Parenting a bubble to its icon would be simpler,
+   but #panel scrolls and therefore clips, so every tip opened near an edge
+   would come out sliced.
+
+   Hovering explains; clicking pins it open, because a long tip read on a
+   trackpad should not vanish when the pointer drifts a pixel. Tab reaches
+   them, Escape and a click elsewhere dismiss them.
+--------------------------------------------------------------------------- */
+const tipbox = $("tipbox");
+let tipOwner = null, tipPinned = false;
+
+function showTip(el) {
+  const text = el.dataset.tip;
+  if (!text) return;
+  if (tipOwner && tipOwner !== el) tipOwner.classList.remove("open");
+  tipbox.innerHTML = text;          // authored in this file, never user input
+  tipbox.style.display = "block";
+  // Measure at a known position: a stale offset would be baked into the height
+  // reading on a bubble that is already wrapping against a window edge.
+  tipbox.style.left = tipbox.style.top = "0px";
+
+  const anchor = el.getBoundingClientRect();
+  const box = tipbox.getBoundingClientRect();
+  const M = 8;
+  // Below the icon by default, above it when the window has no room left,
+  // which is what happens for the last few controls on a short screen.
+  let top = anchor.bottom + M;
+  if (top + box.height > innerHeight - M) {
+    top = anchor.top - box.height - M;
+    if (top < M) top = Math.max(M, innerHeight - box.height - M);
+  }
+  let left = anchor.left + anchor.width / 2 - box.width / 2;
+  left = Math.max(M, Math.min(left, innerWidth - box.width - M));
+  tipbox.style.left = `${Math.round(left)}px`;
+  tipbox.style.top = `${Math.round(top)}px`;
+
+  el.classList.add("open");
+  tipOwner = el;
+}
+
+function hideTip() {
+  tipbox.style.display = "none";
+  if (tipOwner) tipOwner.classList.remove("open");
+  tipOwner = null;
+  tipPinned = false;
+}
+
+const helpAt = target => (target && target.closest ? target.closest(".help") : null);
+
+document.addEventListener("pointerover", e => {
+  const help = helpAt(e.target);
+  if (!help || help === tipOwner) return;
+  // Moving to a different "?" always takes over, pinned or not; otherwise a
+  // pinned tip would make the rest of the page look like it had no help.
+  tipPinned = false;
+  showTip(help);
+});
+
+document.addEventListener("pointerout", e => {
+  const help = helpAt(e.target);
+  if (help && help === tipOwner && !tipPinned) hideTip();
+});
+
+document.addEventListener("click", e => {
+  const help = helpAt(e.target);
+  if (help) {
+    // These sit inside <label>s. Without this the click falls through to the
+    // label and toggles the very checkbox the user was asking about.
+    e.preventDefault();
+    if (tipPinned && tipOwner === help) hideTip();
+    else { showTip(help); tipPinned = true; }
+    return;
+  }
+  if (tipPinned) hideTip();
+});
+
+/* A click focuses the span too. Without knowing that, focusin would pin the
+   tip and the click that follows would read it as "already pinned" and shut
+   it again, so clicking a "?" would look like it did nothing. */
+let helpPressed = null;
+document.addEventListener("pointerdown", e => { helpPressed = helpAt(e.target); });
+
+document.addEventListener("focusin", e => {
+  const help = helpAt(e.target);
+  if (!help || help === helpPressed) return;   // reached by pointer; click owns it
+  showTip(help);
+  tipPinned = true;
+});
+
+document.addEventListener("focusout", e => {
+  if (helpAt(e.target) === tipOwner && tipOwner) hideTip();
+});
+
+document.addEventListener("keydown", e => {
+  const focused = helpAt(document.activeElement);
+  if (e.key === "Escape" && tipOwner) { hideTip(); return; }
+  // Focused by Tab, these are buttons as far as the keyboard is concerned, and
+  // space on a span would otherwise scroll the panel out from under the tip.
+  if (focused && (e.key === "Enter" || e.key === " ")) {
+    e.preventDefault();
+    if (tipPinned && tipOwner === focused) hideTip(); else showTip(focused);
+  }
+});
+
+/* The bubble is positioned against the window, so anything that moves the
+   icon underneath it has to take it down. */
+$("panel").addEventListener("scroll", () => { if (tipOwner) hideTip(); });
+window.addEventListener("resize", () => { if (tipOwner) hideTip(); });
+
+/* ---------------------------------------------------------------------------
    Quality.
 
    Detail is expressed as ground resolution, not as a pixel count, so a setting
@@ -638,6 +949,37 @@ const TOLERANCE_STEPS = [0, 0.05, 0.10, 0.25, 0.50];
 // survives depends on how much this particular bbox moves.
 const TOLERANCE_YIELD = { 0.05: 0.28, 0.10: 0.17, 0.25: 0.08, 0.50: 0.04 };
 const FACADE_STEPS  = [256, 512, 1024, 2048];    // px per storey tile
+
+/* What each step looks like, for the reader who does not think in centimetres
+   per pixel. Keyed by the value rather than by the slider position, so a step
+   and its sentence cannot drift apart when the scales change. */
+const AERIAL_PLAIN = {
+  50: "Blocks and fields. A road is a line, not a surface.",
+  25: "Cars and pavements are recognisable.",
+  12: "Road markings and street furniture are readable.",
+  8:  "Everything the photograph holds.",
+  6:  "Finer than the photograph, so the extra pixels are invented."
+};
+const TERRAIN_PLAIN = {
+  8:   "Large landforms only: an embankment, the slope of a hill.",
+  4:   "The broad lie of the land. Kerbs and ditches disappear.",
+  2:   "Ditches, ramps and embankments come through.",
+  1:   "Kerbs and small steps come through.",
+  0.5: "Every height the scan measured."
+};
+const TOLERANCE_PLAIN = {
+  0:    "Every measured point becomes a corner, flat ground included. Heaviest by far.",
+  0.05: "Never more than 5 cm off the measured ground. Very detailed.",
+  0.10: "Never more than 10 cm off. Kerbs and dikes survive; flat ground becomes a few big triangles.",
+  0.25: "Never more than 25 cm off. Light, though small steps get smoothed over.",
+  0.50: "Never more than 50 cm off. Lightest; only real landforms survive."
+};
+const FACADE_PLAIN = {
+  256:  "Blurry close up, fine from across the water.",
+  512:  "Reads well from across the street.",
+  1024: "Sharp at walking distance.",
+  2048: "Sharp with your nose against the wall. Heaviest."
+};
 
 const PRESETS = {
   draft:    { aerial: 0, terrain: 0, facade: 0, tol: 3, normal: false },
@@ -692,22 +1034,29 @@ function updateQuality() {
   $("facadeDerived").textContent =
     `${q.facadePx} px per storey · ${(q.facadePx / 4).toFixed(0)} px/m`;
 
+  $("aerialPlain").textContent = AERIAL_PLAIN[q.cm] || "";
+  $("terrainPlain").textContent = TERRAIN_PLAIN[q.spacing] || "";
+  $("terrainTolPlain").textContent = TOLERANCE_PLAIN[q.tol] || "";
+  $("facadePlain").textContent = FACADE_PLAIN[q.facadePx] || "";
+
   const notes = [];
   if (q.aerialOver)
-    notes.push(`Aerial is finer than the ${AERIAL_NATIVE_CM} cm source; the extra pixels are upsampled.`);
+    notes.push(`You have asked for more detail than the photograph holds (${AERIAL_NATIVE_CM} cm). The extra pixels are enlarged, not sharper.`);
   if (q.terrainOver)
-    notes.push(`Terrain is finer than the ${TERRAIN_NATIVE_M} m AHN source; the extra vertices are interpolated.`);
+    notes.push(`You have asked for more detail than the height scan measured (${TERRAIN_NATIVE_M} m). The extra points are filled in between real measurements.`);
   if (q.spacing <= 1 && !q.terrainOver)
-    notes.push("Below about 1 m most terrain vertices sit inside AHN's building-shaped holes, so they are reconstructed rather than measured.");
+    notes.push("Below about 1 m, most ground points fall inside the building-shaped holes the scan leaves behind, so they are reconstructed rather than measured.");
+  // These two fire at the recommended settings, so they are worded as things
+  // to know rather than things that have gone wrong.
   if (q.sizePx > UNITY_MAX_TEXTURE)
-    notes.push(`Over Unity's ${UNITY_MAX_TEXTURE} px texture limit: it will be downscaled on import. Use a smaller area to keep this detail.`);
+    notes.push(`Using Unity? The photo is bigger than it will import (${UNITY_MAX_TEXTURE} px) and gets shrunk on the way in. A smaller area keeps this detail. Blender takes it as it is.`);
   else if (q.sizePx > 2048)
-    notes.push("Unity caps imported textures at 2048 by default; raise Max Size on the texture to see this detail.");
+    notes.push("Using Unity? It shrinks imported textures to 2048 px until you raise Max Size on the texture. Blender takes it as it is.");
   const shipped = q.tol === 0 ? q.vertices : q.vertices * TOLERANCE_YIELD[q.tol];
   if (shipped > 1e6)
-    notes.push(`${(shipped / 1e6).toFixed(1)}M terrain vertices needs a 32-bit index buffer, which Unity sets automatically on import.`);
+    notes.push(`That is around ${(shipped / 1e6).toFixed(1)} million points of ground. It will open, but expect a slow import and a heavy scene.`);
   if (q.tol === 0)
-    notes.push("Terrain mesh at every vertex: flat ground costs as much as a dike. One step up drops the vertices the neighbours already describe.");
+    notes.push("Ground triangles are set to keep every point, so a flat field costs as much as a dike. One step along that slider drops the points the neighbours already describe.");
 
   $("qualityNote").innerHTML = notes.map(escapeHtml).join("<br>");
   $("qualityNote").style.color = (q.aerialOver || q.terrainOver)
@@ -734,12 +1083,13 @@ for (const id of ["aerialCm", "terrainM", "terrainTol", "facadePx"]) {
 }
 $("normal").addEventListener("change", () => { $("preset").value = "custom"; });
 
+$("name").addEventListener("input", updateAreaPlain);
+
 function updateFacadeNote() {
   $("facadeNote").textContent = +$("facade").value > 1
-    ? "3DBAG carries a construction year on every building, so the facade "
-      + "follows the era rather than the height: pre-1920 brick through to "
-      + "contemporary glass."
-    : "One wall material for every building.";
+    ? "Walls follow the era rather than the height: pre-1920 brick, through "
+      + "post-war concrete, to contemporary glass."
+    : "One wall material for every building, whatever its age.";
 }
 $("facade").addEventListener("change", updateFacadeNote);
 updateFacadeNote();
