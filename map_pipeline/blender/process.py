@@ -451,14 +451,87 @@ def _build_terrain_mesh(
     )
     quads = int((loop_totals == 4).sum())
     sharp = _mark_breakline_edges(obj, data)
+    groups = _tag_surface_regions(
+        obj, scene, work_dir, points, loop_vertex_indices, loop_starts, loop_totals
+    )
     full = 2 * (len(xs) - 1) ** 2
     log(
         f"terrain: {len(points)} vertices, {n_faces} faces "
         f"({quads} quads, {n_faces - quads} triangles, "
         f"{100.0 * n_faces / full:.1f}% of the {len(xs)}x{len(ys)} grid), "
-        f"{sharp} breakline edges marked sharp"
+        f"{sharp} breakline edges marked sharp, {groups} surface regions tagged"
     )
     return obj
+
+
+def _tag_surface_regions(
+    obj, scene, work_dir, points, loop_vertices, loop_starts, loop_totals
+) -> int:
+    """Label every face with what it is, and group the vertices to match.
+
+    This is what turns "flatten the ground under this building" from a lasso
+    and a prayer into select-then-flatten. The class of every square metre is
+    already worked out for the land cover map; it was simply never attached to
+    the terrain, so the model arrived knowing which faces were road and telling
+    nobody.
+
+    Two forms, because Blender uses them for different things. A face attribute
+    is exact and is what the spreadsheet and Select Similar read. Vertex groups
+    are one click in the Object Data panel and, more to the point, they drive
+    proportional editing -- which is what a designer levelling a plot actually
+    reaches for.
+    """
+    surfaces = scene.get("surfaces") or {}
+    if not surfaces.get("file"):
+        return 0
+    try:
+        data = np.load(work_dir / surfaces["file"])
+    except OSError:
+        return 0
+    if "class_grid" not in data:
+        return 0
+    grid = data["class_grid"]
+    if grid.size == 0:
+        return 0
+
+    names = {int(k): v for k, v in (surfaces.get("class_names") or {}).items()}
+    xmin, ymin, xmax, ymax = scene["bbox_local"]
+    rows, cols = grid.shape
+
+    # One class per face, read at the face centroid.
+    centroids = np.empty((len(loop_totals), 2))
+    for index, (start, total) in enumerate(zip(loop_starts, loop_totals)):
+        centroids[index] = points[loop_vertices[start : start + total]][:, :2].mean(axis=0)
+    col = np.clip(
+        ((centroids[:, 0] - xmin) / max(xmax - xmin, 1e-9) * cols).astype(int),
+        0, cols - 1,
+    )
+    row = np.clip(
+        ((centroids[:, 1] - ymin) / max(ymax - ymin, 1e-9) * rows).astype(int),
+        0, rows - 1,
+    )
+    face_class = grid[row, col].astype(np.int32)
+
+    mesh = obj.data
+    attribute = mesh.attributes.new("surface_class", "INT", "FACE")
+    attribute.data.foreach_set("value", face_class)
+
+    # A vertex belongs to every class touching it, which is what you want at a
+    # kerb: grabbing the road takes the edge of the pavement with it.
+    made = 0
+    for value in np.unique(face_class):
+        name = names.get(int(value)) or f"class_{int(value)}"
+        picked = np.flatnonzero(face_class == value)
+        members = set()
+        for index in picked:
+            start, total = loop_starts[index], loop_totals[index]
+            members.update(int(v) for v in loop_vertices[start : start + total])
+        if not members:
+            continue
+        group = obj.vertex_groups.new(name=f"ground_{name}")
+        group.add(sorted(members), 1.0, "REPLACE")
+        made += 1
+    return made
 
 
 def _mark_breakline_edges(obj, data) -> int:

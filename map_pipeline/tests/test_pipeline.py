@@ -3517,6 +3517,142 @@ class TestQuadPairing(unittest.TestCase):
                 )
 
 
+class TestEvenFaceSize(unittest.TestCase):
+    """Sculpting wants even faces; accuracy wants adaptive ones.
+
+    The mesh is adaptive by default and that is right -- a flat car park does
+    not need vertices. It also means the face size varies about a
+    thousandfold, which is exactly what makes it unpleasant to brush: one
+    stroke grabs five hundred vertices in one place and three in another.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from src.geo import BBox
+
+        n, side = 129, 256.0
+        cls.bbox = BBox(0.0, 0.0, side, side)
+        cls.xs = np.linspace(0.0, side, n)
+        cls.ys = np.linspace(0.0, side, n)
+        _, y = np.meshgrid(cls.xs, cls.ys)
+        rng = np.random.default_rng(23)
+        cls.heights = (
+            1.0
+            - 2.5 * np.exp(-(((y - 150.0) / 9.0) ** 2))
+            + rng.normal(0.0, 0.025, (n, n))
+        )
+        cls.rings = {
+            "unpaved": [
+                np.array([[20.0, 60.0], [230.0, 60.0], [230.0, 96.0], [20.0, 96.0],
+                          [20.0, 60.0]])
+            ]
+        }
+
+    def _build(self, cap):
+        from src.terrain_mesh import build_constrained
+
+        return build_constrained(
+            self.bbox, self.heights, self.xs, self.ys,
+            rings_by_source=self.rings, tolerance_m=0.10,
+            contour_interval_m=0.5, max_face_m=cap,
+        )
+
+    def test_the_cap_is_actually_held(self):
+        from src.terrain_mesh import _longest_edge
+
+        mesh = self._build(10.0)
+        longest = _longest_edge(mesh.vertices, mesh.triangles).max()
+        # A little over is fine -- a triangle 10 m on a side has a longer
+        # hypotenuse -- but nothing like the 60 m spans an adaptive mesh has.
+        self.assertLess(
+            longest, 15.0, f"a {longest:.1f} m face survived a 10 m cap"
+        )
+
+    def test_it_takes_the_big_faces_out(self):
+        """What the cap promises, stated exactly.
+
+        It lowers the top end; it does not raise the bottom. Refinement still
+        packs small faces along a breakline whatever the cap is, so the ratio of
+        largest to smallest barely moves on an area with few features -- and an
+        earlier version of this test asserted that ratio and was simply wrong
+        about what the setting does. The brush problem is a huge face next to a
+        small one, and it is the huge one this removes.
+        """
+        def top_end(mesh):
+            p = mesh.vertices[mesh.triangles][:, :, :2]
+            area = 0.5 * np.abs(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]))
+            return float(np.percentile(area, 99))
+
+        adaptive = top_end(self._build(0.0))
+        even = top_end(self._build(10.0))
+        self.assertLess(
+            even, adaptive / 2.0,
+            f"the largest faces went from {adaptive:.0f} to {even:.0f} m2",
+        )
+
+    def test_it_does_not_cost_accuracy(self):
+        """Adding faces cannot make the ground less accurate, and a cap that
+        starves its own budget silently does exactly that: at half the points it
+        needed, a 5 m cap left 62 m faces standing and the error five times what
+        it had been."""
+        capped = self._build(5.0)
+        self.assertEqual(
+            capped.triangles_over_allowance,
+            0,
+            f"worst gap {capped.max_error_m:.3f} m under a 5 m cap",
+        )
+
+    def test_off_by_default(self):
+        from src.config import DEFAULTS
+
+        self.assertEqual(DEFAULTS["terrain"]["max_face_m"], 0.0)
+        self.assertFalse(DEFAULTS["terrain"]["quads"])
+
+
+class TestSurfaceRegions(unittest.TestCase):
+    """The terrain has to arrive knowing which faces are road and which grass.
+
+    Flattening a plot for a building is the operation, and it was a lasso and a
+    prayer: the class of every square metre was already worked out for the land
+    cover map and simply never attached to the ground.
+    """
+
+    def test_the_class_names_reach_the_blender_stage(self):
+        import inspect
+
+        from src.export import write_scene_description
+
+        self.assertIn(
+            "surface_class_names",
+            inspect.signature(write_scene_description).parameters,
+        )
+        source = inspect.getsource(write_scene_description)
+        self.assertIn('"class_names"', source)
+
+    def test_the_pipeline_passes_the_real_names(self):
+        import inspect
+
+        import pipeline
+        from src.surfaces import CLASS_NAMES
+
+        self.assertIn("surface_class_names=", inspect.getsource(pipeline.run))
+        # The names have to be usable as vertex group suffixes.
+        for name in CLASS_NAMES.values():
+            self.assertRegex(name, r"^[a-z][a-z0-9_]*$", f"{name!r} is not a safe name")
+
+    def test_blender_tags_regions_and_marks_breaklines(self):
+        """Both halves have to be wired, or the model looks right and is still
+        unworkable."""
+        source = (REPO_ROOT / "blender" / "process.py").read_text()
+        self.assertIn("_tag_surface_regions", source)
+        self.assertIn("_mark_breakline_edges", source)
+        # A face attribute for exactness, vertex groups for one-click select and
+        # for proportional editing, which is what levelling a plot uses.
+        self.assertIn('mesh.attributes.new("surface_class", "INT", "FACE")', source)
+        self.assertIn("obj.vertex_groups.new", source)
+        self.assertIn("use_edge_sharp", source)
+
+
 class TestFeatureFilter(unittest.TestCase):
     """Dropping the runs that make a mesh busy without describing the ground."""
 

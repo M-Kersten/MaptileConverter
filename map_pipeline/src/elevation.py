@@ -671,6 +671,7 @@ def build_terrain(
             min_feature_length_m=float(
                 terrain_cfg.get("min_feature_length_m", 0.0)
             ),
+            max_face_m=float(terrain_cfg.get("max_face_m", 0.0)),
             quads=bool(terrain_cfg.get("quads", False)),
             max_fold_deg=float(terrain_cfg.get("quad_max_fold_deg", 12.0)),
             min_quad_angle_deg=float(terrain_cfg.get("quad_min_angle_deg", 25.0)),

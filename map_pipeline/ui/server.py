@@ -317,6 +317,7 @@ def build_config(payload: dict) -> dict:
             "breakline_simplify_m": float(payload.get("breakline_simplify_m", 0.15)),
             "contour_interval_m": float(payload.get("contour_interval_m", 0.5)),
             "min_feature_length_m": float(payload.get("min_feature_length_m", 0.0)),
+            "max_face_m": float(payload.get("max_face_m", 0.0)),
             "quads": bool(payload.get("quads", False)),
             "quad_max_fold_deg": float(payload.get("quad_max_fold_deg", 12.0)),
             **(

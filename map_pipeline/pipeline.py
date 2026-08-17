@@ -665,6 +665,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             water_texture=water_texture,
             furniture_texture=furniture_texture,
             surfaces_cfg=config.surfaces,
+            surface_class_names={
+                int(k): v for k, v in CLASS_NAMES.items()
+            },
             road_class_names={str(k): v for k, v in CLASS_NAMES.items()},
             furniture_cfg=config.furniture,
             vehicle_texture=vehicle_texture,

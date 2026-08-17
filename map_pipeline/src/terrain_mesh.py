@@ -405,6 +405,7 @@ class ConstrainedMesh:
     triangles_over_allowance: int = 0
     breaklines_over_allowance: int = 0
     reachable_tolerance_m: float = 0.0
+    max_face_m: float = 0.0
     # Sliver triangles, split by whose fault they are. A surveyed outline that
     # meets another at four degrees puts a four-degree triangle in the mesh and
     # no triangulation can do better -- the wedge is in the input. Only the
@@ -469,6 +470,7 @@ def build_constrained(
     simplify_m: float = 0.15,
     contour_interval_m: float = 0.5,
     min_feature_length_m: float = 0.0,
+    max_face_m: float = 0.0,
     quads: bool = False,
     max_fold_deg: float = 12.0,
     min_quad_angle_deg: float = 25.0,
@@ -559,6 +561,18 @@ def build_constrained(
             reachable,
         )
     budget = int(MAX_REFINE_GROWTH * max(len(merged), 1))
+    if max_face_m > 0:
+        # A size cap sets its own floor on how many points are needed, and it
+        # can easily be more than six times what the breaklines brought. Two
+        # right triangles fill a square of side `max_face_m`, so the vertex
+        # count is about the area over that squared, and half again for slack.
+        # Two right triangles fill a square of side `max_face_m`, and each
+        # carries about one vertex of its own, so the vertex count runs to
+        # roughly twice the area over that squared. Starving this is worse than
+        # not asking for it: at half the budget it needed, a 5 m cap left 62 m
+        # faces standing and the height error five times what it had been.
+        area = float(bbox.width) * float(bbox.height)
+        budget = max(budget, int(4.0 * area / (max_face_m * max_face_m)) + 2000)
     result = None
     rounds_used = 0
     for round_index in range(MAX_REFINE_ROUNDS):
@@ -589,7 +603,7 @@ def build_constrained(
         )
         extra, stuck = _refine_points(
             vertices, result.triangles, heights, xs, ys, allowance, floor_m,
-            gap, floor_m,
+            gap, floor_m, max_face_m,
         )
         # Anything that could not take a circumcentre falls back on splitting
         # the constraint that blocked it.
@@ -706,6 +720,7 @@ def build_constrained(
         slivers_from_input=from_input,
         slivers_of_our_own=our_own,
         rise_above_grid_m=rise,
+        max_face_m=float(max_face_m),
     )
     if quads:
         from .quadmesh import pair_into_quads
@@ -914,6 +929,26 @@ def grid_interpolation_floor(heights: np.ndarray) -> float:
     return float(twist.max()) / 8.0
 
 
+def _longest_edge(vertices, triangles):
+    """The longest side of each triangle, in metres."""
+    if len(triangles) == 0:
+        return np.zeros(0)
+    return np.max(
+        np.stack(
+            [
+                np.hypot(
+                    *(
+                        vertices[triangles[:, (i + 1) % 3], :2]
+                        - vertices[triangles[:, i], :2]
+                    ).T
+                )
+                for i in range(3)
+            ]
+        ),
+        axis=0,
+    )
+
+
 def _min_angles(points, triangles):
     """Smallest angle of each triangle, in degrees."""
     if len(triangles) == 0:
@@ -1071,7 +1106,8 @@ def _split_at(points, segments, index, sharp, floor_m):
 
 
 def _refine_points(
-    vertices, triangles, heights, xs, ys, allowance, floor_m, gap, clearance
+    vertices, triangles, heights, xs, ys, allowance, floor_m, gap, clearance,
+    max_edge_m=0.0,
 ):
     """Circumcentres of the triangles that are too wrong or too thin.
 
@@ -1099,12 +1135,36 @@ def _refine_points(
     allowed = _allowance_over(vertices, triangles, allowance, xs, ys)
     off_ground = error > allowed
     target = np.where(off_ground[:, None], _snap_to_grid(worst_at, xs, ys), centre)
-    bad = off_ground | (angle < MIN_ANGLE_DEG)
-    # A triangle already at the resolution of the height model cannot be
-    # improved by looking harder at it.
-    bad &= radius > floor_m
+    # A cap on how big a face may be, whether or not the ground needs it. The
+    # mesh is adaptive for accuracy, which is right, and it means the density
+    # varies about a hundredfold -- and that is precisely what makes it awkward
+    # to sculpt, because one brush stroke grabs five hundred vertices in one
+    # place and three in another. Capping the size trades faces for a surface
+    # that behaves the same wherever you push it.
+    longest = _longest_edge(vertices, triangles)
+    oversized = (
+        longest > max_edge_m
+        if max_edge_m > 0
+        else np.zeros(len(triangles), dtype=bool)
+    )
+    bad = off_ground | oversized | (angle < MIN_ANGLE_DEG)
+    # A triangle already smaller than one sample of the height model cannot
+    # learn anything by being cut again: everything inside a cell is the
+    # interpolation's opinion, not a measurement. Judged on the longest side
+    # rather than the circumradius, which was too generous -- triangles a cell
+    # and a half across kept qualifying, kept being refined, and kept being
+    # exactly as wrong afterwards.
+    bad &= longest > 2.0 * floor_m
     if not bad.any():
         return np.zeros((0, 2)), np.zeros(0, dtype=np.int64)
+
+    # A face over the size cap is aimed at its own middle: there is no height
+    # error to chase, it is simply too big, and the centroid is where a new
+    # vertex halves it most evenly.
+    if max_edge_m > 0:
+        centroid = vertices[triangles][:, :, :2].mean(axis=1)
+        only_big = oversized & ~off_ground
+        target[only_big] = centroid[only_big]
 
     # Height first, then size. Refinement runs against a budget, and a round
     # that spends it all chasing thin triangles leaves the handful that are

@@ -163,6 +163,7 @@ def write_scene_description(
     furniture_texture: Path | None = None,
     surfaces_cfg: dict | None = None,
     road_class_names: dict | None = None,
+    surface_class_names: dict | None = None,
     furniture_cfg: dict | None = None,
     vehicle_texture: Path | None = None,
     vehicles_cfg: dict | None = None,
@@ -245,6 +246,9 @@ def write_scene_description(
                 # Named so the Blender stage can label each road object with
                 # what it is rather than with a number.
                 "road_class_names": road_class_names or {},
+                # And so the terrain's own vertex groups come out called
+                # "ground_road_asphalt" rather than "ground_class_1".
+                "class_names": surface_class_names or {},
             }
             if water_texture is not None
             else {}

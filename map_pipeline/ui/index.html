@@ -365,7 +365,16 @@
         with.
       </div>
 
-      <div class="inline" style="margin-top:0">
+      <label for="uniform" style="margin-top:0">Even face size
+        <span class="help" tabindex="0" role="button" aria-label="About even face size"
+          data-tip="Caps how big a face may be, whether or not the ground needs the detail. The mesh is adaptive by default, which is right for accuracy and awkward to sculpt: a flat field gets faces tens of metres across right next to a bank packed with tiny ones, so a brush grabs hundreds of vertices in one place and three in another. This removes the big ones. It does not thin the dense parts &mdash; those are carrying real detail &mdash; and it changes nothing about accuracy.">?</span>
+        <span class="derived" id="uniformDerived"></span>
+      </label>
+      <input type="range" id="uniform" min="0" max="4" step="1" value="0" class="slider">
+      <div class="ticks"><span>adaptive</span><span>even everywhere</span></div>
+      <div class="plain" id="uniformPlain"></div>
+
+      <div class="inline" style="margin-top:14px">
         <input type="checkbox" id="quads">
         <label for="quads">Make quads where it can</label>
         <span class="help" tabindex="0" role="button" aria-label="About quads"
@@ -1055,6 +1064,14 @@ const TOLERANCE_PLAIN = {
    Terrain shape. None of these change how accurate the ground is -- the checks
    measure that either way -- they change what it is like to edit.
 --------------------------------------------------------------------------- */
+const UNIFORM_STEPS = [0, 20, 10, 5, 2];            // metres, 0 = adaptive
+const UNIFORM_PLAIN = {
+  0:  "Adaptive: a flat car park gets three faces, a dike gets thousands. Fewest faces, and the least predictable to sculpt.",
+  20: "Nothing bigger than 20 m across. Takes the worst of the unevenness out cheaply.",
+  10: "Nothing bigger than 10 m. A reasonable compromise for brush work.",
+  5:  "Nothing bigger than 5 m. No large faces left anywhere, which is what a brush wants. Costs a lot of faces over a big area.",
+  2:  "Nothing bigger than 2 m. Near enough a uniform sheet — only use this on a small area."
+};
 const FOLD_STEPS = [3, 6, 12, 25, 60];              // degrees
 const FOLD_PLAIN = {
   3:  "Only genuinely flat pairs are fused. Every ridge and ditch keeps its crease, and you get the fewest quads.",
@@ -1178,6 +1195,7 @@ function updateQuality() {
 
 function shape() {
   return {
+    uniform: UNIFORM_STEPS[+$("uniform").value],
     quads: $("quads").checked,
     fold: FOLD_STEPS[+$("fold").value],
     straighten: STRAIGHTEN_STEPS[+$("straighten").value],
@@ -1194,6 +1212,8 @@ function shape() {
 
 function updateShape() {
   const s = shape();
+  $("uniformDerived").textContent = s.uniform ? `max ${s.uniform} m` : "adaptive";
+  $("uniformPlain").textContent = UNIFORM_PLAIN[s.uniform] || "";
   $("foldDerived").textContent = `${s.fold}°`;
   $("foldPlain").textContent = FOLD_PLAIN[s.fold] || "";
   $("straightenDerived").textContent = `${s.straighten} m`;
@@ -1214,13 +1234,15 @@ function updateShape() {
     notes.push("At 60° almost nothing counts as a fold, so real ridges will be fused flat.");
   if (s.contour === 0 && !s.breaklines.includes("water"))
     notes.push("With contours off and water edges off, a canal bank has nothing to fold along.");
+  if (s.uniform && s.uniform <= 5)
+    notes.push(`An even ${s.uniform} m face over a square kilometre is on the order of ${Math.round(1e6 / (s.uniform * s.uniform) / 1000)}k faces before anything else is counted. Try it on a small area first.`);
   if (s.straighten >= 5 && s.minFeature >= 25)
     notes.push("Bold on both: expect a clean, sparse sheet that no longer follows the survey closely.");
   $("shapeNote").innerHTML = notes.map(escapeHtml).join("<br>");
   $("shapeNote").style.color = notes.length ? "var(--warn)" : "var(--muted)";
 }
 
-for (const id of ["quads", "fold", "straighten", "minFeature", "contours",
+for (const id of ["uniform", "quads", "fold", "straighten", "minFeature", "contours",
                   "blRoads", "blWater", "blLand", "blBuildings"]) {
   $(id).addEventListener("input", updateShape);
   $(id).addEventListener("change", updateShape);
@@ -1378,6 +1400,7 @@ $("run").onclick = async () => {
     clip_mode: $("clip").value,
     preview: $("preview").checked,
     // Terrain shape. See updateShape: none of this changes accuracy.
+    max_face_m: sh.uniform,
     quads: sh.quads,
     quad_max_fold_deg: sh.fold,
     breakline_simplify_m: sh.straighten,

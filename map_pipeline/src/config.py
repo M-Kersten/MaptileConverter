@@ -78,6 +78,12 @@ DEFAULTS: dict[str, Any] = {
         # Fuse flat pairs of triangles into quads at the very end. Nothing
         # moves and nothing is added, so every accuracy figure still holds; it
         # is purely about handing an editor something it can loop and subdivide.
+        # A cap on how big a terrain face may be, in metres, whether or not the
+        # ground needs the detail. 0 leaves the mesh purely adaptive, which is
+        # right for accuracy and wrong for sculpting: the density varies about a
+        # hundredfold, so one brush stroke grabs five hundred vertices in one
+        # place and three in another.
+        "max_face_m": 0.0,
         "quads": False,
         # A fold sharper than this stays two triangles, so a ridge or a ditch
         # is not flattened into one quad. Roughly: a Dutch dike face against

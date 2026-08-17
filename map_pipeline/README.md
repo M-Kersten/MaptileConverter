@@ -636,6 +636,37 @@ Five settings control how busy the ground is, all of them in the UI under
 | Ignore features shorter than | `terrain.min_feature_length_m` | Drops traffic islands, kerb stubs, driveway aprons. A planar partition has thousands, and each one is an edge loop. |
 | Contour lines | `terrain.contour_interval_m` | The only edges that follow the ground itself. Also the costliest. Flat ground contributes none regardless. |
 | Which features become edges | `terrain.breaklines` | Roads, water, land cover, buildings — independently. |
+| Even face size | `terrain.max_face_m` | Caps how big a face may be regardless of whether the ground needs it. |
+
+### What the terrain arrives knowing
+
+Two things ship with the mesh that make it editable rather than merely correct,
+and both are information the pipeline already had and used to throw away.
+
+**Every face is labelled with what it is.** The surface class of every square
+metre is worked out for `landcover.png`; it is now also sampled per terrain face
+into an integer attribute `surface_class`, and turned into vertex groups —
+`ground_road_asphalt`, `ground_water`, `ground_green`, one per class present. So
+"flatten the ground for this building" is select-group-then-flatten rather than a
+lasso and a prayer. The vertex groups matter more than the attribute in practice,
+because they also drive proportional editing, which is what levelling a plot
+actually uses.
+
+**Every breakline is marked sharp and as a UV seam.** *Select Sharp Edges* hands
+you the kerb, the canal bank or a footprint as a loop. A footprint is a closed
+ring, so selecting it and then *Select → Inner Region* gives you the plot.
+
+**A note on field-aligned quadrangulation**, since it is the obvious next thing
+to reach for and it is the wrong tool here. A field-aligned quad mesh is regular
+only *between* its singularities, and loop select, grid select and proportional
+editing all terminate at one. The field must align to the constraints, a
+cross-field carries one direction pair per point, and every junction where two
+streets meet at anything but 90 degrees forces a singularity. A real 1 km area
+carries around 10,400 BGT and building features, so on the order of 7,000
+junctions — against roughly 40,000 quads at a 5 m target. That is a singularity
+every handful of faces: not a regular sheet, and harder to work with than this.
+It looks clean in published examples because those are smooth organic surfaces
+or open countryside, where the field has almost nothing to satisfy.
 
 **Roads still float above it.** They are separate objects with their own
 materials, and they share the terrain's edges rather than being part of it, so
