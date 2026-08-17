@@ -326,8 +326,8 @@ Other knobs worth knowing:
 | `buildings.merge` | `single` | One merged buildings mesh. `per_building` gives one object each. |
 | `terrain.mesh_vertices_per_side` | `257` | 257 → 66k terrain vertices before simplification. Rounded up to 2^k + 1 when simplification is on. |
 | `terrain.breaklines` | roads, water, land cover, buildings | Which outlines the terrain folds along. Empty falls back to the bisection mesh. |
-| `terrain.breakline_simplify_m` | `0.15` | How far a simplified outline may stray from the surveyed one. |
-| `terrain.contour_interval_m` | `0.5` | Contour spacing. `0` leaves contours out and roughly halves the mesh. |
+| `terrain.breakline_simplify_m` | `0.15` | How far a simplified outline may stray from the surveyed one. Applied to the whole outline network at once, not ring by ring, so a boundary two polygons share stays one line. |
+| `terrain.contour_interval_m` | `0.5` | Contour spacing. Contours are then thinned against `simplify_tolerance_m`, so flat ground contributes none. `0` leaves them out entirely. |
 | `terrain.simplify_tolerance_m` | `0.10` | How far the terrain mesh may stray from the height grid. Drops the vertices sitting on ground their neighbours already describe, which over a Dutch bbox is most of them. `0` keeps the full grid. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
 
@@ -472,42 +472,94 @@ amount of extra detail fixes that -- it only makes a finer staircase.
 
 **Breaklines.** `src/breaklines.py` collects the lines the mesh has to fold
 along and `src/cdt.py` triangulates so that every one of them survives as an
-edge. Over 600 m of central Utrecht:
+edge. Four sources: BGT roads, land cover and water; building footprints;
+contours off the DTM; and the bbox edge.
 
-| Source | Segments |
-| --- | --- |
-| BGT roads (`wegdeel`) | 1,498 |
-| BGT unpaved (`onbegroeidterreindeel`) | 1,068 |
-| Building footprints (`pand`) | 1,398 |
-| BGT green (`begroeidterreindeel`) | 492 |
-| BGT water (`waterdeel`) | 22 |
-| Contours off the DTM, 0.5 m apart | 16,593 |
-| The bbox edge | 1 |
+**The BGT is a planar partition, and simplification has to keep it one.** A road
+and the pavement beside it are two polygons carrying the *same* boundary, vertex
+for vertex. Simplifying them one ring at a time does not preserve that:
+Douglas-Peucker is anchored on the ends of whatever it is given, and where three
+polygons meet part way along a kerb, that junction is a ring corner for one of
+them and an ordinary point on a smooth curve for another. The anchors differ,
+the two copies of the kerb keep different vertices, and one line becomes two
+that cross each other repeatedly.
 
-Contours dominate the count and are the one source that follows the ground
-rather than something drawn on it. `terrain.contour_interval_m: 0` leaves them
-out and roughly halves the mesh.
+Everything downstream inherits it. The crossings get cut into a ladder of
+millimetre segments, the ladder meets at angles no triangulation can make a
+decent triangle out of, and refinement chases those corners into ever smaller
+slivers. Measured: **268 of the 283 worst triangles in a test area came from one
+kerb that had been turned into two.** So `partition_chains` welds the outlines
+into a single network first and simplifies the runs *between* junctions. Each
+shared kerb then exists once and is thinned once.
 
-**The BGT is already a planar partition**, which is what makes this cheap:
-adjacent polygons repeat their shared corners exactly, so 77k raw outline
-vertices weld down to 38k. Nothing has to be stitched.
+**Contours are joined before they are thinned.** Marching squares emits one
+chord per grid cell, and emitting those raw made contours **99.8% of every
+breakline in an area** — a vertex every 1.5 m on a 2 m grid, along ground that
+mostly needed none. That put the mesh a hundred times denser along a contour
+than on the field beside it, and a triangulation asked to bridge a density step
+like that can only do it with long thin wedges, whatever triangulator you use.
+
+`contour_polylines` chains the chords back into lines and then thins them
+against the **height** they cost rather than the distance: a contour is a line of
+constant height, so moving it sideways by `d` where the ground slopes at `g`
+misplaces the height by `d * g`. That prices every vertex in the units the
+tolerance is written in, and does the right thing at both ends by itself — a
+canal bank keeps its detail, and a contour out on a flat field, where the only
+slope is the scanner's own noise, is allowed to wander a hundred metres and so
+collapses and drops out. Roughly half of the raw contours over a Dutch area were
+tracing that noise; 37% of them were out on flat ground with no feature to fold
+along at all.
 
 **Nothing may cross.** No triangulation can honour two constraints that cross,
-so every segment is cut at every intersection first. BGT outlines never cross
-each other; contours cross roads and water constantly -- 12,061 crossings over
-that same 600 m. Splitting has to be repeated, because welding afterwards is
+so every segment is cut at every intersection first. Contours cross roads and
+water constantly. Splitting has to be repeated, because welding afterwards is
 what merges the two copies of a shared intersection and also drags a cut that
 landed a millimetre from an endpoint back onto it, undoing the split.
 
-**Then it refines.** Breaklines say nothing about the ground between them, so
-the mesh is built, the triangles that stray further than
-`terrain.simplify_tolerance_m` from the height grid get a point dropped inside
-them, and it is rebuilt. Probes sit strictly inside the triangle on purpose: an
-edge midpoint is the obvious place to check and is usually *on* a breakline,
-which is the one place a point must not go.
+**Then it refines, and this is where the mesh is actually made.** The bisection
+mesh below chooses which grid points are worth keeping, but **its tolerance is a
+property of its own triangles, not of its points**: it keeps a vertex because of
+the right triangles *it* would have drawn, and Delaunay draws different ones.
+Measured, the same points re-triangulated were three times outside the tolerance
+they were chosen for, and with the breaklines added, fourteen times.
 
-Result over that 600 m bbox: 63,612 vertices, 126,525 triangles, 60,400
-breakline edges, covering the bbox to within 1e-6, in about 25 s of a 138 s run.
+So the point set is earned back with Delaunay refinement, after Ruppert:
+
+* **Split a constraint segment** when a vertex encroaches on it — sits inside
+  its diametral circle — or when the ground under its chord has sagged more than
+  the tolerance away from it. Without this a simplified breakline stays a single
+  forced edge with the mesh draped off it; a 339 m one showed up in a mesh whose
+  median edge was 2 m.
+* **Insert the circumcentre** of any triangle that is further than the tolerance
+  from the ground. The circumcentre, not the centroid: the centroid sits among
+  the corners it came from, so inserting it splits a bad triangle into three of
+  the same shape. The loop that did that added 132 points, then 35, then 33,
+  then 38, and stopped no closer than it started.
+* When a circumcentre falls **outside the area**, split the constrained edge
+  blocking it instead. This is the boundary case, and without it the mesh never
+  improves where a canal runs off the edge of the bbox — which is exactly where
+  it was worst.
+
+Ground points are also kept **clear of breaklines** by one grid step. A grid
+node crowding a line carries no height that was ever measured, and the line's
+own vertices are metres apart, so the triangle between them can only be a wedge.
+Forcing the bisection mesh *finer* near lines is the intuitive version of this
+idea and it is simply wrong — it cost 50% more triangles for the same shape,
+because refinement grades the mesh properly by itself and a lattice pushed up
+against an arbitrary polyline can only make wedges.
+
+Measured over one synthetic Dutch area, before and after all of the above:
+
+| | before | after |
+| --- | --- | --- |
+| Triangles | 25,267 | **12,884** |
+| Smallest angle anywhere | 0.0025° | **1.22°** |
+| Triangles under 1° | 628 | **0** |
+| Triangles under 5° | 9.9% | **0.5%** |
+| Triangles under 10° | 17.6% | **1.9%** |
+| Median smallest angle | 29.7° | **40.4°** |
+| Worst height error (0.10 m asked) | 0.459 m | **0.100 m** |
+| Worst sag under a breakline | never measured | **0.100 m** |
 
 **Roads still float above it.** They are separate objects with their own
 materials, and they share the terrain's edges rather than being part of it, so

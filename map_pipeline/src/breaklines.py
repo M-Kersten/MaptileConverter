@@ -23,6 +23,19 @@ The triangulator cannot take two constraints that cross -- no triangulation can
 satisfy both -- so everything here ends in `split_crossings`, which cuts every
 segment at every intersection. BGT outlines do not cross each other, but
 contours cross roads and water constantly.
+
+Two things in here exist because of what they cost the mesh downstream, and
+both are worth knowing before changing anything:
+
+* Outlines are simplified **as a network, not as rings** (`partition_chains`).
+  Ring by ring, a kerb two polygons share is thinned twice, differently, and
+  becomes two lines that cross each other repeatedly -- and a triangulation
+  handed that can only fill the gap between them with slivers.
+* Contours are **joined and then thinned against the height they cost**
+  (`contour_polylines`), not emitted as the raw per-cell chords marching
+  squares produces. Raw, they were 99% of every breakline in an area, put a
+  vertex every grid cell along ground that needed none, and about half of them
+  were tracing the laser scanner's own noise across flat fields.
 """
 
 from __future__ import annotations
@@ -50,6 +63,37 @@ DEFAULT_CONTOUR_INTERVAL_M = 0.5
 # Segments shorter than this are dropped. They come from simplification leaving
 # a stub, and a triangulator handed one makes a sliver.
 MIN_SEGMENT_M = 0.05
+
+# A contour shorter than this, once simplified, is not a feature. Over flat
+# ground AHN's few centimetres of scan noise throws off little closed rings
+# wherever the surface happens to sit near a contour level, and each one used
+# to arrive as a constraint the mesh had to honour.
+MIN_CONTOUR_LENGTH_M = 4.0
+
+# A floor under the slope used to price a contour's simplification, so that
+# dead-flat ground still puts a finite number on it. At a 0.10 m tolerance this
+# floor allows a contour out on the flat to wander 100 m before it is worth a
+# vertex, which is the same as saying it should be a straight line.
+MIN_GRADIENT = 1e-3
+
+# Ground flatter than this carries no contour worth having. AHN measures to a
+# few centimetres and a contour level that happens to land near the height of a
+# flat field will wander all over it chasing that noise -- and once simplified,
+# what is left is a straight line drawn across a field at random, which shows
+# up in Blender as a crease through ground that is not creased.
+#
+# Read it as a run: at a 0.5 m contour interval, 1 in 60 is one contour every
+# 30 m, and ground flatter than that does not need contours to be described to
+# within a tenth of a metre.
+MIN_CONTOUR_SLOPE = 1.0 / 60.0
+
+# Contours are pulled off a lightly smoothed copy of the height grid. The
+# heights themselves are never smoothed -- the mesh has to sit on what was
+# measured -- but the *shape* of a contour is meant to follow the ground, and
+# on a laser scan the raw shape is half noise. One 3x3 pass halves the number
+# of contour chords over flat ground and leaves a canal bank, which is metres
+# deep, exactly where it was.
+CONTOUR_SMOOTH_PASSES = 1
 
 
 @dataclass
@@ -102,6 +146,245 @@ def douglas_peucker(ring: np.ndarray, tolerance: float) -> np.ndarray:
             stack.append((i, k))
             stack.append((k, j))
     return ring[keep]
+
+
+def simplify_by_height(ring: np.ndarray, weights: np.ndarray, tolerance_m: float):
+    """Douglas-Peucker priced in metres of height rather than metres sideways.
+
+    Plain Douglas-Peucker asks how far a vertex sits from the chord that would
+    replace it. For a contour that is the wrong question: a contour is a line
+    of constant height, so moving it sideways by `d` where the ground slopes at
+    `g` misplaces the height by `d * g`, and nothing else about `d` matters.
+
+    Weighting the deviation by the local gradient therefore prices every vertex
+    in the units the tolerance is actually written in. It also does the right
+    thing at both ends by itself: on a canal bank the gradient is steep, the
+    allowance in metres is small and the bank keeps its detail; out on a flat
+    field the gradient is the scanner's own noise, the allowance is tens of
+    metres, and the contour that was only ever tracing that noise collapses to
+    a straight line and then falls under the length floor.
+    """
+    ring = np.asarray(ring, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    n = len(ring)
+    if n < 3 or tolerance_m <= 0:
+        return ring
+    keep = np.zeros(n, dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        span = ring[j] - ring[i]
+        length = float(np.hypot(span[0], span[1]))
+        rel = ring[i + 1 : j] - ring[i]
+        if length < 1e-12:
+            off = np.hypot(rel[:, 0], rel[:, 1])
+        else:
+            off = np.abs(rel[:, 0] * span[1] - rel[:, 1] * span[0]) / length
+        cost = off * weights[i + 1 : j]
+        k = int(np.argmax(cost))
+        if cost[k] > tolerance_m:
+            k += i + 1
+            keep[k] = True
+            stack.append((i, k))
+            stack.append((k, j))
+    return ring[keep]
+
+
+def _gradient_grid(heights: np.ndarray, xs: np.ndarray, ys: np.ndarray):
+    """Slope magnitude at every grid node, in metres of rise per metre along."""
+    heights = np.asarray(heights, dtype=np.float64)
+    dx = float(abs(xs[1] - xs[0])) if len(xs) > 1 else 1.0
+    dy = float(abs(ys[1] - ys[0])) if len(ys) > 1 else 1.0
+    gy, gx = np.gradient(heights, dy, dx)
+    return np.hypot(gx, gy)
+
+
+def _sample_grid(grid, xs, ys, points):
+    """Nearest-node lookup. Good enough: this only sets a tolerance."""
+    if len(points) == 0:
+        return np.zeros(0)
+    cols = np.clip(
+        np.round((points[:, 0] - xs[0]) / (xs[1] - xs[0])).astype(int), 0, len(xs) - 1
+    )
+    rows = np.clip(
+        np.round((points[:, 1] - ys[0]) / (ys[1] - ys[0])).astype(int), 0, len(ys) - 1
+    )
+    return grid[rows, cols]
+
+
+def chain_segments(segments: list[np.ndarray], *, tolerance: float = WELD_M):
+    """Join loose two-point chords into the longest polylines they make.
+
+    Marching squares emits one chord per grid cell, and consecutive cells share
+    the point where the contour crosses the edge between them, so the chords
+    already form chains -- they just arrive shuffled. Walking them back into
+    polylines is what makes simplification possible at all: there is nothing to
+    simplify about a two-point segment, which is why contours used to reach the
+    triangulator at full grid resolution while every other breakline had been
+    thinned.
+    """
+    if not segments:
+        return []
+    quantum = max(tolerance, 1e-9)
+
+    def key(p):
+        return (int(round(p[0] / quantum)), int(round(p[1] / quantum)))
+
+    # Adjacency over shared endpoints. A contour level can pass through a
+    # saddle, where four chord ends meet; those are left as junctions and the
+    # walk simply stops there rather than guessing which pair continues.
+    ends: dict = {}
+    for index, seg in enumerate(segments):
+        ends.setdefault(key(seg[0]), []).append((index, 0))
+        ends.setdefault(key(seg[-1]), []).append((index, 1))
+
+    used = [False] * len(segments)
+    out: list[np.ndarray] = []
+    for start in range(len(segments)):
+        if used[start]:
+            continue
+        used[start] = True
+        chain = [segments[start][0], segments[start][-1]]
+        # Grow from both ends until the chain closes or runs out.
+        for direction in (1, 0):
+            while True:
+                tip = chain[-1] if direction else chain[0]
+                here = ends.get(key(tip), ())
+                # A contour level passing through a saddle brings four chord
+                # ends to one point. Walking through would splice two branches
+                # into one polyline, and the simplifier would then cut the
+                # corner across the saddle. Stop instead and let them stay two.
+                if len(here) != 2:
+                    break
+                nxt = next(((i, s) for i, s in here if not used[i]), None)
+                if nxt is None:
+                    break
+                index, side = nxt
+                used[index] = True
+                far = segments[index][0] if side else segments[index][-1]
+                if direction:
+                    chain.append(far)
+                else:
+                    chain.insert(0, far)
+        out.append(np.asarray(chain, dtype=np.float64))
+    return out
+
+
+def chains_between_junctions(points: np.ndarray, edges) -> list[np.ndarray]:
+    """Break an edge network into the runs between its junctions.
+
+    A junction is any point where something other than exactly two edges meet:
+    a dead end, a corner where three polygons come together, a crossing. Those
+    are the points the network's shape depends on, so they are kept and the
+    simple runs between them are handed back as polylines to be thinned.
+    """
+    neighbours: dict = {}
+    for a, b in edges:
+        a, b = int(a), int(b)
+        if a == b:
+            continue
+        neighbours.setdefault(a, set()).add(b)
+        neighbours.setdefault(b, set()).add(a)
+
+    junctions = {v for v, near in neighbours.items() if len(near) != 2}
+    seen: set = set()
+    out: list[np.ndarray] = []
+
+    def walk(start, step):
+        run = [start, step]
+        seen.add(frozenset((start, step)))
+        previous, current = start, step
+        while current not in junctions:
+            following = [n for n in neighbours[current] if n != previous]
+            if not following:
+                break
+            nxt = following[0]
+            if frozenset((current, nxt)) in seen:
+                break
+            seen.add(frozenset((current, nxt)))
+            run.append(nxt)
+            previous, current = current, nxt
+        return run
+
+    for start in sorted(junctions):
+        for step in sorted(neighbours[start]):
+            if frozenset((start, step)) not in seen:
+                out.append(np.asarray([points[i] for i in walk(start, step)]))
+
+    # Whatever is left is a ring with no junction on it at all -- an island, a
+    # pond, a building standing on its own.
+    for start in sorted(neighbours):
+        for step in sorted(neighbours[start]):
+            if frozenset((start, step)) not in seen:
+                run = walk(start, step)
+                if run[-1] != start:
+                    run.append(start)
+                out.append(np.asarray([points[i] for i in run]))
+    return out
+
+
+def partition_chains(rings_by_source: dict, bbox: BBox, simplify_m: float):
+    """Simplify a planar partition without pulling its shared edges apart.
+
+    The BGT is a planar partition: a road and the pavement beside it are two
+    polygons that carry the *same* boundary, vertex for vertex. Simplifying
+    them one ring at a time does not keep it that way. Douglas-Peucker is
+    anchored on the ends of whatever it is given, and where three polygons meet
+    part-way along a kerb, that junction is a ring corner for one of them and
+    an ordinary point on a smooth curve for another -- so the anchors differ,
+    the two copies of one kerb are thinned to different vertices, and what was
+    a single line becomes two lines up to twice the tolerance apart that cross
+    each other over and over.
+
+    Everything downstream then inherits it. The crossings get cut into a ladder
+    of millimetre segments, the ladder meets at angles no triangulation can
+    make a decent triangle out of, and refinement chases those corners into
+    ever smaller slivers: 268 of the 283 worst triangles in a test area came
+    from one kerb that had been turned into two.
+
+    So the partition is welded into a single network first, and simplification
+    runs on the runs *between* junctions. Each shared kerb then exists once,
+    gets thinned once, and both polygons keep the same one.
+    """
+    pieces: list[np.ndarray] = []
+    owners: list[str] = []
+    for source, rings in rings_by_source.items():
+        for ring in rings:
+            ring = np.asarray(ring, dtype=np.float64)[:, :2]
+            for piece in clip_ring_segments(ring, bbox):
+                if len(piece) >= 2:
+                    pieces.append(piece)
+                    owners.append(source)
+
+    counts = {source: 0 for source in rings_by_source}
+    if not pieces:
+        return [], counts
+
+    welded, mapping = weld(np.vstack(pieces), WELD_M)
+    edges: set = set()
+    offset = 0
+    for piece in pieces:
+        ids = mapping[offset : offset + len(piece)]
+        offset += len(piece)
+        for k in range(len(ids) - 1):
+            if ids[k] != ids[k + 1]:
+                edges.add(frozenset((int(ids[k]), int(ids[k + 1]))))
+
+    chains = []
+    for run in chains_between_junctions(welded, [tuple(e) for e in edges]):
+        simplified = douglas_peucker(run, simplify_m)
+        if len(simplified) >= 2:
+            chains.append(simplified)
+
+    # Which source a run belongs to is only ever reported, never used, and a
+    # shared kerb belongs to two of them. Counted against the first that
+    # claimed a piece so the log still says where the work came from.
+    for source in counts:
+        counts[source] = sum(1 for o in owners if o == source)
+    return chains, counts
 
 
 def clip_ring_segments(ring: np.ndarray, bbox: BBox) -> list[np.ndarray]:
@@ -180,16 +463,28 @@ def contour_lines(
     the triangulator wants, and joining them would only be undone by the
     splitting step anyway.
     """
+    out: list[np.ndarray] = []
+    for _level, segments in _contour_levels(heights, xs, ys, interval_m):
+        out.extend(segments)
+    return out
+
+
+def _contour_levels(heights, xs, ys, interval_m):
+    """Yield (level, chords) so callers can keep the levels apart.
+
+    Chaining has to happen within a level: two chords from different levels can
+    share an endpoint where the surface is flat, and joining across that would
+    make a polyline that is not a contour of anything.
+    """
     heights = np.asarray(heights, dtype=np.float64)
     if interval_m <= 0 or heights.size == 0:
-        return []
+        return
     low = float(np.floor(heights.min() / interval_m) * interval_m)
     high = float(heights.max())
     levels = np.arange(low + interval_m, high, interval_m)
     if len(levels) == 0:
-        return []
+        return
 
-    out: list[np.ndarray] = []
     z00 = heights[:-1, :-1]
     z10 = heights[:-1, 1:]
     z11 = heights[1:, 1:]
@@ -206,11 +501,70 @@ def contour_lines(
         if active.size == 0:
             continue
         rows, cols = np.unravel_index(active, code.shape)
+        here: list[np.ndarray] = []
         for r, c in zip(rows.tolist(), cols.tolist()):
-            for seg in _cell_segments(
-                heights, xs, ys, r, c, float(level), int(code[r, c])
-            ):
-                out.append(seg)
+            here.extend(
+                _cell_segments(heights, xs, ys, r, c, float(level), int(code[r, c]))
+            )
+        if here:
+            yield float(level), here
+
+
+def contour_polylines(
+    heights: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    *,
+    interval_m: float = DEFAULT_CONTOUR_INTERVAL_M,
+    tolerance_m: float = 0.10,
+    min_length_m: float = MIN_CONTOUR_LENGTH_M,
+) -> list[np.ndarray]:
+    """Contours as joined, simplified polylines rather than per-cell chords.
+
+    This is what the terrain mesh wants. Emitting the chords raw put a vertex
+    every grid cell along every contour, which made the contours 99% of all the
+    breaklines in an area and left the mesh a hundred times denser along them
+    than on the ground either side -- and a triangulation that has to bridge a
+    density step like that can only do it with long thin wedges, whatever
+    triangulator you use.
+
+    So: join the chords back into the lines they came from, then spend vertices
+    on them at the rate the height tolerance justifies.
+    """
+    source = _smooth(np.asarray(heights, dtype=np.float64), CONTOUR_SMOOTH_PASSES)
+    gradient = _gradient_grid(source, xs, ys)
+    out: list[np.ndarray] = []
+    for _level, chords in _contour_levels(source, xs, ys, interval_m):
+        for line in chain_segments(chords):
+            if len(line) < 2:
+                continue
+            slope = _sample_grid(gradient, xs, ys, line)
+            # Not a contour of anything: the ground it crosses is flat enough
+            # that the level it marks is inside the scanner's own noise.
+            if float(np.median(slope)) < MIN_CONTOUR_SLOPE:
+                continue
+            simplified = simplify_by_height(
+                line, np.maximum(slope, MIN_GRADIENT), tolerance_m
+            )
+            if len(simplified) < 2:
+                continue
+            run = float(np.hypot(*np.diff(simplified, axis=0).T).sum())
+            if run < min_length_m:
+                continue
+            out.append(simplified)
+    return out
+
+
+def _smooth(grid: np.ndarray, passes: int) -> np.ndarray:
+    """3x3 mean, edges held. Only ever used to decide where contours run."""
+    out = grid
+    for _ in range(max(int(passes), 0)):
+        pad = np.pad(out, 1, mode="edge")
+        out = (
+            sum(pad[i : i + grid.shape[0], j : j + grid.shape[1]]
+                for i in range(3) for j in range(3))
+            / 9.0
+        )
     return out
 
 
@@ -378,25 +732,23 @@ def build_breaklines(
     ys: np.ndarray | None = None,
     simplify_m: float = DEFAULT_SIMPLIFY_M,
     contour_interval_m: float = DEFAULT_CONTOUR_INTERVAL_M,
+    tolerance_m: float = 0.10,
 ) -> BreaklineSet:
     """Turn outlines and a height grid into non-crossing constraint segments."""
-    chains: list[np.ndarray] = []
-    counts: dict = {}
-
-    for source, rings in rings_by_source.items():
-        before = len(chains)
-        for ring in rings:
-            ring = np.asarray(ring, dtype=np.float64)[:, :2]
-            for piece in clip_ring_segments(ring, bbox):
-                simplified = douglas_peucker(piece, simplify_m)
-                if len(simplified) >= 2:
-                    chains.append(simplified)
-        counts[source] = len(chains) - before
+    # Simplified as one network rather than ring by ring, so a boundary two
+    # polygons share stays one line. See partition_chains.
+    chains, counts = partition_chains(rings_by_source, bbox, simplify_m)
 
     if heights is not None and xs is not None and ys is not None:
         before = len(chains)
-        for seg in contour_lines(heights, xs, ys, interval_m=contour_interval_m):
-            for piece in clip_ring_segments(seg, bbox):
+        for line in contour_polylines(
+            heights,
+            xs,
+            ys,
+            interval_m=contour_interval_m,
+            tolerance_m=tolerance_m,
+        ):
+            for piece in clip_ring_segments(line, bbox):
                 if len(piece) >= 2:
                     chains.append(piece)
         counts["contours"] = len(chains) - before
@@ -494,11 +846,17 @@ __all__ = [
     "fetch_outline_rings",
     "DEFAULT_CONTOUR_INTERVAL_M",
     "DEFAULT_SIMPLIFY_M",
+    "MIN_CONTOUR_LENGTH_M",
     "BreaklineSet",
     "build_breaklines",
+    "chain_segments",
+    "chains_between_junctions",
     "clip_ring_segments",
     "contour_lines",
+    "contour_polylines",
     "douglas_peucker",
+    "partition_chains",
     "resolve_crossings",
+    "simplify_by_height",
     "split_crossings",
 ]

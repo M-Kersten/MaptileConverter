@@ -2527,6 +2527,182 @@ class TestBag3dTiles(unittest.TestCase):
         self.assertIn("vertices", inspect.signature(_extract_feature).parameters)
 
 
+class TestPlanarPartitionSimplification(unittest.TestCase):
+    """A boundary two polygons share has to stay one line.
+
+    This is the defect that produced almost every unusable triangle in the
+    mesh. Simplifying ring by ring pulled shared kerbs into two lines that
+    crossed each other, the crossings were cut into a ladder of millimetre
+    segments, and refinement then chased the resulting acute corners into ever
+    smaller slivers -- 268 of the 283 worst triangles in a measured area came
+    from one kerb that had become two.
+    """
+
+    @staticmethod
+    def _kerb(n=400):
+        t = np.linspace(0.0, 1.0, n)
+        return np.column_stack(
+            [10.0 + 80.0 * t, 50.0 + 6.0 * np.sin(t * 5.0) + np.sin(t * 29.0)]
+        )
+
+    def _partition(self):
+        """A road with three separate verges along it, BGT style.
+
+        The point of three is the junction between two of them, which lands
+        part way along a smooth stretch of the kerb: a ring corner for the
+        verge and an ordinary point for the road. That difference is what used
+        to make Douglas-Peucker keep different vertices on each side.
+        """
+        kerb = self._kerb()
+        road = np.vstack([kerb, [[90.0, 30.0], [10.0, 30.0]], kerb[:1]])
+        verges = []
+        for lo, hi in ((0, 140), (140, 260), (260, 399)):
+            piece = kerb[lo : hi + 1]
+            verges.append(
+                np.vstack(
+                    [piece, [[piece[-1, 0], 70.0], [piece[0, 0], 70.0]], piece[:1]]
+                )
+            )
+        return {"roads": [road], "unpaved": verges}
+
+    def test_a_shared_kerb_survives_as_one_line(self):
+        from src.breaklines import partition_chains
+        from src.geo import BBox
+
+        chains, _ = partition_chains(self._partition(), BBox(0, 0, 100, 100), 0.15)
+
+        # Every vertex of every chain that lies along the kerb must be one of
+        # the kerb's own points: two differing copies would put vertices in
+        # between, off the surveyed line.
+        kerb = self._kerb()
+        on_kerb = np.vstack(
+            [c for c in chains if ((c[:, 1] > 40) & (c[:, 1] < 60)).all()]
+        )
+        for point in on_kerb:
+            gap = np.hypot(*(kerb - point).T).min()
+            self.assertLess(
+                gap, 1e-6, f"{point} is on neither copy of the kerb, so there are two"
+            )
+
+    def test_the_kerb_is_not_cut_into_a_ladder(self):
+        """Two copies of one line cross constantly, and every crossing became a
+        cut. One line crosses nothing."""
+        from src.breaklines import build_breaklines
+        from src.geo import BBox
+
+        lines = build_breaklines(
+            BBox(0, 0, 100, 100), rings_by_source=self._partition(), simplify_m=0.15
+        )
+        length = np.hypot(
+            *(lines.points[lines.segments[:, 1]] - lines.points[lines.segments[:, 0]]).T
+        )
+        self.assertEqual(
+            int((length < 0.02).sum()),
+            0,
+            "millimetre segments mean the kerb was cut at its own crossings",
+        )
+
+    def test_junctions_are_never_simplified_away(self):
+        """A run is simplified between junctions, so the junctions themselves
+        have to survive or the polygons stop meeting where they meet."""
+        from src.breaklines import chains_between_junctions
+
+        points = np.array(
+            [[0, 0], [1, 0.01], [2, 0], [3, 0.01], [4, 0], [2, 3]], dtype=float
+        )
+        edges = [(0, 1), (1, 2), (2, 3), (3, 4), (2, 5)]
+        chains = chains_between_junctions(points, edges)
+        # Three runs meet at point 2, so it is a junction: every run ends there.
+        self.assertEqual(len(chains), 3)
+        for chain in chains:
+            self.assertTrue(
+                np.isclose(chain[0], points[2]).all()
+                or np.isclose(chain[-1], points[2]).all()
+            )
+
+
+class TestContourBreaklines(unittest.TestCase):
+    """Contours used to arrive at full grid resolution and were 99% of all the
+    breaklines in an area, which is what made the mesh a hundred times denser
+    along them than on the ground either side."""
+
+    @staticmethod
+    def _ground(n=129, noise=0.025, seed=3):
+        xs = np.linspace(0.0, 256.0, n)
+        ys = np.linspace(0.0, 256.0, n)
+        _, y = np.meshgrid(xs, ys)
+        rng = np.random.default_rng(seed)
+        # Flat at 1 m, with one bank dropping 3 m, plus scanner noise.
+        height = 1.0 - 3.0 * np.exp(-(((y - 128.0) / 10.0) ** 2))
+        return height + rng.normal(0.0, noise, height.shape), xs, ys
+
+    def test_chords_are_joined_into_lines_and_thinned(self):
+        from src.breaklines import contour_lines, contour_polylines
+
+        height, xs, ys = self._ground()
+        raw = contour_lines(height, xs, ys, interval_m=0.5)
+        thin = contour_polylines(height, xs, ys, interval_m=0.5, tolerance_m=0.10)
+        raw_vertices = sum(len(s) for s in raw)
+        thin_vertices = sum(len(line) for line in thin)
+        self.assertLess(
+            thin_vertices,
+            raw_vertices / 10,
+            f"{thin_vertices} vertices against {raw_vertices}: barely thinned",
+        )
+
+    def test_flat_ground_contributes_no_contours(self):
+        """A level that lands near the height of a flat field used to trace the
+        scanner's noise all over it and arrive as a constraint."""
+        from src.breaklines import contour_polylines
+
+        rng = np.random.default_rng(5)
+        xs = ys = np.linspace(0.0, 256.0, 129)
+        flat = np.full((129, 129), 1.0) + rng.normal(0.0, 0.03, (129, 129))
+        # Levels either side of the ground, so marching squares has plenty to
+        # bite on if it is going to.
+        self.assertEqual(
+            contour_polylines(flat, xs, ys, interval_m=0.05, tolerance_m=0.10), []
+        )
+
+    def test_a_real_bank_still_gets_its_contours(self):
+        from src.breaklines import contour_polylines
+
+        height, xs, ys = self._ground()
+        lines = contour_polylines(height, xs, ys, interval_m=0.5, tolerance_m=0.10)
+        self.assertGreater(len(lines), 0, "the bank lost its contours entirely")
+        middle = np.vstack([0.5 * (line[:-1] + line[1:]) for line in lines])
+        on_bank = np.abs(middle[:, 1] - 128.0) < 25.0
+        self.assertGreater(
+            on_bank.mean(), 0.9, "contours are landing somewhere other than the bank"
+        )
+
+    def test_simplification_is_priced_in_height_not_distance(self):
+        from src.breaklines import simplify_by_height
+
+        wobble = np.column_stack(
+            [np.linspace(0, 100, 41), np.tile([0.0, 1.0], 21)[:41]]
+        )
+        steep = simplify_by_height(wobble, np.full(41, 0.5), 0.10)
+        gentle = simplify_by_height(wobble, np.full(41, 0.001), 0.10)
+        self.assertGreater(len(steep), len(gentle))
+        self.assertEqual(len(gentle), 2, "a wobble on flat ground is a straight line")
+
+    def test_chaining_stops_at_a_saddle(self):
+        """Four chord ends meeting at a point is two branches, not one line;
+        joining them would let the simplifier cut the corner across it."""
+        from src.breaklines import chain_segments
+
+        hub = [1.0, 1.0]
+        chords = [
+            np.array([[0.0, 0.0], hub]),
+            np.array([hub, [2.0, 2.0]]),
+            np.array([[2.0, 0.0], hub]),
+            np.array([hub, [0.0, 2.0]]),
+        ]
+        for line in chain_segments(chords):
+            self.assertLessEqual(len(line), 2)
+
+
 class TestTerrainMesh(unittest.TestCase):
     """The adaptive terrain mesh must still be the ground, and still be a mesh."""
 
@@ -2935,6 +3111,186 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertFalse(buildings.probe(self.config).endswith("/items"))
 
         self.assertIn(buildings.probe(self.config), health_targets(self.config))
+
+
+class TestConstrainedRefinement(unittest.TestCase):
+    """The mesh has to reach its tolerance and be made of usable triangles.
+
+    Neither was true. The old loop probed four points huddled round each
+    triangle's centre, inserted the centroid of whatever failed, and so split
+    a bad triangle into three of the same shape -- it added 132 points, then
+    35, then 33, then 38, and stopped no closer than it started, three times
+    outside its tolerance, with a tenth of the mesh under five degrees.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from src.geo import BBox
+
+        n, side = 129, 256.0
+        cls.bbox = BBox(0.0, 0.0, side, side)
+        cls.xs = np.linspace(0.0, side, n)
+        cls.ys = np.linspace(0.0, side, n)
+        _, y = np.meshgrid(cls.xs, cls.ys)
+        rng = np.random.default_rng(17)
+        # Dutch: flat, with a canal through it, and centimetres of scan noise.
+        cls.heights = (
+            1.0
+            - 3.0 * np.exp(-(((y - 150.0) / 9.0) ** 2))
+            + rng.normal(0.0, 0.025, (n, n))
+        )
+        edge = np.array(
+            [[20.0, 60.0], [230.0, 60.0], [230.0, 96.0], [20.0, 96.0], [20.0, 60.0]]
+        )
+        cls.rings = {"unpaved": [edge]}
+        cls.mesh = cls._build(0.10)
+
+    @classmethod
+    def _build(cls, tolerance):
+        from src.terrain_mesh import build_constrained
+
+        return build_constrained(
+            cls.bbox,
+            cls.heights,
+            cls.xs,
+            cls.ys,
+            rings_by_source=cls.rings,
+            tolerance_m=tolerance,
+            contour_interval_m=0.5,
+        )
+
+    def test_it_reaches_the_tolerance_it_was_given(self):
+        self.assertLessEqual(
+            self.mesh.max_error_m,
+            1.05 * self.mesh.tolerance_m,
+            "refinement stopped short of the tolerance",
+        )
+
+    def test_it_converges_rather_than_running_out_of_rounds(self):
+        self.assertTrue(
+            self.mesh.converged,
+            f"still working after {self.mesh.refined_rounds} rounds",
+        )
+
+    def test_the_error_is_measured_across_a_triangle_not_at_its_centre(self):
+        """A wedge laid across a bank passes through the true surface near the
+        middle and is metres out at both ends, so the centre is the one place
+        that flatters it."""
+        import inspect
+
+        from src.terrain_mesh import _sampled_error
+
+        self.assertNotIn("centre", inspect.getsource(_sampled_error).split('"""')[2])
+
+    def test_no_triangle_is_a_sliver(self):
+        from src.validate import _triangle_quality
+
+        quality = _triangle_quality(self.mesh)
+        self.assertEqual(
+            quality["under_one_degree"],
+            0,
+            f"worst angle is {quality['worst_angle_deg']:.3f} degrees",
+        )
+        self.assertLess(quality["under_ten_degrees"], 0.05 * quality["count"])
+
+    def test_breaklines_are_split_until_the_ground_meets_them(self):
+        """A constraint is a straight line and the ground under it is not. The
+        segment has to be cut until it is, or the mesh has a crease running
+        through ground that does not crease there."""
+        self.assertLessEqual(self.mesh.max_edge_sag_m, 1.05 * self.mesh.tolerance_m)
+        # Which means the outline it started from is no longer four segments.
+        self.assertGreater(self.mesh.breakline_edges, 8)
+
+    def test_a_tighter_tolerance_buys_a_closer_mesh(self):
+        coarse = self._build(0.40)
+        self.assertLess(self.mesh.max_error_m, coarse.max_error_m)
+        self.assertGreater(self.mesh.triangle_count, coarse.triangle_count)
+
+    def test_a_circumcentre_is_not_a_centroid(self):
+        """The centroid sits among the corners it came from; the circumcentre
+        is a full circumradius from every one of them. That difference is the
+        whole reason the loop now converges."""
+        from src.terrain_mesh import _circumcentres
+
+        points = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]])
+        centre, radius = _circumcentres(points, np.array([[0, 1, 2]]))
+        self.assertTrue(np.allclose(centre[0], [2.0, 1.5]))
+        self.assertAlmostEqual(float(radius[0]), 2.5)
+
+
+class TestTerrainMeshChecks(unittest.TestCase):
+    """The checks that let all of this ship without a word.
+
+    `terrain_mesh_follows_the_ground` allowed eight times the tolerance, or a
+    whole metre, and only warned; nothing looked at the shape of a triangle at
+    all.
+    """
+
+    @staticmethod
+    def _mesh(**over):
+        from src.terrain_mesh import ConstrainedMesh
+
+        # Two healthy triangles tiling the bbox, and where asked the same area
+        # cut into a wedge and its neighbour instead.
+        vertices = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [10.0, 8.0, 0.0],
+                [0.0, 8.0, 0.0],
+                [10.0, 0.001, 0.0],
+            ],
+            dtype=float,
+        )
+        triangles = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        if over.pop("sliver", False):
+            triangles = np.array(
+                [[0, 1, 4], [0, 4, 2], [0, 2, 3]], dtype=np.int32
+            )
+        fields = dict(
+            vertices=vertices,
+            triangles=triangles,
+            breakline_edges=3,
+            height_points=3,
+            tolerance_m=0.10,
+            max_error_m=0.05,
+            counts={"roads": 1},
+        )
+        fields.update(over)
+        return ConstrainedMesh(**fields)
+
+    def _run(self, mesh):
+        from src.geo import BBox
+        from src.validate import CheckReport, check_constrained_mesh
+
+        report = CheckReport()
+        check_constrained_mesh(report, mesh, BBox(0, 0, 10, 8))
+        return {c.name: c for c in report.checks}
+
+    def test_a_mesh_outside_its_tolerance_now_fails(self):
+        checks = self._run(self._mesh(max_error_m=0.285))
+        found = checks["terrain_mesh_follows_the_ground"]
+        self.assertFalse(found.passed, "0.285 m against a 0.10 m tolerance passed")
+        self.assertEqual(found.severity, "error", "it must fail, not warn")
+
+    def test_the_old_slack_would_have_let_that_through(self):
+        """Kept as a statement of what changed: eight times the tolerance."""
+        self.assertLess(0.285, 8.0 * 0.10)
+
+    def test_slivers_are_caught(self):
+        checks = self._run(self._mesh(sliver=True))
+        self.assertFalse(
+            checks["terrain_triangles_are_not_slivers"].passed,
+            "a triangle 1 mm thick and 10 m long passed the quality check",
+        )
+
+    def test_a_clean_mesh_passes_everything(self):
+        for check in self._run(self._mesh()).values():
+            self.assertTrue(check.passed, f"{check.name}: {check.detail}")
+
+    def test_a_breakline_the_ground_has_left_behind_is_reported(self):
+        checks = self._run(self._mesh(max_edge_sag_m=0.9))
+        self.assertFalse(checks["breaklines_lie_on_the_ground"].passed)
 
 
 class TestUIServer(unittest.TestCase):

@@ -173,13 +173,80 @@ def check_constrained_mesh(report: CheckReport, mesh, bbox: BBox) -> None:
         f"{mesh.breakline_edges} breakline edges from "
         f"{', '.join(f'{k} {v}' for k, v in mesh.counts.items() if v)}",
     )
+    # This used to allow eight times the tolerance, or a whole metre, and only
+    # warn. Both halves of that were wrong, and together they let a mesh three
+    # times outside its tolerance ship without a word. Refinement now converges
+    # to the tolerance, so the check asks for the tolerance.
     report.add(
         "terrain_mesh_follows_the_ground",
-        mesh.max_error_m < max(1.0, 8.0 * mesh.tolerance_m),
+        mesh.max_error_m <= CONSTRAINED_ERROR_SLACK * mesh.tolerance_m,
         f"worst gap between the mesh and the height grid is "
-        f"{mesh.max_error_m:.3f} m, sampled at triangle centres",
+        f"{mesh.max_error_m:.3f} m against a {mesh.tolerance_m:.2f} m tolerance",
+    )
+
+    quality = _triangle_quality(mesh)
+    # A mesh can be perfectly accurate and still be unusable. Nothing measured
+    # the shape of these triangles before, which is exactly how a terrain made
+    # largely of wedges passed every check it had.
+    report.add(
+        "terrain_triangles_are_not_slivers",
+        quality["under_one_degree"] <= MAX_SLIVER_FRACTION * quality["count"],
+        f"{quality['under_one_degree']} of {quality['count']} triangles have an "
+        f"angle under 1 degree; worst is {quality['worst_angle_deg']:.2f} deg, "
+        f"median smallest angle {quality['median_angle_deg']:.1f} deg",
+    )
+    report.add(
+        "terrain_triangles_are_well_shaped",
+        quality["under_ten_degrees"] <= MAX_THIN_FRACTION * quality["count"],
+        f"{100 * quality['under_ten_degrees'] / max(quality['count'], 1):.1f}% "
+        f"of triangles have an angle under 10 degrees",
         severity="warning",
     )
+    # A breakline the ground has left behind is a crease in the wrong place,
+    # and it is invisible to the error check above because that measures inside
+    # triangles, not along their constrained edges.
+    report.add(
+        "breaklines_lie_on_the_ground",
+        quality["worst_edge_sag_m"] <= CONSTRAINED_ERROR_SLACK * mesh.tolerance_m,
+        f"the ground under the breaklines strays up to "
+        f"{quality['worst_edge_sag_m']:.3f} m from them",
+        severity="warning",
+    )
+
+
+# Refinement drives the worst height error down to the tolerance itself, so
+# there is no slack to allow here beyond the arithmetic.
+CONSTRAINED_ERROR_SLACK = 1.05
+
+# Some slivers are unavoidable where two surveyed outlines meet at a sharp
+# angle: no triangulation can put a good triangle in a wedge the input already
+# had. A handful is the input's fault; a percent is ours.
+MAX_SLIVER_FRACTION = 0.001
+MAX_THIN_FRACTION = 0.05
+
+
+def _triangle_quality(mesh) -> dict:
+    """Smallest angle per triangle, and how far the ground sags under an edge."""
+    import numpy as np
+
+    corner = mesh.vertices[mesh.triangles][:, :, :2]
+    angles = []
+    for i in range(3):
+        u = corner[:, (i + 1) % 3] - corner[:, i]
+        v = corner[:, (i + 2) % 3] - corner[:, i]
+        cos = (u * v).sum(axis=1) / np.maximum(
+            np.hypot(*u.T) * np.hypot(*v.T), 1e-30
+        )
+        angles.append(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+    smallest = np.min(np.stack(angles), axis=0)
+    return {
+        "count": int(len(smallest)),
+        "worst_angle_deg": float(smallest.min()) if len(smallest) else 0.0,
+        "median_angle_deg": float(np.median(smallest)) if len(smallest) else 0.0,
+        "under_one_degree": int((smallest < 1.0).sum()),
+        "under_ten_degrees": int((smallest < 10.0).sum()),
+        "worst_edge_sag_m": float(getattr(mesh, "max_edge_sag_m", 0.0)),
+    }
 
 
 # The nested error bound is measured at hypotenuse midpoints, and a vertex can

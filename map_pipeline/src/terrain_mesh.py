@@ -27,6 +27,31 @@ midpoint test while hiding a dike between two of its corners.
 
 Reference: Evans, Kirkpatrick and Townsend, "Right-triangulated irregular
 networks" (2001); the level-synchronous form here follows Mapbox's martini.
+
+`build_constrained` is the other mesh, and the one that actually ships. It puts
+edges along real features by triangulating the breaklines together with the
+ground, and the bisection mesh above is reduced to a way of choosing which grid
+points are worth keeping.
+
+That hand-off is where the whole thing used to come apart, and the reason is
+worth stating plainly: **the bisection mesh's tolerance is a property of its own
+triangles, not of its points.** It keeps a vertex because of the right triangles
+*it* would have drawn between them; Delaunay draws different ones, and the
+guarantee does not come with. Measured, the same points re-triangulated were
+three times outside the tolerance they had been chosen for, and with the
+breaklines added, fourteen times.
+
+So the point set has to be earned back, and `build_constrained` does it with
+Delaunay refinement after Ruppert: split any constraint segment that a vertex
+encroaches upon or that the ground has sagged away from, and insert the
+circumcentre of any triangle that is too wrong. The circumcentre matters more
+than it looks -- the centroid sits among the corners it came from, so inserting
+it splits a bad triangle into three of the same shape, and the loop that did
+that added 132 points, then 35, then 33, then 38, and finished no closer than it
+started.
+
+Reference: Ruppert, "A Delaunay refinement algorithm for quality 2-dimensional
+mesh generation" (1995).
 """
 
 from __future__ import annotations
@@ -38,10 +63,49 @@ import numpy as np
 
 LOG = logging.getLogger(__name__)
 
-# How many times the constrained mesh is allowed to add points and rebuild to
-# get closer to the ground. Each round costs a full retriangulation, and the
-# gain falls off fast after the second.
-MAX_REFINE_ROUNDS = 4
+# How many times the constrained mesh is allowed to add points and rebuild.
+# Each round costs a full retriangulation. Four was enough when the loop was
+# only ever going to stall anyway; a loop that converges deserves the room to.
+MAX_REFINE_ROUNDS = 12
+
+# A floor on triangle shape, and a deliberately low one: it is here to catch
+# the degenerate, not to chase a quality bound.
+#
+# Refinement textbooks aim for 20 degrees or so, and measuring it here says
+# not to. Driving on height alone already gives 8.2% of triangles under 20
+# degrees; asking for 20 gives *15.7%* and 80% more triangles, because a whole
+# round of circumcentres goes in at once and inserting one into a marginal
+# triangle mostly makes more marginal triangles. Two degrees costs 5% more
+# triangles and halves the genuinely degenerate tail, and that is the whole of
+# the bargain worth taking. The shape of this mesh comes from refining on
+# height and splitting encroached segments, not from an angle target.
+MIN_ANGLE_DEG = 2.0
+
+# Refinement stops at the spacing the ground was measured at, as a fraction of
+# a grid step. Below that there is no more information to resolve, only more
+# triangles, and no lower bound to a loop that keeps splitting.
+REFINE_FLOOR_STEPS = 0.5
+
+# A ceiling on refinement, as a multiple of the points it started with. Ruppert
+# terminates on well-formed input; this is the seatbelt for input that is not,
+# and it is a real risk here because a BGT planar partition is full of acute
+# corners where two outlines meet.
+MAX_REFINE_GROWTH = 6.0
+
+# Ground points within this much of a breakline are dropped. Nothing is known
+# about the ground at a finer spacing than it was sampled at, so a grid point
+# that close is not carrying height -- it is only carrying a thin triangle,
+# because the line it is crowding has its own vertices metres apart and the
+# triangle between them can only be a wedge.
+#
+# This is the one part of "grade the density around breaklines" that survived
+# contact with the measurements. Forcing the bisection mesh *finer* near a line
+# was the other half of that idea and it was simply wrong: it cost 50% more
+# triangles for the same shape, because refinement grades the mesh properly by
+# itself and a lattice pushed up against an arbitrary polyline can only ever
+# make wedges. Removing the clearance entirely is worse again -- 20081
+# triangles against 13949, and 22 degenerate ones against none.
+GROUND_CLEARANCE_STEPS = 1.0
 
 
 @dataclass
@@ -177,6 +241,57 @@ def _wind_ccw(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     return out
 
 
+def distance_to_lines(points, segments, xs, ys) -> np.ndarray:
+    """Distance from every grid node to the nearest constraint segment.
+
+    A chamfer transform, so the answer is a couple of percent out. That is
+    plenty: it only ever sets how big a triangle may be, and being 2% wrong
+    about that changes nothing anyone can see.
+    """
+    n_rows, n_cols = len(ys), len(xs)
+    step_x = float(xs[1] - xs[0]) if n_cols > 1 else 1.0
+    step_y = float(ys[1] - ys[0]) if n_rows > 1 else 1.0
+    spacing = 0.5 * (abs(step_x) + abs(step_y))
+    far = float(n_rows + n_cols)
+    dist = np.full((n_rows, n_cols), far, dtype=np.float64)
+
+    points = np.asarray(points, dtype=np.float64)
+    segments = np.asarray(segments, dtype=np.int64).reshape(-1, 2)
+    if len(segments):
+        a, b = points[segments[:, 0]], points[segments[:, 1]]
+        # Walk each segment at half a cell so no crossed cell is missed.
+        run = np.hypot(*(b - a).T)
+        steps = np.maximum(1, np.ceil(run / (0.5 * spacing)).astype(np.int64))
+        offsets = np.concatenate([np.linspace(0.0, 1.0, s + 1) for s in steps])
+        owner = np.repeat(np.arange(len(segments)), steps + 1)
+        walk = a[owner] + offsets[:, None] * (b - a)[owner]
+        cols = np.clip(np.round((walk[:, 0] - xs[0]) / step_x), 0, n_cols - 1)
+        rows = np.clip(np.round((walk[:, 1] - ys[0]) / step_y), 0, n_rows - 1)
+        dist[rows.astype(np.int64), cols.astype(np.int64)] = 0.0
+
+    # Two sweeps over the grid, in cells. Within a row the horizontal term is
+    # a running minimum of (value - index), which is the whole point: it turns
+    # a sequential scan into one accumulate.
+    diag = np.sqrt(2.0)
+    index = np.arange(n_cols, dtype=np.float64)
+
+    def sweep(rows_in_order, above):
+        for r in rows_in_order:
+            row = dist[r]
+            if above is not None and 0 <= r + above < n_rows:
+                near = dist[r + above]
+                np.minimum(row, near + 1.0, out=row)
+                np.minimum(row[1:], near[:-1] + diag, out=row[1:])
+                np.minimum(row[:-1], near[1:] + diag, out=row[:-1])
+            np.minimum(row, index + np.minimum.accumulate(row - index), out=row)
+            flip = row[::-1]
+            np.minimum(flip, index + np.minimum.accumulate(flip - index), out=flip)
+
+    sweep(range(n_rows), -1)
+    sweep(range(n_rows - 1, -1, -1), 1)
+    return dist * spacing
+
+
 def build_rtin(heights: np.ndarray, *, tolerance_m: float) -> TerrainMesh:
     """Simplify an (n, n) height grid to within `tolerance_m` of itself.
 
@@ -276,6 +391,12 @@ class ConstrainedMesh:
     tolerance_m: float
     max_error_m: float
     counts: dict
+    # How far the ground strays from a breakline, which the error above cannot
+    # see: it samples inside triangles, and a constrained edge is the boundary
+    # between two of them.
+    max_edge_sag_m: float = 0.0
+    refined_rounds: int = 0
+    converged: bool = True
 
     @property
     def vertex_count(self) -> int:
@@ -293,6 +414,9 @@ class ConstrainedMesh:
             "height_points": int(self.height_points),
             "tolerance_m": round(float(self.tolerance_m), 4),
             "max_error_m": round(float(self.max_error_m), 4),
+            "max_edge_sag_m": round(float(self.max_edge_sag_m), 4),
+            "refined_rounds": int(self.refined_rounds),
+            "refinement_converged": bool(self.converged),
             "breaklines_by_source": dict(self.counts),
         }
 
@@ -327,14 +451,35 @@ def build_constrained(
         ys=ys,
         simplify_m=simplify_m,
         contour_interval_m=contour_interval_m,
+        # Contours are simplified against the height they cost, not against a
+        # distance, so they need to know what the mesh is aiming for.
+        tolerance_m=tolerance_m,
     )
 
     # Grid points worth keeping for height alone. The adaptive mesh already
     # answers exactly that question, so its vertices are reused as a point set
     # rather than as a triangulation.
+    #
+    # Height is not the only thing they are wanted for, though. Where a
+    # breakline runs through flat ground, height alone asks for no points at
+    # all, and the triangulation is then left to reach from a vertex every few
+    # metres along the line to the far side of an empty field. So the same pass
+    # is also told how big a triangle may be near a line, and it fills in a
+    # band that steps the density down instead of dropping off it.
+    step = 0.5 * (
+        abs(float(xs[1] - xs[0])) + abs(float(ys[1] - ys[0]))
+    ) if len(xs) > 1 and len(ys) > 1 else 1.0
+    gap = (
+        distance_to_lines(lines.points, lines.segments, xs, ys)
+        if len(lines.segments)
+        else None
+    )
     height_mesh = build_rtin(heights, tolerance_m=tolerance_m)
     columns = height_mesh.vertices[:, 0].astype(int)
     rows = height_mesh.vertices[:, 1].astype(int)
+    if gap is not None:
+        clear = gap[rows, columns] >= GROUND_CLEARANCE_STEPS * step
+        columns, rows = columns[clear], rows[clear]
     height_points = np.column_stack([xs[columns], ys[rows]])
 
     n_break = len(lines.points)
@@ -348,34 +493,120 @@ def build_constrained(
 
     # Breaklines decide where the mesh folds, but they say nothing about the
     # ground between them, and the height points were chosen for a different
-    # triangulation. So triangulate, find the triangles that stray, drop a
-    # point in each, and go round again. Two or three rounds is plenty: each
-    # one roughly halves the worst gap.
+    # triangulation than the one they end up in -- the bisection mesh keeps a
+    # point because of the triangles *it* would have drawn, and Delaunay draws
+    # different ones. So the point set has to be earned back here.
+    #
+    # This is Delaunay refinement, after Ruppert: split any constraint segment
+    # that is encroached upon or that the ground has left behind, and insert
+    # the circumcentre of any triangle that is too wrong or too thin. Both
+    # halves matter. Splitting segments alone leaves the interior coarse;
+    # inserting circumcentres alone leaves a long breakline as one forced edge
+    # with the mesh hanging off it.
+    floor_m = REFINE_FLOOR_STEPS * step
+    clearance = GROUND_CLEARANCE_STEPS * step
+    budget = int(MAX_REFINE_GROWTH * max(len(merged), 1))
     result = None
-    for _ in range(MAX_REFINE_ROUNDS):
+    rounds_used = 0
+    for round_index in range(MAX_REFINE_ROUNDS):
+        rounds_used = round_index + 1
         result = triangulate(
             merged, segments, origin=tuple(bbox.center), skip_crossing=True
         )
+        # The mesh handed back is this one, so the segments that built it are
+        # the ones to report and to measure. A round that ends on the budget
+        # leaves `segments` describing points the returned mesh never got.
+        built_from = segments
         world = result.world_points()
         z = _bilinear(heights, xs, ys, world[:, 0], world[:, 1])
-        extra = _straying_triangles(
-            np.column_stack([world[:, 0], world[:, 1], z]),
-            result.triangles,
-            heights,
-            xs,
-            ys,
-            tolerance_m,
+        vertices = np.column_stack([world[:, 0], world[:, 1], z])
+
+        length_of = (
+            np.hypot(*(vertices[segments[:, 1], :2] - vertices[segments[:, 0], :2]).T)
+            if len(segments)
+            else np.zeros(0)
         )
-        if len(extra) == 0:
+        cut = (
+            _segments_to_split(
+                vertices, segments, result.triangles, heights, xs, ys,
+                tolerance_m, floor_m,
+            )
+            if len(segments)
+            else np.zeros(0, dtype=bool)
+        )
+        extra, stuck = _refine_points(
+            vertices, result.triangles, heights, xs, ys, tolerance_m, floor_m,
+            gap, floor_m,
+        )
+        # Anything that could not take a circumcentre falls back on splitting
+        # the constraint that blocked it.
+        if len(stuck) and len(segments):
+            index_of = {
+                (min(int(a), int(b)), max(int(a), int(b))): i
+                for i, (a, b) in enumerate(segments)
+            }
+            for tri in result.triangles[stuck]:
+                for i in range(3):
+                    a, b = int(tri[i]), int(tri[(i + 1) % 3])
+                    at = index_of.get((min(a, b), max(a, b)))
+                    if at is not None and length_of[at] > 2.0 * floor_m:
+                        cut[at] = True
+
+        if not cut.any() and len(extra) == 0:
             break
-        LOG.info("terrain mesh: %d more points to follow the ground", len(extra))
+        if len(merged) >= budget:
+            LOG.info(
+                "terrain mesh: refinement stopped at its %d point ceiling", budget
+            )
+            break
+
+        # Segment midpoints go in as points and as two segments each, so the
+        # constraint survives the split rather than being replaced by it.
+        added = [merged]
+        next_index = len(merged)
+        keep = list(segments[~cut]) if len(segments) else []
+        mids = []
+        for index in np.flatnonzero(cut):
+            p, q = segments[index]
+            mids.append(0.5 * (merged[p] + merged[q]))
+            keep.append((int(p), next_index))
+            keep.append((next_index, int(q)))
+            next_index += 1
+        if mids:
+            mids = np.asarray(mids)
+            added.append(mids)
+            extra = _keep_clear_of(extra, mids, floor_m)
+        if len(extra):
+            added.append(extra)
+
+        LOG.info(
+            "terrain mesh: round %d splits %d breakline segments and adds "
+            "%d points",
+            round_index + 1,
+            int(cut.sum()),
+            len(extra),
+        )
         before = len(merged)
-        merged, mapping = weld(np.vstack([merged, extra]), WELD_M)
+        merged, mapping = weld(np.vstack(added), WELD_M)
+        segments = (
+            np.asarray(keep, dtype=np.int64).reshape(-1, 2)
+            if keep
+            else np.zeros((0, 2), dtype=np.int64)
+        )
+        if len(segments):
+            segments = mapping[segments].reshape(-1, 2)
+            segments = segments[segments[:, 0] != segments[:, 1]]
+            segments = np.unique(np.sort(segments, axis=1), axis=0)
         if len(merged) == before:
             break
-        segments = mapping[segments] if len(segments) else segments
-        if len(segments):
-            segments = segments[segments[:, 0] != segments[:, 1]]
+    else:
+        # The loop ran out of rounds with work still applied but never
+        # triangulated. Returning `result` here would hand back a mesh a round
+        # older than the segments describing it.
+        result = triangulate(
+            merged, segments, origin=tuple(bbox.center), skip_crossing=True
+        )
+        built_from = segments
 
     world = result.world_points()
     z = _bilinear(heights, xs, ys, world[:, 0], world[:, 1])
@@ -395,22 +626,37 @@ def build_constrained(
         )
 
     error = _sampled_error(vertices, result.triangles, heights, xs, ys)
+    sag = _edge_sag(vertices, built_from, heights, xs, ys)
+    # Converged means the mesh reached what it was asked for. Counting how much
+    # work the last round did measures the loop, not the answer, and the tail
+    # of a converging refinement is always a handful of points on a mesh of
+    # thousands -- which reads as "still working" and is not.
+    converged = bool(
+        error <= 1.02 * tolerance_m and sag <= 1.02 * tolerance_m
+    )
     mesh = ConstrainedMesh(
         vertices=vertices,
         triangles=result.triangles,
-        breakline_edges=len(segments),
+        breakline_edges=len(built_from),
         height_points=len(height_points),
         tolerance_m=float(tolerance_m),
         max_error_m=error,
         counts=lines.counts,
+        max_edge_sag_m=sag,
+        refined_rounds=rounds_used,
+        converged=converged,
     )
     LOG.info(
-        "terrain mesh: %d vertices, %d triangles, %d breakline edges "
-        "(worst height error %.3f m)",
+        "terrain mesh: %d vertices, %d triangles, %d breakline edges, "
+        "worst height error %.3f m, worst breakline sag %.3f m, "
+        "%d refinement rounds%s",
         mesh.vertex_count,
         mesh.triangle_count,
         mesh.breakline_edges,
         mesh.max_error_m,
+        mesh.max_edge_sag_m,
+        mesh.refined_rounds,
+        "" if converged else " (stopped short)",
     )
     return mesh
 
@@ -433,35 +679,310 @@ def _assert_tiles(vertices, triangles, bbox) -> None:
         raise ValueError(f"{down} terrain triangles face down or are degenerate")
 
 
-def _straying_triangles(vertices, triangles, heights, xs, ys, tolerance):
-    """Points to add where the mesh has drifted off the ground.
+def _barycentric_probes(rounds: int = 4):
+    """Sample positions inside a triangle, as barycentric weights.
 
-    Sampled at the centroid and the three edge midpoints rather than the
-    centroid alone: a triangle spanning a ditch can pass at its centre and be
-    a metre out halfway along a side.
+    The old refinement looked at the centroid and three points a third of the
+    way out to the corners, all of them huddled in the middle. A triangle that
+    straddles a canal bank is at its worst near an *edge*, so those four probes
+    passed it and the mesh kept the wedge. These reach out to a twentieth of
+    the way from each edge, which is close enough to see it.
+    """
+    out = []
+    for i in range(rounds + 1):
+        for j in range(rounds + 1 - i):
+            k = rounds - i - j
+            weights = np.array([i, j, k], dtype=np.float64) / rounds
+            # Pulled a little off the corners and edges: a probe exactly on an
+            # edge is shared with the neighbour and says nothing about either.
+            weights = 0.05 / 3.0 + 0.95 * weights
+            out.append(weights)
+    return np.asarray(out)
+
+
+PROBES = _barycentric_probes()
+
+
+def _height_error(vertices, triangles, heights, xs, ys):
+    """Worst gap between each triangle and the ground under it."""
+    if len(triangles) == 0:
+        return np.zeros(0)
+    corners = vertices[triangles]
+    worst = np.zeros(len(triangles))
+    for weights in PROBES:
+        probe = (
+            weights[0] * corners[:, 0]
+            + weights[1] * corners[:, 1]
+            + weights[2] * corners[:, 2]
+        )
+        truth = _bilinear(heights, xs, ys, probe[:, 0], probe[:, 1])
+        np.maximum(worst, np.abs(probe[:, 2] - truth), out=worst)
+    return worst
+
+
+def _min_angles(points, triangles):
+    """Smallest angle of each triangle, in degrees."""
+    if len(triangles) == 0:
+        return np.zeros(0)
+    corner = points[triangles][:, :, :2]
+    angles = []
+    for i in range(3):
+        u = corner[:, (i + 1) % 3] - corner[:, i]
+        v = corner[:, (i + 2) % 3] - corner[:, i]
+        cos = (u * v).sum(axis=1) / np.maximum(
+            np.hypot(*u.T) * np.hypot(*v.T), 1e-30
+        )
+        angles.append(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+    return np.min(np.stack(angles), axis=0)
+
+
+def _circumcentres(points, triangles):
+    """Centre of each triangle's circumcircle, and its radius."""
+    a = points[triangles[:, 0], :2]
+    b = points[triangles[:, 1], :2]
+    c = points[triangles[:, 2], :2]
+    bx, by = (b - a).T
+    cx, cy = (c - a).T
+    d = 2.0 * (bx * cy - by * cx)
+    safe = np.where(np.abs(d) < 1e-18, 1e-18, d)
+    b2 = bx * bx + by * by
+    c2 = cx * cx + cy * cy
+    ux = (cy * b2 - by * c2) / safe
+    uy = (bx * c2 - cx * b2) / safe
+    centre = a + np.column_stack([ux, uy])
+    return centre, np.hypot(ux, uy)
+
+
+def _apexes_across(triangles):
+    """For each edge, the opposite corner of every triangle carrying it.
+
+    This is what makes the encroachment test cheap. A vertex inside the
+    diametral circle of a constrained edge is, in a constrained Delaunay
+    triangulation, always visible as the apex of one of the two triangles that
+    edge belongs to, so there is no need to search the whole point set.
+    """
+    across: dict = {}
+    for a, b, c in triangles:
+        a, b, c = int(a), int(b), int(c)
+        across.setdefault((min(a, b), max(a, b)), []).append(c)
+        across.setdefault((min(b, c), max(b, c)), []).append(a)
+        across.setdefault((min(c, a), max(c, a)), []).append(b)
+    return across
+
+
+def _segments_to_split(points, segments, triangles, heights, xs, ys, tolerance, floor_m):
+    """Which constraint segments have to be cut in half, and why.
+
+    Two reasons, both of which the old code had no answer to at all.
+
+    *Encroachment*: a vertex sitting inside a segment's diametral circle can
+    only ever be the apex of a thin triangle on that segment. Splitting the
+    segment is Ruppert's answer and it is what stops a breakline from being a
+    single forced edge hundreds of metres long with the mesh draped off it.
+
+    *Sag*: a constraint is a straight line between its endpoints, and the
+    ground under it is not. Simplification is what makes this bite -- it exists
+    to delete the vertices in between -- so the segment has to earn its length
+    back wherever the ground disagrees with it by more than the tolerance.
+    """
+    if len(segments) == 0:
+        return np.zeros(0, dtype=bool)
+
+    a = points[segments[:, 0], :2]
+    b = points[segments[:, 1], :2]
+    length = np.hypot(*(b - a).T)
+    want = np.zeros(len(segments), dtype=bool)
+
+    across = _apexes_across(triangles)
+    midpoint = 0.5 * (a + b)
+    radius = 0.5 * length
+    for index, (p, q) in enumerate(segments):
+        for apex in across.get((min(int(p), int(q)), max(int(p), int(q))), ()):
+            if np.hypot(*(points[apex, :2] - midpoint[index])) < radius[index] * 0.999:
+                want[index] = True
+                break
+
+    # Sag, measured along the chord against the height grid.
+    steps = np.linspace(0.1, 0.9, 9)
+    z0 = points[segments[:, 0], 2]
+    z1 = points[segments[:, 1], 2]
+    for s in steps:
+        probe = a + s * (b - a)
+        truth = _bilinear(heights, xs, ys, probe[:, 0], probe[:, 1])
+        want |= np.abs((z0 + s * (z1 - z0)) - truth) > tolerance
+
+    # Nothing is gained by cutting below the spacing the ground was measured
+    # at, and it is the only thing standing between this and a loop that never
+    # ends on a segment running along a cliff.
+    return want & (length > 2.0 * floor_m)
+
+
+def _refine_points(
+    vertices, triangles, heights, xs, ys, tolerance, floor_m, gap, clearance
+):
+    """Circumcentres of the triangles that are too wrong or too thin.
+
+    The circumcentre, not the centroid. That is not a detail: the centroid sits
+    among the corners it came from, so inserting it splits a bad triangle into
+    three more of the same shape and the loop chases its own tail -- which is
+    exactly what the old one did, adding 132, then 35, then 33, then 38 points
+    and stopping no closer than it started. The circumcentre is by construction
+    a full circumradius from every existing vertex, which is what makes each
+    insertion buy a well-shaped triangle instead of three thin ones.
     """
     if len(triangles) == 0:
-        return np.zeros((0, 2))
-    corners = vertices[triangles]
-    centre = corners.mean(axis=1)
-    # Every probe has to sit strictly inside its triangle. An edge midpoint
-    # looks like the obvious place to check, but most edges here are
-    # breaklines, and a point dropped exactly on a constraint is the one thing
-    # the triangulator cannot then route around.
-    probes = [centre]
-    for i in range(3):
-        probes.append((corners[:, i] + 2.0 * centre) / 3.0)
+        return np.zeros((0, 2)), np.zeros(0, dtype=np.int64)
 
-    wanted = []
-    for probe in probes:
+    error = _height_error(vertices, triangles, heights, xs, ys)
+    angle = _min_angles(vertices, triangles)
+    centre, radius = _circumcentres(vertices, triangles)
+
+    off_ground = error > tolerance
+    bad = off_ground | (angle < MIN_ANGLE_DEG)
+    # A triangle already at the resolution of the height model cannot be
+    # improved by looking harder at it.
+    bad &= radius > floor_m
+    if not bad.any():
+        return np.zeros((0, 2)), np.zeros(0, dtype=np.int64)
+
+    # Height first, then size. Refinement runs against a budget, and a round
+    # that spends it all chasing thin triangles leaves the handful that are
+    # genuinely off the ground unfixed -- which is the wrong way round, because
+    # a thin triangle is ugly and a triangle in the wrong place is wrong.
+    where = np.flatnonzero(bad)
+    order = np.lexsort((-radius[where], ~off_ground[where]))
+    where = where[order]
+    picked = centre[where]
+    keep_radius = radius[where]
+
+    # Inside the area, and not landing on top of a breakline. The clearance
+    # here is only the degenerate case, deliberately: keeping circumcentres a
+    # fixed distance clear of every breakline sounds prudent and is not, since
+    # a canal bank *is* a breakline and refusing to refine within six metres of
+    # one leaves the bank exactly as wrong as it was. Splitting encroached
+    # segments is what keeps the geometry near a line healthy, and it is
+    # scale-adaptive in a way a fixed distance can never be.
+    inside = (
+        (picked[:, 0] > xs[0]) & (picked[:, 0] < xs[-1])
+        & (picked[:, 1] > ys[0]) & (picked[:, 1] < ys[-1])
+    )
+    if gap is not None:
+        inside &= _sample(gap, xs, ys, picked) >= clearance
+    # A bad triangle whose circumcentre falls outside the area is the boundary
+    # case Ruppert's rule exists for: the point cannot be placed, so the thing
+    # standing in its way -- the constrained edge it would have crossed -- is
+    # split instead. Without this the mesh never improves where a canal runs
+    # off the edge of the bbox, which is precisely where it was worst.
+    stuck = where[~inside]
+    picked, keep_radius = picked[inside], keep_radius[inside]
+
+    # Classic refinement inserts one point and rebuilds. Rebuilding per point
+    # is far too slow here, so a whole round goes in at once -- and then two
+    # circumcentres landing on top of each other would make the very sliver
+    # this is trying to remove. Spaced on a grid at the local circumradius.
+    return _spread(picked, keep_radius, floor_m), stuck
+
+
+def _keep_clear_of(points, others, distance):
+    """Drop any point sitting within `distance` of one already spoken for.
+
+    A round inserts two kinds of point at once: midpoints of segments being
+    split, and circumcentres. Each kind is spaced against its own kind and
+    neither knew about the other, which is how a circumcentre came to land
+    34 mm from a midpoint and leave a pair of triangles at 0.6 degrees.
+    """
+    if len(points) == 0 or len(others) == 0:
+        return points
+    cell = max(float(distance), 1e-9)
+    buckets: dict = {}
+    for other in others:
+        buckets.setdefault((int(other[0] // cell), int(other[1] // cell)), []).append(
+            other
+        )
+    keep = []
+    for index, point in enumerate(points):
+        cx, cy = int(point[0] // cell), int(point[1] // cell)
+        near = [
+            q
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for q in buckets.get((cx + dx, cy + dy), ())
+        ]
+        if all(np.hypot(*(point - q)) > distance for q in near):
+            keep.append(index)
+    return points[keep]
+
+
+def _spread(points, radius, floor_m):
+    """Thin a batch so two new points cannot make the sliver they came to fix.
+
+    The first version of this keyed its grid by the local circumradius as well
+    as by position, meaning to allow a fine point to sit near a coarse one. The
+    effect was that two circumcentres of almost the same size were never
+    compared with each other at all, and a pair of them landed 34 mm apart with
+    a 3 m triangle either side. Separation is symmetric or it is nothing.
+    """
+    if len(points) == 0:
+        return points
+    cell = max(float(floor_m), 1e-9)
+    taken: dict = {}
+    keep = []
+    for index in range(len(points)):
+        # Scaled to the triangle it came from, floored at the resolution of the
+        # height model, and capped so a huge triangle cannot make this a scan
+        # of the whole grid.
+        want = max(cell, 0.3 * float(radius[index]))
+        rings = min(int(np.ceil(want / cell)), 8)
+        cx = int(points[index, 0] // cell)
+        cy = int(points[index, 1] // cell)
+        clash = False
+        for dx in range(-rings, rings + 1):
+            for dy in range(-rings, rings + 1):
+                for other in taken.get((cx + dx, cy + dy), ()):
+                    if np.hypot(*(points[index] - other)) <= want:
+                        clash = True
+                        break
+                if clash:
+                    break
+            if clash:
+                break
+        if clash:
+            continue
+        taken.setdefault((cx, cy), []).append(points[index])
+        keep.append(index)
+    return points[keep]
+
+
+def _sample(grid, xs, ys, points):
+    """Nearest-node lookup on a grid, clamped to it."""
+    cols = np.clip(
+        np.round((points[:, 0] - xs[0]) / (xs[1] - xs[0])).astype(int), 0, len(xs) - 1
+    )
+    rows = np.clip(
+        np.round((points[:, 1] - ys[0]) / (ys[1] - ys[0])).astype(int), 0, len(ys) - 1
+    )
+    return grid[rows, cols]
+
+
+def _edge_sag(vertices, segments, heights, xs, ys) -> float:
+    """Worst gap between a breakline and the ground beneath it.
+
+    A constrained edge is a straight line the mesh is obliged to keep, and the
+    ground under it is under no such obligation. Nothing measured this before,
+    and it is not covered by the error inside triangles: that is sampled across
+    a face, and this is the face's boundary.
+    """
+    if len(segments) == 0:
+        return 0.0
+    a = vertices[segments[:, 0]]
+    b = vertices[segments[:, 1]]
+    worst = 0.0
+    for s in np.linspace(0.05, 0.95, 19):
+        probe = a[:, :2] + s * (b[:, :2] - a[:, :2])
         truth = _bilinear(heights, xs, ys, probe[:, 0], probe[:, 1])
-        gap = np.abs(probe[:, 2] - truth)
-        pick = gap > tolerance
-        if pick.any():
-            wanted.append(probe[pick, :2])
-    if not wanted:
-        return np.zeros((0, 2))
-    return np.vstack(wanted)
+        chord = a[:, 2] + s * (b[:, 2] - a[:, 2])
+        worst = max(worst, float(np.abs(chord - truth).max()))
+    return worst
 
 
 def _bilinear(grid, xs, ys, x, y):
@@ -472,18 +993,17 @@ def _bilinear(grid, xs, ys, x, y):
 
 
 def _sampled_error(vertices, triangles, heights, xs, ys) -> float:
-    """Worst gap between the mesh and the grid, measured at triangle centres.
+    """Worst gap between the mesh and the grid under it.
 
-    Only a sample -- checking every grid point against the triangle over it
-    would cost more than building the mesh did -- but a triangle big enough to
-    stray is big enough to stray at its centre.
+    Sampled across each triangle rather than at its centre. Centre-only was
+    cheap and wrong in the one case that matters: a long wedge laid across a
+    canal bank passes through the true surface near the middle and is metres
+    out at both ends, so the centre is the single best place to measure if you
+    want a flattering answer.
     """
     if len(triangles) == 0:
         return 0.0
-    corners = vertices[triangles]
-    centre = corners.mean(axis=1)
-    truth = _bilinear(heights, xs, ys, centre[:, 0], centre[:, 1])
-    return float(np.abs(centre[:, 2] - truth).max())
+    return float(_height_error(vertices, triangles, heights, xs, ys).max())
 
 
 def save_constrained_mesh(mesh: ConstrainedMesh, path, origin) -> "Path":
