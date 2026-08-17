@@ -668,6 +668,12 @@ def build_terrain(
             tolerance_m=max(tolerance, 0.01),
             simplify_m=float(terrain_cfg.get("breakline_simplify_m", 0.15)),
             contour_interval_m=float(terrain_cfg.get("contour_interval_m", 0.5)),
+            min_feature_length_m=float(
+                terrain_cfg.get("min_feature_length_m", 0.0)
+            ),
+            quads=bool(terrain_cfg.get("quads", False)),
+            max_fold_deg=float(terrain_cfg.get("quad_max_fold_deg", 12.0)),
+            min_quad_angle_deg=float(terrain_cfg.get("quad_min_angle_deg", 25.0)),
         )
         save_constrained_mesh(
             constrained, work_dir / "terrain_mesh.npz", bbox.center

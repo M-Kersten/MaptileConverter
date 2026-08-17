@@ -423,10 +423,19 @@ def _build_terrain_mesh(
     z = _sink_mesh_water_bed(scene, work_dir, columns, rows, vertices[:, 2])
     points = np.column_stack([x, y, z - z_offset])
 
-    n_faces = len(triangles)
-    loop_vertex_indices = triangles.ravel()
-    loop_starts = np.arange(0, n_faces * 3, 3)
-    loop_totals = np.full(n_faces, 3)
+    # Quad-dominant when the mesh stage paired the triangles up, plain
+    # triangles otherwise. Loops and lengths carry both without a second path.
+    if "face_loops" in data and "face_sizes" in data:
+        loop_vertex_indices = data["face_loops"].astype(np.int64)
+        loop_totals = data["face_sizes"].astype(np.int64)
+        loop_starts = np.concatenate(
+            [[0], np.cumsum(loop_totals)[:-1]]
+        ).astype(np.int64)
+    else:
+        loop_vertex_indices = triangles.ravel()
+        loop_totals = np.full(len(triangles), 3)
+        loop_starts = np.arange(0, len(triangles) * 3, 3)
+    n_faces = len(loop_totals)
     uvs = planar_uv(points[loop_vertex_indices][:, :2], scene["aerial"]["bbox_local"])
 
     obj = build_mesh_object(
@@ -440,12 +449,44 @@ def _build_terrain_mesh(
         [material],
         shade_smooth=True,
     )
+    quads = int((loop_totals == 4).sum())
+    sharp = _mark_breakline_edges(obj, data)
     full = 2 * (len(xs) - 1) ** 2
     log(
-        f"terrain: {len(points)} vertices, {n_faces} triangles "
-        f"({100.0 * n_faces / full:.1f}% of the {len(xs)}x{len(ys)} grid)"
+        f"terrain: {len(points)} vertices, {n_faces} faces "
+        f"({quads} quads, {n_faces - quads} triangles, "
+        f"{100.0 * n_faces / full:.1f}% of the {len(xs)}x{len(ys)} grid), "
+        f"{sharp} breakline edges marked sharp"
     )
     return obj
+
+
+def _mark_breakline_edges(obj, data) -> int:
+    """Tag the breaklines so they can be selected as edge loops.
+
+    This is the whole point of having built the mesh around them. Without it
+    Blender is handed a sheet of faces with no record of which edges are the
+    kerb, the canal bank or the foot of a building, and the loop you wanted to
+    grab has to be hunted for one face at a time.
+
+    Marked both sharp and seam: sharp is what Select Sharp Edges and the Edge
+    Split modifier read, and a seam survives into an FBX where sharpness
+    sometimes does not.
+    """
+    if "sharp_edges" not in data:
+        return 0
+    wanted = data["sharp_edges"].astype(np.int64).reshape(-1, 2)
+    if not len(wanted):
+        return 0
+    mesh = obj.data
+    keys = {frozenset((int(a), int(b))) for a, b in wanted}
+    marked = 0
+    for edge in mesh.edges:
+        if frozenset((int(edge.vertices[0]), int(edge.vertices[1]))) in keys:
+            edge.use_edge_sharp = True
+            edge.use_seam = True
+            marked += 1
+    return marked
 
 
 def _terrain_summary() -> dict:

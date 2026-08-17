@@ -596,6 +596,47 @@ Measured over one synthetic Dutch area, before and after all of the above:
 | Worst height error (0.10 m asked) | 0.459 m | **0.100 m** |
 | Worst sag under a breakline | never measured | **0.100 m** |
 
+### Quads, and controlling how busy the ground is
+
+Everything above makes the ground *correct*. It does not make it pleasant to
+edit, and those are different problems. A triangulation is what the geometry
+wants; quads are what Blender wants, because selecting, looping and subdividing
+all work along quads and none of them work on a triangle fan.
+
+So `src/quadmesh.py` runs last and only decides which pairs of triangles to
+fuse. Nothing moves, nothing is added, nothing is dropped — so every accuracy
+figure measured on the triangles still holds afterwards, and the triangles stay
+the source of truth that the checks read. Two edges are never dissolved:
+
+* **A breakline.** Fusing across one would delete the edge the mesh exists to
+  have. This is the difference from an automatic quad remesher: those align
+  edges to the *curvature* of the surface they are handed, and a kerb is not a
+  curvature feature — it is a line from another dataset that happens to lie on
+  this surface. Often it has no dihedral angle at all, because both sides take
+  their height from the same grid cell. Told which edges those are, the pairing
+  keeps every one.
+* **A fold.** Two triangles meeting at an angle are a ridge or a ditch, and
+  fusing them would smooth it away. `quad_max_fold_deg` is where that line sits.
+
+Greedy matching on the dual graph, best-shaped quads first. Optimal matching is
+a blossom algorithm and buys nothing visible; greedy reaches 60–90% quads.
+
+The breakline edges are also **marked sharp and as UV seams on export**, so in
+Blender *Select Sharp Edges* hands you the kerb, the canal bank or a building
+footprint as a loop instead of leaving you to hunt for it face by face.
+
+Five settings control how busy the ground is, all of them in the UI under
+**Terrain shape**, and none of them affect accuracy:
+
+| Setting | Config key | What it does |
+| --- | --- | --- |
+| Make quads | `terrain.quads` | Fuse flat triangle pairs. |
+| Keep folds sharper than | `terrain.quad_max_fold_deg` | 3° keeps every crease; 60° fuses almost everything. |
+| Straighten the features | `terrain.breakline_simplify_m` | 0.15 m is as surveyed; 5 m leaves only the layout. The biggest single lever on visual busyness. |
+| Ignore features shorter than | `terrain.min_feature_length_m` | Drops traffic islands, kerb stubs, driveway aprons. A planar partition has thousands, and each one is an edge loop. |
+| Contour lines | `terrain.contour_interval_m` | The only edges that follow the ground itself. Also the costliest. Flat ground contributes none regardless. |
+| Which features become edges | `terrain.breaklines` | Roads, water, land cover, buildings — independently. |
+
 **Roads still float above it.** They are separate objects with their own
 materials, and they share the terrain's edges rather than being part of it, so
 the 6 cm lift is raised just enough to clear how far the mesh *rises above* the

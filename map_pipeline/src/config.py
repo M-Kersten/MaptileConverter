@@ -70,6 +70,22 @@ DEFAULTS: dict[str, Any] = {
         # that follow the ground rather than something drawn on it, and also
         # the ones that cost the most triangles.
         "contour_interval_m": 0.5,
+        # Runs shorter than this are dropped. A planar partition is full of
+        # traffic islands, kerb stubs and driveway aprons; each is a real
+        # surveyed line and each becomes an edge loop, and a thousand of them
+        # makes a mesh look busy without saying anything about the ground.
+        "min_feature_length_m": 0.0,
+        # Fuse flat pairs of triangles into quads at the very end. Nothing
+        # moves and nothing is added, so every accuracy figure still holds; it
+        # is purely about handing an editor something it can loop and subdivide.
+        "quads": False,
+        # A fold sharper than this stays two triangles, so a ridge or a ditch
+        # is not flattened into one quad. Roughly: a Dutch dike face against
+        # its crown is about 20 degrees.
+        "quad_max_fold_deg": 12.0,
+        # A quad with a corner tighter than this is worse than the triangles it
+        # replaces, so it is left alone.
+        "quad_min_angle_deg": 25.0,
     },
     "buildings": {
         "lod": "2.2",

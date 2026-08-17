@@ -3398,6 +3398,169 @@ class TestConstrainedRefinement(unittest.TestCase):
         self.assertAlmostEqual(float(radius[0]), 2.5)
 
 
+class TestQuadPairing(unittest.TestCase):
+    """Quads for an editor, without giving up anything the triangles earned.
+
+    Nothing moves, nothing is added and nothing is dropped -- only pairs of
+    triangles are fused -- so every accuracy figure measured on the triangles
+    still holds. What the pairing must not do is dissolve the edges the mesh was
+    built around, or flatten a fold.
+    """
+
+    @staticmethod
+    def _sheet(n=7, height=lambda x, y: 0.0):
+        """A regular triangulated grid, as a stand-in for flat-ish terrain."""
+        xs = np.arange(n, dtype=np.float64)
+        gx, gy = np.meshgrid(xs, xs)
+        vertices = np.column_stack(
+            [gx.ravel(), gy.ravel(), [height(x, y) for x, y in zip(gx.ravel(), gy.ravel())]]
+        )
+        tris = []
+        for r in range(n - 1):
+            for c in range(n - 1):
+                a, b = r * n + c, r * n + c + 1
+                d, e = (r + 1) * n + c, (r + 1) * n + c + 1
+                tris.append([a, b, e])
+                tris.append([a, e, d])
+        return vertices, np.asarray(tris, dtype=np.int64)
+
+    def _faces(self, loops, sizes):
+        out, at = [], 0
+        for size in sizes:
+            out.append([int(v) for v in loops[at : at + size]])
+            at += size
+        return out
+
+    def test_flat_ground_pairs_up(self):
+        from src.quadmesh import pair_into_quads
+
+        vertices, tris = self._sheet()
+        loops, sizes, stats = pair_into_quads(vertices, tris, set())
+        self.assertGreater(stats["quad_fraction"], 0.9, f"only {stats}")
+        self.assertEqual(len(loops), int(sizes.sum()))
+
+    def test_a_breakline_is_never_dissolved(self):
+        from src.quadmesh import pair_into_quads
+
+        vertices, tris = self._sheet()
+        # Protect every edge of the first triangle.
+        a, b, c = (int(v) for v in tris[0])
+        protected = {frozenset((a, b)), frozenset((b, c)), frozenset((c, a))}
+        loops, sizes, _ = pair_into_quads(vertices, tris, protected)
+
+        present = set()
+        for face in self._faces(loops, sizes):
+            for i in range(len(face)):
+                present.add(frozenset((face[i], face[(i + 1) % len(face)])))
+        for edge in protected:
+            self.assertIn(
+                edge, present, f"the breakline {sorted(edge)} was fused away"
+            )
+
+    def test_a_fold_is_not_flattened(self):
+        """Two triangles meeting at an angle are a ridge or a ditch. Merging
+        them into one quad smooths it away, which is the one thing a terrain
+        mesh must not do quietly."""
+        from src.quadmesh import pair_into_quads
+
+        # A roof ridge along x = 3: height rises to it and falls away.
+        vertices, tris = self._sheet(height=lambda x, y: 2.0 - abs(x - 3.0))
+        loops, sizes, stats = pair_into_quads(
+            vertices, tris, set(), max_fold_deg=5.0
+        )
+        self.assertGreater(
+            stats["edges_kept_for_folds"], 0, "the ridge was fused straight over"
+        )
+        # Every quad has to be flat to within the threshold it was given.
+        for face in self._faces(loops, sizes):
+            if len(face) != 4:
+                continue
+            p = vertices[face]
+            n1 = np.cross(p[1] - p[0], p[2] - p[0])
+            n2 = np.cross(p[2] - p[0], p[3] - p[0])
+            cos = np.dot(n1, n2) / (np.linalg.norm(n1) * np.linalg.norm(n2))
+            self.assertLess(np.degrees(np.arccos(np.clip(cos, -1, 1))), 6.0)
+
+    def test_nothing_is_lost_or_added(self):
+        from src.quadmesh import pair_into_quads
+
+        vertices, tris = self._sheet()
+        loops, sizes, stats = pair_into_quads(vertices, tris, set())
+
+        def area(face):
+            p = vertices[face][:, :2]
+            return 0.5 * abs(
+                sum(
+                    p[i][0] * p[(i + 1) % len(p)][1] - p[(i + 1) % len(p)][0] * p[i][1]
+                    for i in range(len(p))
+                )
+            )
+
+        faces = self._faces(loops, sizes)
+        before = sum(area(list(t)) for t in tris)
+        self.assertAlmostEqual(sum(area(f) for f in faces), before, places=6)
+        self.assertEqual(stats["quads"] * 2 + stats["triangles"], len(tris))
+
+    def test_every_quad_is_convex_and_wound_the_same_way(self):
+        """A concave or flipped quad renders as a crease that is not there."""
+        from src.quadmesh import pair_into_quads
+
+        vertices, tris = self._sheet()
+        loops, sizes, _ = pair_into_quads(vertices, tris, set())
+        for face in self._faces(loops, sizes):
+            p = vertices[face][:, :2]
+            for i in range(len(p)):
+                u = p[(i + 1) % len(p)] - p[i]
+                v = p[(i + 2) % len(p)] - p[(i + 1) % len(p)]
+                self.assertGreater(
+                    u[0] * v[1] - u[1] * v[0], 0, f"face {face} turns back on itself"
+                )
+
+
+class TestFeatureFilter(unittest.TestCase):
+    """Dropping the runs that make a mesh busy without describing the ground."""
+
+    def test_short_runs_are_dropped(self):
+        from src.breaklines import build_breaklines
+        from src.geo import BBox
+
+        bbox = BBox(0, 0, 100, 100)
+        # One long road edge, and a scatter of traffic-island-sized rings.
+        rings = {
+            "roads": [np.array([[5.0, 50.0], [95.0, 50.0], [95.0, 54.0], [5.0, 54.0],
+                                [5.0, 50.0]])],
+            "unpaved": [
+                np.array([[x, 20.0], [x + 2.0, 20.0], [x + 2.0, 22.0], [x, 22.0],
+                          [x, 20.0]])
+                for x in range(10, 80, 10)
+            ],
+        }
+        keep_all = build_breaklines(bbox, rings_by_source=rings, simplify_m=0.15)
+        pruned = build_breaklines(
+            bbox, rings_by_source=rings, simplify_m=0.15, min_feature_length_m=20.0
+        )
+        self.assertLess(
+            len(pruned.segments),
+            len(keep_all.segments),
+            "the islands survived a 20 m minimum",
+        )
+        # The road is 90 m long, so it has to be there either way.
+        self.assertGreater(len(pruned.segments), 0)
+
+    def test_a_zero_minimum_changes_nothing(self):
+        from src.breaklines import build_breaklines
+        from src.geo import BBox
+
+        rings = {"roads": [np.array([[1.0, 1.0], [9.0, 1.0], [9.0, 9.0], [1.0, 9.0],
+                                     [1.0, 1.0]])]}
+        bbox = BBox(0, 0, 10, 10)
+        plain = build_breaklines(bbox, rings_by_source=rings, simplify_m=0.15)
+        zero = build_breaklines(
+            bbox, rings_by_source=rings, simplify_m=0.15, min_feature_length_m=0.0
+        )
+        self.assertEqual(len(plain.segments), len(zero.segments))
+
+
 class TestTerrainMeshChecks(unittest.TestCase):
     """The checks that let all of this ship without a word.
 

@@ -311,6 +311,19 @@ def build_config(payload: dict) -> dict:
             "resolution_m": 0.5,
             "mesh_vertices_per_side": int(payload.get("mesh_vertices", 257)),
             "simplify_tolerance_m": float(payload.get("simplify_tolerance_m", 0.10)),
+            # Terrain shape controls. Every one of these changes what the mesh
+            # looks like to edit rather than how accurate it is, so they are all
+            # safe to play with -- the checks measure accuracy either way.
+            "breakline_simplify_m": float(payload.get("breakline_simplify_m", 0.15)),
+            "contour_interval_m": float(payload.get("contour_interval_m", 0.5)),
+            "min_feature_length_m": float(payload.get("min_feature_length_m", 0.0)),
+            "quads": bool(payload.get("quads", False)),
+            "quad_max_fold_deg": float(payload.get("quad_max_fold_deg", 12.0)),
+            **(
+                {"breaklines": list(payload["breaklines"])}
+                if payload.get("breaklines") is not None
+                else {}
+            ),
         },
         "buildings": {
             "lod": "2.2",

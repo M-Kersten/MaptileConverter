@@ -57,7 +57,7 @@ mesh generation" (1995).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -417,6 +417,16 @@ class ConstrainedMesh:
     # purpose: one bad triangle in four square kilometres should not lift every
     # road in the model.
     rise_above_grid_m: float = 0.0
+    # The same faces, with flat pairs of triangles fused into quads. The
+    # triangles above stay the source of truth -- every check measures those --
+    # and this is what gets exported, because it is what an editor can work on.
+    face_loops: np.ndarray | None = None
+    face_sizes: np.ndarray | None = None
+    quad_stats: dict = field(default_factory=dict)
+    # Which edges are breaklines, as vertex index pairs. Marked sharp on export
+    # so a kerb or a bank can be selected as an edge loop in Blender instead of
+    # hunted for one triangle at a time.
+    sharp_edges: np.ndarray | None = None
 
     @property
     def vertex_count(self) -> int:
@@ -441,6 +451,7 @@ class ConstrainedMesh:
             "rise_above_grid_m": round(float(self.rise_above_grid_m), 4),
             "slivers_from_input": int(self.slivers_from_input),
             "slivers_of_our_own": int(self.slivers_of_our_own),
+            **({"quads": self.quad_stats} if self.quad_stats else {}),
             "refined_rounds": int(self.refined_rounds),
             "refinement_converged": bool(self.converged),
             "breaklines_by_source": dict(self.counts),
@@ -457,6 +468,10 @@ def build_constrained(
     tolerance_m: float = 0.10,
     simplify_m: float = 0.15,
     contour_interval_m: float = 0.5,
+    min_feature_length_m: float = 0.0,
+    quads: bool = False,
+    max_fold_deg: float = 12.0,
+    min_quad_angle_deg: float = 25.0,
 ) -> ConstrainedMesh:
     """Triangulate the area so every breakline comes out as an edge.
 
@@ -480,6 +495,7 @@ def build_constrained(
         # Contours are simplified against the height they cost, not against a
         # distance, so they need to know what the mesh is aiming for.
         tolerance_m=tolerance_m,
+        min_feature_length_m=min_feature_length_m,
     )
 
     # Grid points worth keeping for height alone. The adaptive mesh already
@@ -691,6 +707,23 @@ def build_constrained(
         slivers_of_our_own=our_own,
         rise_above_grid_m=rise,
     )
+    if quads:
+        from .quadmesh import pair_into_quads
+
+        protected = {frozenset((int(a), int(b))) for a, b in built_from}
+        mesh.face_loops, mesh.face_sizes, mesh.quad_stats = pair_into_quads(
+            vertices,
+            result.triangles,
+            protected,
+            max_fold_deg=max_fold_deg,
+            min_quad_angle_deg=min_quad_angle_deg,
+        )
+    mesh.sharp_edges = (
+        np.asarray(built_from, dtype=np.int32).reshape(-1, 2)
+        if len(built_from)
+        else np.zeros((0, 2), dtype=np.int32)
+    )
+
     LOG.info(
         "terrain mesh: %d vertices, %d triangles, %d breakline edges, "
         "worst height error %.3f m, worst breakline sag %.3f m, "
@@ -1331,14 +1364,21 @@ def save_constrained_mesh(mesh: ConstrainedMesh, path, origin) -> "Path":
     local = mesh.vertices.copy()
     local[:, 0] -= origin[0]
     local[:, 1] -= origin[1]
-    np.savez(
-        path,
+    payload = dict(
         vertices=local.astype(np.float64),
         triangles=mesh.triangles.astype(np.int32),
         tolerance_m=np.float64(mesh.tolerance_m),
         max_error_m=np.float64(mesh.max_error_m),
         grid_indexed=np.array(False),
     )
+    # Faces as loops and lengths, so one pair of arrays carries the quads and
+    # the triangles that would not pair.
+    if mesh.face_loops is not None and mesh.face_sizes is not None:
+        payload["face_loops"] = mesh.face_loops.astype(np.int32)
+        payload["face_sizes"] = mesh.face_sizes.astype(np.int32)
+    if mesh.sharp_edges is not None:
+        payload["sharp_edges"] = mesh.sharp_edges.astype(np.int32)
+    np.savez(path, **payload)
     LOG.info("wrote %s", path)
     return path
 

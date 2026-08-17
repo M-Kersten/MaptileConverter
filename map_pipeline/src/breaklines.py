@@ -733,11 +733,29 @@ def build_breaklines(
     simplify_m: float = DEFAULT_SIMPLIFY_M,
     contour_interval_m: float = DEFAULT_CONTOUR_INTERVAL_M,
     tolerance_m: float = 0.10,
+    min_feature_length_m: float = 0.0,
 ) -> BreaklineSet:
     """Turn outlines and a height grid into non-crossing constraint segments."""
     # Simplified as one network rather than ring by ring, so a boundary two
     # polygons share stays one line. See partition_chains.
     chains, counts = partition_chains(rings_by_source, bbox, simplify_m)
+    # Short runs are the traffic islands, kerb stubs and driveway aprons a
+    # planar partition is full of. Each is a real surveyed line and each becomes
+    # an edge loop, and a thousand of them is what makes a mesh look busy
+    # without telling anyone anything about the shape of the ground.
+    if min_feature_length_m > 0:
+        before = len(chains)
+        chains = [
+            chain
+            for chain in chains
+            if float(np.hypot(*np.diff(chain, axis=0).T).sum()) >= min_feature_length_m
+        ]
+        dropped = before - len(chains)
+        if dropped:
+            LOG.info(
+                "breaklines: dropped %d runs shorter than %.1f m", dropped,
+                min_feature_length_m,
+            )
 
     if heights is not None and xs is not None and ys is not None:
         before = len(chains)

@@ -357,6 +357,83 @@
   </fieldset>
 
   <details class="adv">
+    <summary>Terrain shape &mdash; quads, and what becomes an edge</summary>
+    <div class="inner">
+      <div class="plain" style="margin: 0 0 10px">
+        These change what the ground is like to <i>edit</i>, not how accurate it
+        is. The checks measure accuracy either way, so all of it is safe to play
+        with.
+      </div>
+
+      <div class="inline" style="margin-top:0">
+        <input type="checkbox" id="quads">
+        <label for="quads">Make quads where it can</label>
+        <span class="help" tabindex="0" role="button" aria-label="About quads"
+          data-tip="Fuses flat pairs of triangles into quads at the very end. Nothing moves and nothing is added, so the ground is exactly as accurate either way &mdash; but Blender can select, loop and subdivide along quads, and it can do none of that with a triangle fan. Expect roughly 60&ndash;90% quads; the rest are where a breakline or a fold got in the way.">?</span>
+      </div>
+
+      <label for="fold" style="margin-top:12px">Keep folds sharper than
+        <span class="help" tabindex="0" role="button" aria-label="About the fold limit"
+          data-tip="Two triangles meeting at an angle are a ridge or a ditch, and fusing them into one quad would smooth it away. Below this angle a pair counts as flat and may be fused. A Dutch dike face against its crown is around <b>20&deg;</b>, a kerb a few degrees. Lower keeps more of the shape and gives you fewer quads.">?</span>
+        <span class="derived" id="foldDerived"></span>
+      </label>
+      <input type="range" id="fold" min="0" max="4" step="1" value="2" class="slider">
+      <div class="ticks"><span>keep everything</span><span>quads everywhere</span></div>
+      <div class="plain" id="foldPlain"></div>
+
+      <label for="straighten" style="margin-top:12px">Straighten the features
+        <span class="help" tabindex="0" role="button" aria-label="About straightening"
+          data-tip="How far a road or water edge may be moved to make it a straight run. The survey carries vertices centimetres apart along what is visibly a straight kerb, and every one of them becomes a vertex in your mesh. This is the biggest single lever on how busy the ground looks.">?</span>
+        <span class="derived" id="straightenDerived"></span>
+      </label>
+      <input type="range" id="straighten" min="0" max="4" step="1" value="0" class="slider">
+      <div class="ticks"><span>as surveyed</span><span>bold and simple</span></div>
+      <div class="plain" id="straightenPlain"></div>
+
+      <label for="minFeature" style="margin-top:12px">Ignore features shorter than
+        <span class="help" tabindex="0" role="button" aria-label="About the size filter"
+          data-tip="Drops the short runs: traffic islands, kerb stubs, driveway aprons, the corner of a parking bay. Each is a real surveyed line and each becomes an edge loop in the ground, and a few thousand of them is most of what makes a mesh look chaotic without telling you anything about the shape of the land.">?</span>
+        <span class="derived" id="minFeatureDerived"></span>
+      </label>
+      <input type="range" id="minFeature" min="0" max="4" step="1" value="0" class="slider">
+      <div class="ticks"><span>keep every one</span><span>only big features</span></div>
+      <div class="plain" id="minFeaturePlain"></div>
+
+      <label for="contours" style="margin-top:12px">Contour lines
+        <span class="help" tabindex="0" role="button" aria-label="About contours"
+          data-tip="Contours are the only edges that follow the ground itself rather than something drawn on it, so they are what makes a hill read as a hill. They are also the ones that cost the most faces. Flat ground contributes none whatever you set here &mdash; a contour on a field is tracing the scanner's noise, and those are thrown away.">?</span>
+        <span class="derived" id="contourDerived"></span>
+      </label>
+      <input type="range" id="contours" min="0" max="3" step="1" value="2" class="slider">
+      <div class="ticks"><span>off</span><span>every 25 cm</span></div>
+      <div class="plain" id="contourPlain"></div>
+
+      <label style="margin-top:14px">Which features become edges
+        <span class="help" tabindex="0" role="button" aria-label="About which features"
+          data-tip="Each of these is a surveyed outline the ground will fold along, and each one you switch off is that many fewer edges. Roads and water are what most people want; land cover is every patch of grass and paving between them, and buildings put a loop around each footprint so you can select where a wall meets the ground.">?</span>
+      </label>
+      <div class="inline" style="margin-top:6px">
+        <input type="checkbox" id="blRoads" checked>
+        <label for="blRoads">Road and pavement edges</label>
+      </div>
+      <div class="inline">
+        <input type="checkbox" id="blWater" checked>
+        <label for="blWater">Water edges and canal banks</label>
+      </div>
+      <div class="inline">
+        <input type="checkbox" id="blLand" checked>
+        <label for="blLand">Land cover &mdash; grass, paving, bare ground</label>
+      </div>
+      <div class="inline">
+        <input type="checkbox" id="blBuildings" checked>
+        <label for="blBuildings">Building footprints</label>
+      </div>
+
+      <div class="plain" id="shapeNote" style="margin-top:12px"></div>
+    </div>
+  </details>
+
+  <details class="adv">
     <summary>Fine tuning &mdash; model weight and how buildings look</summary>
     <div class="inner">
       <label for="terrainTol">Ground triangles
@@ -974,6 +1051,42 @@ const TOLERANCE_PLAIN = {
   0.25: "Never more than 25 cm off. Light, though small steps get smoothed over.",
   0.50: "Never more than 50 cm off. Lightest; only real landforms survive."
 };
+/* ---------------------------------------------------------------------------
+   Terrain shape. None of these change how accurate the ground is -- the checks
+   measure that either way -- they change what it is like to edit.
+--------------------------------------------------------------------------- */
+const FOLD_STEPS = [3, 6, 12, 25, 60];              // degrees
+const FOLD_PLAIN = {
+  3:  "Only genuinely flat pairs are fused. Every ridge and ditch keeps its crease, and you get the fewest quads.",
+  6:  "Careful. Kerbs and small steps stay as triangles.",
+  12: "A good default. Dike faces and canal banks keep their fold; flat ground becomes quads.",
+  25: "Most of the ground becomes quads. Gentle folds get flattened into one face.",
+  60: "Almost everything is fused. Ridges will be smoothed over — use this if you want a clean sheet more than a faithful one."
+};
+const STRAIGHTEN_STEPS = [0.15, 0.5, 1, 2, 5];      // metres
+const STRAIGHTEN_PLAIN = {
+  0.15: "Exactly as surveyed. Every wobble in a kerb is a vertex in your mesh.",
+  0.5:  "Slightly tidied. Survey noise goes, corners stay.",
+  1:    "Clean runs. A curved kerb becomes a few straight lengths.",
+  2:    "Bold. Streets read as straight lines and gentle curves flatten out.",
+  5:    "Very bold. Only the layout survives; a bend under 5 m disappears."
+};
+const MINFEATURE_STEPS = [0, 5, 10, 25, 50];        // metres
+const MINFEATURE_PLAIN = {
+  0:  "Every surveyed run becomes an edge, down to the corner of a parking bay.",
+  5:  "Drops the smallest: kerb stubs and driveway aprons.",
+  10: "Drops traffic islands and single bays. Usually the sweet spot.",
+  25: "Only streets, waterways and larger plots.",
+  50: "Just the big structure of the place."
+};
+const CONTOUR_STEPS = [0, 1, 0.5, 0.25];            // metres of height, 0 = off
+const CONTOUR_PLAIN = {
+  0:    "No contours. Hills are described only by where the ground points fell.",
+  1:    "Coarse. The big landforms read, cheaply.",
+  0.5:  "A good default. Banks and dikes get an edge loop each.",
+  0.25: "Fine. Every slope is heavily banded, and this costs the most faces."
+};
+
 const FACADE_PLAIN = {
   256:  "Blurry close up, fine from across the water.",
   512:  "Reads well from across the street.",
@@ -1061,6 +1174,56 @@ function updateQuality() {
   $("qualityNote").innerHTML = notes.map(escapeHtml).join("<br>");
   $("qualityNote").style.color = (q.aerialOver || q.terrainOver)
     ? "var(--warn)" : "var(--muted)";
+}
+
+function shape() {
+  return {
+    quads: $("quads").checked,
+    fold: FOLD_STEPS[+$("fold").value],
+    straighten: STRAIGHTEN_STEPS[+$("straighten").value],
+    minFeature: MINFEATURE_STEPS[+$("minFeature").value],
+    contour: CONTOUR_STEPS[+$("contours").value],
+    breaklines: [
+      ...($("blRoads").checked ? ["roads"] : []),
+      ...($("blWater").checked ? ["water"] : []),
+      ...($("blLand").checked ? ["unpaved", "green"] : []),
+      ...($("blBuildings").checked ? ["buildings"] : [])
+    ]
+  };
+}
+
+function updateShape() {
+  const s = shape();
+  $("foldDerived").textContent = `${s.fold}°`;
+  $("foldPlain").textContent = FOLD_PLAIN[s.fold] || "";
+  $("straightenDerived").textContent = `${s.straighten} m`;
+  $("straightenPlain").textContent = STRAIGHTEN_PLAIN[s.straighten] || "";
+  $("minFeatureDerived").textContent = s.minFeature ? `${s.minFeature} m` : "off";
+  $("minFeaturePlain").textContent = MINFEATURE_PLAIN[s.minFeature] || "";
+  $("contourDerived").textContent = s.contour ? `every ${s.contour} m` : "off";
+  $("contourPlain").textContent = CONTOUR_PLAIN[s.contour] || "";
+
+  // The fold slider only means anything once quads are on.
+  for (const id of ["fold"]) $(id).disabled = !s.quads;
+  $("foldPlain").style.opacity = s.quads ? "1" : "0.45";
+
+  const notes = [];
+  if (!s.breaklines.length)
+    notes.push("Nothing left to fold along: the ground will be a plain surface through the height points, with no edge on any street or bank.");
+  if (s.quads && s.fold >= 60)
+    notes.push("At 60° almost nothing counts as a fold, so real ridges will be fused flat.");
+  if (s.contour === 0 && !s.breaklines.includes("water"))
+    notes.push("With contours off and water edges off, a canal bank has nothing to fold along.");
+  if (s.straighten >= 5 && s.minFeature >= 25)
+    notes.push("Bold on both: expect a clean, sparse sheet that no longer follows the survey closely.");
+  $("shapeNote").innerHTML = notes.map(escapeHtml).join("<br>");
+  $("shapeNote").style.color = notes.length ? "var(--warn)" : "var(--muted)";
+}
+
+for (const id of ["quads", "fold", "straighten", "minFeature", "contours",
+                  "blRoads", "blWater", "blLand", "blBuildings"]) {
+  $(id).addEventListener("input", updateShape);
+  $(id).addEventListener("change", updateShape);
 }
 
 function applyPreset(name) {
@@ -1199,6 +1362,7 @@ function setStatus(state, text) {
 
 $("run").onclick = async () => {
   const q = quality();
+  const sh = shape();
   const payload = {
     name: $("name").value.trim(),
     bbox: bbox(),
@@ -1212,7 +1376,14 @@ $("run").onclick = async () => {
     facade_photo_textures: $("photoTextures").checked,
     sources: selectedSources(),
     clip_mode: $("clip").value,
-    preview: $("preview").checked
+    preview: $("preview").checked,
+    // Terrain shape. See updateShape: none of this changes accuracy.
+    quads: sh.quads,
+    quad_max_fold_deg: sh.fold,
+    breakline_simplify_m: sh.straighten,
+    min_feature_length_m: sh.minFeature,
+    contour_interval_m: sh.contour,
+    breaklines: sh.breaklines
   };
 
   $("banner").innerHTML = "";
@@ -1458,6 +1629,7 @@ updateBboxInfo();
 // The preset dropdown is the authority at load: without this the sliders keep
 // their markup defaults and can disagree with the preset shown next to them.
 applyPreset($("preset").value);
+updateShape();
 refreshEstimate();
 checkServices();
 
