@@ -61,6 +61,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .cdt import WELD_M
+
 LOG = logging.getLogger(__name__)
 
 # How many times the constrained mesh is allowed to add points and rebuild.
@@ -397,6 +399,18 @@ class ConstrainedMesh:
     max_edge_sag_m: float = 0.0
     refined_rounds: int = 0
     converged: bool = True
+    # Triangles further from the ground than the height model's own resolution
+    # allows. This, not the raw worst error, is the number that means the mesh
+    # has a fault rather than the data having a step in it.
+    triangles_over_allowance: int = 0
+    breaklines_over_allowance: int = 0
+    reachable_tolerance_m: float = 0.0
+    # Sliver triangles, split by whose fault they are. A surveyed outline that
+    # meets another at four degrees puts a four-degree triangle in the mesh and
+    # no triangulation can do better -- the wedge is in the input. Only the
+    # other number says the mesh has a problem.
+    slivers_from_input: int = 0
+    slivers_of_our_own: int = 0
 
     @property
     def vertex_count(self) -> int:
@@ -415,6 +429,11 @@ class ConstrainedMesh:
             "tolerance_m": round(float(self.tolerance_m), 4),
             "max_error_m": round(float(self.max_error_m), 4),
             "max_edge_sag_m": round(float(self.max_edge_sag_m), 4),
+            "reachable_tolerance_m": round(float(self.reachable_tolerance_m), 4),
+            "triangles_over_allowance": int(self.triangles_over_allowance),
+            "breaklines_over_allowance": int(self.breaklines_over_allowance),
+            "slivers_from_input": int(self.slivers_from_input),
+            "slivers_of_our_own": int(self.slivers_of_our_own),
             "refined_rounds": int(self.refined_rounds),
             "refinement_converged": bool(self.converged),
             "breaklines_by_source": dict(self.counts),
@@ -441,7 +460,7 @@ def build_constrained(
     almost none of them, which is the whole point.
     """
     from .breaklines import build_breaklines
-    from .cdt import WELD_M, triangulate, weld
+    from .cdt import triangulate, weld
 
     lines = build_breaklines(
         bbox,
@@ -505,6 +524,17 @@ def build_constrained(
     # with the mesh hanging off it.
     floor_m = REFINE_FLOOR_STEPS * step
     clearance = GROUND_CLEARANCE_STEPS * step
+    allowance = height_allowance(heights, tolerance_m)
+    reachable = float(allowance.max())
+    if reachable > tolerance_m * 1.01:
+        LOG.info(
+            "terrain mesh: the height model steps by up to %.2f m between "
+            "neighbouring samples, so a %.2f m tolerance is not reachable "
+            "everywhere; up to %.2f m is allowed where it steps",
+            2.0 * reachable,
+            tolerance_m,
+            reachable,
+        )
     budget = int(MAX_REFINE_GROWTH * max(len(merged), 1))
     result = None
     rounds_used = 0
@@ -529,13 +559,13 @@ def build_constrained(
         cut = (
             _segments_to_split(
                 vertices, segments, result.triangles, heights, xs, ys,
-                tolerance_m, floor_m,
+                allowance, floor_m,
             )
             if len(segments)
             else np.zeros(0, dtype=bool)
         )
         extra, stuck = _refine_points(
-            vertices, result.triangles, heights, xs, ys, tolerance_m, floor_m,
+            vertices, result.triangles, heights, xs, ys, allowance, floor_m,
             gap, floor_m,
         )
         # Anything that could not take a circumcentre falls back on splitting
@@ -566,9 +596,10 @@ def build_constrained(
         next_index = len(merged)
         keep = list(segments[~cut]) if len(segments) else []
         mids = []
+        sharp = _acute_corners(merged, segments)
         for index in np.flatnonzero(cut):
             p, q = segments[index]
-            mids.append(0.5 * (merged[p] + merged[q]))
+            mids.append(_split_at(merged, segments, index, sharp, floor_m))
             keep.append((int(p), next_index))
             keep.append((next_index, int(q)))
             next_index += 1
@@ -626,14 +657,14 @@ def build_constrained(
         )
 
     error = _sampled_error(vertices, result.triangles, heights, xs, ys)
-    sag = _edge_sag(vertices, built_from, heights, xs, ys)
+    sag, sagging = _edge_sag(vertices, built_from, heights, xs, ys, allowance)
+    over = _over_allowance(vertices, result.triangles, heights, xs, ys, allowance)
+    from_input, our_own = _count_slivers(vertices, result.triangles, built_from)
     # Converged means the mesh reached what it was asked for. Counting how much
     # work the last round did measures the loop, not the answer, and the tail
     # of a converging refinement is always a handful of points on a mesh of
     # thousands -- which reads as "still working" and is not.
-    converged = bool(
-        error <= 1.02 * tolerance_m and sag <= 1.02 * tolerance_m
-    )
+    converged = bool(over == 0 and sagging == 0)
     mesh = ConstrainedMesh(
         vertices=vertices,
         triangles=result.triangles,
@@ -645,16 +676,27 @@ def build_constrained(
         max_edge_sag_m=sag,
         refined_rounds=rounds_used,
         converged=converged,
+        triangles_over_allowance=over,
+        breaklines_over_allowance=sagging,
+        reachable_tolerance_m=reachable,
+        slivers_from_input=from_input,
+        slivers_of_our_own=our_own,
     )
     LOG.info(
         "terrain mesh: %d vertices, %d triangles, %d breakline edges, "
         "worst height error %.3f m, worst breakline sag %.3f m, "
+        "%d triangles and %d breaklines over what the height model allows, "
+        "%d slivers of our own and %d from sharp corners in the input, "
         "%d refinement rounds%s",
         mesh.vertex_count,
         mesh.triangle_count,
         mesh.breakline_edges,
         mesh.max_error_m,
         mesh.max_edge_sag_m,
+        mesh.triangles_over_allowance,
+        mesh.breaklines_over_allowance,
+        mesh.slivers_of_our_own,
+        mesh.slivers_from_input,
         mesh.refined_rounds,
         "" if converged else " (stopped short)",
     )
@@ -703,12 +745,18 @@ def _barycentric_probes(rounds: int = 4):
 PROBES = _barycentric_probes()
 
 
-def _height_error(vertices, triangles, heights, xs, ys):
-    """Worst gap between each triangle and the ground under it."""
+def _height_error(vertices, triangles, heights, xs, ys, *, want_where=False):
+    """Worst gap between each triangle and the ground under it.
+
+    With `want_where`, also returns where in each triangle that worst gap was
+    found, which is what tells refinement where to aim.
+    """
     if len(triangles) == 0:
-        return np.zeros(0)
+        empty = np.zeros(0)
+        return (empty, np.zeros((0, 2))) if want_where else empty
     corners = vertices[triangles]
     worst = np.zeros(len(triangles))
+    where = corners[:, 0, :2].copy() if want_where else None
     for weights in PROBES:
         probe = (
             weights[0] * corners[:, 0]
@@ -716,8 +764,90 @@ def _height_error(vertices, triangles, heights, xs, ys):
             + weights[2] * corners[:, 2]
         )
         truth = _bilinear(heights, xs, ys, probe[:, 0], probe[:, 1])
-        np.maximum(worst, np.abs(probe[:, 2] - truth), out=worst)
-    return worst
+        gap = np.abs(probe[:, 2] - truth)
+        if want_where:
+            better = gap > worst
+            where[better] = probe[better, :2]
+        np.maximum(worst, gap, out=worst)
+    return (worst, where) if want_where else worst
+
+
+def _snap_to_grid(points, xs, ys):
+    """Move each point to the nearest node of the height grid.
+
+    Refinement used to insert circumcentres for height as well as for shape,
+    and a circumcentre is almost never a grid node. That matters more than it
+    sounds: a real AHN model is full of one-cell features -- a quay wall, the
+    lip of a filled building hole, the scar where a tree was taken out -- and
+    the only way a mesh reproduces one is to have a vertex *at* it. Inserting
+    beside it instead leaves the error exactly where it was, which is why
+    refinement stalled at two and a half times its tolerance on real ground
+    however fine it was allowed to cut.
+
+    There are also finitely many grid nodes, so this is what makes the loop
+    terminate at the resolution of the data instead of chasing a target that
+    the data cannot express.
+    """
+    if len(points) == 0:
+        return points
+    step_x = float(xs[1] - xs[0])
+    step_y = float(ys[1] - ys[0])
+    cols = np.clip(np.round((points[:, 0] - xs[0]) / step_x), 1, len(xs) - 2)
+    rows = np.clip(np.round((points[:, 1] - ys[0]) / step_y), 1, len(ys) - 2)
+    return np.column_stack([xs[cols.astype(int)], ys[rows.astype(int)]])
+
+
+def height_allowance(heights: np.ndarray, tolerance_m: float) -> np.ndarray:
+    """How close to the ground the mesh can actually be asked to get, per node.
+
+    A tolerance is a promise about a surface, and this one is a grid. Between
+    two neighbouring samples the ground is whatever the interpolation says, and
+    where those two samples differ by a step -- a quay wall, the lip of a filled
+    building hole, the scar where a tree was taken out -- a flat triangle
+    spanning the pair can only sit about half the step away from it, unless one
+    of its edges happens to lie exactly along the boundary between the two
+    cells. A Delaunay mesh over scattered points cannot promise that.
+
+    So the allowance is the tolerance, or half the local step, whichever is
+    larger. Asking for less is asking the mesh to reproduce detail that the
+    height model does not contain, and it does real damage: refinement cannot
+    ever satisfy it, so it keeps inserting points into triangles it has no way
+    to improve. On a real Utrecht kilometre that ran to 701,978 triangles and
+    still reported a tenth of a metre missed by a factor of five.
+
+    Both refinement and the checks read this same number, on purpose. A target
+    the mesh is driven towards and a target it is judged against have to be the
+    same target.
+    """
+    heights = np.asarray(heights, dtype=np.float64)
+    step = np.zeros_like(heights)
+    for axis in (0, 1):
+        difference = np.abs(np.diff(heights, axis=axis))
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (0, 1)
+        np.maximum(step, np.pad(difference, pad, mode="edge"), out=step)
+        pad[axis] = (1, 0)
+        np.maximum(step, np.pad(difference, pad, mode="edge"), out=step)
+    return np.maximum(float(tolerance_m), 0.5 * step)
+
+
+def grid_interpolation_floor(heights: np.ndarray) -> float:
+    """The best any mesh on this grid can do, in metres.
+
+    Everything downstream reads the ground as a bilinear surface over the grid,
+    and a triangle is flat. Inside one cell the two differ by the cell's twist
+    over eight, and no amount of refinement removes it -- cutting a cell finer
+    only interpolates the same four numbers. Asking for a tolerance under this
+    is asking for detail the height model does not carry, so it is worth saying
+    so rather than refining forever and failing a check.
+    """
+    heights = np.asarray(heights, dtype=np.float64)
+    if heights.shape[0] < 2 or heights.shape[1] < 2:
+        return 0.0
+    twist = np.abs(
+        heights[:-1, :-1] + heights[1:, 1:] - heights[:-1, 1:] - heights[1:, :-1]
+    )
+    return float(twist.max()) / 8.0
 
 
 def _min_angles(points, triangles):
@@ -770,7 +900,7 @@ def _apexes_across(triangles):
     return across
 
 
-def _segments_to_split(points, segments, triangles, heights, xs, ys, tolerance, floor_m):
+def _segments_to_split(points, segments, triangles, heights, xs, ys, allowance, floor_m):
     """Which constraint segments have to be cut in half, and why.
 
     Two reasons, both of which the old code had no answer to at all.
@@ -809,7 +939,8 @@ def _segments_to_split(points, segments, triangles, heights, xs, ys, tolerance, 
     for s in steps:
         probe = a + s * (b - a)
         truth = _bilinear(heights, xs, ys, probe[:, 0], probe[:, 1])
-        want |= np.abs((z0 + s * (z1 - z0)) - truth) > tolerance
+        allowed = _sample(allowance, xs, ys, probe)
+        want |= np.abs((z0 + s * (z1 - z0)) - truth) > allowed
 
     # Nothing is gained by cutting below the spacing the ground was measured
     # at, and it is the only thing standing between this and a loop that never
@@ -817,8 +948,66 @@ def _segments_to_split(points, segments, triangles, heights, xs, ys, tolerance, 
     return want & (length > 2.0 * floor_m)
 
 
+def _acute_corners(points, segments, degrees=60.0):
+    """Vertices where two constraints meet at less than `degrees`.
+
+    These are Ruppert's known bad case, and BGT is full of them: wherever one
+    road splits off another, or a building footprint crosses a kerb at a
+    shallow angle. Splitting one of the two segments puts a new vertex inside
+    the other's diametral circle, which makes that one split, which puts a
+    vertex inside the first's -- and the pair grind each other down for as long
+    as they are allowed to, throwing off a sliver at every step.
+    """
+    at: dict = {}
+    for a, b in segments:
+        at.setdefault(int(a), []).append(int(b))
+        at.setdefault(int(b), []).append(int(a))
+    sharp = set()
+    limit = np.cos(np.radians(degrees))
+    for vertex, others in at.items():
+        if len(others) < 2:
+            continue
+        arms = points[others, :2] - points[vertex, :2]
+        norm = np.hypot(*arms.T)
+        keep = norm > 1e-12
+        arms, norm = arms[keep], norm[keep]
+        if len(arms) < 2:
+            continue
+        unit = arms / norm[:, None]
+        cosines = unit @ unit.T
+        np.fill_diagonal(cosines, -1.0)
+        if cosines.max() > limit:
+            sharp.add(vertex)
+    return sharp
+
+
+def _split_at(points, segments, index, sharp, floor_m):
+    """Where to cut a segment: its midpoint, or a concentric shell.
+
+    A segment with one end at a sharp corner is cut at a power-of-two distance
+    from that corner rather than in half. Both segments meeting there then get
+    their cut at the same radius, so the two new vertices are as far from each
+    other as they are from the corner, and neither lands inside the other's
+    diametral circle. The grinding stops.
+
+    This is Ruppert's concentric shells, in Shewchuk's formulation.
+    """
+    a, b = int(segments[index][0]), int(segments[index][1])
+    p, q = points[a, :2], points[b, :2]
+    length = float(np.hypot(*(q - p)))
+    ends = (a in sharp, b in sharp)
+    if ends[0] == ends[1]:
+        # Neither end is sharp, or both are: halving is right, and for two
+        # sharp ends there is no shell radius that suits both.
+        return 0.5 * (p + q)
+    corner, far = (p, q) if ends[0] else (q, p)
+    shell = 2.0 ** np.floor(np.log2(max(length * 0.5, floor_m)))
+    shell = float(min(max(shell, floor_m), length - floor_m))
+    return corner + (far - corner) * (shell / length)
+
+
 def _refine_points(
-    vertices, triangles, heights, xs, ys, tolerance, floor_m, gap, clearance
+    vertices, triangles, heights, xs, ys, allowance, floor_m, gap, clearance
 ):
     """Circumcentres of the triangles that are too wrong or too thin.
 
@@ -833,11 +1022,19 @@ def _refine_points(
     if len(triangles) == 0:
         return np.zeros((0, 2)), np.zeros(0, dtype=np.int64)
 
-    error = _height_error(vertices, triangles, heights, xs, ys)
+    error, worst_at = _height_error(
+        vertices, triangles, heights, xs, ys, want_where=True
+    )
     angle = _min_angles(vertices, triangles)
     centre, radius = _circumcentres(vertices, triangles)
 
-    off_ground = error > tolerance
+    # Where a triangle is off the ground, aim at the grid node nearest the worst
+    # of it: that is a place the ground was actually measured, so the mesh can
+    # reproduce what is there. Shape is a different question and still takes the
+    # circumcentre, which is the point that provably improves it.
+    allowed = _sample(allowance, xs, ys, worst_at)
+    off_ground = error > allowed
+    target = np.where(off_ground[:, None], _snap_to_grid(worst_at, xs, ys), centre)
     bad = off_ground | (angle < MIN_ANGLE_DEG)
     # A triangle already at the resolution of the height model cannot be
     # improved by looking harder at it.
@@ -852,8 +1049,21 @@ def _refine_points(
     where = np.flatnonzero(bad)
     order = np.lexsort((-radius[where], ~off_ground[where]))
     where = where[order]
-    picked = centre[where]
+    picked = target[where]
     keep_radius = radius[where]
+
+    # A grid node the mesh already has welds away to nothing, so the round would
+    # report progress and make none. Fall back to the circumcentre -- and do it
+    # before anything is filtered, because a substitution made afterwards is one
+    # nothing has checked. Doing it the other way round let circumcentres of
+    # near-degenerate triangles through, and they are not nearby: the mesh came
+    # out covering 672 million square metres of a 250 thousand metre bbox.
+    existing = {
+        (int(round(x / WELD_M)), int(round(y / WELD_M))) for x, y in vertices[:, :2]
+    }
+    for index, point in enumerate(picked):
+        if (int(round(point[0] / WELD_M)), int(round(point[1] / WELD_M))) in existing:
+            picked[index] = centre[where[index]]
 
     # Inside the area, and not landing on top of a breakline. The clearance
     # here is only the degenerate case, deliberately: keeping circumcentres a
@@ -868,18 +1078,18 @@ def _refine_points(
     )
     if gap is not None:
         inside &= _sample(gap, xs, ys, picked) >= clearance
-    # A bad triangle whose circumcentre falls outside the area is the boundary
-    # case Ruppert's rule exists for: the point cannot be placed, so the thing
-    # standing in its way -- the constrained edge it would have crossed -- is
-    # split instead. Without this the mesh never improves where a canal runs
-    # off the edge of the bbox, which is precisely where it was worst.
+    # A bad triangle whose point cannot be placed is the boundary case Ruppert's
+    # rule exists for: the thing standing in its way -- the constrained edge it
+    # would have crossed -- is split instead. Without this the mesh never
+    # improves where a canal runs off the edge of the bbox, which is precisely
+    # where it was worst.
     stuck = where[~inside]
     picked, keep_radius = picked[inside], keep_radius[inside]
 
     # Classic refinement inserts one point and rebuilds. Rebuilding per point
     # is far too slow here, so a whole round goes in at once -- and then two
-    # circumcentres landing on top of each other would make the very sliver
-    # this is trying to remove. Spaced on a grid at the local circumradius.
+    # points landing on top of each other would make the very sliver this is
+    # trying to remove. Spaced on a grid at the local circumradius.
     return _spread(picked, keep_radius, floor_m), stuck
 
 
@@ -964,7 +1174,55 @@ def _sample(grid, xs, ys, points):
     return grid[rows, cols]
 
 
-def _edge_sag(vertices, segments, heights, xs, ys) -> float:
+# A triangle under this is a sliver. An input corner under it explains one.
+SLIVER_DEG = 1.0
+
+
+def _count_slivers(vertices, triangles, segments):
+    """Sliver triangles, split into the input's and ours.
+
+    Two outlines that meet at half a degree -- and a BGT partition does contain
+    those, where two surveyed polygons touch at a hair -- put a half-degree
+    triangle in the mesh. There is nowhere to place a point that improves it:
+    the wedge is the input's shape. Blaming the mesh for those hides the ones
+    that are genuinely its own, which are the ones worth fixing.
+    """
+    if len(triangles) == 0:
+        return 0, 0
+    smallest = _min_angles(vertices, triangles)
+    slivers = smallest < SLIVER_DEG
+    if not slivers.any():
+        return 0, 0
+    if len(segments) == 0:
+        return 0, int(slivers.sum())
+
+    # Attributed by whether the input alone decided the triangle's shape. Every
+    # corner on a constraint means it fills a gap between surveyed lines -- a
+    # wedge where two outlines converge, a strip too narrow to fit anything
+    # better -- and there is no point to add that would improve it. A sliver out
+    # in open ground has at least one corner that refinement put there, and that
+    # one is ours.
+    #
+    # Membership of the sharp corner itself is not enough on its own: a wedge
+    # closing at a degree and a half throws slivers along its whole length, tens
+    # of metres from the apex, and none of those touch it.
+    on_line = np.zeros(len(vertices), dtype=bool)
+    on_line[np.unique(segments)] = True
+    from_input = slivers & on_line[triangles].all(axis=1)
+    return int(from_input.sum()), int((slivers & ~from_input).sum())
+
+
+def _over_allowance(vertices, triangles, heights, xs, ys, allowance) -> int:
+    """How many triangles miss the ground by more than the ground allows."""
+    if len(triangles) == 0:
+        return 0
+    error, worst_at = _height_error(
+        vertices, triangles, heights, xs, ys, want_where=True
+    )
+    return int((error > _sample(allowance, xs, ys, worst_at)).sum())
+
+
+def _edge_sag(vertices, segments, heights, xs, ys, allowance=None):
     """Worst gap between a breakline and the ground beneath it.
 
     A constrained edge is a straight line the mesh is obliged to keep, and the
@@ -973,16 +1231,20 @@ def _edge_sag(vertices, segments, heights, xs, ys) -> float:
     a face, and this is the face's boundary.
     """
     if len(segments) == 0:
-        return 0.0
+        return 0.0, 0
     a = vertices[segments[:, 0]]
     b = vertices[segments[:, 1]]
     worst = 0.0
+    over = np.zeros(len(segments), dtype=bool)
     for s in np.linspace(0.05, 0.95, 19):
         probe = a[:, :2] + s * (b[:, :2] - a[:, :2])
         truth = _bilinear(heights, xs, ys, probe[:, 0], probe[:, 1])
         chord = a[:, 2] + s * (b[:, 2] - a[:, 2])
-        worst = max(worst, float(np.abs(chord - truth).max()))
-    return worst
+        gap = np.abs(chord - truth)
+        worst = max(worst, float(gap.max()))
+        if allowance is not None:
+            over |= gap > _sample(allowance, xs, ys, probe)
+    return worst, int(over.sum())
 
 
 def _bilinear(grid, xs, ys, x, y):

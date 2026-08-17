@@ -3159,11 +3159,13 @@ class TestConstrainedRefinement(unittest.TestCase):
             contour_interval_m=0.5,
         )
 
-    def test_it_reaches_the_tolerance_it_was_given(self):
-        self.assertLessEqual(
-            self.mesh.max_error_m,
-            1.05 * self.mesh.tolerance_m,
-            "refinement stopped short of the tolerance",
+    def test_it_gets_as_close_to_the_ground_as_the_ground_allows(self):
+        self.assertEqual(
+            self.mesh.triangles_over_allowance,
+            0,
+            f"worst gap {self.mesh.max_error_m:.3f} m against a "
+            f"{self.mesh.tolerance_m:.2f} m tolerance, of which "
+            f"{self.mesh.reachable_tolerance_m:.3f} m is the model's own steps",
         )
 
     def test_it_converges_rather_than_running_out_of_rounds(self):
@@ -3197,7 +3199,15 @@ class TestConstrainedRefinement(unittest.TestCase):
         """A constraint is a straight line and the ground under it is not. The
         segment has to be cut until it is, or the mesh has a crease running
         through ground that does not crease there."""
-        self.assertLessEqual(self.mesh.max_edge_sag_m, 1.05 * self.mesh.tolerance_m)
+        # Judged against what the height model can deliver, for the same reason
+        # the check is: the ground here has scan noise in it, and a chord
+        # between two samples cannot be closer to the ground than the step
+        # between them allows.
+        self.assertEqual(
+            self.mesh.breaklines_over_allowance,
+            0,
+            f"worst sag {self.mesh.max_edge_sag_m:.3f} m",
+        )
         # Which means the outline it started from is no longer four segments.
         self.assertGreater(self.mesh.breakline_edges, 8)
 
@@ -3205,6 +3215,85 @@ class TestConstrainedRefinement(unittest.TestCase):
         coarse = self._build(0.40)
         self.assertLess(self.mesh.max_error_m, coarse.max_error_m)
         self.assertGreater(self.mesh.triangle_count, coarse.triangle_count)
+
+    def test_a_step_in_the_grid_does_not_send_refinement_into_a_spiral(self):
+        """The failure this class exists to prevent a repeat of.
+
+        Real AHN steps 60 cm between neighbouring samples at a quay wall. No
+        triangle that is not aligned to the sample grid gets nearer than about
+        half of that, so a 0.10 m tolerance is unreachable there -- and asking
+        for it anyway meant refinement kept inserting points into triangles it
+        had no way to improve. On a real Utrecht kilometre that ran to 701,978
+        triangles and still missed the tolerance by a factor of five.
+        """
+        from src.terrain_mesh import build_constrained, height_allowance
+
+        heights = self.heights.copy()
+        wall = (self.ys > 96.0) & (self.ys < 100.0)
+        heights[wall, :] += 0.6
+
+        allowance = height_allowance(heights, 0.10)
+        self.assertGreater(
+            allowance.max(), 0.25, "a 60 cm step has to raise the allowance"
+        )
+
+        mesh = build_constrained(
+            self.bbox,
+            heights,
+            self.xs,
+            self.ys,
+            rings_by_source=self.rings,
+            tolerance_m=0.10,
+            contour_interval_m=0.5,
+        )
+        # It has to stop, and it has to stop having done what it could.
+        self.assertLess(
+            mesh.triangle_count,
+            8 * self.mesh.triangle_count,
+            f"{mesh.triangle_count} triangles: refinement ran away on a step",
+        )
+        self.assertLessEqual(
+            mesh.triangles_over_allowance,
+            0.001 * mesh.triangle_count,
+            f"worst gap {mesh.max_error_m:.3f} m",
+        )
+
+    def test_the_allowance_is_the_tolerance_on_smooth_ground(self):
+        """It must not become a licence. Where the grid does not step, the
+        allowance is exactly what was asked for."""
+        from src.terrain_mesh import height_allowance
+
+        smooth = np.add.outer(np.linspace(0.0, 1.0, 40), np.linspace(0.0, 1.0, 40))
+        self.assertAlmostEqual(float(height_allowance(smooth, 0.10).max()), 0.10)
+
+    def test_a_wedge_in_the_input_is_reported_as_the_input_s(self):
+        from src.terrain_mesh import build_constrained
+
+        apex = [30.0, 40.0]
+        rings = dict(self.rings)
+        rings["green"] = [
+            np.array([apex, [220.0, 39.0], [220.0, 44.0], apex]),
+            np.array([apex, [220.0, 45.0], [220.0, 56.0], apex]),
+        ]
+        mesh = build_constrained(
+            self.bbox,
+            self.heights,
+            self.xs,
+            self.ys,
+            rings_by_source=rings,
+            tolerance_m=0.10,
+            contour_interval_m=0.5,
+        )
+        self.assertGreater(
+            mesh.slivers_from_input + mesh.slivers_of_our_own,
+            0,
+            "a one-degree wedge in the input made no sliver at all?",
+        )
+        self.assertGreaterEqual(
+            mesh.slivers_from_input,
+            mesh.slivers_of_our_own,
+            "the wedge is the input's, so most slivers should be attributed to it",
+        )
 
     def test_a_circumcentre_is_not_a_centroid(self):
         """The centroid sits among the corners it came from; the circumcentre
@@ -3267,29 +3356,63 @@ class TestTerrainMeshChecks(unittest.TestCase):
         check_constrained_mesh(report, mesh, BBox(0, 0, 10, 8))
         return {c.name: c for c in report.checks}
 
-    def test_a_mesh_outside_its_tolerance_now_fails(self):
-        checks = self._run(self._mesh(max_error_m=0.285))
+    def test_a_mesh_further_off_than_the_ground_allows_fails(self):
+        checks = self._run(
+            self._mesh(max_error_m=0.285, triangles_over_allowance=1)
+        )
         found = checks["terrain_mesh_follows_the_ground"]
-        self.assertFalse(found.passed, "0.285 m against a 0.10 m tolerance passed")
+        self.assertFalse(found.passed, "a triangle beyond the allowance passed")
         self.assertEqual(found.severity, "error", "it must fail, not warn")
 
-    def test_the_old_slack_would_have_let_that_through(self):
-        """Kept as a statement of what changed: eight times the tolerance."""
+    def test_a_step_in_the_height_model_is_not_the_mesh_s_fault(self):
+        """The distinction the check turns on. AHN has quay walls and filled
+        building holes in it: 60 cm between neighbouring samples. No triangle
+        that is not aligned to the sample grid gets nearer than about 30 cm of
+        such a pair, so failing the mesh for it is failing it for the data's
+        resolution -- and chasing it is what ran a real Utrecht kilometre to
+        701,978 triangles."""
+        checks = self._run(
+            self._mesh(
+                max_error_m=0.285,
+                triangles_over_allowance=0,
+                reachable_tolerance_m=0.30,
+            )
+        )
+        found = checks["terrain_mesh_follows_the_ground"]
+        self.assertTrue(found.passed, "penalised for a step in the source data")
+        self.assertIn("steps by up to", found.detail, "the reason must be stated")
+
+    def test_the_old_slack_would_have_let_a_real_fault_through(self):
+        """Kept as a statement of what changed: eight times the tolerance, and
+        only a warning."""
         self.assertLess(0.285, 8.0 * 0.10)
 
     def test_slivers_are_caught(self):
-        checks = self._run(self._mesh(sliver=True))
+        checks = self._run(self._mesh(sliver=True, slivers_of_our_own=1))
         self.assertFalse(
             checks["terrain_triangles_are_not_slivers"].passed,
             "a triangle 1 mm thick and 10 m long passed the quality check",
         )
+
+    def test_a_wedge_the_input_already_had_is_not_the_mesh_s_fault(self):
+        """Two surveyed outlines meeting at half a degree put a half-degree
+        triangle in the mesh, and there is nowhere to put a point that improves
+        it. Counting those against the mesh hides the ones that are its own."""
+        checks = self._run(
+            self._mesh(sliver=True, slivers_of_our_own=0, slivers_from_input=1)
+        )
+        found = checks["terrain_triangles_are_not_slivers"]
+        self.assertTrue(found.passed, "penalised for a wedge in the source data")
+        self.assertIn("input already had", found.detail)
 
     def test_a_clean_mesh_passes_everything(self):
         for check in self._run(self._mesh()).values():
             self.assertTrue(check.passed, f"{check.name}: {check.detail}")
 
     def test_a_breakline_the_ground_has_left_behind_is_reported(self):
-        checks = self._run(self._mesh(max_edge_sag_m=0.9))
+        checks = self._run(
+            self._mesh(max_edge_sag_m=0.9, breaklines_over_allowance=2)
+        )
         self.assertFalse(checks["breaklines_lie_on_the_ground"].passed)
 
 

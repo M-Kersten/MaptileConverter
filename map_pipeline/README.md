@@ -548,6 +548,36 @@ idea and it is simply wrong — it cost 50% more triangles for the same shape,
 because refinement grades the mesh properly by itself and a lattice pushed up
 against an arbitrary polyline can only make wedges.
 
+**A tolerance is a promise about a surface, and AHN is a grid with steps in it.**
+A quay wall, the lip of a filled building hole, the scar where a tree was taken
+out: 60 cm between neighbouring samples is ordinary. Where two samples differ by
+a step, no triangle that is not aligned to the sample grid gets closer than about
+half of it, however finely it is cut — a flat face cannot follow a kink that
+falls between cells, and a Delaunay mesh over scattered points cannot promise an
+edge exactly on a cell boundary.
+
+So refinement and the checks share one notion of *how close the mesh can be
+asked to get*: the tolerance, or half the local step, whichever is larger
+(`height_allowance`). This is not a relaxation, it is the difference between a
+target and a wish. Asking for the wish did real damage — refinement could never
+satisfy it, so it kept inserting points into triangles it had no way to improve,
+and on a real Utrecht kilometre that ran to **701,978 triangles while still
+missing the tolerance by a factor of five**. Refinement also now stops at any
+triangle already smaller than one grid cell, because everything inside a cell is
+the interpolation's opinion rather than a measurement.
+
+Two more things are reported honestly rather than blamed on the mesh:
+
+* **Where a point should go.** A triangle off the ground now takes the *grid
+  node* nearest the worst of it, not a circumcentre. A circumcentre is almost
+  never a grid node, and a one-cell feature is only reproduced by a vertex
+  standing on it. Circumcentres are still what fixes *shape*.
+* **Whose sliver it is.** Two surveyed outlines meeting at half a degree put a
+  half-degree triangle in the mesh, and there is nowhere to put a point that
+  improves it. A sliver with every corner on a constraint is filling a gap the
+  input already had; one with a corner refinement placed itself is ours. Only
+  the second count fails a check.
+
 Measured over one synthetic Dutch area, before and after all of the above:
 
 | | before | after |
