@@ -1391,6 +1391,64 @@ class TestStructures(unittest.TestCase):
         self.assertAlmostEqual(float(depth[0]), 0.0, places=6)
 
 
+class TestBridgeDecks(unittest.TestCase):
+    """A deck may not sink into the ground it crosses.
+
+    A BGT bridge part is often a whole approach, and in dike country the ground
+    climbs to meet the deck at the abutment. One flat level for the part then
+    leaves the last stretch buried: a fifth of all deck geometry went under the
+    terrain over a 2 km area near Dordrecht.
+    """
+
+    class _Ramp:
+        """Ground rising steeply across the part, as an approach does."""
+
+        @staticmethod
+        def sample(x, y):
+            return 0.9 * np.atleast_1d(np.asarray(x, dtype=float))
+
+    @staticmethod
+    def _flat():
+        # Two triangles spanning x = 0 to 20, so the ramp climbs 18 m over them.
+        return np.array(
+            [
+                [[0.0, 0.0], [20.0, 0.0], [20.0, 8.0]],
+                [[0.0, 0.0], [20.0, 8.0], [0.0, 8.0]],
+            ]
+        )
+
+    def test_a_deck_over_rising_ground_is_not_buried(self):
+        from src.structures import deck_corner_heights
+
+        z = deck_corner_heights(self._flat(), level=9.0, terrain=self._Ramp(), lift=0.05)
+        corners = self._flat().reshape(-1, 2)
+        ground = self._Ramp.sample(corners[:, 0], corners[:, 1])
+        self.assertTrue(
+            (z.reshape(-1) >= ground - 1e-9).all(),
+            f"{int((z.reshape(-1) < ground - 1e-9).sum())} deck corners are under "
+            f"the ground they cross",
+        )
+
+    def test_the_span_itself_stays_flat(self):
+        """Only the ends lift. Levelling the whole part to its highest ground
+        would take a bridge over a dike and stand it on stilts."""
+        from src.structures import deck_corner_heights
+
+        z = deck_corner_heights(self._flat(), level=9.0, terrain=self._Ramp(), lift=0.05)
+        self.assertAlmostEqual(float(z.min()), 9.05, places=6)
+
+    def test_ground_below_the_deck_leaves_it_alone(self):
+        from src.structures import deck_corner_heights
+
+        class Low:
+            @staticmethod
+            def sample(x, y):
+                return np.zeros(len(np.atleast_1d(x)))
+
+        z = deck_corner_heights(self._flat(), level=9.0, terrain=Low(), lift=0.05)
+        np.testing.assert_allclose(z, 9.05)
+
+
 class TestBridgeRoads(unittest.TestCase):
     """A carriageway on a bridge has to ride its deck, not the ground."""
 
@@ -3293,6 +3351,39 @@ class TestConstrainedRefinement(unittest.TestCase):
             mesh.slivers_from_input,
             mesh.slivers_of_our_own,
             "the wedge is the input's, so most slivers should be attributed to it",
+        )
+
+    def test_the_lift_reads_how_far_the_mesh_stands_above_the_grid(self):
+        """Roads are draped on the grid and lifted to clear the mesh, and that
+        lift used to come from the mesh's worst error in either direction. Two
+        things wrong with it: a mesh dipping *below* the grid buries nothing, and
+        the worst single triangle in four square kilometres is not a statistic to
+        apply to every road in the model -- it pinned the lift to its 0.2 m cap
+        and left every carriageway floating 22 cm."""
+        self.assertLessEqual(
+            self.mesh.rise_above_grid_m,
+            self.mesh.max_error_m + 1e-9,
+            "rising above the grid cannot exceed the total error",
+        )
+        self.assertGreaterEqual(self.mesh.rise_above_grid_m, 0.0)
+
+    def test_the_allowance_covers_the_whole_triangle(self):
+        """A triangle's error is limited by the roughest ground it covers, not by
+        the ground at the point where its own error happens to peak. Reading it
+        at that point flagged 2515 triangles on a real 2 km area for a step that
+        was inside them."""
+        from src.terrain_mesh import _allowance_over, _sample, height_allowance
+
+        allowance = height_allowance(self.heights, 0.10)
+        over_all = _allowance_over(
+            self.mesh.vertices, self.mesh.triangles, allowance, self.xs, self.ys
+        )
+        at_corner = _sample(
+            allowance, self.xs, self.ys, self.mesh.vertices[self.mesh.triangles[:, 0], :2]
+        )
+        self.assertTrue(
+            (over_all >= at_corner - 1e-12).all(),
+            "the allowance across a triangle cannot be less than at a point in it",
         )
 
     def test_a_circumcentre_is_not_a_centroid(self):

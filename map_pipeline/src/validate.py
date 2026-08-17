@@ -557,15 +557,20 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
         )
         centroid = surfaces.road_tris[at_grade].mean(axis=1)
         ground = terrain.sample(centroid[:, 0], centroid[:, 1])
-        error = np.abs(centroid[:, 2] - ground)
+        # Measured against the drape, with the deliberate lift taken back off.
+        # Comparing lift plus drape against one fixed number only ever worked
+        # while the lift was 6 cm: raise it to clear a coarser terrain mesh and
+        # the check fails for the very thing that was done to satisfy it.
+        lift = float(getattr(surfaces, "road_lift_m", 0.0) or 0.0)
+        error = np.abs(centroid[:, 2] - lift - ground)
         # Generous against the 8 cm the refinement targets, so this catches a
         # broken drape rather than an unlucky triangle.
         report.add(
             "road_surface_follows_terrain",
             bool((error < 0.5).all()),
-            f"road surface sits {np.median(error):.3f} m above the ground at "
-            f"the median and never more than {error.max():.2f} m (it is lifted "
-            f"deliberately, to stop it fighting the terrain for depth)",
+            f"road surface follows the ground to {np.median(error):.3f} m at the "
+            f"median and never more than {error.max():.2f} m, over a "
+            f"{lift:.3f} m lift that keeps it from fighting the terrain for depth",
         )
 
         elevated = ~at_grade

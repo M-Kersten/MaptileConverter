@@ -482,7 +482,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             # Roads float just above the ground so the two do not fight for
             # depth. The mesh can stray from the grid the roads are draped on,
             # so the lift has to clear that or the terrain pokes through.
-            clearance = round(min(terrain.constrained.max_error_m, 0.2) + 0.02, 3)
+            #
+            # From how far the mesh *rises above* the grid, not from its worst
+            # error in either direction. A mesh dipping below the grid is hidden
+            # by whatever is laid on top and needs no clearance at all, and the
+            # worst single triangle is the wrong statistic for a number applied
+            # to every road in the model: over four square kilometres it pinned
+            # itself to the 0.2 m cap and lifted every carriageway 22 cm.
+            clearance = round(min(terrain.constrained.rise_above_grid_m, 0.2) + 0.02, 3)
             if clearance > float(config.surfaces["road_lift_m"]):
                 LOG.info(
                     "raising surfaces.road_lift_m to %.3f m to clear the "

@@ -223,6 +223,29 @@ def tunnel_depth_profile(
     return depth_m * (fraction * fraction * (3.0 - 2.0 * fraction))
 
 
+def deck_corner_heights(flat, level: float, terrain, lift: float) -> np.ndarray:
+    """A deck's height at each corner: its own level, or the ground if higher.
+
+    One height for the whole part, except where the ground rises through it. A
+    BGT bridge part is often a whole approach, and in dike country the ground
+    climbs to meet the deck at the abutment -- so a single flat level leaves the
+    last stretch buried, which put a fifth of all deck geometry under the
+    terrain over a 2 km area near Dordrecht.
+
+    Held up per corner rather than moved as a whole. Levelling the part to its
+    highest ground would take a bridge over a dike and stand it on stilts; this
+    way the span stays flat and only the ends lift, which is what an abutment
+    looks like anyway.
+    """
+    flat = np.asarray(flat, dtype=np.float64)
+    if not len(flat):
+        return np.zeros((0, 3, 1))
+    ground = np.asarray(
+        terrain.sample(flat[:, :, 0].ravel(), flat[:, :, 1].ravel()), dtype=np.float64
+    ).reshape(len(flat), 3, 1)
+    return np.maximum(np.full((len(flat), 3, 1), float(level)), ground) + float(lift)
+
+
 def build_structures(
     bbox: BBox,
     work_dir: Path,
@@ -349,7 +372,15 @@ def _build_geometry(
             measured += 1
 
         if part.kind == KIND_DECK:
-            deck = np.dstack([flat, np.full((len(flat), 3, 1), level + lift)])
+            # One height for the whole part, except where the ground rises
+            # through it. A BGT bridge part is often a whole approach, and in
+            # dike country the ground climbs to meet the deck at the abutment:
+            # a single flat level then leaves the last stretch buried, which is
+            # what put a fifth of the deck geometry under the terrain over a
+            # 2 km area near Dordrecht. Held up per corner rather than moved as
+            # a whole, so the span itself stays flat and only the ends lift --
+            # which is what an abutment looks like anyway.
+            deck = np.dstack([flat, deck_corner_heights(flat, level, terrain, lift)])
             add(deck, KIND_DECK)
             result.deck_levels.append((flat.reshape(-1, 2), level))
         else:
@@ -439,6 +470,7 @@ def save_structures(structures: StructureSet, path: Path) -> Path:
 
 __all__ = [
     "KIND_DECK",
+    "deck_corner_heights",
     "KIND_NAMES",
     "KIND_PIER",
     "KIND_TUNNEL_ROAD",

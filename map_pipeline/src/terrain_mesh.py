@@ -411,6 +411,12 @@ class ConstrainedMesh:
     # other number says the mesh has a problem.
     slivers_from_input: int = 0
     slivers_of_our_own: int = 0
+    # How far this mesh stands above the height grid that roads, rails and
+    # water are draped on. Anything laid on the grid has to clear this or the
+    # terrain pokes through it, and it is a percentile rather than a maximum on
+    # purpose: one bad triangle in four square kilometres should not lift every
+    # road in the model.
+    rise_above_grid_m: float = 0.0
 
     @property
     def vertex_count(self) -> int:
@@ -432,6 +438,7 @@ class ConstrainedMesh:
             "reachable_tolerance_m": round(float(self.reachable_tolerance_m), 4),
             "triangles_over_allowance": int(self.triangles_over_allowance),
             "breaklines_over_allowance": int(self.breaklines_over_allowance),
+            "rise_above_grid_m": round(float(self.rise_above_grid_m), 4),
             "slivers_from_input": int(self.slivers_from_input),
             "slivers_of_our_own": int(self.slivers_of_our_own),
             "refined_rounds": int(self.refined_rounds),
@@ -660,6 +667,7 @@ def build_constrained(
     sag, sagging = _edge_sag(vertices, built_from, heights, xs, ys, allowance)
     over = _over_allowance(vertices, result.triangles, heights, xs, ys, allowance)
     from_input, our_own = _count_slivers(vertices, result.triangles, built_from)
+    rise = _rise_above_grid(vertices, result.triangles, heights, xs, ys)
     # Converged means the mesh reached what it was asked for. Counting how much
     # work the last round did measures the loop, not the answer, and the tail
     # of a converging refinement is always a handful of points on a mesh of
@@ -681,6 +689,7 @@ def build_constrained(
         reachable_tolerance_m=reachable,
         slivers_from_input=from_input,
         slivers_of_our_own=our_own,
+        rise_above_grid_m=rise,
     )
     LOG.info(
         "terrain mesh: %d vertices, %d triangles, %d breakline edges, "
@@ -770,6 +779,28 @@ def _height_error(vertices, triangles, heights, xs, ys, *, want_where=False):
             where[better] = probe[better, :2]
         np.maximum(worst, gap, out=worst)
     return (worst, where) if want_where else worst
+
+
+def _allowance_over(vertices, triangles, allowance, xs, ys):
+    """The allowance across a whole triangle, not at one point in it.
+
+    A triangle's ability to follow the ground is limited by the roughest part
+    of the ground it covers, and that is not always where its own worst error
+    lands. Reading the allowance at the error's location alone flagged 2515
+    triangles on a real 2 km area for a step that was inside them.
+    """
+    if len(triangles) == 0:
+        return np.zeros(0)
+    corners = vertices[triangles]
+    best = np.zeros(len(triangles))
+    for weights in PROBES:
+        probe = (
+            weights[0] * corners[:, 0]
+            + weights[1] * corners[:, 1]
+            + weights[2] * corners[:, 2]
+        )
+        np.maximum(best, _sample(allowance, xs, ys, probe), out=best)
+    return best
 
 
 def _snap_to_grid(points, xs, ys):
@@ -1032,7 +1063,7 @@ def _refine_points(
     # of it: that is a place the ground was actually measured, so the mesh can
     # reproduce what is there. Shape is a different question and still takes the
     # circumcentre, which is the point that provably improves it.
-    allowed = _sample(allowance, xs, ys, worst_at)
+    allowed = _allowance_over(vertices, triangles, allowance, xs, ys)
     off_ground = error > allowed
     target = np.where(off_ground[:, None], _snap_to_grid(worst_at, xs, ys), centre)
     bad = off_ground | (angle < MIN_ANGLE_DEG)
@@ -1212,14 +1243,37 @@ def _count_slivers(vertices, triangles, segments):
     return int(from_input.sum()), int((slivers & ~from_input).sum())
 
 
+def _rise_above_grid(vertices, triangles, heights, xs, ys) -> float:
+    """How far the mesh stands above the grid, at the 99.9th percentile.
+
+    Signed and one-sided: only a mesh standing *above* the grid buries what is
+    draped on it, and a mesh dipping below is hidden by whatever is on top. A
+    percentile rather than a maximum because this sets a lift applied to every
+    road in the model, and taking the worst single triangle in four square
+    kilometres lifted all of them by 22 cm.
+    """
+    if len(triangles) == 0:
+        return 0.0
+    corners = vertices[triangles]
+    best = 0.0
+    for weights in PROBES:
+        probe = (
+            weights[0] * corners[:, 0]
+            + weights[1] * corners[:, 1]
+            + weights[2] * corners[:, 2]
+        )
+        truth = _bilinear(heights, xs, ys, probe[:, 0], probe[:, 1])
+        above = probe[:, 2] - truth
+        best = max(best, float(np.percentile(above, 99.9)))
+    return max(best, 0.0)
+
+
 def _over_allowance(vertices, triangles, heights, xs, ys, allowance) -> int:
     """How many triangles miss the ground by more than the ground allows."""
     if len(triangles) == 0:
         return 0
-    error, worst_at = _height_error(
-        vertices, triangles, heights, xs, ys, want_where=True
-    )
-    return int((error > _sample(allowance, xs, ys, worst_at)).sum())
+    error = _height_error(vertices, triangles, heights, xs, ys)
+    return int((error > _allowance_over(vertices, triangles, allowance, xs, ys)).sum())
 
 
 def _edge_sag(vertices, segments, heights, xs, ys, allowance=None):

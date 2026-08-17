@@ -168,6 +168,9 @@ class SurfaceSet:
     )
     # BGT level per road triangle, so a check can tell a carriageway that
     # should hug the ground from one riding a bridge deck.
+    # The deliberate lift the roads were given, so anything judging the drape
+    # can take it back off rather than counting it as error.
+    road_lift_m: float = 0.06
     road_tri_level: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int32)
     )
@@ -467,6 +470,7 @@ def build_surfaces(
         result.water_bed = np.flipud(bed)
 
     if result.roads:
+        result.road_lift_m = float(surfaces_cfg.get("road_lift_m", 0.06))
         (
             result.road_tris,
             result.road_tri_class,
@@ -474,7 +478,7 @@ def build_surfaces(
         ) = triangulate_roads(
             result.roads,
             terrain.sample,
-            lift_m=float(surfaces_cfg.get("road_lift_m", 0.06)),
+            lift_m=result.road_lift_m,
             tolerance_m=float(surfaces_cfg.get("road_drape_tolerance_m", 0.08)),
             deck_sampler=deck_sampler,
         )
@@ -845,6 +849,7 @@ def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
         road_tris=surfaces.road_tris,
         road_tri_class=surfaces.road_tri_class,
         road_tri_level=surfaces.road_tri_level,
+        road_lift_m=surfaces.road_lift_m,
         class_grid=(
             surfaces.class_grid
             if surfaces.class_grid is not None

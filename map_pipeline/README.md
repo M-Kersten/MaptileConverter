@@ -566,6 +566,11 @@ missing the tolerance by a factor of five**. Refinement also now stops at any
 triangle already smaller than one grid cell, because everything inside a cell is
 the interpolation's opinion rather than a measurement.
 
+The allowance is read across a **whole triangle**, not at the point where its
+own error happens to peak: a triangle's ability to follow the ground is limited
+by the roughest ground it covers, and reading it at one point flagged 2515
+triangles on a 2 km area for a step that was inside them.
+
 Two more things are reported honestly rather than blamed on the mesh:
 
 * **Where a point should go.** A triangle off the ground now takes the *grid
@@ -593,8 +598,16 @@ Measured over one synthetic Dutch area, before and after all of the above:
 
 **Roads still float above it.** They are separate objects with their own
 materials, and they share the terrain's edges rather than being part of it, so
-the 6 cm lift is raised just enough to clear how far the mesh strays from the
-grid the roads were draped on.
+the 6 cm lift is raised just enough to clear how far the mesh *rises above* the
+grid the roads were draped on — a one-sided 99.9th percentile, not the worst
+error in either direction. Both halves of that matter: a mesh dipping below the
+grid buries nothing and needs no clearance, and the worst single triangle is not
+a statistic to apply to every road in a model. Taking the maximum pinned the
+lift to its 0.2 m cap over 4 km² and left every carriageway floating 22 cm.
+
+This is a mitigation, not a cure. The real fix is to drape roads, rails and
+water on the terrain mesh itself rather than on the grid, so the two agree by
+construction and the lift can go back to 6 cm.
 
 ## Adaptive terrain mesh (no breaklines)
 
