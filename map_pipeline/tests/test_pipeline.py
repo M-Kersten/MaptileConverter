@@ -3398,6 +3398,55 @@ class TestConstrainedRefinement(unittest.TestCase):
         self.assertAlmostEqual(float(radius[0]), 2.5)
 
 
+class TestBuiltAsPlanned(unittest.TestCase):
+    """The check that reads the model rather than the plan.
+
+    It exists because a run once shipped the plain grid while every terrain
+    check passed, all of them reading the in-memory object and none the file.
+    It then failed a perfect model, because it was written when a terrain was
+    always triangles and it asserted that no quad existed.
+    """
+
+    def _run(self, built, intended_triangles):
+        import json
+        import tempfile
+
+        from src.validate import CheckReport, check_built_terrain
+
+        class Mesh:
+            triangle_count = intended_triangles
+
+        class Terrain:
+            constrained = Mesh()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "blender_summary.json").write_text(json.dumps({"terrain": built}))
+            report = CheckReport()
+            check_built_terrain(report, work, Terrain())
+        return {c.name: c for c in report.checks}
+
+    def test_the_numbers_from_the_two_kilometre_run(self):
+        """A quad is two triangles fused, so this model was exactly right."""
+        checks = self._run(
+            {"triangles": 540424, "quads": 1031304}, 2603032
+        )
+        self.assertEqual(540424 + 2 * 1031304, 2603032)
+        self.assertTrue(
+            checks["terrain_built_as_planned"].passed,
+            checks["terrain_built_as_planned"].detail,
+        )
+
+    def test_plain_triangles_still_count(self):
+        checks = self._run({"triangles": 1000, "quads": 0}, 1000)
+        self.assertTrue(checks["terrain_built_as_planned"].passed)
+
+    def test_a_model_that_is_not_the_mesh_still_fails(self):
+        """What the check was written for: the run that shipped the grid."""
+        checks = self._run({"triangles": 0, "quads": 65536}, 2603032)
+        self.assertFalse(checks["terrain_built_as_planned"].passed)
+
+
 class TestQuadPairing(unittest.TestCase):
     """Quads for an editor, without giving up anything the triangles earned.
 
@@ -3651,6 +3700,61 @@ class TestSurfaceRegions(unittest.TestCase):
         self.assertIn('mesh.attributes.new("surface_class", "INT", "FACE")', source)
         self.assertIn("obj.vertex_groups.new", source)
         self.assertIn("use_edge_sharp", source)
+
+
+class TestRoadDrape(unittest.TestCase):
+    """A road follows the ground as closely as the ground allows, no closer."""
+
+    def test_it_stops_cutting_below_the_sample_spacing(self):
+        """Without a floor the drape chases a step it cannot resolve, and 12
+        rounds was not enough for a long street over a 1 m grid either -- one
+        carriageway came out 0.82 m off the ground it was draped on."""
+        from src.surfaces import drape_to_terrain
+
+        # A hard step in the middle, as a quay wall is.
+        def sampler(x, y):
+            return np.where(np.atleast_1d(np.asarray(x, dtype=float)) > 50.0, 2.0, 0.0)
+
+        big = np.array([[[0.0, 0.0], [100.0, 0.0], [0.0, 40.0]]])
+        floored = drape_to_terrain(big, sampler, tolerance_m=0.08, min_edge_m=1.0)
+        unfloored = drape_to_terrain(big, sampler, tolerance_m=0.08, min_edge_m=0.0)
+        self.assertLess(
+            len(floored),
+            len(unfloored),
+            "the floor did not stop the drape cutting into the interpolation",
+        )
+        self.assertGreater(len(floored), 1, "it did not refine at all")
+
+    def test_smooth_ground_is_followed_closely(self):
+        """The floor must not become an excuse: where the ground is smooth the
+        drape still has to land on it."""
+        from src.surfaces import drape_to_terrain
+
+        def sampler(x, y):
+            return 0.01 * np.atleast_1d(np.asarray(x, dtype=float))
+
+        tris = np.array([[[0.0, 0.0], [100.0, 0.0], [0.0, 40.0]]])
+        draped = drape_to_terrain(tris, sampler, tolerance_m=0.08, min_edge_m=1.0)
+        centre = draped.mean(axis=1)
+        truth = sampler(centre[:, 0], centre[:, 1])
+        self.assertLess(float(np.abs(centre[:, 2] - truth).max()), 0.09)
+
+    def test_the_check_allows_what_the_ground_forces(self):
+        """The failure reported from a 2 km run: median error 22 mm, one
+        triangle over a wall at 0.82 m, judged against a flat 0.5 m."""
+        from src.validate import _ground_allowance
+
+        class Terrain:
+            xs = np.linspace(0.0, 100.0, 101)
+            ys = np.linspace(0.0, 100.0, 101)
+            heights = np.zeros((101, 101))
+
+        Terrain.heights[:, 50:] = 1.8   # a 1.8 m wall
+
+        at_wall = _ground_allowance(Terrain, np.array([[50.0, 50.0]]), floor_m=0.5)
+        on_flat = _ground_allowance(Terrain, np.array([[10.0, 10.0]]), floor_m=0.5)
+        self.assertGreater(float(at_wall[0]), 0.82, "0.82 m over a 1.8 m wall failed")
+        self.assertAlmostEqual(float(on_flat[0]), 0.5, places=6)
 
 
 class TestFeatureFilter(unittest.TestCase):

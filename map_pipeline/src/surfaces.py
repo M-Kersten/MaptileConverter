@@ -480,6 +480,12 @@ def build_surfaces(
             terrain.sample,
             lift_m=result.road_lift_m,
             tolerance_m=float(surfaces_cfg.get("road_drape_tolerance_m", 0.08)),
+            # One cell of the height grid: nothing below that is measured.
+            min_edge_m=(
+                float(abs(terrain.xs[1] - terrain.xs[0]))
+                if getattr(terrain, "xs", None) is not None and len(terrain.xs) > 1
+                else 0.0
+            ),
             deck_sampler=deck_sampler,
         )
         on_bridges = sum(1 for part in result.roads if part.level > 0)
@@ -589,10 +595,17 @@ def drape_to_terrain(
     sampler,
     *,
     tolerance_m: float = 0.08,
-    # Twelve rather than six: because only the triangles still over tolerance
-    # are split, the extra rounds cost 0.6% more geometry and clear the last
-    # 79 offenders, taking the worst error from 47 cm to the tolerance itself.
-    max_rounds: int = 12,
+    # A floor on how small a road triangle is worth cutting: the spacing the
+    # ground was sampled at. Below one cell the surface under it is the
+    # interpolation's opinion rather than a measurement, so splitting further
+    # buys nothing and the loop would only be chasing a step it cannot resolve.
+    min_edge_m: float = 0.0,
+    # Twenty rather than twelve. With a floor to stop at, extra rounds are free
+    # where nothing needs them -- only triangles still over tolerance are cut --
+    # and twelve was not enough for a long street over a 1 m height grid, which
+    # needs about fourteen halvings to get from a 100 m span down to a cell.
+    # That left one carriageway 0.82 m off the ground it was draped on.
+    max_rounds: int = 20,
 ) -> np.ndarray:
     """Give flat triangles a Z that follows the ground under them.
 
@@ -623,6 +636,22 @@ def drape_to_terrain(
         error = np.abs(corner_z.mean(axis=1) - sampler(centroid[:, 0], centroid[:, 1]))
 
         split = error > tolerance_m
+        if min_edge_m > 0:
+            longest = np.max(
+                np.stack(
+                    [
+                        np.hypot(
+                            *(
+                                triangles[:, (i + 1) % 3, :2]
+                                - triangles[:, i, :2]
+                            ).T
+                        )
+                        for i in range(3)
+                    ]
+                ),
+                axis=0,
+            )
+            split &= longest > min_edge_m
         if not split.any():
             break
         triangles = np.concatenate(
@@ -681,6 +710,7 @@ def triangulate_roads(
     *,
     lift_m: float = 0.06,
     tolerance_m: float = 0.08,
+    min_edge_m: float = 0.0,
     deck_sampler=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Road polygons into ``(triangles, surface class)``, draped on the ground.
@@ -733,7 +763,8 @@ def triangulate_roads(
         if not on_ground.any():
             continue
         draped = drape_to_terrain(
-            all_tris[on_ground], sampler, tolerance_m=tolerance_m
+            all_tris[on_ground], sampler, tolerance_m=tolerance_m,
+            min_edge_m=min_edge_m,
         )
         if len(draped):
             draped[:, :, 2] += lift_m
@@ -765,7 +796,10 @@ def triangulate_roads(
                 # than hoist it to whatever the lidar happened to hit —
                 # flattening it to the ground's median instead put half of it
                 # under the ground it was supposed to be crossing.
-                draped = drape_to_terrain(corners, sampler, tolerance_m=tolerance_m)
+                draped = drape_to_terrain(
+                    corners, sampler, tolerance_m=tolerance_m,
+                    min_edge_m=min_edge_m,
+                )
                 if not len(draped):
                     continue
                 draped[:, :, 2] += lift_m

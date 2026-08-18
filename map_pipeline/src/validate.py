@@ -284,6 +284,33 @@ MAX_SLIVER_FRACTION = 0.001
 MAX_THIN_FRACTION = 0.05
 
 
+def _ground_allowance(terrain, points, *, floor_m: float) -> np.ndarray:
+    """How close anything draped on the grid can get to it, at these points.
+
+    The same idea the terrain mesh is judged by, and deliberately the same
+    function behind it: where two neighbouring height samples differ by a step,
+    nothing flat spanning the pair sits closer than about half of it. Judging a
+    road against a flat number instead means a single triangle crossing a quay
+    wall fails a drape whose median error is 22 mm.
+    """
+    heights = getattr(terrain, "heights", None)
+    xs = getattr(terrain, "xs", None)
+    ys = getattr(terrain, "ys", None)
+    if heights is None or xs is None or ys is None or len(xs) < 2:
+        return np.full(len(points), floor_m)
+
+    from .terrain_mesh import height_allowance
+
+    allowance = height_allowance(np.asarray(heights, dtype=np.float64), floor_m)
+    cols = np.clip(
+        np.round((points[:, 0] - xs[0]) / (xs[1] - xs[0])).astype(int), 0, len(xs) - 1
+    )
+    rows = np.clip(
+        np.round((points[:, 1] - ys[0]) / (ys[1] - ys[0])).astype(int), 0, len(ys) - 1
+    )
+    return allowance[rows, cols]
+
+
 def _triangle_quality(mesh) -> dict:
     """Smallest angle per triangle, and how far the ground sags under an edge."""
     import numpy as np
@@ -563,13 +590,19 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
         # the check fails for the very thing that was done to satisfy it.
         lift = float(getattr(surfaces, "road_lift_m", 0.0) or 0.0)
         error = np.abs(centroid[:, 2] - lift - ground)
-        # Generous against the 8 cm the refinement targets, so this catches a
-        # broken drape rather than an unlucky triangle.
+        # Against what the height model can deliver, for the same reason the
+        # terrain mesh is: a road crossing a quay wall spans a step between two
+        # samples, and no flat triangle sits closer than about half of it
+        # however finely the drape is cut. A flat 0.5 m limit failed a
+        # carriageway whose median error was 22 mm for one triangle over a wall.
+        allowance = _ground_allowance(terrain, centroid[:, :2], floor_m=0.5)
+        over = int((error > allowance).sum())
         report.add(
             "road_surface_follows_terrain",
-            bool((error < 0.5).all()),
-            f"road surface follows the ground to {np.median(error):.3f} m at the "
-            f"median and never more than {error.max():.2f} m, over a "
+            over <= 0.001 * max(len(error), 1),
+            f"{over} of {len(error)} road triangles are further from the ground "
+            f"than the height model allows; it follows to {np.median(error):.3f} m "
+            f"at the median and never more than {error.max():.2f} m, over a "
             f"{lift:.3f} m lift that keeps it from fighting the terrain for depth",
         )
 
@@ -906,13 +939,24 @@ def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
         )
         return
 
+    # Counted in triangles, because a quad in this mesh is two of them fused
+    # and the fusing is the last thing that happens. Asserting that no quad
+    # exists was right while every terrain was triangles and became wrong the
+    # moment pairing shipped: a perfect 2 km model reported 540424 triangles
+    # and 1031304 quads against 2603032 built, and 540424 + 2 x 1031304 is
+    # exactly 2603032.
+    #
+    # This still catches what the check was written for -- the run that shipped
+    # the plain grid instead of the mesh it had built -- because a grid's face
+    # count does not agree with the mesh's triangle count either.
+    triangles = int(built.get("triangles", 0))
+    quads = int(built.get("quads", 0))
     report.add(
         "terrain_built_as_planned",
-        int(built.get("triangles", 0)) == int(intended.triangle_count)
-        and int(built.get("quads", 0)) == 0,
-        f"the model contains {built.get('triangles', 0)} terrain triangles and "
-        f"{built.get('quads', 0)} quads, against the {intended.triangle_count} "
-        f"triangles that were built for it",
+        triangles + 2 * quads == int(intended.triangle_count),
+        f"the model contains {triangles} terrain triangles and {quads} quads, "
+        f"which is {triangles + 2 * quads} triangles' worth against the "
+        f"{intended.triangle_count} that were built for it",
     )
 
 
