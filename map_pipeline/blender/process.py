@@ -360,7 +360,11 @@ def build_roads(scene: dict, work_dir: Path, make_material):
         part = local[classes == code]
         if not len(part):
             continue
-        corners = part.reshape(-1, 3)
+        # Welded, so the road arrives indexed. Every triangle used to carry its
+        # own three corners, which is three times the vertex buffer with no
+        # reuse at all -- and no shared normals, so an engine cannot smooth the
+        # surface even where it should be smooth.
+        corners, indices = _weld_corners(part.reshape(-1, 3))
         n_triangles = len(part)
         label = str(names.get(str(code), f"class_{code}"))
         # The class names already say "road_asphalt", and Roads_road_asphalt
@@ -372,20 +376,33 @@ def build_roads(scene: dict, work_dir: Path, make_material):
             build_mesh_object(
                 f"Roads_{label}",
                 corners,
-                np.arange(n_triangles * 3),
+                indices,
                 np.arange(0, n_triangles * 3, 3),
                 np.full(n_triangles, 3),
                 # The same top-down projection the terrain uses, so the photo
                 # lines up across the join.
-                planar_uv(corners[:, :2], scene["aerial"]["bbox_local"]),
+                planar_uv(corners[indices][:, :2], scene["aerial"]["bbox_local"]),
                 np.zeros(n_triangles),
                 [make_material(f"M_road_{label}")],
                 shade_smooth=False,
             )
         )
-        log(f"roads: {label}, {n_triangles} triangles")
+        log(
+            f"roads: {label}, {n_triangles} triangles, {len(corners)} vertices "
+            f"({n_triangles * 3 / max(len(corners), 1):.1f}x reuse)"
+        )
 
     return objects
+
+
+def _weld_corners(corners, tolerance=1e-4):
+    """Merge corners that are the same point, returning points plus indices."""
+    quantised = np.round(corners / tolerance).astype(np.int64)
+    _, first, inverse = np.unique(
+        quantised, axis=0, return_index=True, return_inverse=True
+    )
+    order = np.argsort(np.argsort(first))
+    return corners[np.sort(first)], order[inverse.ravel()].astype(np.int64)
 
 
 def _build_terrain_mesh(
@@ -1399,7 +1416,11 @@ def build_structures(scene: dict, work_dir: Path, material):
         part = local[kinds == code]
         if not len(part):
             continue
-        corners = part.reshape(-1, 3)
+        # Welded, so the road arrives indexed. Every triangle used to carry its
+        # own three corners, which is three times the vertex buffer with no
+        # reuse at all -- and no shared normals, so an engine cannot smooth the
+        # surface even where it should be smooth.
+        corners, indices = _weld_corners(part.reshape(-1, 3))
         n_triangles = len(part)
         label = str(names.get(str(code), f"kind_{code}"))
 

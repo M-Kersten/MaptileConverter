@@ -791,23 +791,94 @@ pixel-identical to what it replaced — including road markings and crossings,
 which a tiling texture would lose. The point of the split is that the material
 is now yours to replace.
 
-Two details make it work:
+**The road surface floats 6 cm above the terrain**, so the two do not fight for
+the same depth. That is safe here and only here: the terrain sits directly
+underneath wearing the same photograph, so any gap shows the ground rather than
+a hole.
 
-- **The road surface is draped, not flat.** Earcut turns a road strip into long
-  slivers — a quarter of the edges over Utrecht are longer than 10 m and the
-  longest is 163 m — and sampling the ground only at their corners left one
-  cutting through a canal bank by 1.86 m. Triangles are now split until a flat
-  one no longer misses the ground beneath it, testing the error at the centroid
-  where a plane through the corners is exactly their mean. It is adaptive, not
-  uniform: flat streets stay coarse and only slopes get subdivided, which costs
-  9% more geometry rather than several times as much, and takes 0.2 s. The worst
-  error over the demo area drops from 1.86 m to the 8 cm tolerance. A check
-  asserts it.
-- **It floats 6 cm above the terrain**, so the two do not fight for the same
-  depth. Splitting one triangle and not its neighbour leaves a hanging node and
-  so a crack no wider than the tolerance, which is harmless here and only here:
-  the terrain sits directly underneath wearing the same photograph, so a crack
-  shows the ground rather than a hole.
+### Road topology
+
+The roads were correct and unusable. Correct in that they covered the right
+ground; unusable in that no engine wants that mesh. Four things were wrong and
+they compounded:
+
+- **Nothing was simplified.** BGT surveys a kerb to the centimetre, so a
+  straight street arrived carrying a vertex every few centimetres.
+- **Earcut fans a strip into slivers**, and that is not a consequence of the
+  dense input — hand it a clean 280 m rectangle and it still returns two
+  triangles 35 times longer than they are wide.
+- **Refinement cut single triangles**, leaving T-junctions: a crack and a
+  shading seam in any engine that welds normals.
+- **Nothing was indexed.** Every triangle carried its own three corners.
+
+The replacement (`src/roadmesh.py`) simplifies the rings as a *network*, so a
+kerb two road parts share is thinned once and they stay welded; triangulates
+with the same constrained Delaunay code the terrain uses, so the outline
+survives as edges; refines by inserting points rather than cutting triangles,
+so the result stays conforming; and comes out indexed. Over one square
+kilometre of Utrecht centre, 1,864 road parts at grade:
+
+| | earcut | now |
+|---|---|---|
+| triangles | 70,803 | 82,239 |
+| vertex buffer | 212,409 | 66,458 |
+| smallest angle, median | 1.5° | 35.4° |
+| faces under 10° | 82.2% | 1.2% |
+| thinnest face | 0.000° | 0.117° |
+| non-manifold edges | — | 0 |
+| surface area | 311,746 m² | 311,727 m² |
+
+It is not fewer triangles, and it was never going to be: a footpath 2.7 m wide
+cannot be covered in 12 m faces whatever you do. It is a third of the vertices
+and a mesh whose faces are shaped like faces.
+
+**Two things about the refinement are worth knowing before touching it**,
+because both were got wrong first and the pair of them made the mesh worse than
+no refinement at all. Nothing stopped a candidate point being inserted right
+beside a kerb — and since the triangulator may not flip across a constraint,
+such a point cannot improve the triangle there, it only wedges a thinner sliver
+against the kerb. Meanwhile a circumcentre landing outside the road was replaced
+by the triangle's centroid, which for a triangle lying along a kerb is a hair
+off that kerb: it manufactured exactly the points the first fault could not cope
+with. Each round laid new slivers for the next round to chase.
+
+| footpath network, 18,731 triangles unrefined | after | median | under 10° |
+|---|---|---|---|
+| both faults | 233,807 | 22.6° | 33.0% |
+| no encroachment split only | 43,849 | 26.6° | 21.1% |
+| centroid fallback only | 53,105 | 35.1° | 0.9% |
+| neither | 51,240 | 35.1° | 1.2% |
+
+The fix that matters is Ruppert's rule: a candidate inside a kerb segment's
+diametral circle is dropped and the kerb halved in its place. That is also what
+made the pass that used to chop every kerb to the face size redundant, and
+removing it saved 1,499 triangles and nine seconds.
+
+**Two BGT parts that share a kerb have both drawn it**, and the two drawings
+rarely agree to the millimetre. Where they disagree by more than the 5 mm weld
+the vertices do not merge and the pair becomes a ribbon of triangles a few
+millimetres tall — 691 of them under a hundredth of a degree over one square
+kilometre, with a median height of exactly the weld tolerance. Welding cannot
+fix it, because those vertices are near each other's *edges*, not near each
+other's *vertices*. `road_snap_m` bends a kerb by up to 5 cm to meet a vertex
+that all but lies on it, which removes four fifths of them. Not more than 5 cm:
+at 10 cm a bent kerb starts crossing its neighbour.
+
+What is left is 82 faces under a degree out of 82,239, and they are the survey's
+own — two streets meeting at a very acute angle is a wedge no triangulation
+improves.
+
+**The surface is draped, not flat.** Sampling the ground only at the corners of
+a long face left one cutting through a canal bank by 1.86 m. A face whose middle
+misses the ground by more than the tolerance is refined like any other, at the
+same time and by the same mechanism, so the drape costs no separate pass and
+leaves no hanging nodes. The worst error over the demo area is the 8 cm
+tolerance. A check asserts it.
+
+Two settings are on the **Terrain and road shape** panel: *Road outlines* is how
+far a simplified kerb may move (`road_simplify_m`, 25 cm), and *Road face size*
+is the size a face aims for (`road_max_edge_m`, 12 m). `road_min_angle_deg`
+(22°) and `road_snap_m` (5 cm) are config-only.
 
 Tunnels (`relatieve_hoogteligging` below zero) are left out — a tunnel drawn on
 the surface is simply wrong. Bridges are kept, because the DTM under a canal is

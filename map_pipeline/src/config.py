@@ -201,6 +201,22 @@ DEFAULTS: dict[str, Any] = {
         # gets split. Earcut leaves slivers over 100 m long, and one that size
         # cuts straight through a canal bank.
         "road_drape_tolerance_m": 0.08,
+        # How far a simplified kerb may move. BGT surveys to the centimetre, so
+        # a straight street arrives carrying a vertex every few centimetres and
+        # every one of them used to become geometry.
+        "road_simplify_m": 0.25,
+        # The size a road face aims for. Also what the kerb is cut at, because a
+        # constrained edge cannot be crossed: a 280 m kerb left as one segment
+        # forces every triangle along it to span the whole street.
+        "road_max_edge_m": 12.0,
+        # Refinement stops chasing shape here. A road outline has sharp corners
+        # where two streets meet and no triangulation improves those.
+        "road_min_angle_deg": 22.0,
+        # How far a kerb may be bent onto a vertex that all but lies on it.
+        # Two BGT parts sharing a kerb have both drawn it, and where the two
+        # drawings disagree by a few millimetres the pair becomes a ribbon of
+        # near-zero triangles that welding cannot see.
+        "road_snap_m": 0.05,
         # How far the bed is sunk below the water surface.
         "water_depth_m": 1.2,
         # Grain mixed into the aerial per surface class, to counter how mushy

@@ -341,6 +341,12 @@ def build_config(payload: dict) -> dict:
         "vehicles": {
             "car_occupancy": float(payload.get("car_occupancy", 0.72)),
         },
+        "surfaces": {
+            # Road topology. These decide what the carriageway is like to use
+            # in an engine, not how accurate it is.
+            "road_simplify_m": float(payload.get("road_simplify_m", 0.25)),
+            "road_max_edge_m": float(payload.get("road_max_edge_m", 12.0)),
+        },
     }
 
     # Optional sources come as a list of ids from the sources panel. Older

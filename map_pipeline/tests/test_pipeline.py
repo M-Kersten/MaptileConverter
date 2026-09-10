@@ -3702,6 +3702,434 @@ class TestSurfaceRegions(unittest.TestCase):
         self.assertIn("use_edge_sharp", source)
 
 
+class TestRoadTopology(unittest.TestCase):
+    """The road surface has to be usable in an engine, not merely correct.
+
+    Four things were wrong and they compounded: nothing was simplified, so a
+    surveyed kerb put a vertex every few centimetres into the model; earcut
+    fanned a strip into slivers, a third of them under one degree; refinement
+    cut single triangles and left hanging nodes; and nothing was indexed, so
+    every triangle carried its own three corners.
+    """
+
+    @staticmethod
+    def _street(x0, y0, x1, y1, width, seed=5):
+        rng = np.random.default_rng(seed)
+        length = np.hypot(x1 - x0, y1 - y0)
+        n = max(4, int(length / 0.05))          # surveyed every 5 cm
+        t = np.linspace(0, 1, n)
+        cx, cy = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+        dx, dy = (x1 - x0) / length, (y1 - y0) / length
+        nx, ny = -dy, dx
+        w = width / 2 + rng.normal(0, 0.01, n)
+        left = np.column_stack([cx + nx * w, cy + ny * w])
+        right = np.column_stack([cx - nx * w, cy - ny * w])[::-1]
+        return np.vstack([left, right, left[:1]])
+
+    @staticmethod
+    def _angles(points, triangles):
+        q = points[triangles]
+        out = []
+        for i in range(3):
+            u = q[:, (i + 1) % 3] - q[:, i]
+            v = q[:, (i + 2) % 3] - q[:, i]
+            cos = (u * v).sum(1) / np.maximum(
+                np.hypot(*u.T) * np.hypot(*v.T), 1e-30
+            )
+            out.append(np.degrees(np.arccos(np.clip(cos, -1, 1))))
+        return np.min(np.stack(out), axis=0)
+
+    def test_a_straight_street_is_not_a_fan_of_slivers(self):
+        """Earcut gave a 280 m street two triangles 35 times longer than they
+        were wide, and that is not a consequence of the dense input -- it does
+        the same to a clean rectangle."""
+        from src.roadmesh import build_road_mesh
+
+        ring = self._street(10, 100, 290, 100, 8.0)
+        points, triangles = build_road_mesh([[ring]], simplify_m=0.25,
+                                            max_edge_m=12.0)
+        smallest = self._angles(points, triangles)
+        self.assertGreater(len(triangles), 4)
+        self.assertGreater(
+            float(np.median(smallest)), 30.0,
+            f"median smallest angle is {np.median(smallest):.1f} degrees",
+        )
+        self.assertEqual(
+            int((smallest < 20.0).sum()), 0, "a clean street should have no wedges"
+        )
+
+    def test_the_kerb_keeps_its_shape(self):
+        """Simplification may thin a road; it may not move it."""
+        from src.roadmesh import build_road_mesh
+
+        ring = self._street(10, 100, 290, 100, 8.0)
+        points, triangles = build_road_mesh([[ring]], simplify_m=0.25,
+                                            max_edge_m=12.0)
+        q = points[triangles]
+        area = 0.5 * np.abs(
+            (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
+            - (q[:, 1, 1] - q[:, 0, 1]) * (q[:, 2, 0] - q[:, 0, 0])
+        ).sum()
+        self.assertAlmostEqual(area / (280.0 * 8.0), 1.0, delta=0.02)
+
+    def test_two_parts_that_meet_still_cover_their_own_area(self):
+        """Checked against the real number, not merely against itself.
+
+        Even-odd applied across parts punches a hole wherever two of them
+        overlap, and crossing constraints dropped rather than split leave the
+        outline open so the inside test keeps whatever it likes. Both faults
+        are invisible to a test that only asks whether the answer is stable,
+        because both are perfectly stable wrong answers.
+        """
+        from src.roadmesh import build_road_mesh
+
+        # Exact rectangles, so the answer is exact and a hole the size of the
+        # crossing cannot hide inside a survey wobble and a loose tolerance.
+        # Wide ones, so that hole is 13% of the total rather than 1%.
+        def rect(x0, y0, x1, y1):
+            return np.array(
+                [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=float
+            )
+
+        groups = [[rect(10, 90, 290, 110)], [rect(140, 10, 160, 290)]]
+        # The union counts the 20 x 20 crossing once, not twice and not zero
+        # times: 280x20 + 280x20 - 20x20.
+        want = 280.0 * 20.0 * 2 - 20.0 * 20.0
+
+        for max_edge in (6.0, 12.0, 25.0):
+            points, triangles = build_road_mesh(groups, simplify_m=0.25,
+                                                max_edge_m=max_edge)
+            q = points[triangles]
+            area = 0.5 * np.abs(
+                (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
+                - (q[:, 1, 1] - q[:, 0, 1]) * (q[:, 2, 0] - q[:, 0, 0])
+            ).sum()
+            self.assertAlmostEqual(
+                area / want, 1.0, delta=0.005,
+                msg=f"{area:.0f} m2 against {want:.0f} at a {max_edge} m face",
+            )
+
+    def test_a_shared_kerb_is_not_pulled_apart(self):
+        """Road parts are a planar partition, and a gap between two copies of
+        one kerb is a stripe of ground showing through the road.
+
+        The fixture is a T-junction on purpose. Handing two parts the *same*
+        run and reversing one proves nothing, because Douglas-Peucker is
+        symmetric end to end and gives the identical answer either way -- a
+        first version of this test did that and passed with the network logic
+        torn out. What breaks it is a junction part way along a run: that point
+        is a ring corner for one part and an ordinary vertex on a smooth curve
+        for the other, so anchored per ring the two are thinned differently.
+        """
+        from src.roadmesh import simplify_ring_network
+
+        # A kerb, surveyed once and shared by three parts: one long one on the
+        # south side, two short ones meeting half way along it on the north.
+        t = np.linspace(0.0, 1.0, 600)
+        kerb = np.column_stack(
+            [10.0 + 280.0 * t, 100.0 + 4.0 * np.sin(t * 5.0) + 0.4 * np.sin(t * 33.0)]
+        )
+        south = np.vstack([kerb, [[290.0, 80.0], [10.0, 80.0]], kerb[:1]])
+        half = len(kerb) // 2
+        north = []
+        for piece in (kerb[: half + 1], kerb[half:]):
+            north.append(
+                np.vstack(
+                    [piece, [[piece[-1, 0], 120.0], [piece[0, 0], 120.0]], piece[:1]]
+                )
+            )
+
+        thinned, _ = simplify_ring_network([south, *north], 0.25)
+        self.assertEqual(len(thinned), 3)
+
+        # Compared with each other, not with the kerb. Douglas-Peucker only ever
+        # keeps vertices it was given, so "is this point on the surveyed kerb"
+        # is true however badly the two copies disagree -- an earlier version of
+        # this test asserted exactly that and passed with the network logic torn
+        # out. What matters is that both parts kept the *same* ones.
+        def on_shared_run(ring):
+            picked = ring[
+                (ring[:, 1] > 90.0) & (ring[:, 1] < 110.0)
+                & (ring[:, 0] >= kerb[0, 0] - 1e-9)
+                & (ring[:, 0] <= kerb[half, 0] + 1e-9)
+            ]
+            return {tuple(np.round(p, 6)) for p in picked}
+
+        south_run = on_shared_run(thinned[0])
+        north_run = on_shared_run(thinned[1])
+        self.assertGreater(len(south_run), 3, "nothing was kept to compare")
+        self.assertEqual(
+            south_run,
+            north_run,
+            f"the two parts kept different vertices along one kerb: "
+            f"{len(south_run ^ north_run)} differ",
+        )
+
+    def test_the_result_is_conforming(self):
+        """Splitting one triangle and not its neighbour leaves a T-junction,
+        which is a crack and a shading seam. Inserting points cannot."""
+        from collections import defaultdict
+
+        from src.roadmesh import build_road_mesh
+
+        ring = self._street(10, 100, 290, 100, 8.0)
+        points, triangles = build_road_mesh(
+            [[ring]], simplify_m=0.25, max_edge_m=8.0,
+            sampler=lambda x, y: 0.3 * np.atleast_1d(np.asarray(x, float)),
+        )
+        seen = defaultdict(int)
+        for tri in triangles:
+            for i in range(3):
+                a, b = int(tri[i]), int(tri[(i + 1) % 3])
+                seen[(min(a, b), max(a, b))] += 1
+        self.assertEqual(
+            [v for v in seen.values() if v > 2], [], "non-manifold edge"
+        )
+
+    def test_it_is_indexed_when_it_reaches_blender(self):
+        """Every triangle used to carry its own three corners: three times the
+        vertex buffer, no reuse, and no shared normals."""
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text()
+        self.assertIn("_weld_corners", source)
+        body = re.search(
+            r"def _weld_corners.*?return corners\[np\.sort\(first\)\], "
+            r"order\[inverse\.ravel\(\)\]\.astype\(np\.int64\)",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(body, "the weld helper moved")
+        namespace = {"np": np}
+        exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
+
+        # Two triangles sharing an edge, handed over as six loose corners.
+        corners = np.array(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+            dtype=float,
+        )
+        points, indices = namespace["_weld_corners"](corners)
+        self.assertEqual(len(points), 4)
+        self.assertTrue(
+            np.allclose(points[indices], corners), "welding moved a corner"
+        )
+
+    def test_the_outline_really_is_the_edge_of_the_mesh(self):
+        """Where two parts cross, their kerbs cross too, and no triangulation
+        can honour two constraints that cross -- so one gets dropped. Silently.
+        The area still comes out right, because the inside test reads the rings
+        rather than the mesh, so nothing notices until you look at the model and
+        find the road's edge cutting across its own corner.
+        """
+        from collections import defaultdict
+
+        from src.roadmesh import build_road_mesh
+
+        def rect(x0, y0, x1, y1):
+            return np.array(
+                [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=float
+            )
+
+        rings = [rect(10, 90, 290, 110), rect(140, 10, 160, 290)]
+        points, triangles = build_road_mesh(
+            [[rings[0]], [rings[1]]], simplify_m=0.25, max_edge_m=12.0
+        )
+
+        used = defaultdict(int)
+        for tri in triangles:
+            for i in range(3):
+                a, b = int(tri[i]), int(tri[(i + 1) % 3])
+                used[(min(a, b), max(a, b))] += 1
+        boundary = [e for e, n in used.items() if n == 1]
+        self.assertGreater(len(boundary), 8)
+
+        def distance_to_rings(point):
+            best = np.inf
+            for ring in rings:
+                a, b = ring[:-1], ring[1:]
+                d = b - a
+                length2 = np.maximum((d * d).sum(axis=1), 1e-12)
+                t = np.clip(((point - a) * d).sum(axis=1) / length2, 0.0, 1.0)
+                foot = a + t[:, None] * d
+                best = min(best, float(np.hypot(*(point - foot).T).min()))
+            return best
+
+        for a, b in boundary:
+            middle = 0.5 * (points[a] + points[b])
+            self.assertLess(
+                distance_to_rings(middle), 0.5,
+                f"the mesh has an edge at {middle} that is not on any kerb",
+            )
+
+    def test_a_coarser_setting_never_costs_more_faces(self):
+        """A face size coarser than the road is wide leaves the kerb carrying a
+        vertex every 30 m across an 8 m strip, which can only be triangulated
+        into wedges -- and the shape refinement then spends far more faces
+        digging out than it would have used. Asking for 30 m faces produced
+        5760 triangles where asking for 12 m produced 1152."""
+        from src.roadmesh import build_road_mesh
+
+        ring = self._street(10, 100, 290, 100, 8.0)
+        counts = []
+        for max_edge in (6.0, 12.0, 30.0):
+            _, triangles = build_road_mesh([[ring]], simplify_m=0.25,
+                                           max_edge_m=max_edge)
+            counts.append(len(triangles))
+        self.assertEqual(
+            counts, sorted(counts, reverse=True),
+            f"face counts {counts} do not fall as the setting coarsens",
+        )
+
+    def test_refining_a_narrow_street_reaches_the_angle_it_was_asked_for(self):
+        """The one that matters, and the one the small fixtures all missed.
+
+        A constrained edge cannot be crossed, so a point dropped beside a kerb
+        cannot improve the triangle there -- it only wedges a thinner sliver
+        against the kerb. Refinement has to split the kerb instead, and when it
+        does not, it either fails to converge or feeds on its own slivers; over
+        one square kilometre of Utrecht it turned 18,731 triangles into 233,807
+        and took the share under ten degrees from 23.6% up to 33.0%.
+
+        It takes nothing exotic to reproduce: a plain rectangle 2.5 m wide and
+        200 m long, with not one stray vertex in it. Every triangle in a strip
+        that narrow has a kerb for a side, which is the whole condition. The
+        target is what to assert on -- without the split the same fixture stops
+        at 12 degrees, which is a mesh that quietly ignored its setting.
+        """
+        from src.roadmesh import build_road_mesh
+
+        ring = np.array(
+            [[0, 0], [200, 0], [200, 2.5], [0, 2.5], [0, 0]], dtype=float
+        )
+        points, triangles = build_road_mesh([[ring]], simplify_m=0.25,
+                                            max_edge_m=12.0, min_angle_deg=22.0)
+        angles = self._angles(points, triangles)
+        self.assertGreater(
+            angles.min(), 20.0,
+            f"asked for 22 degrees and the thinnest face is "
+            f"{angles.min():.1f}: refinement did not converge",
+        )
+        # And it did not pay for that by burying the path in geometry.
+        self.assertLess(
+            len(triangles), 200,
+            f"{len(triangles)} faces for a 200 m footpath",
+        )
+
+    def test_a_sharp_corner_does_not_set_refinement_off(self):
+        """Two streets meeting at a narrow angle give the triangulator a wedge
+        it cannot improve. Chasing it anyway -- which is what inserting beside
+        a kerb amounts to -- turned 73 faces into 201, 29% of them under ten
+        degrees."""
+        from src.roadmesh import build_road_mesh
+
+        street = np.array(
+            [[0, 0], [100, 0], [100, 8], [0, 8], [0, 0]], dtype=float
+        )
+        spur = np.array(
+            [[95, 8], [140, 30], [138, 34], [93, 10], [95, 8]], dtype=float
+        )
+        points, triangles = build_road_mesh(
+            [[street], [spur]], simplify_m=0.25, max_edge_m=12.0
+        )
+        angles = self._angles(points, triangles)
+        self.assertLess(float((angles < 10).mean()), 0.05)
+        self.assertLess(len(triangles), 150, f"{len(triangles)} faces")
+
+    def test_a_point_that_encroaches_a_kerb_splits_it(self):
+        """The mechanism on its own: a candidate inside a kerb segment's
+        diametral circle is dropped, and the kerb is halved in its place."""
+        from src.roadmesh import _split_encroached
+
+        kerb = np.array([[[0.0, 0.0], [10.0, 0.0]]])
+        # Well inside the circle on that segment as a diameter.
+        surviving, split = _split_encroached(kerb, np.array([[5.0, 0.5]]))
+        self.assertEqual(len(surviving), 0, "the encroaching point was kept")
+        self.assertEqual(len(split), 2, "the kerb was not halved")
+        self.assertTrue(
+            np.allclose(sorted(np.vstack(split).tolist()),
+                        sorted([[0, 0], [5, 0], [5, 0], [10, 0]])),
+            f"the halves are not the kerb: {split}",
+        )
+
+        # And a point clear of every diametral circle is left alone.
+        surviving, split = _split_encroached(kerb, np.array([[5.0, 8.0]]))
+        self.assertEqual(len(surviving), 1)
+        self.assertEqual(len(split), 0)
+
+    def test_two_drawings_of_one_kerb_do_not_make_a_ribbon(self):
+        """Both parts either side of a shared kerb have drawn it, and the two
+        drawings disagree by millimetres. Past the weld tolerance the vertices
+        no longer merge, and the pair becomes a ribbon of triangles a few
+        millimetres tall -- 691 of them under a hundredth of a degree over one
+        square kilometre, median height exactly the 5 mm weld.
+
+        Welding cannot see it: these vertices are near each other's *edges*,
+        not near each other's *vertices*.
+        """
+        from src.roadmesh import build_road_mesh
+
+        # Two strips meeting along y = 0. The lower one puts a vertex every
+        # 2 m exactly on the line; the upper puts one every 3 m, each up to
+        # 12 mm off it -- above the 5 mm weld, so not one vertex merges with
+        # any other, and the pair becomes a chain of lenses.
+        rng = np.random.default_rng(3)
+        along = np.arange(0.0, 120.001, 2.0)
+        straight = np.column_stack([along, np.zeros(len(along))])
+        wobbly_x = np.arange(0.0, 120.001, 3.0)
+        wobbly_y = rng.uniform(-0.012, 0.012, len(wobbly_x))
+        wobbly_y[0] = wobbly_y[-1] = 0.0
+        wobbly = np.column_stack([wobbly_x, wobbly_y])
+
+        lower = np.vstack([straight, [[120, -6], [0, -6]], straight[:1]])
+        upper = np.vstack([wobbly, [[120, 6], [0, 6]], wobbly[:1]])
+
+        points, triangles = build_road_mesh(
+            [[lower], [upper]], simplify_m=0.0, max_edge_m=12.0
+        )
+        angles = self._angles(points, triangles)
+        # Snapping does not make the disagreement go away -- the surveyors
+        # still drew two lines -- but it stops it becoming a ribbon: 77 faces
+        # under a degree become 14, and the thinnest goes from 0.016 to 0.3.
+        self.assertGreater(
+            angles.min(), 0.1,
+            f"thinnest face is {angles.min():.4f} deg: the two drawings made "
+            f"a ribbon",
+        )
+        self.assertLess(
+            int((angles < 1).sum()), 30,
+            f"{int((angles < 1).sum())} faces under one degree",
+        )
+
+    def test_a_stray_vertex_is_found_on_a_long_kerb_too(self):
+        """The snap pass runs before the kerbs are cut down, so it meets
+        segments hundreds of metres long. Filing those under their midpoint --
+        which is what a grid usually does -- hides them from anything near
+        their ends, and the ribbon comes back at exactly the places nobody
+        looks."""
+        from src.roadmesh import _snap_to_edges
+
+        # One 300 m kerb, and a point 3 mm off it near the far end.
+        points = np.array(
+            [[0.0, 0.0], [300.0, 0.0], [295.0, 0.003]], dtype=float
+        )
+        segments = np.array([[0, 1], [1, 2]], dtype=np.int64)
+        _, split = _snap_to_edges(points, segments, 0.05, 12.0)
+
+        chain = [tuple(pair) for pair in split.tolist()]
+        self.assertIn(
+            (0, 2), chain,
+            f"the long kerb was not bent onto the stray vertex: {chain}",
+        )
+        self.assertIn((2, 1), chain, f"and not put back together: {chain}")
+
+    def test_the_settings_reach_the_config(self):
+        from src.config import DEFAULTS
+
+        self.assertEqual(DEFAULTS["surfaces"]["road_simplify_m"], 0.25)
+        self.assertEqual(DEFAULTS["surfaces"]["road_max_edge_m"], 12.0)
+        self.assertEqual(DEFAULTS["surfaces"]["road_snap_m"], 0.05)
+
+
 class TestRoadDrape(unittest.TestCase):
     """A road follows the ground as closely as the ground allows, no closer."""
 

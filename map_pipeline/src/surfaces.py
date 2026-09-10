@@ -480,6 +480,10 @@ def build_surfaces(
             terrain.sample,
             lift_m=result.road_lift_m,
             tolerance_m=float(surfaces_cfg.get("road_drape_tolerance_m", 0.08)),
+            simplify_m=float(surfaces_cfg.get("road_simplify_m", 0.25)),
+            max_edge_m=float(surfaces_cfg.get("road_max_edge_m", 12.0)),
+            min_angle_deg=float(surfaces_cfg.get("road_min_angle_deg", 22.0)),
+            snap_m=float(surfaces_cfg.get("road_snap_m", 0.05)),
             # One cell of the height grid: nothing below that is measured.
             min_edge_m=(
                 float(abs(terrain.xs[1] - terrain.xs[0]))
@@ -711,6 +715,10 @@ def triangulate_roads(
     lift_m: float = 0.06,
     tolerance_m: float = 0.08,
     min_edge_m: float = 0.0,
+    simplify_m: float = 0.25,
+    max_edge_m: float = 12.0,
+    min_angle_deg: float = 22.0,
+    snap_m: float = 0.05,
     deck_sampler=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Road polygons into ``(triangles, surface class)``, draped on the ground.
@@ -757,20 +765,38 @@ def triangulate_roads(
     all_class = np.concatenate(classes)
     all_level = np.concatenate(levels)
 
-    # A road at grade follows the ground, and is refined until it does.
-    for code in np.unique(all_class):
-        on_ground = (all_class == code) & (all_level <= 0)
-        if not on_ground.any():
+    # A road at grade follows the ground, and is built to follow it rather than
+    # cut up afterwards until it does.
+    #
+    # Every class is triangulated as one surface, not part by part. A street and
+    # the junction it runs into are separate BGT parts carrying the same kerb
+    # between them, and triangulating them separately leaves two meshes abutting
+    # along a seam instead of one continuous road.
+    from .roadmesh import build_road_mesh
+
+    for code in np.unique([part.surface_class for part in roads]):
+        groups = [
+            part.rings for part in roads
+            if part.surface_class == code and part.level <= 0
+        ]
+        if not groups:
             continue
-        draped = drape_to_terrain(
-            all_tris[on_ground], sampler, tolerance_m=tolerance_m,
-            min_edge_m=min_edge_m,
+        points, tris = build_road_mesh(
+            groups,
+            simplify_m=simplify_m,
+            max_edge_m=max_edge_m,
+            min_angle_deg=min_angle_deg,
+            snap_m=snap_m,
+            sampler=sampler,
+            tolerance_m=tolerance_m,
         )
-        if len(draped):
-            draped[:, :, 2] += lift_m
-            out_tris.append(draped)
-            out_class.append(np.full(len(draped), code, dtype=np.int32))
-            out_level.append(np.zeros(len(draped), dtype=np.int32))
+        if not len(tris):
+            continue
+        z = np.asarray(sampler(points[:, 0], points[:, 1]), dtype=np.float64) + lift_m
+        placed = np.column_stack([points, z])[tris]
+        out_tris.append(placed)
+        out_class.append(np.full(len(tris), code, dtype=np.int32))
+        out_level.append(np.zeros(len(tris), dtype=np.int32))
 
     # A road on a bridge follows its deck. Without this the deck rises to its
     # real height and leaves its own carriageway lying on the water.

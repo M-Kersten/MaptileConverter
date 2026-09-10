@@ -357,7 +357,7 @@
   </fieldset>
 
   <details class="adv">
-    <summary>Terrain shape &mdash; quads, and what becomes an edge</summary>
+    <summary>Terrain and road shape &mdash; quads, faces, and what becomes an edge</summary>
     <div class="inner">
       <div class="plain" style="margin: 0 0 10px">
         These change what the ground is like to <i>edit</i>, not how accurate it
@@ -437,6 +437,24 @@
         <input type="checkbox" id="blBuildings" checked>
         <label for="blBuildings">Building footprints</label>
       </div>
+
+      <label for="roadDetail" style="margin-top:14px">Road outlines
+        <span class="help" tabindex="0" role="button" aria-label="About road outlines"
+          data-tip="How far a kerb may move when it is straightened. The survey draws a road to the centimetre, so a straight street arrives carrying a vertex every few centimetres and a corner carrying dozens &mdash; and every one of them used to become geometry. A quarter of a metre is still visibly the same road for a fraction of the vertices.">?</span>
+        <span class="derived" id="roadDetailDerived"></span>
+      </label>
+      <input type="range" id="roadDetail" min="0" max="4" step="1" value="2" class="slider">
+      <div class="ticks"><span>as surveyed</span><span>bold</span></div>
+      <div class="plain" id="roadDetailPlain"></div>
+
+      <label for="roadFace" style="margin-top:12px">Road face size
+        <span class="help" tabindex="0" role="button" aria-label="About road face size"
+          data-tip="The size a road face aims for, and what the kerb itself is cut at. Both, because a constrained edge cannot be crossed: leave a 280 m kerb as one segment and every triangle along it has to span the whole street. Smaller gives rounder faces and more of them; it is never coarser than the road is wide, since that only makes wedges the refinement then has to dig out of.">?</span>
+        <span class="derived" id="roadFaceDerived"></span>
+      </label>
+      <input type="range" id="roadFace" min="0" max="4" step="1" value="2" class="slider">
+      <div class="ticks"><span>fine</span><span>coarse</span></div>
+      <div class="plain" id="roadFacePlain"></div>
 
       <div class="plain" id="shapeNote" style="margin-top:12px"></div>
     </div>
@@ -1064,6 +1082,22 @@ const TOLERANCE_PLAIN = {
    Terrain shape. None of these change how accurate the ground is -- the checks
    measure that either way -- they change what it is like to edit.
 --------------------------------------------------------------------------- */
+const ROADDETAIL_STEPS = [0.05, 0.15, 0.25, 0.5, 1.0];   // metres
+const ROADDETAIL_PLAIN = {
+  0.05: "Every surveyed vertex kept. A curved kerb becomes hundreds of them.",
+  0.15: "Barely thinned. Survey noise goes.",
+  0.25: "A good default. Still visibly the same road, for a fraction of the vertices.",
+  0.5:  "Bold. Gentle curves become a few straight runs.",
+  1.0:  "Very bold. Only the shape of the street survives."
+};
+const ROADFACE_STEPS = [4, 8, 12, 20, 30];              // metres
+const ROADFACE_PLAIN = {
+  4:  "Small faces, roundest shapes, most of them. Good if the designer will sculpt the road.",
+  8:  "Fine. About one face per lane width.",
+  12: "A good default: few faces, and none of them slivers.",
+  20: "Coarse.",
+  30: "Coarsest. Never actually coarser than the road is wide."
+};
 const UNIFORM_STEPS = [0, 20, 10, 5, 2];            // metres, 0 = adaptive
 const UNIFORM_PLAIN = {
   0:  "Adaptive: a flat car park gets three faces, a dike gets thousands. Fewest faces, and the least predictable to sculpt.",
@@ -1195,6 +1229,8 @@ function updateQuality() {
 
 function shape() {
   return {
+    roadDetail: ROADDETAIL_STEPS[+$("roadDetail").value],
+    roadFace: ROADFACE_STEPS[+$("roadFace").value],
     uniform: UNIFORM_STEPS[+$("uniform").value],
     quads: $("quads").checked,
     fold: FOLD_STEPS[+$("fold").value],
@@ -1212,6 +1248,10 @@ function shape() {
 
 function updateShape() {
   const s = shape();
+  $("roadDetailDerived").textContent = `${s.roadDetail} m`;
+  $("roadDetailPlain").textContent = ROADDETAIL_PLAIN[s.roadDetail] || "";
+  $("roadFaceDerived").textContent = `${s.roadFace} m`;
+  $("roadFacePlain").textContent = ROADFACE_PLAIN[s.roadFace] || "";
   $("uniformDerived").textContent = s.uniform ? `max ${s.uniform} m` : "adaptive";
   $("uniformPlain").textContent = UNIFORM_PLAIN[s.uniform] || "";
   $("foldDerived").textContent = `${s.fold}°`;
@@ -1242,7 +1282,8 @@ function updateShape() {
   $("shapeNote").style.color = notes.length ? "var(--warn)" : "var(--muted)";
 }
 
-for (const id of ["uniform", "quads", "fold", "straighten", "minFeature", "contours",
+for (const id of ["roadDetail", "roadFace",
+                  "uniform", "quads", "fold", "straighten", "minFeature", "contours",
                   "blRoads", "blWater", "blLand", "blBuildings"]) {
   $(id).addEventListener("input", updateShape);
   $(id).addEventListener("change", updateShape);
@@ -1400,6 +1441,8 @@ $("run").onclick = async () => {
     clip_mode: $("clip").value,
     preview: $("preview").checked,
     // Terrain shape. See updateShape: none of this changes accuracy.
+    road_simplify_m: sh.roadDetail,
+    road_max_edge_m: sh.roadFace,
     max_face_m: sh.uniform,
     quads: sh.quads,
     quad_max_fold_deg: sh.fold,
