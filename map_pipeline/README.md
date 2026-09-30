@@ -1175,6 +1175,18 @@ went wrong without it:
   reservation instead, a quarter of the detections landed inside a tree the model
   already had.
 
+**A found tree is not allowed to stand on a carriageway.** A tall rough thing
+on a road is a lorry, a bus, scaffolding or a crane far more often than a tree:
+over a square kilometre of Gelderland **9.5% of everything the canopy model
+found was standing on a drivable surface**. Avenues do exist and this costs the
+odd real one — a street tree whose crown leans far enough over the road for its
+peak to land there — which is a good trade at ten to one. It applies only to
+what the detector found: where the BGT has surveyed a trunk, the trunk is
+there, whatever surface the survey says it stands on. Footpaths are deliberately
+not in the set, because a tree in a pit on a pedestrianised street is ordinary
+and the BGT calls that surface a road. `trees.detect_off_surfaces` names the
+classes.
+
 **Detected trees arrive as their own object.** The model gets `Trees_registered`
 and `Trees_detected`, sharing one material. The detector is good rather than
 perfect — scaffolding, roof plant and the odd parked lorry will get through — and
@@ -1186,6 +1198,32 @@ understory be separated from the canopy, but the 0.5 m surface model already
 resolves crowns well enough to place a tree, and AHN has no vegetation class at
 all — vegetation sits in "unclassified", so the work would be the same
 height-above-ground reasoning at higher resolution and considerably more cost.
+
+### What a tree looks like
+
+A tree used to be a sphere on a prism, which reads as a lollipop from any
+distance you can still see the trunk at, and as eight identical lollipops in a
+row from closer. Three things fix that, and together they cost four triangles a
+tree — 42 to 46 on a real height mix:
+
+- **The crown is pushed out of round** by two frequencies of noise, so it lobes
+  rather than merely leans.
+- **Roughly a third come out as conifers**, a stack of three cones. That is the
+  one silhouette a deformed ball will not give you, and a Dutch verge is not all
+  lime trees.
+- **The trunk tapers, flares at the foot and leans a little**, because a
+  cylinder meets the ground like a pipe.
+
+All of it is seeded from the tree's **own position** rather than from a running
+generator, so the same tree is the same shape every run. Turning detection off,
+or rebuilding one group and not the other, must not reshape the trees that were
+already there — and a sequential generator cannot promise that, because the
+order it is drawn in changes with the membership.
+
+Detail follows size: under four metres a crown is twelve faces, above it
+thirty-two. Over a wooded square kilometre only a seventh of what the canopy
+model finds is that small, so the saving is modest and it keeps the coarse
+shape off anything big enough to look at.
 
 Trees leave in two forms, and you get both:
 

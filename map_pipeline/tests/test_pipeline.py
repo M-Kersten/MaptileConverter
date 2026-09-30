@@ -881,6 +881,61 @@ class TestTreeDetection(unittest.TestCase):
             "a tree survived the clip from outside the area",
         )
 
+    def test_a_tree_does_not_stand_on_a_carriageway(self):
+        """A tall rough thing on a road is a lorry, a bus or scaffolding far
+        more often than a tree: 9.5% of everything found over a square
+        kilometre of Gelderland was standing on one.
+
+        Avenues exist and this costs the odd real one, which is a good trade at
+        ten to one -- but only for what the detector found. Where the BGT has
+        surveyed a trunk, the trunk is there.
+        """
+        from src.trees import detect_trees
+
+        # A crown over the road, and another on the verge beside it.
+        grid = self._put(self._blank(), 50, 50, 11.0, radius=3.0, rough=0.9)
+        grid = self._put(grid, 50, 70, 11.0, radius=3.0, rough=0.9, seed=5)
+        road = np.zeros(grid.shape, dtype=bool)
+        road[np.ix_(range(80, 120), range(0, 200))] = True   # RD y 40..60
+
+        loose, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        kept, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), road_mask=road,
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        self.assertTrue(
+            any(40 < y < 60 for _, y in loose),
+            "the fixture has nothing on the road to drop",
+        )
+        self.assertEqual(
+            [(x, y) for x, y in kept if 40 < y < 60], [],
+            "a tree is still standing on the carriageway",
+        )
+        self.assertTrue(
+            any(y > 60 for _, y in kept), "the verge tree went with it"
+        )
+
+    def test_the_surfaces_are_named_not_numbered(self):
+        """"cycle_path" survives someone reading the config a year later and 7
+        does not, and these are the names the road objects already carry."""
+        from src.config import DEFAULTS
+        from src.surfaces import CLASS_CYCLE, CLASS_FOOTPATH, CLASS_ROAD
+        from src.trees import _road_classes
+
+        codes = _road_classes(DEFAULTS["trees"]["detect_off_surfaces"])
+        self.assertIn(CLASS_ROAD, codes)
+        self.assertIn(CLASS_CYCLE, codes)
+        self.assertNotIn(
+            CLASS_FOOTPATH, codes,
+            "a tree in a pit on a pedestrianised street is ordinary",
+        )
+        # A name that is not a surface class is dropped, not silently obeyed.
+        self.assertEqual(_road_classes(["road_asphalt", "nonsense"]), {CLASS_ROAD})
+        self.assertEqual(_road_classes(None), set())
+
     def test_build_trees_hands_the_detector_the_area(self):
         """The clip is only worth anything if the caller asks for it."""
         import inspect
@@ -3466,6 +3521,182 @@ def _blender_mesh_calls():
             yield name, list(calls), f"{type(exc).__name__}: {exc}"
             continue
         yield name, list(calls), None
+
+
+class TestTreeShape(unittest.TestCase):
+    """A tree used to be a sphere on a prism, which reads as a lollipop.
+
+    None of this is about triangle count for its own sake -- the budget barely
+    moved, from 42 to 46 triangles a tree on a real height mix. It is about a
+    wooded square kilometre not being fifteen thousand copies of one ball.
+    """
+
+    @staticmethod
+    def _shapes():
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        namespace = {"np": np}
+        for name in ("_octahedron_canopy", "_tree_dice", "_blob", "_conifer",
+                     "_tree_group_mesh"):
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            assert body is not None, f"{name} moved"
+            exec(body.group(0), namespace)  # noqa: S102 - our own source
+        return namespace
+
+    @staticmethod
+    def _one(namespace, x, y, height):
+        fields = (
+            np.array([[x, y]]), np.zeros(1), np.array([float(height)]),
+            np.array([float(np.clip(0.26 * height, 0.8, 7.0))]),
+            np.array([float(np.clip(0.38 * height, 0.6, 6.0))]),
+        )
+        return namespace["_tree_group_mesh"](
+            np.ones(1, dtype=bool), fields, (x, y, 0.0), np.random.default_rng(1)
+        )
+
+    def test_a_tree_is_the_same_tree_every_run(self):
+        """Shape comes from the position, not from a running generator. Turning
+        detection off, or rebuilding one group and not the other, must not
+        reshape the trees that were already there -- and a sequential generator
+        cannot promise that, because the order it is drawn in changes with the
+        membership."""
+        namespace = self._shapes()
+        dice = namespace["_tree_dice"]
+
+        self.assertEqual(dice(193627.9, 445301.6), dice(193627.9, 445301.6))
+        self.assertNotEqual(dice(193627.9, 445301.6), dice(193628.9, 445301.6))
+
+        rolls = np.array([dice(x, y) for x, y in
+                          zip(np.linspace(0, 5000, 400), np.linspace(700, 90, 400))])
+        self.assertTrue((rolls >= 0).all() and (rolls < 1).all())
+        for column in range(rolls.shape[1]):
+            self.assertGreater(
+                float(rolls[:, column].std()), 0.2,
+                f"die {column} barely varies, so every tree gets the same roll",
+            )
+
+    def test_a_street_is_not_one_species(self):
+        """Roughly a third conifers. A Dutch verge is not all lime trees, and a
+        conifer is the one silhouette a deformed ball will not give you."""
+        namespace = self._shapes()
+        dice = namespace["_tree_dice"]
+        rng = np.random.default_rng(5)
+        points = rng.uniform(100000, 500000, (2000, 2))
+        conifers = np.array([dice(x, y)[2] < 0.34 for x, y in points])
+        self.assertGreater(float(conifers.mean()), 0.2)
+        self.assertLess(float(conifers.mean()), 0.5)
+
+    def test_no_two_crowns_are_the_same_shape(self):
+        """Two trees of the same height next to each other have to differ, or a
+        row of them reads as one asset repeated."""
+        namespace = self._shapes()
+        # Two broadleaves of identical size, at different positions.
+        found = []
+        for x in np.arange(1000.0, 1400.0, 3.0):
+            if namespace["_tree_dice"](x, 500.0)[2] >= 0.34:
+                found.append(x)
+            if len(found) == 2:
+                break
+        self.assertEqual(len(found), 2, "could not find two broadleaves")
+
+        first, _, _ = self._one(namespace, found[0], 500.0, 14.0)
+        second, _, _ = self._one(namespace, found[1], 500.0, 14.0)
+        # Compare the crowns about their own centres, so position is not the
+        # difference being measured. The trunk is three rings of five vertices
+        # and the crown is appended after it, so the tail is exactly the crown
+        # -- a height cut picks different counts once the crowns differ, which
+        # is the thing being measured.
+        a, b = first[15:], second[15:]
+        self.assertEqual(len(a), len(b), "the two crowns are not comparable")
+        spread = np.abs((a - a.mean(axis=0)) - (b - b.mean(axis=0))).max()
+        self.assertGreater(
+            float(spread), 0.15,
+            f"two crowns differ by {spread:.3f} m, which is one asset twice",
+        )
+
+    def test_a_crown_is_not_a_ball(self):
+        """The deformation has to actually deform. An ellipsoid is a lollipop
+        at any distance you can still see the trunk at."""
+        namespace = self._shapes()
+        for x in np.arange(2000.0, 2400.0, 3.0):
+            if namespace["_tree_dice"](x, 800.0)[2] >= 0.34:
+                break
+        vertices, _, _ = self._one(namespace, x, 800.0, 16.0)
+        crown = vertices[vertices[:, 2] > 8.0]
+        centre = crown.mean(axis=0)
+        radius = np.linalg.norm(crown - centre, axis=1)
+        # A sphere has one radius; a lobed crown has a spread of them.
+        self.assertGreater(
+            float(radius.std() / radius.mean()), 0.12,
+            "every crown vertex is the same distance out, so it is a ball",
+        )
+
+    def test_a_tree_stands_on_the_ground(self):
+        """Whatever the species, the trunk reaches the ground and the crown is
+        above it. A tree floating is worse than a tree missing."""
+        namespace = self._shapes()
+        for height in (3.0, 5.0, 9.0, 18.0, 28.0):
+            for x in (1500.0, 1503.0):
+                vertices, faces, uvs = self._one(namespace, x, 600.0, height)
+                self.assertAlmostEqual(
+                    float(vertices[:, 2].min()), -0.05, places=6,
+                    msg=f"a {height:.0f} m tree does not meet the ground",
+                )
+                self.assertLessEqual(
+                    float(vertices[:, 2].max()), height + 0.6,
+                    f"a {height:.0f} m tree is {vertices[:, 2].max():.1f} m tall",
+                )
+                self.assertGreater(float(vertices[:, 2].max()), height * 0.6)
+                self.assertEqual(len(uvs), len(faces) * 3)
+
+    def test_detail_follows_size(self):
+        """A three-metre sapling is not worth the geometry of the oak next to
+        it, and over a wooded square kilometre a seventh of what the canopy
+        model finds is under four metres."""
+        namespace = self._shapes()
+        counts = {}
+        for height in (3.0, 12.0):
+            for x in np.arange(3000.0, 3400.0, 3.0):
+                if namespace["_tree_dice"](x, 400.0)[2] >= 0.34:   # broadleaf
+                    break
+            _, faces, _ = self._one(namespace, x, 400.0, height)
+            counts[height] = len(faces)
+        self.assertLess(
+            counts[3.0], counts[12.0],
+            f"a sapling costs {counts[3.0]} triangles and a mature tree "
+            f"{counts[12.0]}",
+        )
+
+    def test_a_conifer_tapers(self):
+        """The whole point of the second species: the silhouette is a triangle,
+        not a lollipop."""
+        namespace = self._shapes()
+        for x in np.arange(4000.0, 4400.0, 3.0):
+            if namespace["_tree_dice"](x, 300.0)[2] < 0.34:
+                break
+        vertices, _, _ = self._one(namespace, x, 300.0, 18.0)
+        crown = vertices[15:]                       # the trunk is 3 x 5
+        axis = crown[:, :2].mean(axis=0)
+        radius = np.linalg.norm(crown[:, :2] - axis, axis=1)
+        low, high = crown[:, 2].min(), crown[:, 2].max()
+
+        def widest(lo, hi):
+            band = (crown[:, 2] >= low + (high - low) * lo) & (
+                crown[:, 2] < low + (high - low) * hi
+            )
+            return float(radius[band].max()) if band.any() else 0.0
+
+        # The middle band is the one that tells the story. Comparing the foot
+        # against the tip says nothing -- a stack of equal-width cones has a
+        # point at the top too, and that was the first version of this test
+        # passing a mutation that made every tier the same width.
+        base, middle = widest(0.0, 0.3), widest(0.3, 0.6)
+        self.assertGreater(
+            base, middle * 1.8,
+            f"a conifer {base:.1f} m across at the foot and {middle:.1f} m "
+            f"halfway up is a cylinder with a lid",
+        )
 
 
 class TestBlenderMeshContract(unittest.TestCase):

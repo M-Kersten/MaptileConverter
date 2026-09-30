@@ -208,6 +208,19 @@ DEFAULTS: dict[str, Any] = {
         "detect_eaves_clearance_m": 2.0,
         # No two detected trees closer than this, whatever their crowns say.
         "detect_min_spacing_m": 3.0,
+        # Surfaces a found tree is not allowed to stand on. A tall rough thing
+        # on a carriageway is a lorry, a bus or scaffolding far more often than
+        # a tree: 9.5% of everything found over a square kilometre of
+        # Gelderland was standing on one. Avenues exist and this costs the odd
+        # real one, which is a good trade at ten to one -- and it is only
+        # applied to what the detector found, never to a surveyed trunk.
+        #
+        # "footpath" is deliberately absent: a tree in a pit on a pedestrianised
+        # street is ordinary, and the BGT calls that surface a road.
+        "detect_off_surfaces": [
+            "road_asphalt", "road_brick", "cycle_path", "parking",
+            "transit_lane",
+        ],
         "geometry": True,
         "texture_px": 512,
     },

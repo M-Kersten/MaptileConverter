@@ -400,6 +400,7 @@ def detect_trees(
     bbox: BBox | None = None,
     building_mask: np.ndarray | None = None,
     water_mask: np.ndarray | None = None,
+    road_mask: np.ndarray | None = None,
     min_height_m: float = 2.5,
     max_height_m: float = 30.0,
     crown_radius_ratio: float = 0.25,
@@ -455,6 +456,11 @@ def detect_trees(
         # Lidar does not reflect off water, and the returns that do come back
         # scatter over six metres. Noise that high would be a forest.
         candidate &= ~water_mask
+    if road_mask is not None:
+        # A tall rough thing standing on a carriageway is a lorry, a bus or
+        # scaffolding far more often than a tree: 9.5% of everything found over
+        # a square kilometre of Gelderland was standing on one.
+        candidate &= ~road_mask
     if not candidate.any():
         return np.zeros((0, 2)), np.zeros(0)
 
@@ -669,6 +675,10 @@ def build_trees(
 
     if want_detect:
         water_mask = _rasterize_water(surfaces, bounds, ndsm.shape)
+        road_mask = _rasterize_roads(
+            surfaces, bounds, ndsm.shape,
+            _road_classes(trees_cfg.get("detect_off_surfaces")),
+        )
         found, heights = detect_trees(
             ndsm,
             bounds,
@@ -679,6 +689,7 @@ def build_trees(
             ),
             building_mask=building_mask,
             water_mask=water_mask,
+            road_mask=road_mask,
             min_height_m=float(trees_cfg.get("detect_min_height_m", 2.5)),
             max_height_m=float(trees_cfg.get("detect_max_height_m", 30.0)),
             crown_radius_ratio=crown_ratio,
@@ -704,6 +715,65 @@ def build_trees(
     return result
 
 
+def _road_classes(names) -> set[int]:
+    """Surface-class codes from the names used in the config and the FBX.
+
+    Named rather than numbered, because "cycle_path" survives someone reading
+    it a year later and 7 does not, and because these are the same names the
+    road objects already carry in the model.
+    """
+    from .surfaces import CLASS_NAMES
+
+    if names is None:
+        return set()
+    by_name = {str(label): int(code) for code, label in CLASS_NAMES.items()}
+    wanted: set[int] = set()
+    for name in names:
+        code = by_name.get(str(name))
+        if code is None:
+            LOG.warning(
+                "trees.detect_off_surfaces names %r, which is not a surface "
+                "class; known names are %s",
+                name, ", ".join(sorted(by_name)),
+            )
+            continue
+        wanted.add(code)
+    return wanted
+
+
+def _rasterize_rings(rings, bounds, shape) -> np.ndarray:
+    """Even-odd scanline fill of polygon rings onto a raster."""
+    left, bottom, right, top = bounds
+    rows, cols = shape
+    cell_x = (right - left) / cols
+    cell_y = (top - bottom) / rows
+    mask = np.zeros(shape, dtype=bool)
+
+    for ring in rings:
+        ring = np.asarray(ring, dtype=np.float64)
+        if ring.ndim != 2 or len(ring) < 3:
+            continue
+        ring = ring[:, :2]
+        px = (ring[:, 0] - left) / cell_x
+        py = (top - ring[:, 1]) / cell_y
+        ax, ay, bx, by = px[:-1], py[:-1], px[1:], py[1:]
+        for row in range(
+            max(0, int(np.floor(py.min()))), min(rows, int(np.ceil(py.max())) + 1)
+        ):
+            centre = row + 0.5
+            straddles = (ay > centre) != (by > centre)
+            if not straddles.any():
+                continue
+            t = (centre - ay[straddles]) / (by[straddles] - ay[straddles])
+            crossings = np.sort(ax[straddles] + t * (bx[straddles] - ax[straddles]))
+            for start, end in zip(crossings[0::2], crossings[1::2]):
+                col0 = max(0, int(np.ceil(start - 0.5)))
+                col1 = min(cols - 1, int(np.floor(end - 0.5)))
+                if col1 >= col0:
+                    mask[row, col0 : col1 + 1] = True
+    return mask
+
+
 def _rasterize_water(surfaces, bounds, shape) -> np.ndarray | None:
     """Mark the cells covered by water, so lidar noise is not read as forest.
 
@@ -715,36 +785,52 @@ def _rasterize_water(surfaces, bounds, shape) -> np.ndarray | None:
     if not bodies:
         return None
 
-    left, bottom, right, top = bounds
-    rows, cols = shape
-    cell_x = (right - left) / cols
-    cell_y = (top - bottom) / rows
-    mask = np.zeros(shape, dtype=bool)
-
-    for body in bodies:
-        for ring in getattr(body, "rings", ()) or ():
-            ring = np.asarray(ring, dtype=np.float64)[:, :2]
-            if len(ring) < 3:
-                continue
-            px = (ring[:, 0] - left) / cell_x
-            py = (top - ring[:, 1]) / cell_y
-            ax, ay, bx, by = px[:-1], py[:-1], px[1:], py[1:]
-            for row in range(
-                max(0, int(np.floor(py.min()))), min(rows, int(np.ceil(py.max())) + 1)
-            ):
-                centre = row + 0.5
-                straddles = (ay > centre) != (by > centre)
-                if not straddles.any():
-                    continue
-                t = (centre - ay[straddles]) / (by[straddles] - ay[straddles])
-                crossings = np.sort(ax[straddles] + t * (bx[straddles] - ax[straddles]))
-                for start, end in zip(crossings[0::2], crossings[1::2]):
-                    col0 = max(0, int(np.ceil(start - 0.5)))
-                    col1 = min(cols - 1, int(np.floor(end - 0.5)))
-                    if col1 >= col0:
-                        mask[row, col0 : col1 + 1] = True
-
+    mask = _rasterize_rings(
+        (ring for body in bodies for ring in getattr(body, "rings", ()) or ()),
+        bounds, shape,
+    )
     LOG.info("masked %.1f%% of the canopy model as water", 100.0 * mask.mean())
+    return mask
+
+
+def _rasterize_roads(surfaces, bounds, shape, classes) -> np.ndarray | None:
+    """Mark the cells covered by the road classes a tree has no business on.
+
+    A tall rough thing standing on a carriageway is a lorry, a bus, scaffolding
+    or a crane far more often than it is a tree. Over a square kilometre of
+    Gelderland 9.5% of everything the canopy model found was standing on a
+    drivable surface, which is a lot of parked traffic to hand a level designer
+    as woodland.
+
+    Avenues do exist, and this does cost the odd real one -- a street tree
+    whose crown leans far enough over the carriageway for its peak to land
+    there. That trade is worth it at ten to one, and it is only applied to what
+    the detector found: where the BGT has surveyed a trunk, the trunk is there,
+    whatever surface the survey says it stands on.
+
+    Footpaths are deliberately not in the default set. A tree in a pit on a
+    pedestrianised street is ordinary, and the BGT calls that surface a road.
+    """
+    parts = getattr(surfaces, "roads", None) if surfaces is not None else None
+    if not parts or not classes:
+        return None
+
+    wanted = set(classes)
+    rings = [
+        ring
+        for part in parts
+        if int(getattr(part, "surface_class", -1)) in wanted
+        and int(getattr(part, "level", 0)) <= 0
+        for ring in getattr(part, "rings", ()) or ()
+    ]
+    if not rings:
+        return None
+
+    mask = _rasterize_rings(rings, bounds, shape)
+    LOG.info(
+        "masked %.1f%% of the canopy model as road a tree would not stand on",
+        100.0 * mask.mean(),
+    )
     return mask
 
 

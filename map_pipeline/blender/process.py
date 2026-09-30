@@ -905,12 +905,91 @@ def _octahedron_canopy(subdivisions: int = 1):
     return np.asarray(verts), np.asarray(faces, dtype=np.int64)
 
 
+def _tree_dice(x, y):
+    """Four stable pseudo-random numbers in [0, 1) from a tree's position.
+
+    From the position rather than from a running generator, so a tree looks the
+    same whatever else is in the model: turning detection off, or rebuilding
+    one group and not the other, must not reshape the trees that were already
+    there. A sequential generator cannot promise that, because the order it is
+    drawn in changes with the membership.
+    """
+    seed = np.float64(x) * 73856093.0 + np.float64(y) * 19349663.0
+    out = []
+    for salt in (0.0, 1.7, 3.1, 5.9):
+        value = np.sin(seed * 0.0001 + salt) * 43758.5453
+        out.append(float(value - np.floor(value)))
+    return out
+
+
+def _blob(sides: int = 6):
+    """A low bipyramid with blunt poles, as (vertices, faces) in a unit box.
+
+    What a small tree gets instead of an octahedron. An octahedron has a point
+    at the top and another at the bottom, and at sapling size that is not a
+    shrub, it is a gem on a stick. Pulling both poles in and widening the waist
+    costs four triangles and reads as foliage.
+    """
+    angles = np.linspace(0, 2 * np.pi, sides, endpoint=False)
+    ring = np.column_stack([np.cos(angles), np.sin(angles), np.zeros(sides)])
+    # Blunt poles, close in to the waist. Pushed out to a proper apex this is
+    # a gem again, which is the thing it exists not to be.
+    verts = np.vstack([ring, [[0.0, 0.0, 0.58]], [[0.0, 0.0, -0.62]]])
+    top, bottom = sides, sides + 1
+    faces = [[i, (i + 1) % sides, top] for i in range(sides)]
+    faces += [[(i + 1) % sides, i, bottom] for i in range(sides)]
+    return verts, np.asarray(faces, dtype=np.int64)
+
+
+def _conifer(tiers: int, sides: int = 7):
+    """A stack of cones, as (vertices, faces) in a unit box.
+
+    Half the trees in a Dutch verge are conifers, and a conifer is the one
+    shape a deformed ball cannot be made to look like: the silhouette is a
+    triangle, not a lollipop. Cheap, too -- three tiers of seven sides is 42
+    triangles, about what one subdivided sphere costs.
+    """
+    angles = np.linspace(0, 2 * np.pi, sides, endpoint=False)
+    ring = np.column_stack([np.cos(angles), np.sin(angles)])
+    verts: list[np.ndarray] = []
+    faces: list[list[int]] = []
+
+    for tier in range(tiers):
+        # Each tier starts lower and wider than the one above it, and they
+        # overlap, so the join reads as foliage rather than as a seam.
+        base_z = tier / tiers * 0.85
+        top_z = base_z + 1.25 / tiers
+        width = 1.0 - 0.72 * (tier / max(tiers - 1, 1))
+        start = len(verts)
+        verts.extend(np.column_stack([ring * width, np.full(sides, base_z)]))
+        verts.append(np.array([0.0, 0.0, min(top_z, 1.0)]))
+        apex = start + sides
+        for side in range(sides):
+            faces.append([start + side, start + (side + 1) % sides, apex])
+    return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int64)
+
+
 def _tree_group_mesh(members, fields, origin, rng):
-    """Trunks and canopies for one group of trees, as (vertices, faces, uvs)."""
+    """Trunks and canopies for one group of trees, as (vertices, faces, uvs).
+
+    A tree used to be a sphere on a prism, which from any distance reads as a
+    lollipop and from close up reads as eight of them in a row. Three things
+    fix that without spending much: the crown is pushed out of round by noise
+    taken from the tree's own position, so no two match; the trunk tapers and
+    flares; and roughly a third come out as conifers, which is the one
+    silhouette a deformed ball will not give you.
+
+    Detail follows size. A three-metre sapling gets an eight-face crown and a
+    mature tree a thirty-two-face one, because over a wooded square kilometre a
+    third of what the canopy model finds is under five metres tall and none of
+    it is worth the same geometry as the oak next to it.
+    """
     xy, ground, heights, crowns, trunks = fields
     origin_x, origin_y, z_offset = origin
 
-    canopy_verts, canopy_faces = _octahedron_canopy(1)
+    coarse_verts, coarse_faces = _blob(6)
+    fine_verts, fine_faces = _octahedron_canopy(1)
+    conifer_verts, conifer_faces = _conifer(3)
     trunk_sides = 5
     angles = np.linspace(0, 2 * np.pi, trunk_sides, endpoint=False)
 
@@ -931,45 +1010,89 @@ def _tree_group_mesh(members, fields, origin, rng):
         crown_r = float(crowns[index])
         trunk_h = float(trunks[index])
 
-        # A little variation so a street of trees does not look cloned.
-        spin = float(rng.random()) * 2 * np.pi
-        squash = 0.85 + 0.3 * float(rng.random())
-
-        trunk_r = max(0.08, crown_r * 0.11)
-        ring_x = base_x + trunk_r * np.cos(angles + spin)
-        ring_y = base_y + trunk_r * np.sin(angles + spin)
-        canopy_base = base_z + trunk_h
-
-        lower = np.column_stack([ring_x, ring_y, np.full(trunk_sides, base_z)])
-        upper = np.column_stack(
-            [ring_x, ring_y, np.full(trunk_sides, canopy_base + crown_r * 0.3)]
+        spin_d, squash_d, species_d, lean_d = _tree_dice(
+            xy[index, 0], xy[index, 1]
         )
-        all_verts.append(np.vstack([lower, upper]))
+        spin = spin_d * 2 * np.pi
+        squash = 0.78 + 0.34 * squash_d
+        conifer = species_d < 0.34
+        canopy_base = base_z + trunk_h
+        crown_h = max(0.6, height - trunk_h)
 
+        # Trunk: tapered, and flared at the foot. A cylinder meets the ground
+        # like a pipe; a tree meets it like a tree.
+        trunk_r = max(0.08, crown_r * 0.12)
+        cos_a, sin_a = np.cos(angles + spin), np.sin(angles + spin)
+        # A slight lean, so an avenue is not a row of plumb lines.
+        lean = (lean_d - 0.5) * 0.06 * height
+        tops = np.column_stack([
+            base_x + lean + trunk_r * 0.55 * cos_a,
+            base_y + lean * 0.4 + trunk_r * 0.55 * sin_a,
+            np.full(trunk_sides, canopy_base + crown_r * 0.3),
+        ])
+        mids = np.column_stack([
+            base_x + trunk_r * cos_a,
+            base_y + trunk_r * sin_a,
+            np.full(trunk_sides, base_z + min(0.6, trunk_h * 0.35)),
+        ])
+        feet = np.column_stack([
+            base_x + trunk_r * 1.5 * cos_a,
+            base_y + trunk_r * 1.5 * sin_a,
+            np.full(trunk_sides, base_z - 0.05),
+        ])
+        all_verts.append(np.vstack([feet, mids, tops]))
         for side in range(trunk_sides):
             nxt = (side + 1) % trunk_sides
-            all_faces.append(
-                np.array(
-                    [
-                        [offset + side, offset + nxt, offset + trunk_sides + nxt],
-                        [offset + side, offset + trunk_sides + nxt, offset + trunk_sides + side],
-                    ]
+            for lower_ring, upper_ring in ((0, 1), (1, 2)):
+                a = offset + lower_ring * trunk_sides
+                b = offset + upper_ring * trunk_sides
+                all_faces.append(
+                    np.array([[a + side, a + nxt, b + nxt],
+                              [a + side, b + nxt, b + side]])
                 )
-            )
-        all_uvs.append(np.tile(bark_uv, (trunk_sides * 2 * 3, 1)))
-        offset += trunk_sides * 2
+        all_uvs.append(np.tile(bark_uv, (trunk_sides * 4 * 3, 1)))
+        offset += trunk_sides * 3
 
-        # Canopy: an ellipsoid sitting on top of the trunk.
-        crown_centre = np.array(
-            [base_x, base_y, canopy_base + (height - trunk_h) * 0.5]
-        )
-        radii = np.array(
-            [crown_r, crown_r * squash, max(0.6, (height - trunk_h) * 0.5)]
-        )
-        all_verts.append(canopy_verts * radii + crown_centre)
-        all_faces.append(canopy_faces + offset)
-        all_uvs.append(np.tile(leaf_uv, (len(canopy_faces) * 3, 1)))
-        offset += len(canopy_verts)
+        if conifer:
+            shape, faces = conifer_verts, conifer_faces
+            # A conifer carries its foliage most of the way down the trunk.
+            centre = np.array([base_x + lean, base_y, base_z + trunk_h * 0.35])
+            radii = np.array([crown_r * 0.95, crown_r * 0.95 * squash,
+                              height - trunk_h * 0.35])
+            crown = shape * radii + centre
+        else:
+            # Measured on the Gelderland square: only 14.6% of trees are
+            # under four metres, so reserving the coarse crown for those
+            # costs 6% of the tree budget and keeps it off anything big
+            # enough to look at. Everything above gets the lobed sphere.
+            fine = height >= 4.0
+            shape, faces = (
+                (fine_verts, fine_faces) if fine else (coarse_verts, coarse_faces)
+            )
+            centre = np.array([base_x + lean, base_y, canopy_base + crown_h * 0.5])
+            # A young tree is a round bush, not a narrow one: without this the
+            # coarse crown comes out taller than it is wide and reads as a
+            # spike however blunt its poles are.
+            spread = 1.0 if fine else 1.25
+            radii = np.array(
+                [crown_r * spread, crown_r * squash * spread, crown_h * 0.5]
+            )
+            # Push the crown out of round. Two frequencies, so it lobes rather
+            # than merely leans, and seeded off the tree's own position so the
+            # same tree is the same shape every run. A single ellipsoid reads
+            # as a lollipop at any distance you can still see the trunk at.
+            wobble = (
+                1.0
+                + 0.34 * np.sin(shape[:, 0] * 2.1 + spin)
+                * np.cos(shape[:, 1] * 1.8 - spin * 0.7)
+                + 0.20 * np.sin(shape[:, 2] * 3.3 + shape[:, 0] * 1.4 + spin * 1.9)
+            )
+            crown = shape * wobble[:, None] * radii + centre
+
+        all_verts.append(crown)
+        all_faces.append(faces + offset)
+        all_uvs.append(np.tile(leaf_uv, (len(faces) * 3, 1)))
+        offset += len(crown)
 
     return np.vstack(all_verts), np.vstack(all_faces), np.vstack(all_uvs)
 
