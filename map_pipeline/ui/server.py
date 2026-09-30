@@ -63,7 +63,10 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     "surfaces":           {"c": 1.0, "a": 30.0, "m": 2.5},
     "usage":              {"c": 0.5, "a": 5.0,  "m": 0.0},
     "buildings":          {"c": 2.0, "a": 75.0, "m": 0.0},
-    "trees":              {"c": 1.0, "a": 23.0, "m": 0.0},
+    # The canopy model was always fetched; finding trees in it rather than only
+    # sampling it at the registered points costs about three seconds a square
+    # kilometre, measured.
+    "trees":              {"c": 1.0, "a": 26.0, "m": 0.0},
     "furniture":          {"c": 0.5, "a": 3.0,  "m": 0.0},
     # Five collections, and more features than any other BGT stage: 3013
     # separations over one square kilometre of Utrecht. Cheaper than that

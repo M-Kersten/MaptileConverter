@@ -1116,6 +1116,77 @@ is the local maximum within a few metres. Building roofs are cut out of the
 canopy model first, otherwise a tree standing near a wall inherits the height of
 the building next to it.
 
+### Finding the trees nobody registered
+
+The BGT tree register is a municipal asset list, not a survey of vegetation. It
+has the street trees the council maintains and knows nothing about the tree in
+someone's garden. Over the demo square kilometre **45% of the canopy above 2.5 m
+is nowhere near a registered tree** — and that is the flattering case, because
+the register is at its best in a city centre.
+
+So the canopy model is now read as a source of trees rather than only as a
+lookup at 1,489 points. Over the same square: **1,489 registered, 7,211 found,
+8,700 in the model**, in about three seconds.
+
+**Colour is not the way to do it, in this country.** The obvious approach is
+Google Earth's apparent one — find the parts that are tall and green. PDOK
+publishes a real colour-infrared ortho at 8 cm, so a proper NDVI is available
+rather than a guess at greenness, and it does not work here:
+
+| | NDVI |
+|---|---|
+| park trees | **+0.075** |
+| water | −0.005 |
+| big roof | −0.181 |
+| road | −0.184 |
+
+Summer foliage would read +0.6. Dutch national orthos are flown deliberately
+**leaf-off** in early spring, so that the ground and the buildings are visible
+rather than hidden under canopy — which makes them excellent for everything else
+this pipeline does and useless for finding trees by colour. A quarter of an index
+point between a tree and a road is not a detector. Height is the signal.
+
+**Difference against the filled ground, not the raw download.** The bare-earth
+DTM arrives **51% measured** over this square, and its holes are exactly under
+dense canopy, because dense canopy is what stops a ground return reaching the
+lidar. Subtracting one raster from the other therefore leaves the canopy model
+undefined in the middle of a wood, which is the one place it is most wanted.
+Using the terrain surface the pipeline has already filled and smoothed takes
+coverage from 51% to 96%, costs nothing, and has the trees standing on the same
+ground everything else is draped on.
+
+Four filters turn canopy into trees, and each is there because of something that
+went wrong without it:
+
+- **Off the building footprints, and 2 m clear of the eaves.** A roof overhangs
+  its own footprint; without the clearance the eaves come out as a line of trees
+  along every terrace.
+- **Extra clearance the taller the candidate.** Measured: 65% of detections above
+  25 m sat within 5 m of a building against 32% of those under 10 m, and the
+  tallest were one tight cluster around a tower the footprints do not cover. The
+  taller a thing is, the likelier it is part of the building it leans on.
+- **Rough, not smooth.** A crown is a mess of leaves at half-metre scale where a
+  made thing is a surface: roughness at a registered tree runs to a median of
+  3.1 m against 0.67 m on a roof. This cleans up what the footprint mask misses;
+  it does not replace it, because a roof *edge* is as rough as any crown.
+- **One seed per crown.** Every cell of a crown clears the height threshold, so
+  the peaks are found first and each tree then reserves its own crown. Registered
+  trees reserve theirs before any seed is taken — with a token three-metre
+  reservation instead, a quarter of the detections landed inside a tree the model
+  already had.
+
+**Detected trees arrive as their own object.** The model gets `Trees_registered`
+and `Trees_detected`, sharing one material. The detector is good rather than
+perfect — scaffolding, roof plant and the odd parked lorry will get through — and
+a bad patch has to be deletable as a group rather than hunted tree by tree. Turn
+it off with `trees.detect`, and the thresholds are all under `trees.detect_*`.
+
+**Point clouds would not fix this.** They would improve crown *shape* and let the
+understory be separated from the canopy, but the 0.5 m surface model already
+resolves crowns well enough to place a tree, and AHN has no vegetation class at
+all — vegetation sits in "unclassified", so the work would be the same
+height-above-ground reasoning at higher resolution and considerably more cost.
+
 Trees leave in two forms, and you get both:
 
 - Low-poly geometry in the FBX — a trunk prism and a subdivided-octahedron

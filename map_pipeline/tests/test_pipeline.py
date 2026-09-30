@@ -618,6 +618,242 @@ class TestTrees(unittest.TestCase):
         self.assertEqual(float(wider[0]), 14.0)
 
 
+class TestTreeDetection(unittest.TestCase):
+    """Finding the trees the BGT never registered.
+
+    The register is a municipal asset list, not a survey of vegetation: over a
+    square kilometre of Utrecht centre it holds 1489 trees where 45% of the
+    canopy above 2.5 m is nowhere near one of them, and that is the good case.
+    Colour cannot help -- Dutch national orthos are flown deliberately leaf-off
+    so the ground stays visible, and the infrared ortho gives park trees an
+    NDVI of +0.08 against -0.18 for a roof. Height is the signal.
+    """
+
+    BOUNDS = (0.0, 0.0, 100.0, 100.0)
+
+    @staticmethod
+    def _blank(rows=200, cols=200):
+        return np.zeros((rows, cols))
+
+    @classmethod
+    def _put(cls, grid, x, y, height, radius=2.0, rough=0.0, seed=0):
+        """Drop a dome of `height` at RD (x, y), optionally roughened."""
+        left, bottom, right, top = cls.BOUNDS
+        rows, cols = grid.shape
+        cx = (x - left) / (right - left) * cols
+        cy = (top - y) / (top - bottom) * rows
+        rr, cc = np.mgrid[0:rows, 0:cols]
+        cell = (right - left) / cols
+        dist = np.hypot((cc - cx) * cell, (rr - cy) * cell)
+        dome = np.where(dist < radius, height * np.sqrt(
+            np.maximum(1 - (dist / radius) ** 2, 0)), 0.0)
+        if rough:
+            noise = np.random.default_rng(seed).normal(0, rough, grid.shape)
+            dome = np.where(dome > 0, dome + noise, dome)
+        return np.maximum(grid, dome)
+
+    def test_a_crown_becomes_one_tree_not_a_hundred(self):
+        """Every cell of a crown is above the height threshold. Without a peak
+        search and a crown-sized reservation, each would be its own tree."""
+        from src.trees import detect_trees
+
+        # A big tree, so the crown it reserves (0.26 x 22 = 5.7 m) is clearly
+        # wider than the three-metre floor. With a tree barely above the floor
+        # the two rules agree and the fixture proves nothing.
+        grid = self._put(self._blank(), 50, 50, 22.0, radius=7.0, rough=0.9)
+        found, heights = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        self.assertEqual(len(found), 1, f"one crown became {len(found)} trees")
+        self.assertAlmostEqual(found[0][0], 50.0, delta=2.0)
+        self.assertAlmostEqual(found[0][1], 50.0, delta=2.0)
+        self.assertGreater(heights[0], 18.0)
+
+    def test_a_registered_tree_is_not_found_twice(self):
+        """A crown's canopy peak sits nowhere near the surveyed trunk, so the
+        register has to reserve its own crown, not a token radius -- a flat
+        three metres left a quarter of the detections inside a tree that was
+        already in the model."""
+        from src.trees import detect_trees
+
+        grid = self._put(self._blank(), 50, 50, 20.0, radius=5.0, rough=0.9)
+        surveyed = np.array([[50.0, 50.0]])
+
+        # A crown reservation the size of the crown keeps the detector out.
+        covered, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=surveyed,
+            registered_reach=np.array([0.26 * 20.0]),
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        self.assertEqual(len(covered), 0, "the surveyed tree was found again")
+
+        # A token reservation does not, which is the bug this replaced: a flat
+        # three metres left a quarter of the detections inside a tree the model
+        # already had.
+        token, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=surveyed,
+            registered_reach=np.array([0.5]), min_spacing_m=0.5,
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        self.assertGreater(len(token), 0, "the fixture cannot show a difference")
+
+    def test_a_smooth_tall_thing_is_not_a_tree(self):
+        """What roughness is for. A crown is a mess of leaves at half-metre
+        scale where a made thing is a surface: at a registered tree roughness
+        runs to a median of 3.1 m against 0.67 m on a roof.
+
+        It cleans up what the footprint mask misses rather than replacing it --
+        measured over the Utrecht square, a roughness cut alone still keeps
+        64% of roof area, because a roof *edge* is as rough as anything.
+        """
+        from src.trees import detect_trees
+
+        # A rough crown, and a smooth flat-topped slab as tall as it is.
+        grid = self._put(self._blank(), 25, 25, 9.0, radius=4.0, rough=0.9)
+        grid[40:80, 120:160] = 9.0          # RD x 60..80, y 60..80
+
+        found, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            min_height_m=2.5, min_roughness_m=0.4, crown_radius_ratio=0.26,
+        )
+        self.assertGreater(len(found), 0, "the rough crown was missed too")
+        inside = [(x, y) for x, y in found if 63 < x < 77 and 63 < y < 77]
+        self.assertEqual(
+            inside, [], f"{len(inside)} trees growing on a flat roof",
+        )
+        # The edges of that slab are as rough as any crown -- measured at 4.3
+        # against 0.0 in the middle -- so they are still detected here. That is
+        # the building mask's job, not this one's, and the point of saying so
+        # is that raising the roughness cut will not fix a roof edge.
+        self.assertTrue(
+            any(x > 55 for x, _ in found),
+            "the fixture no longer has a roof edge to leak",
+        )
+
+    def test_a_roof_and_its_eaves_are_both_excluded(self):
+        """A roof overhangs its own footprint, and without clearance the eaves
+        read as a line of trees along every terrace."""
+        from src.trees import detect_trees
+
+        grid = self._blank()
+        grid[60:140, 60:140] = 10.0
+        rng = np.random.default_rng(3)
+        grid[60:140, 60:140] += rng.normal(0, 1.2, (80, 80))
+        mask = np.zeros(grid.shape, dtype=bool)
+        mask[62:138, 62:138] = True     # the footprint, inside the roofline
+
+        loose, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            building_mask=mask, eaves_clearance_m=0.0, clearance_per_metre=0.0,
+            min_height_m=2.5, min_roughness_m=0.4, crown_radius_ratio=0.26,
+        )
+        clear, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            building_mask=mask, eaves_clearance_m=2.0, clearance_per_metre=0.0,
+            min_height_m=2.5, min_roughness_m=0.4, crown_radius_ratio=0.26,
+        )
+        self.assertGreater(len(loose), 0, "the fixture has no eaves to find")
+        self.assertEqual(len(clear), 0, f"{len(clear)} trees along the eaves")
+
+    def test_a_tall_thing_against_a_building_is_the_building(self):
+        """Measured over the Utrecht square: 65% of detections above 25 m sat
+        within 5 m of a building against 32% of those under 10 m, and the
+        tallest were one cluster around a tower the footprints do not cover."""
+        from src.trees import detect_trees
+
+        grid = self._blank()
+        mask = np.zeros(grid.shape, dtype=bool)
+        mask[80:120, 80:120] = True
+        grid[80:120, 80:120] = 20.0
+        # A tall rough spire 4 m off the roof, and a short tree 4 m off it too.
+        grid = self._put(grid, 62, 50, 26.0, radius=2.0, rough=1.2, seed=1)
+        grid = self._put(grid, 50, 38, 6.0, radius=2.0, rough=0.9, seed=2)
+
+        found, heights = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            building_mask=mask, eaves_clearance_m=2.0,
+            clearance_per_metre=0.15, max_height_m=30.0,
+            min_height_m=2.5, min_roughness_m=0.4, crown_radius_ratio=0.26,
+        )
+        self.assertTrue(
+            all(h < 20.0 for h in heights),
+            f"kept a {max(heights, default=0):.0f} m spire beside the roof",
+        )
+
+    def test_water_is_not_a_forest(self):
+        """Lidar does not reflect off water and the returns that do come back
+        scatter over six metres, which any height threshold reads as canopy."""
+        from src.trees import detect_trees
+
+        grid = self._blank()
+        rng = np.random.default_rng(7)
+        grid[20:80, 20:80] = np.abs(rng.normal(0, 3.0, (60, 60)))
+        mask = np.zeros(grid.shape, dtype=bool)
+        mask[20:80, 20:80] = True
+
+        noisy, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            min_height_m=2.5, min_roughness_m=0.4, crown_radius_ratio=0.26,
+        )
+        masked, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), water_mask=mask,
+            min_height_m=2.5, min_roughness_m=0.4, crown_radius_ratio=0.26,
+        )
+        self.assertGreater(len(noisy), 10, "the fixture is not noisy enough")
+        self.assertEqual(len(masked), 0, f"{len(masked)} trees on the canal")
+
+    def test_the_canopy_model_is_measured_from_the_filled_ground(self):
+        """The bare-earth grid arrives 51% measured over the Utrecht square and
+        its holes are exactly under dense canopy, because dense canopy is what
+        stops a ground return. Differencing the two rasters therefore leaves the
+        model undefined in the middle of a wood, which is where it is wanted."""
+        import inspect
+
+        from src import trees as trees_module
+
+        source = inspect.getsource(trees_module._load_ndsm)
+        self.assertIn(
+            "terrain.sample", source,
+            "the canopy model is differenced against the raw download again",
+        )
+        self.assertNotIn(
+            "dsm - dtm", source.replace(" ", " "),
+            "the canopy model still subtracts the unfilled bare-earth grid",
+        )
+
+    def test_detected_trees_stay_separable(self):
+        """The detector is good and not perfect, so a bad patch has to be
+        deletable as a group rather than hunted tree by tree."""
+        import tempfile
+
+        from src.trees import Tree, TreeSet, save_trees
+
+        result = TreeSet()
+        for index in range(4):
+            result.trees.append(
+                Tree(x=float(index), y=0.0, ground_z_nap=0.0, height_m=8.0,
+                     crown_radius_m=2.0, trunk_height_m=2.0, measured=True,
+                     detected=index >= 2)
+            )
+        stats = result.stats()
+        self.assertEqual(stats["registered"], 2)
+        self.assertEqual(stats["detected"], 2)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = save_trees(result, Path(folder) / "trees.npz")
+            data = np.load(path)
+            self.assertIn("detected", data.files)
+            self.assertEqual(list(data["detected"]), [False, False, True, True])
+
+    def test_the_settings_reach_the_config(self):
+        from src.config import DEFAULTS
+
+        self.assertTrue(DEFAULTS["trees"]["detect"])
+        self.assertEqual(DEFAULTS["trees"]["detect_min_height_m"], 2.5)
+        self.assertEqual(DEFAULTS["trees"]["detect_max_height_m"], 30.0)
+
+
 class TestSurfaces(unittest.TestCase):
     @staticmethod
     def _area(ring):

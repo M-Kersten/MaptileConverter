@@ -905,28 +905,10 @@ def _octahedron_canopy(subdivisions: int = 1):
     return np.asarray(verts), np.asarray(faces, dtype=np.int64)
 
 
-def build_trees(scene: dict, work_dir: Path, tree_material):
-    """One mesh holding every tree: a trunk prism plus a low-poly canopy.
-
-    Solid geometry rather than crossed billboards, so nothing depends on alpha
-    settings surviving the FBX trip and being configured again in Unity.
-    """
-    tree_file = scene.get("trees", {}).get("file")
-    if not tree_file or not (work_dir / tree_file).is_file():
-        return None
-
-    data = np.load(work_dir / tree_file)
-    xy = data["xy"]
-    if len(xy) == 0:
-        return None
-
-    ground = data["ground_z_nap"]
-    heights = data["height_m"]
-    crowns = data["crown_radius_m"]
-    trunks = data["trunk_height_m"]
-
-    origin_x, origin_y = scene["origin_rd"]
-    z_offset = float(scene["ground_z_offset_nap"])
+def _tree_group_mesh(members, fields, origin, rng):
+    """Trunks and canopies for one group of trees, as (vertices, faces, uvs)."""
+    xy, ground, heights, crowns, trunks = fields
+    origin_x, origin_y, z_offset = origin
 
     canopy_verts, canopy_faces = _octahedron_canopy(1)
     trunk_sides = 5
@@ -940,9 +922,8 @@ def build_trees(scene: dict, work_dir: Path, tree_material):
     all_faces: list[np.ndarray] = []
     all_uvs: list[np.ndarray] = []
     offset = 0
-    rng = np.random.default_rng(4242)
 
-    for index in range(len(xy)):
+    for index in np.flatnonzero(members):
         base_x = float(xy[index, 0]) - origin_x
         base_y = float(xy[index, 1]) - origin_y
         base_z = float(ground[index]) - z_offset
@@ -990,28 +971,62 @@ def build_trees(scene: dict, work_dir: Path, tree_material):
         all_uvs.append(np.tile(leaf_uv, (len(canopy_faces) * 3, 1)))
         offset += len(canopy_verts)
 
-    vertices = np.vstack(all_verts)
-    faces = np.vstack(all_faces)
-    uvs = np.vstack(all_uvs)
+    return np.vstack(all_verts), np.vstack(all_faces), np.vstack(all_uvs)
 
-    n_triangles = len(faces)
-    loop_vertex_indices = faces.reshape(-1)
-    loop_starts = np.arange(0, n_triangles * 3, 3)
-    loop_totals = np.full(n_triangles, 3)
 
-    obj = build_mesh_object(
-        "Trees",
-        vertices,
-        loop_vertex_indices,
-        loop_starts,
-        loop_totals,
-        uvs,
-        np.zeros(n_triangles),
-        [tree_material],
-        shade_smooth=False,
+def build_trees(scene: dict, work_dir: Path, tree_material):
+    """Trees as trunk prisms with low-poly canopies, in two groups.
+
+    Solid geometry rather than crossed billboards, so nothing depends on alpha
+    settings surviving the FBX trip and being configured again in Unity.
+
+    Split into Trees_registered and Trees_detected. The BGT tree register is a
+    municipal asset list rather than a survey of vegetation -- over a square
+    kilometre of Utrecht centre it holds 1489 trees where the canopy model
+    finds 8700 -- so most of what arrives was found rather than surveyed. The
+    detector is good and not perfect, so the found ones stay their own object
+    and a bad patch can be deleted as a group without touching a surveyed tree.
+    """
+    tree_file = scene.get("trees", {}).get("file")
+    if not tree_file or not (work_dir / tree_file).is_file():
+        return []
+
+    data = np.load(work_dir / tree_file)
+    xy = data["xy"]
+    if len(xy) == 0:
+        return []
+
+    fields = (xy, data["ground_z_nap"], data["height_m"],
+              data["crown_radius_m"], data["trunk_height_m"])
+    detected = (
+        data["detected"] if "detected" in data.files
+        else np.zeros(len(xy), dtype=bool)
     )
-    log(f"trees: {len(xy)} trees, {n_triangles} triangles")
-    return obj
+    origin = (*scene["origin_rd"], float(scene["ground_z_offset_nap"]))
+    rng = np.random.default_rng(4242)
+
+    objects = []
+    for label, members in (("Trees_registered", ~detected),
+                           ("Trees_detected", detected)):
+        if not members.any():
+            continue
+        vertices, faces, uvs = _tree_group_mesh(members, fields, origin, rng)
+        n_triangles = len(faces)
+        objects.append(
+            build_mesh_object(
+                label,
+                vertices,
+                faces.reshape(-1),
+                np.arange(0, n_triangles * 3, 3),
+                np.full(n_triangles, 3),
+                uvs,
+                np.zeros(n_triangles),
+                [tree_material],
+                shade_smooth=False,
+            )
+        )
+        log(f"{label}: {int(members.sum())} trees, {n_triangles} triangles")
+    return objects
 
 
 # ---------------------------------------------------------------------------

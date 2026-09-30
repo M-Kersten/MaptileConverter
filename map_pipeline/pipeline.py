@@ -573,6 +573,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 trees_cfg=config.trees,
                 terrain=terrain,
                 buildings=buildings,
+                # For the water mask: lidar scatter over a canal is six metres
+                # of noise, which any height threshold reads as forest.
+                surfaces=surfaces if want_surfaces else None,
             )
             if len(trees):
                 write_tree_list(trees, config.geo, out_dir)

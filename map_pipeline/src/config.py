@@ -181,6 +181,33 @@ DEFAULTS: dict[str, Any] = {
         "default_height_m": 7.0,
         "crown_radius_ratio": 0.26,
         "trunk_height_ratio": 0.38,
+        # The BGT tree register is a municipal asset list, not a survey of
+        # vegetation: over one square kilometre of Utrecht centre 45% of the
+        # canopy above 2.5 m is nowhere near a registered tree, and the
+        # register is at its best in a city centre. The rest is found in the
+        # canopy height model. Detected trees stay flagged, and arrive as their
+        # own object, because the detector is good rather than perfect.
+        "detect": True,
+        # Below this a crown is a shrub, and shrubs are not worth a tree mesh.
+        "detect_min_height_m": 2.5,
+        # And above this it is a structure, not a tree. Urban trees top out
+        # around thirty metres; the forty-metre "trees" the first run found
+        # were one tower the building footprints do not cover.
+        "detect_max_height_m": 30.0,
+        # Extra clearance from a building per metre of height. Measured: 65% of
+        # detections above 25 m sat within 5 m of a building against 32% of
+        # those under 10 m, so height near a roof is the tell.
+        "detect_clearance_per_metre": 0.15,
+        # How rough the surface has to be. Once the building footprints are
+        # masked this is what rejects scaffolding, roof plant and lorries:
+        # roughness at a registered tree runs to a median of 3.1 m against
+        # 0.67 m on a roof.
+        "detect_min_roughness_m": 0.4,
+        # A roof overhangs its own footprint, and without this clearance the
+        # eaves read as a line of trees along every terrace.
+        "detect_eaves_clearance_m": 2.0,
+        # No two detected trees closer than this, whatever their crowns say.
+        "detect_min_spacing_m": 3.0,
         "geometry": True,
         "texture_px": 512,
     },

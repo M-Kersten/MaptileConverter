@@ -43,6 +43,10 @@ class Tree:
     crown_radius_m: float
     trunk_height_m: float
     measured: bool  # False when AHN had nothing usable and a default was used
+    # True when the canopy model found it rather than the BGT registering it.
+    # The detector is good, not perfect, so these stay separable all the way
+    # to the FBX and a bad patch can be deleted as a group.
+    detected: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -53,6 +57,7 @@ class Tree:
             "crown_radius_m": round(self.crown_radius_m, 2),
             "trunk_height_m": round(self.trunk_height_m, 2),
             "height_measured": self.measured,
+            "detected": self.detected,
         }
 
 
@@ -79,6 +84,8 @@ class TreeSet:
             "height_median_m": round(float(np.median(heights)), 2),
             "heights_measured": measured,
             "heights_defaulted": len(self.trees) - measured,
+            "registered": sum(1 for t in self.trees if not t.detected),
+            "detected": sum(1 for t in self.trees if t.detected),
             "raw_features": self.raw_features,
             "superseded_dropped": self.superseded_dropped,
             "pages_fetched": self.pages_fetched,
@@ -147,7 +154,7 @@ def iter_bgt_pages(
 
 
 def _load_ndsm(
-    bbox: BBox, work_dir: Path, dtm_geotiff: Path, trees_cfg: dict
+    bbox: BBox, work_dir: Path, dtm_geotiff: Path, trees_cfg: dict, terrain
 ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
     """Canopy height model: DSM minus DTM, on the DTM's own grid.
 
@@ -190,13 +197,34 @@ def _load_ndsm(
             f"the two AHN grids must line up to subtract them"
         )
 
-    valid = (dsm < NODATA_CUTOFF) & (dtm < NODATA_CUTOFF)
-    ndsm = np.where(valid, dsm - dtm, np.nan)
+    # Against the terrain the model already stands on, not against the raw
+    # download. This matters more than it sounds: the bare-earth DTM arrives
+    # only 51% measured over this square kilometre, and its holes are exactly
+    # under dense canopy, because dense canopy is what stops a ground return
+    # reaching the lidar. Differencing the two rasters therefore leaves the
+    # canopy model undefined in the middle of a wood -- which is the one place
+    # it is most wanted. The terrain stage has already filled and smoothed that
+    # surface, so using it takes the model from 51% coverage to 96% and costs
+    # nothing, and the trees end up standing on the ground everything else is
+    # draped on.
+    rows, cols = dsm.shape
+    left, bottom, right, top = bounds
+    xs = left + (np.arange(cols) + 0.5) * (right - left) / cols
+    ys = top - (np.arange(rows) + 0.5) * (top - bottom) / rows
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    ground = np.asarray(
+        terrain.sample(grid_x.ravel(), grid_y.ravel()), dtype=np.float64
+    ).reshape(dsm.shape)
+
+    valid = dsm < NODATA_CUTOFF
+    ndsm = np.where(valid, dsm - ground, np.nan)
     LOG.info(
-        "canopy height model over %d x %d cells, %.1f%% usable",
+        "canopy height model over %d x %d cells, %.1f%% usable "
+        "(the bare-earth grid alone would give %.1f%%)",
         ndsm.shape[1],
         ndsm.shape[0],
         100.0 * valid.mean(),
+        100.0 * (valid & (dtm < NODATA_CUTOFF)).mean(),
     )
     return ndsm, bounds
 
@@ -286,6 +314,227 @@ def _max_in_radius(
     return best
 
 
+def _dilate(mask: np.ndarray, cells: int) -> np.ndarray:
+    """Grow a boolean mask by `cells`. No scipy in this project, so: shifts."""
+    out = mask.copy()
+    for _ in range(max(0, cells)):
+        grown = out.copy()
+        grown[1:, :] |= out[:-1, :]
+        grown[:-1, :] |= out[1:, :]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        out = grown
+    return out
+
+
+def _roughness(grid: np.ndarray, radius: int) -> np.ndarray:
+    """How far the surface departs from its own local mean, per cell.
+
+    The one measurement that tells a crown from roof clutter once the building
+    footprints are already masked. Over a square kilometre of Utrecht the
+    roughness at a registered tree runs to a median of 3.1 m against 0.67 m on
+    a roof, so scaffolding, roof plant and the odd parked lorry come out on the
+    right side of it.
+
+    Summed-area tables, so the window size costs nothing.
+    """
+    valid = np.isfinite(grid)
+    filled = np.where(valid, grid, 0.0)
+    rows, cols = grid.shape
+
+    def integral(values):
+        out = np.zeros((rows + 1, cols + 1))
+        out[1:, 1:] = values.cumsum(0).cumsum(1)
+        return out
+
+    sum_x = integral(filled)
+    sum_xx = integral(filled * filled)
+    sum_n = integral(valid.astype(np.float64))
+
+    r0 = np.clip(np.arange(rows) - radius, 0, rows)
+    r1 = np.clip(np.arange(rows) + radius + 1, 0, rows)
+    c0 = np.clip(np.arange(cols) - radius, 0, cols)
+    c1 = np.clip(np.arange(cols) + radius + 1, 0, cols)
+
+    def window(table):
+        return (
+            table[np.ix_(r1, c1)] - table[np.ix_(r0, c1)]
+            - table[np.ix_(r1, c0)] + table[np.ix_(r0, c0)]
+        )
+
+    count = np.maximum(window(sum_n), 1.0)
+    mean = window(sum_x) / count
+    variance = window(sum_xx) / count - mean * mean
+    return np.where(window(sum_n) > 0, np.sqrt(np.maximum(variance, 0.0)), np.nan)
+
+
+def _local_peaks(grid: np.ndarray, radius: int) -> np.ndarray:
+    """Cells no lower than anything within `radius`, as a boolean mask.
+
+    One seed per crown rather than one per cell. Without it the greedy pass
+    below would have a third of a million candidates to sort through instead of
+    a few thousand.
+    """
+    best = np.where(np.isfinite(grid), grid, -np.inf)
+    peak = best.copy()
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx == 0 and dy == 0:
+                continue
+            shifted = np.full_like(best, -np.inf)
+            ys = slice(max(0, dy), best.shape[0] + min(0, dy))
+            xs = slice(max(0, dx), best.shape[1] + min(0, dx))
+            yt = slice(max(0, -dy), best.shape[0] + min(0, -dy))
+            xt = slice(max(0, -dx), best.shape[1] + min(0, -dx))
+            shifted[yt, xt] = best[ys, xs]
+            peak = np.maximum(peak, shifted)
+    return np.isfinite(grid) & (best >= peak)
+
+
+def detect_trees(
+    ndsm: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    *,
+    registered_xy: np.ndarray,
+    registered_reach: np.ndarray | None = None,
+    building_mask: np.ndarray | None = None,
+    water_mask: np.ndarray | None = None,
+    min_height_m: float = 2.5,
+    max_height_m: float = 30.0,
+    crown_radius_ratio: float = 0.25,
+    min_roughness_m: float = 0.4,
+    eaves_clearance_m: float = 2.0,
+    clearance_per_metre: float = 0.15,
+    min_spacing_m: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find tree crowns the BGT never registered. Returns `(xy, heights)`.
+
+    The BGT registers street trees, which is a municipal asset register, not a
+    survey of vegetation. Over one square kilometre of Utrecht centre 45% of the
+    canopy above 2.5 m is nowhere near a registered tree, and that is the good
+    case -- the register is at its best in a city centre and knows nothing about
+    private gardens.
+
+    Colour would be the obvious second opinion and it is not available: Dutch
+    national orthos are flown deliberately leaf-off in early spring so the
+    ground and the buildings are visible, and measured over the same square the
+    infrared ortho gives park trees an NDVI of +0.08 against -0.18 for a roof.
+    A quarter of an index point is not a detector. Height is the signal here.
+    """
+    left, bottom, right, top = bounds
+    rows, cols = ndsm.shape
+    cell_x = (right - left) / cols
+    cell_y = (top - bottom) / rows
+    cell = min(cell_x, cell_y)
+
+    candidate = np.isfinite(ndsm) & (ndsm > min_height_m) & (ndsm <= max_height_m)
+    if building_mask is not None:
+        # Dilated, because a roof overhangs its own footprint and the eaves
+        # otherwise read as a line of trees along every terrace.
+        #
+        # And dilated further for taller candidates, which is not a hunch: over
+        # the Utrecht square, 65% of detections above 25 m sat within 5 m of a
+        # building against 32% of those under 10 m, and the tallest were one
+        # tight cluster around a tower the BGT footprint does not cover. The
+        # taller a thing is, the likelier it is part of the building it is
+        # standing against, so it has to stand further off to be believed.
+        near = _dilate(building_mask, int(round(eaves_clearance_m / cell)))
+        candidate &= ~near
+        if clearance_per_metre > 0:
+            reach = eaves_clearance_m
+            step = max(cell, 1.0)
+            while reach < eaves_clearance_m + clearance_per_metre * max_height_m:
+                reach += step
+                near = _dilate(near, int(round(step / cell)))
+                # Everything this close to a roof must be shorter than the
+                # clearance it has earned.
+                too_tall = (reach - eaves_clearance_m) / clearance_per_metre
+                candidate &= ~(near & (ndsm > too_tall))
+    if water_mask is not None:
+        # Lidar does not reflect off water, and the returns that do come back
+        # scatter over six metres. Noise that high would be a forest.
+        candidate &= ~water_mask
+    if not candidate.any():
+        return np.zeros((0, 2)), np.zeros(0)
+
+    if min_roughness_m > 0:
+        candidate &= _roughness(ndsm, max(1, int(round(2.5 / cell)))) > min_roughness_m
+    if not candidate.any():
+        return np.zeros((0, 2)), np.zeros(0)
+
+    # One seed per crown. The window is sized for the smallest tree worth
+    # finding, so two trees closer than that merge -- which is the right answer
+    # for a hedge row read as one crown.
+    seed_radius = max(1, int(round(crown_radius_ratio * min_height_m / cell)))
+    peaks = _local_peaks(np.where(candidate, ndsm, np.nan), seed_radius)
+    seed_rows, seed_cols = np.nonzero(peaks)
+    if not len(seed_rows):
+        return np.zeros((0, 2)), np.zeros(0)
+
+    heights = ndsm[seed_rows, seed_cols]
+    xs = left + (seed_cols + 0.5) * cell_x
+    ys = top - (seed_rows + 0.5) * cell_y
+
+    # Tallest first, so where two seeds compete the real crown wins and the
+    # shoulder beside it is the one dropped.
+    order = np.argsort(-heights)
+    xs, ys, heights = xs[order], ys[order], heights[order]
+
+    spacing = np.maximum(crown_radius_ratio * heights, min_spacing_m)
+    grid_size = max(
+        float(spacing.max()),
+        float(np.max(registered_reach)) if registered_reach is not None
+        and len(np.atleast_1d(registered_reach)) else 0.0,
+        min_spacing_m,
+        cell,
+    )
+    taken: dict = {}
+
+    def claim(x, y, reach, store):
+        key = (int(x // grid_size), int(y // grid_size))
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for ox, oy, oreach in taken.get((key[0] + dx, key[1] + dy), ()):
+                    if np.hypot(x - ox, y - oy) < max(reach, oreach):
+                        return False
+        if store:
+            taken.setdefault(key, []).append((x, y, reach))
+        return True
+
+    # Registered trees are placed first and never displaced: where the BGT has
+    # surveyed a trunk, that position is better than anything a raster peak can
+    # offer, and a detected twin beside it would be one tree drawn twice.
+    #
+    # Each reserves its own crown, not a flat radius. A fifteen-metre tree is
+    # four metres across, and its canopy peak sits nowhere near the surveyed
+    # trunk -- which is why a flat three-metre reservation left a quarter of
+    # the detections sitting inside a tree that was already there.
+    fixed = np.asarray(registered_xy, dtype=np.float64).reshape(-1, 2)
+    if registered_reach is None:
+        reserved = np.full(len(fixed), min_spacing_m)
+    else:
+        reserved = np.maximum(
+            np.asarray(registered_reach, dtype=np.float64).ravel(), min_spacing_m
+        )
+    for (x, y), reach in zip(fixed, reserved):
+        claim(float(x), float(y), float(reach), store=True)
+
+    keep_x, keep_y, keep_h = [], [], []
+    for x, y, height, reach in zip(xs, ys, heights, spacing):
+        if not claim(float(x), float(y), float(reach), store=True):
+            continue
+        keep_x.append(float(x))
+        keep_y.append(float(y))
+        keep_h.append(float(height))
+
+    LOG.info(
+        "detected %d trees the register does not have, from %d canopy peaks",
+        len(keep_x),
+        len(seed_rows),
+    )
+    return np.column_stack([keep_x, keep_y]), np.asarray(keep_h)
+
+
 def build_trees(
     bbox: BBox,
     work_dir: Path,
@@ -293,6 +542,7 @@ def build_trees(
     trees_cfg: dict,
     terrain,
     buildings=None,
+    surfaces=None,
 ) -> TreeSet:
     """Fetch BGT trees over `bbox` and give each one a height from AHN."""
     result = TreeSet()
@@ -342,22 +592,13 @@ def build_trees(
         result.raw_features,
         len(points),
     )
-    if not points:
+    coords = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if not len(coords):
         LOG.warning("no BGT trees found for %s", bbox)
+
+    want_detect = bool(trees_cfg.get("detect", True))
+    if not len(coords) and not want_detect:
         return result
-
-    coords = np.asarray(points, dtype=np.float64)
-
-    ndsm, bounds = _load_ndsm(
-        bbox, work_dir, terrain.geotiff_path, trees_cfg
-    )
-    if buildings is not None and len(buildings):
-        ndsm = np.where(
-            _rasterize_buildings(buildings, bounds, ndsm.shape), np.nan, ndsm
-        )
-    canopy = _max_in_radius(
-        ndsm, bounds, coords[:, 0], coords[:, 1], float(trees_cfg["crown_search_m"])
-    )
 
     min_h = float(trees_cfg["min_height_m"])
     max_h = float(trees_cfg["max_height_m"])
@@ -365,31 +606,127 @@ def build_trees(
     crown_ratio = float(trees_cfg["crown_radius_ratio"])
     trunk_ratio = float(trees_cfg["trunk_height_ratio"])
 
-    ground = np.asarray(terrain.sample(coords[:, 0], coords[:, 1]), dtype=np.float64)
+    ndsm, bounds = _load_ndsm(
+        bbox, work_dir, terrain.geotiff_path, trees_cfg, terrain
+    )
+    # Kept rather than blanked, because the detector needs to know where the
+    # roofs are in order to stay off them and their eaves, and blanking loses
+    # that. Only the registered-tree sampling wants them out of the way.
+    building_mask = (
+        _rasterize_buildings(buildings, bounds, ndsm.shape)
+        if buildings is not None and len(buildings)
+        else None
+    )
+    off_buildings = ndsm if building_mask is None else np.where(building_mask, np.nan, ndsm)
 
-    for index, (x, y) in enumerate(coords):
-        raw = canopy[index]
-        measured = bool(np.isfinite(raw) and min_h <= raw <= max_h)
-        height = float(raw) if measured else default_h
+    def add(x, y, height, ground_z, measured, detected):
         height = float(np.clip(height, min_h, max_h))
-
         result.trees.append(
             Tree(
                 x=float(x),
                 y=float(y),
-                ground_z_nap=float(ground[index]),
+                ground_z_nap=float(ground_z),
                 height_m=height,
                 # Urban crowns run about a quarter of the tree's height across,
                 # bounded so a young tree still reads as a tree.
                 crown_radius_m=float(np.clip(crown_ratio * height, 0.8, 7.0)),
                 trunk_height_m=float(np.clip(trunk_ratio * height, 0.6, 6.0)),
                 measured=measured,
+                detected=detected,
             )
         )
+
+    if len(coords):
+        canopy = _max_in_radius(
+            off_buildings, bounds, coords[:, 0], coords[:, 1],
+            float(trees_cfg["crown_search_m"]),
+        )
+        ground = np.asarray(
+            terrain.sample(coords[:, 0], coords[:, 1]), dtype=np.float64
+        )
+        for index, (x, y) in enumerate(coords):
+            raw = canopy[index]
+            measured = bool(np.isfinite(raw) and min_h <= raw <= max_h)
+            add(x, y, raw if measured else default_h, ground[index], measured, False)
+
+    if want_detect:
+        water_mask = _rasterize_water(surfaces, bounds, ndsm.shape)
+        found, heights = detect_trees(
+            ndsm,
+            bounds,
+            registered_xy=coords,
+            registered_reach=np.array(
+                [t.crown_radius_m for t in result.trees], dtype=np.float64
+            ),
+            building_mask=building_mask,
+            water_mask=water_mask,
+            min_height_m=float(trees_cfg.get("detect_min_height_m", 2.5)),
+            max_height_m=float(trees_cfg.get("detect_max_height_m", 30.0)),
+            crown_radius_ratio=crown_ratio,
+            min_roughness_m=float(trees_cfg.get("detect_min_roughness_m", 0.4)),
+            eaves_clearance_m=float(trees_cfg.get("detect_eaves_clearance_m", 2.0)),
+            clearance_per_metre=float(
+                trees_cfg.get("detect_clearance_per_metre", 0.15)
+            ),
+            min_spacing_m=float(trees_cfg.get("detect_min_spacing_m", 3.0)),
+        )
+        if len(found):
+            ground = np.asarray(
+                terrain.sample(found[:, 0], found[:, 1]), dtype=np.float64
+            )
+            for index, (x, y) in enumerate(found):
+                add(x, y, heights[index], ground[index], True, True)
+
+    if not result.trees:
+        return result
 
     LOG.info("%s", _summary_line(result))
     save_trees(result, work_dir / "trees.npz")
     return result
+
+
+def _rasterize_water(surfaces, bounds, shape) -> np.ndarray | None:
+    """Mark the cells covered by water, so lidar noise is not read as forest.
+
+    Lidar does not reflect off water: the returns that do come back scatter
+    over six metres, and six metres of scatter above the ground is a tree as
+    far as any height threshold can tell.
+    """
+    bodies = getattr(surfaces, "water", None) if surfaces is not None else None
+    if not bodies:
+        return None
+
+    left, bottom, right, top = bounds
+    rows, cols = shape
+    cell_x = (right - left) / cols
+    cell_y = (top - bottom) / rows
+    mask = np.zeros(shape, dtype=bool)
+
+    for body in bodies:
+        for ring in getattr(body, "rings", ()) or ():
+            ring = np.asarray(ring, dtype=np.float64)[:, :2]
+            if len(ring) < 3:
+                continue
+            px = (ring[:, 0] - left) / cell_x
+            py = (top - ring[:, 1]) / cell_y
+            ax, ay, bx, by = px[:-1], py[:-1], px[1:], py[1:]
+            for row in range(
+                max(0, int(np.floor(py.min()))), min(rows, int(np.ceil(py.max())) + 1)
+            ):
+                centre = row + 0.5
+                straddles = (ay > centre) != (by > centre)
+                if not straddles.any():
+                    continue
+                t = (centre - ay[straddles]) / (by[straddles] - ay[straddles])
+                crossings = np.sort(ax[straddles] + t * (bx[straddles] - ax[straddles]))
+                for start, end in zip(crossings[0::2], crossings[1::2]):
+                    col0 = max(0, int(np.ceil(start - 0.5)))
+                    col1 = min(cols - 1, int(np.floor(end - 0.5)))
+                    if col1 >= col0:
+                        mask[row, col0 : col1 + 1] = True
+
+    LOG.info("masked %.1f%% of the canopy model as water", 100.0 * mask.mean())
+    return mask
 
 
 def _summary_line(result: TreeSet) -> str:
@@ -398,7 +735,9 @@ def _summary_line(result: TreeSet) -> str:
         f"{stats['count']} trees, heights {stats['height_min_m']}-"
         f"{stats['height_max_m']} m (median {stats['height_median_m']} m), "
         f"{stats['heights_measured']} measured from AHN, "
-        f"{stats['heights_defaulted']} defaulted"
+        f"{stats['heights_defaulted']} defaulted; "
+        f"{stats['registered']} from the BGT register, "
+        f"{stats['detected']} found in the canopy model"
     )
 
 
@@ -416,6 +755,9 @@ def save_trees(trees: TreeSet, path: Path) -> Path:
         trunk_height_m=np.array(
             [t.trunk_height_m for t in trees.trees], dtype=np.float64
         ),
+        # So the Blender stage can split them into two objects. The detector is
+        # good, not perfect, and a bad patch has to be deletable as a group.
+        detected=np.array([t.detected for t in trees.trees], dtype=bool),
     )
     LOG.info("wrote %s (%d trees)", path, len(trees))
     return path
@@ -459,6 +801,7 @@ def write_tree_list(trees: TreeSet, geo, out_dir: Path, filename: str = "trees.j
 
 
 __all__ = [
+    "detect_trees",
     "Tree",
     "TreeSet",
     "build_trees",

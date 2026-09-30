@@ -490,6 +490,39 @@ def check_trees(report: CheckReport, trees, bbox: BBox) -> None:
         f"(median {np.median(heights):.1f})",
     )
 
+    detected = np.array([getattr(t, "detected", False) for t in trees.trees])
+    if not detected.any():
+        return
+
+    report.add(
+        "trees_found_as_well_as_surveyed",
+        True,
+        f"{int((~detected).sum())} from the BGT register, "
+        f"{int(detected.sum())} found in the canopy model",
+    )
+    # No two trees on the same spot. The detector places one seed per crown,
+    # and a registered tree reserves its own crown before any seed is taken, so
+    # a pair closer than a metre means that reservation is not working and the
+    # model has a tree drawn twice.
+    points = np.column_stack([xs, ys])
+    order = np.lexsort((points[:, 1], points[:, 0]))
+    ordered = points[order]
+    gaps = np.hypot(*(np.diff(ordered, axis=0)).T)
+    closest = float(gaps.min()) if len(gaps) else np.inf
+    report.add(
+        "no_two_trees_share_a_spot",
+        closest >= 1.0,
+        f"the closest two trees are {closest:.2f} m apart",
+    )
+    # A detected tree taller than anything that grows here is a structure the
+    # building footprints did not cover.
+    tallest = float(heights[detected].max())
+    report.add(
+        "found_trees_are_tree_sized",
+        tallest <= 32.0,
+        f"the tallest found tree is {tallest:.1f} m",
+    )
+
     # Stacked duplicates are what a naive read of the BGT version history gives.
     positions = np.column_stack([np.round(xs, 2), np.round(ys, 2)])
     unique = len(np.unique(positions, axis=0))
