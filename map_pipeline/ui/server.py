@@ -65,6 +65,11 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     "buildings":          {"c": 2.0, "a": 75.0, "m": 0.0},
     "trees":              {"c": 1.0, "a": 23.0, "m": 0.0},
     "furniture":          {"c": 0.5, "a": 3.0,  "m": 0.0},
+    # Five collections, and more features than any other BGT stage: 3013
+    # separations over one square kilometre of Utrecht. Cheaper than that
+    # sounds -- measured at 7.4 s for the demo square, fetch included -- because
+    # a swept prism is a handful of quads and none of it needs triangulating.
+    "barriers":           {"c": 0.5, "a": 7.0,  "m": 0.0},
     # Two BGT collections, and wegdeel is the big one in a city centre.
     "vehicles":           {"c": 0.5, "a": 14.0, "m": 0.0},
     # One collection, and empty over most of a city.
@@ -115,6 +120,7 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
         "usage": on("usage"),
         "trees": on("trees"),
         "furniture": on("furniture"),
+        "barriers": on("barriers"),
         "vehicles": on("vehicles"),
         "rails": on("rails"),
         "structures": on("structures"),
@@ -183,6 +189,7 @@ def measured_speed_factor() -> tuple[float, int]:
                 "water": drivers.get("surfaces", True),
                 "land_cover": drivers.get("surfaces", True),
                 "furniture": drivers.get("furniture", True),
+                "barriers": drivers.get("barriers", True),
                 "usage": drivers.get("usage", True),
                 "preview": drivers.get("preview", False),
             }
@@ -754,6 +761,7 @@ class Handler(BaseHTTPRequestHandler):
                     "water": flag("water"),
                     "land_cover": flag("land_cover"),
                     "furniture": flag("furniture"),
+                    "barriers": flag("barriers"),
                     "usage": flag("usage"),
                     "preview": flag("preview"),
                 }

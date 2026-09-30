@@ -643,6 +643,70 @@ def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
     )
 
 
+def check_barriers(report: CheckReport, barriers, sampler=None) -> None:
+    """Walls and fences are closed, on the ground, and a believable height.
+
+    Height is the one thing the BGT does not survey for these, so it comes
+    from a table of assumptions -- which is exactly the sort of number that
+    gets edited to 30 in a config file and noticed three models later.
+    """
+    if barriers is None or not len(barriers):
+        report.add("barriers_present", True, "no walls or fences", severity="warning")
+        return
+
+    report.add(
+        "barriers_present",
+        True,
+        ", ".join(f"{v} {k}" for k, v in sorted(barriers.counts.items())),
+    )
+
+    vertices, triangles = barriers.vertices, barriers.triangles
+    edges = np.sort(
+        np.concatenate(
+            [triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]]
+        ),
+        axis=1,
+    )
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    bad_edges = int((counts > 2).sum())
+    report.add(
+        "barriers_are_manifold",
+        bad_edges == 0,
+        f"{bad_edges} edges shared by more than two faces",
+    )
+
+    corner = vertices[triangles]
+    area = np.linalg.norm(
+        np.cross(corner[:, 1] - corner[:, 0], corner[:, 2] - corner[:, 0]), axis=1
+    ) / 2
+    degenerate = int((area < 1e-9).sum())
+    report.add(
+        "barriers_have_no_degenerate_faces",
+        degenerate == 0,
+        f"{degenerate} of {len(triangles)} faces have no area",
+    )
+
+    if sampler is not None:
+        ground = np.asarray(sampler(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
+        above = vertices[:, 2] - ground
+        # An awning is meant to be up in the air; everything else is meant to
+        # be standing on the pavement, and 8 m of garden wall is a mistake.
+        tallest = float(above.max())
+        report.add(
+            "barriers_are_a_believable_height",
+            tallest <= 8.0,
+            f"the highest point stands {tallest:.1f} m above the ground",
+        )
+        # Nothing should hang below its own embed depth, or a fence up a bank
+        # has sunk out of sight.
+        deepest = float(-above.min())
+        report.add(
+            "barriers_sit_on_the_ground",
+            deepest <= 0.30,
+            f"the lowest point is {deepest:.2f} m below the ground",
+        )
+
+
 def check_vehicles(report: CheckReport, vehicles, bbox: BBox, surfaces=None) -> None:
     """Cars are on land and boats are on water, at the right height.
 

@@ -1048,11 +1048,189 @@ def _box(cx, cy, cz, sx, sy, sz, spin=0.0):
     return corners, faces
 
 
-def build_furniture(scene: dict, work_dir: Path, material):
-    """Lampposts, bollards, signs and benches as simple boxes.
+def _furniture_pieces(kind, x, y, base, spin, uv, cfg):
+    """The boxes one piece of street furniture is made of.
 
-    Every piece shares one material, so a couple of thousand objects cost one
-    draw call rather than a couple of thousand.
+    A proxy, not a model: three or four boxes that read correctly at the
+    distance anyone will see them from. What matters is the silhouette -- a
+    flagpole is tall and thin with something at the top, a bus shelter is a
+    roof on posts -- because that is all the eye gets at street scale, and
+    anything more would be a thousand objects nobody asked to be detailed.
+    """
+    metal, wood = uv["metal"], uv["wood"]
+    stone, glass, paint = uv["stone"], uv["glass"], uv["paint"]
+    lamp_h = float(cfg.get("lamp_height_m", 5.0))
+    bollard_h = float(cfg.get("bollard_height_m", 0.9))
+    bench_l = float(cfg.get("bench_length_m", 1.8))
+
+    if kind == 0:  # lamppost: column plus a short arm
+        return [
+            (_box(x, y, base + lamp_h / 2, 0.14, 0.14, lamp_h, spin), metal),
+            (_box(x, y, base + lamp_h + 0.08, 0.7, 0.24, 0.16, spin), metal),
+        ]
+    if kind == 1:  # bollard
+        return [
+            (_box(x, y, base + bollard_h / 2, 0.16, 0.16, bollard_h, spin), metal),
+        ]
+    if kind == 2:  # bench: seat on two legs
+        return [
+            (_box(x, y, base + 0.45, bench_l, 0.5, 0.08, spin), wood),
+            (_box(x, y, base + 0.22, bench_l * 0.8, 0.1, 0.44, spin), metal),
+        ]
+    if kind == 3:  # sign post
+        return [
+            (_box(x, y, base + 1.1, 0.09, 0.09, 2.2, spin), metal),
+            (_box(x, y, base + 2.1, 0.5, 0.05, 0.4, spin), metal),
+        ]
+    if kind == 4:  # flagpole: tall, thin, and a flag hanging off the top
+        pole = float(cfg.get("flagpole_height_m", 7.0))
+        return [
+            (_box(x, y, base + pole / 2, 0.12, 0.12, pole, spin), metal),
+            (_box(x, y, base + pole - 0.9, 0.06, 0.06, 0.3, spin), metal),
+            # Hung against the pole rather than flying: a flag modelled flat
+            # and horizontal reads as a mistake on a still day.
+            (_box(x + 0.5 * np.cos(spin), y + 0.5 * np.sin(spin),
+                  base + pole - 1.1, 1.0, 0.04, 0.7, spin), glass),
+        ]
+    if kind == 5:  # bus shelter: roof on four posts, one glazed side
+        return [
+            (_box(x, y, base + 2.45, 3.6, 1.6, 0.12, spin), metal),
+            (_box(x, y, base + 1.2, 3.4, 0.06, 2.4, spin), glass),
+            (_box(x, y, base + 0.5, 2.4, 0.4, 0.08, spin), wood),
+        ]
+    if kind == 6:  # advertising column: a drum on a plinth
+        return [
+            (_box(x, y, base + 0.1, 1.3, 1.3, 0.2, spin), stone),
+            (_box(x, y, base + 1.5, 1.2, 1.2, 2.6, spin), glass),
+            (_box(x, y, base + 2.9, 1.34, 1.34, 0.16, spin), metal),
+        ]
+    if kind == 7:  # art object: a plinth and something on it
+        return [
+            (_box(x, y, base + 0.2, 1.6, 1.6, 0.4, spin), stone),
+            (_box(x, y, base + 1.5, 0.7, 0.7, 2.2, spin + 0.6), stone),
+        ]
+    if kind == 8:  # memorial: a wider plinth, a slab, and a step
+        return [
+            (_box(x, y, base + 0.15, 3.0, 2.2, 0.3, spin), stone),
+            (_box(x, y, base + 0.5, 2.2, 1.4, 0.4, spin), stone),
+            (_box(x, y, base + 1.7, 1.4, 0.5, 2.0, spin), stone),
+        ]
+    if kind == 9:  # playground: a frame with a crossbar and a slide
+        return [
+            (_box(x - 1.4 * np.cos(spin), y - 1.4 * np.sin(spin),
+                  base + 1.1, 0.12, 0.12, 2.2, spin), paint),
+            (_box(x + 1.4 * np.cos(spin), y + 1.4 * np.sin(spin),
+                  base + 1.1, 0.12, 0.12, 2.2, spin), paint),
+            (_box(x, y, base + 2.2, 3.0, 0.14, 0.14, spin), paint),
+            (_box(x + 1.0 * np.sin(spin), y - 1.0 * np.cos(spin),
+                  base + 0.6, 1.2, 0.7, 0.1, spin), paint),
+        ]
+    if kind == 10:  # picnic table: top and two benches
+        return [
+            (_box(x, y, base + 0.74, 1.8, 0.8, 0.07, spin), wood),
+            (_box(x + 0.72 * np.sin(spin), y - 0.72 * np.cos(spin),
+                  base + 0.45, 1.8, 0.3, 0.06, spin), wood),
+            (_box(x - 0.72 * np.sin(spin), y + 0.72 * np.cos(spin),
+                  base + 0.45, 1.8, 0.3, 0.06, spin), wood),
+            (_box(x, y, base + 0.35, 0.2, 0.7, 0.7, spin), metal),
+        ]
+    if kind == 11:  # electrical cabinet: a box with a lid
+        return [
+            (_box(x, y, base + 0.6, 0.9, 0.45, 1.2, spin), paint),
+            (_box(x, y, base + 1.23, 0.96, 0.5, 0.06, spin), metal),
+        ]
+    if kind == 12:  # waste collection point: a below-ground container's head
+        return [
+            (_box(x, y, base + 0.05, 1.5, 1.5, 0.1, spin), stone),
+            (_box(x, y, base + 0.6, 0.8, 0.8, 1.0, spin), metal),
+        ]
+    if kind == 13:  # catenary mast: a tapered post with a bracket arm
+        mast = float(cfg.get("catenary_height_m", 7.5))
+        return [
+            (_box(x, y, base + mast / 2, 0.24, 0.24, mast, spin), paint),
+            (_box(x + 0.8 * np.cos(spin), y + 0.8 * np.sin(spin),
+                  base + mast - 0.4, 1.6, 0.1, 0.1, spin), paint),
+        ]
+    # Anything unmapped would be a guess. Drawing nothing is the honest answer.
+    return []
+
+
+def build_barriers(scene: dict, work_dir: Path, material):
+    """Walls, fences and hedges, one object per BGT type.
+
+    Split by type rather than delivered as one mesh, because that is the
+    difference between "a wall" and "every wall": a designer can hide the
+    fences to see the plots, swap the hedge material for a real one, or put
+    the quay walls on their own collision layer without selecting anything by
+    hand. They still share one material, so the split costs nothing to draw.
+    """
+    barriers_file = scene.get("barriers", {}).get("file")
+    if not barriers_file or not (work_dir / barriers_file).is_file():
+        return []
+
+    data = np.load(work_dir / barriers_file, allow_pickle=True)
+    vertices = data["vertices"]
+    triangles = data["triangles"]
+    if len(triangles) == 0:
+        return []
+
+    kind = data["kind"]
+    kind_names = [str(n) for n in data["kind_names"]]
+    material_of = data["material"]
+    material_names = [str(n) for n in data["material_names"]]
+
+    table = scene.get("furniture", {}).get("atlas_uv") or {}
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    local = vertices - np.array([origin_x, origin_y, z_offset])
+
+    objects = []
+    total = 0
+    for index, name in enumerate(kind_names):
+        mask = kind == index
+        if not mask.any():
+            continue
+        part = triangles[mask]
+        # Only the vertices this type actually uses, renumbered, so each
+        # object carries its own buffer rather than a slice of everyone's.
+        used = np.unique(part)
+        renumber = np.zeros(len(local), dtype=np.int64)
+        renumber[used] = np.arange(len(used))
+        corners = local[used]
+        indices = renumber[part]
+        n_triangles = len(part)
+
+        patch = np.asarray(
+            table.get(material_names[int(material_of[mask][0])], (0.125, 0.25)),
+            dtype=np.float64,
+        )
+        objects.append(
+            build_mesh_object(
+                f"Barriers_{name}",
+                corners,
+                indices.reshape(-1),
+                np.arange(0, n_triangles * 3, 3),
+                np.full(n_triangles, 3),
+                np.tile(patch, (n_triangles * 3, 1)),
+                np.zeros(n_triangles),
+                [material],
+                shade_smooth=False,
+            )
+        )
+        total += n_triangles
+
+    log(
+        f"barriers: {len(objects)} kinds, {total} triangles "
+        f"({', '.join(kind_names)})"
+    )
+    return objects
+
+
+def build_furniture(scene: dict, work_dir: Path, material):
+    """Street furniture as small groups of boxes, one shape per BGT type.
+
+    Every piece shares one material and one atlas, so a couple of thousand
+    objects cost one draw call rather than a couple of thousand.
     """
     furniture_file = scene.get("furniture", {}).get("file")
     if not furniture_file or not (work_dir / furniture_file).is_file():
@@ -1069,19 +1247,26 @@ def build_furniture(scene: dict, work_dir: Path, material):
     z_offset = float(scene["ground_z_offset_nap"])
     cfg = scene.get("furniture", {})
 
-    lamp_h = float(cfg.get("lamp_height_m", 5.0))
-    bollard_h = float(cfg.get("bollard_height_m", 0.9))
-    bench_l = float(cfg.get("bench_length_m", 1.8))
+    # Where each material sits in the atlas, from the scene file rather than
+    # duplicated here. Falls back to the old two-patch split so an older
+    # scene.json still renders.
+    table = cfg.get("atlas_uv") or {}
+    uv = {
+        name: np.asarray(table.get(name, default), dtype=np.float64)
+        for name, default in (
+            ("metal", (0.125, 0.25)), ("wood", (0.375, 0.25)),
+            ("brick", (0.625, 0.25)), ("concrete", (0.875, 0.25)),
+            ("hedge", (0.125, 0.75)), ("paint", (0.375, 0.75)),
+            ("stone", (0.625, 0.75)), ("glass", (0.875, 0.75)),
+        )
+    }
 
     vertices: list[np.ndarray] = []
     faces: list[np.ndarray] = []
     uvs: list[np.ndarray] = []
     offset = 0
     rng = np.random.default_rng(808)
-
-    # A dark metal patch and a wood patch, addressed by UV like the tree atlas.
-    metal_uv = np.array([0.25, 0.5])
-    wood_uv = np.array([0.75, 0.5])
+    drawn = 0
 
     for index in range(len(xy)):
         x = float(xy[index, 0]) - origin_x
@@ -1090,28 +1275,19 @@ def build_furniture(scene: dict, work_dir: Path, material):
         kind = int(kinds[index])
         spin = float(rng.random()) * np.pi
 
-        pieces = []
-        if kind == 0:  # lamppost: column plus a short arm
-            pieces.append((_box(x, y, base + lamp_h / 2, 0.14, 0.14, lamp_h, spin), metal_uv))
-            pieces.append(
-                (_box(x, y, base + lamp_h + 0.08, 0.7, 0.24, 0.16, spin), metal_uv)
-            )
-        elif kind == 1:  # bollard
-            pieces.append(
-                (_box(x, y, base + bollard_h / 2, 0.16, 0.16, bollard_h, spin), metal_uv)
-            )
-        elif kind == 2:  # bench: seat on two legs
-            pieces.append((_box(x, y, base + 0.45, bench_l, 0.5, 0.08, spin), wood_uv))
-            pieces.append((_box(x, y, base + 0.22, bench_l * 0.8, 0.1, 0.44, spin), metal_uv))
-        else:  # sign post
-            pieces.append((_box(x, y, base + 1.1, 0.09, 0.09, 2.2, spin), metal_uv))
-            pieces.append((_box(x, y, base + 2.1, 0.5, 0.05, 0.4, spin), metal_uv))
+        pieces = _furniture_pieces(kind, x, y, base, spin, uv, cfg)
+        if pieces:
+            drawn += 1
 
-        for (piece_verts, piece_faces), uv in pieces:
+        for (piece_verts, piece_faces), uv_patch in pieces:
             vertices.append(piece_verts)
             faces.append(piece_faces + offset)
-            uvs.append(np.tile(uv, (len(piece_faces) * 3, 1)))
+            uvs.append(np.tile(uv_patch, (len(piece_faces) * 3, 1)))
             offset += len(piece_verts)
+
+    if not vertices:
+        log("street furniture: nothing of a drawable type")
+        return None
 
     all_vertices = np.vstack(vertices)
     all_faces = np.vstack(faces)
@@ -1129,7 +1305,10 @@ def build_furniture(scene: dict, work_dir: Path, material):
         [material],
         shade_smooth=False,
     )
-    log(f"street furniture: {len(xy)} objects, {n_triangles} triangles")
+    log(
+        f"street furniture: {drawn} of {len(xy)} objects drawn, "
+        f"{n_triangles} triangles"
+    )
     return obj
 
 
@@ -1608,13 +1787,13 @@ def main() -> int:
         )
 
     if "furniture" in extra_textures:
-        build_furniture(
-            scene,
-            work_dir,
-            make_textured_material(
-                "M_furniture", extra_textures["furniture"], roughness=0.55
-            ),
+        # One material for both: the atlas covers a brick wall and a wooden
+        # bench alike, and sharing it keeps the whole streetscape to one draw.
+        furniture_material = make_textured_material(
+            "M_furniture", extra_textures["furniture"], roughness=0.55
         )
+        build_furniture(scene, work_dir, furniture_material)
+        build_barriers(scene, work_dir, furniture_material)
 
     if "vehicle" in extra_textures:
         # Car paint is the one glossy thing out here.

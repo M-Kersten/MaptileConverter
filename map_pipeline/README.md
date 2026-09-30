@@ -896,13 +896,76 @@ junctions and kerbs, so they are painted in an explicit order — broad surfaces
 first, the things cut out of them last — rather than in whatever order the API
 returned them.
 
-## Street furniture
+## Street detail
 
-About 2000 poles and 200 pieces of furniture per square kilometre: lampposts,
-bollards, sign posts and benches, from BGT `paal` and `straatmeubilair`. None of
-it is structurally important, which is the point — a street with nothing on it
-reads as a model. They are simple boxes sharing one material, so a couple of
-thousand objects cost one draw call.
+None of this is structurally important, which is exactly the point. A street
+with nothing on it reads as a model; the same street with lampposts along the
+kerb, a wall between the plots and a hedge behind it reads as a place. Everything
+here shares one 8-patch atlas and one material, so a few thousand objects cost
+one draw call.
+
+The BGT registers far more of it than the model used to draw. These are real
+counts for one square kilometre of Utrecht centre:
+
+| BGT collection | count | drawn as |
+|---|---|---|
+| `paal` | 1,996 | lampposts 1058, bollards 918, sign posts 16, **flagpole 1** |
+| `scheiding_vlak` | 1,450 | walls 1330, quay walls 120 |
+| `scheiding_lijn` | 1,563 | fences 1174, walls 332, quay walls 36, noise barriers 4 |
+| `straatmeubilair` | 217 | benches 148, **playgrounds 50, art 8, ad columns 6, shelters 3, monument 1, picnic table 1** |
+| `gebouwinstallatie` | 114 | **entrance steps 55, awnings 53, stoops 6** |
+| `overigbouwwerk` | 82 | **transformer housings 6, canopies 4, open sheds 2** |
+| `kast` | 69 | **electrical cabinets 51** |
+| `bak` | 41 | **waste collection points 41** |
+| `mast` | 40 | **tram catenary masts 40** |
+| `vegetatieobject_lijn` | 34 | **hedges 34** |
+
+Bold is what was being fetched and thrown away. The walls and fences are the
+bulk of it — three thousand objects that divide one plot from the next, without
+which a street is a row of buildings standing in a field. The quay walls matter
+more still: an Utrecht canal without its wall is a trench.
+
+**Nothing here carries a height.** The BGT surveys where a wall is and never how
+tall, so heights come from a table by type in `barriers.LINE_STYLES` and
+`AREA_STYLES`, overridable per type under `barriers.heights`. That is an
+assumption and it is kept in one place rather than spread through the geometry.
+AHN cannot help: a fence is thinner than the half-metre height grid can see, and
+a wall against a building takes the building's height — the same trap the tree
+heights had to be dug out of.
+
+Three things about the geometry are worth knowing:
+
+- **A barrier is a closed prism, never a plane.** A line is swept: offset either
+  side by half its thickness, both edges draped, top and both ends closed. A
+  fence is 6 cm thick and a wall 24, and neither is zero — a zero-thickness wall
+  is a hole from one side in anything with backface culling on, which is every
+  engine.
+- **Vertices go where the ground bends, not every two metres.** Cutting each
+  line at a fixed step holds straight lines straight at full price: 203,020
+  triangles against 88,324 for the same walls followed to 5 cm. The survey's own
+  vertices are anchors and always survive, because those are the shape of the
+  fence rather than the shape of the ground under it.
+- **A polygon's base is sampled per vertex.** One height for a whole outline
+  fails exactly where these objects live — a quay wall runs along a canal bank,
+  the steepest ground in a Dutch city — and on a test surface a single median
+  buried one end of a wall by 0.65 m. Awnings are the exception: they hang off a
+  facade at one height and take the median, because an awning that ripples with
+  the pavement is worse than one that does not.
+
+Over the demo square kilometre that comes to 2,799 objects and 88,329 triangles,
+with no non-manifold edges and no degenerate faces. They arrive as one object per
+type — `Barriers_fence`, `Barriers_quay_wall`, `Barriers_hedge` and so on — so a
+designer can hide the fences to see the plots, or swap the hedge material,
+without selecting anything by hand.
+
+**A word on why this is not Google Earth.** Google's 3D is photogrammetry: a
+mesh reconstructed automatically from oblique imagery, which has hedges and
+flagpoles in it because it does not know what anything *is*. That is also why it
+cannot be used here — no semantics, no separable objects, trees fused into
+rooflines, topology far worse than anything in this pipeline, and a licence that
+does not permit extraction. What is above is the other route to the same
+density: every object is a known thing, in a named group, that a level designer
+can take apart.
 
 ## Bridges and tunnels
 

@@ -3089,7 +3089,7 @@ class TestSourceRegistry(unittest.TestCase):
         )
 
     def test_shared_hosts_are_probed_once(self):
-        """Seven BGT layers behind one host must not look like seven outages."""
+        """Eight BGT layers behind one host must not look like eight outages."""
         from src.sources import health_targets
 
         targets = health_targets(self.config)
@@ -3097,8 +3097,8 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(len(bgt), 1)
         self.assertEqual(
             set(bgt[0].split(",")),
-            {"trees", "water", "land_cover", "furniture", "vehicles", "rails",
-             "structures"},
+            {"trees", "water", "land_cover", "furniture", "barriers",
+             "vehicles", "rails", "structures"},
         )
 
     def test_disabled_sources_are_not_checked(self):
@@ -4128,6 +4128,256 @@ class TestRoadTopology(unittest.TestCase):
         self.assertEqual(DEFAULTS["surfaces"]["road_simplify_m"], 0.25)
         self.assertEqual(DEFAULTS["surfaces"]["road_max_edge_m"], 12.0)
         self.assertEqual(DEFAULTS["surfaces"]["road_snap_m"], 0.05)
+
+
+class TestStreetDetail(unittest.TestCase):
+    """The small things a street is not a street without.
+
+    Three thousand walls and fences per square kilometre, and they were all
+    being fetched and thrown away. What these check is not that the numbers
+    are right -- the BGT does not survey how tall a wall is, so the heights
+    are an assumption -- but that the geometry closes, sits on the ground, and
+    comes from the field the data actually uses.
+    """
+
+    @staticmethod
+    def _slope(gradient=0.05, bump=0.0):
+        def sample(x, y):
+            x = np.asarray(x, dtype=float)
+            return gradient * x + bump * np.sin(x / 7.0)
+        return sample
+
+    @staticmethod
+    def _closed(vertices, triangles):
+        """Boundary edges, non-manifold edges. A closed prism has none of either."""
+        edges = np.sort(
+            np.concatenate([triangles[:, [0, 1]], triangles[:, [1, 2]],
+                            triangles[:, [2, 0]]]),
+            axis=1,
+        )
+        _, counts = np.unique(edges, axis=0, return_counts=True)
+        return int((counts == 1).sum()), int((counts > 2).sum())
+
+    def test_the_type_comes_from_whichever_field_carries_it(self):
+        """The bug that made the first run of this draw nothing.
+
+        It is not the same field twice. scheiding and overigbouwwerk put the
+        value in `type` and leave `plus_type` explicitly null; gebouwinstallatie
+        and vegetatieobject do the reverse, carrying a real `plus_type` beside a
+        useless `type: niet-bgt`. Reading only `plus_type` fetched 1563 fences
+        and 1450 walls over one square kilometre and built none of them.
+        """
+        from src.barriers import feature_type
+
+        # A fence, as scheiding_lijn really returns it.
+        self.assertEqual(
+            feature_type({"plus_type": None, "plus_type_leeg": "waardeOnbekend",
+                          "type": "hek"}),
+            "hek",
+        )
+        # Entrance steps, as gebouwinstallatie really returns them.
+        self.assertEqual(
+            feature_type({"plus_type": "toegangstrap", "type": "niet-bgt"}),
+            "toegangstrap",
+        )
+        # A surveyed object the standard has no type for is not a type.
+        self.assertEqual(feature_type({"plus_type": None, "type": "niet-bgt"}), "")
+        self.assertEqual(feature_type({}), "")
+
+    def test_a_swept_fence_is_a_closed_prism(self):
+        """A wall modelled as a plane is a hole from one side in anything with
+        backface culling on, which is every engine."""
+        from src.barriers import LINE_STYLES, _sweep_line
+
+        points = np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 6.0], [34.0, 6.0]])
+        style = LINE_STYLES[("scheiding_lijn", "hek")]
+        vertices, triangles = _sweep_line(points, np.zeros(len(points)), style)
+
+        boundary, nonmanifold = self._closed(vertices, triangles)
+        self.assertEqual(boundary, 0, f"{boundary} open edges: the prism is a tube")
+        self.assertEqual(nonmanifold, 0)
+        # And it has the thickness it claims, not zero.
+        width = vertices[:, :2].max(axis=0) - vertices[:, :2].min(axis=0)
+        self.assertGreater(min(width), 0.0)
+
+    def test_a_barrier_keeps_its_height_up_a_slope(self):
+        """Sampling the ground once and extruding from there gives a wall that
+        levels off on a hill, which on a canal bank means it disappears."""
+        from src.barriers import EMBED_M, LINE_STYLES, _drape_points, _sweep_line
+
+        style = LINE_STYLES[("scheiding_lijn", "muur")]
+        line = np.array([[0.0, 0.0], [60.0, 0.0]])
+        points, base = _drape_points(line, self._slope(0.05), 1.0, 0.05)
+        vertices, _ = _sweep_line(points, base, style)
+
+        n = len(points)
+        # The four rails are stacked in order: left-low, left-high, ...
+        low, high = vertices[:n, 2], vertices[n : 2 * n, 2]
+        heights = high - low
+        self.assertAlmostEqual(float(heights.min()), style.height_m + EMBED_M, places=6)
+        self.assertAlmostEqual(float(heights.max()), style.height_m + EMBED_M, places=6)
+        # And it really did climb, rather than staying flat.
+        self.assertGreater(float(high.max() - high.min()), 2.0)
+
+    def test_the_drape_spends_vertices_where_the_ground_bends(self):
+        """Cutting every fence at a fixed step holds straight lines straight at
+        full price: over one square kilometre it was 203,020 triangles against
+        88,324 for the same walls followed to five centimetres."""
+        from src.barriers import _drape_points
+
+        line = np.array([[0.0, 0.0], [200.0, 0.0]])
+        flat, _ = _drape_points(line, self._slope(0.02, bump=0.0), 1.0, 0.05)
+        bumpy, _ = _drape_points(line, self._slope(0.02, bump=0.5), 1.0, 0.05)
+        uniform, _ = _drape_points(line, self._slope(0.02, bump=0.0), 1.0, 0.0)
+
+        self.assertLess(
+            len(flat), 10,
+            f"{len(flat)} vertices to hold a straight line straight",
+        )
+        self.assertGreater(
+            len(bumpy), 4 * len(flat),
+            "rolling ground got no more vertices than flat ground",
+        )
+        self.assertGreater(len(uniform), 100, "the fixed-step path is the baseline")
+
+    def test_the_drape_stays_inside_its_tolerance(self):
+        """Thinning is only allowed to cost what it was told it could cost."""
+        from src.barriers import _drape_points
+
+        sampler = self._slope(0.02, bump=0.5)
+        line = np.array([[0.0, 0.0], [200.0, 0.0]])
+        kept, height = _drape_points(line, sampler, 1.0, 0.05)
+
+        # Walk the kept polyline at a fine step and compare to the real ground.
+        worst = 0.0
+        for (x0, _), (x1, _), z0, z1 in zip(kept[:-1], kept[1:], height[:-1], height[1:]):
+            xs = np.linspace(x0, x1, 25)
+            along = (xs - x0) / max(x1 - x0, 1e-9)
+            worst = max(worst, float(np.abs(z0 + (z1 - z0) * along - sampler(xs, xs)).max()))
+        self.assertLess(worst, 0.08, f"the barrier strays {worst:.3f} m from the ground")
+
+    def test_an_awning_hangs_off_the_facade(self):
+        """Drawn from the ground it is a solid block against the wall, which is
+        worse than leaving it out."""
+        from src.barriers import AREA_STYLES, _extrude_rings
+
+        ring = np.array([[0.0, 0.0], [6.0, 0.0], [6.0, 1.4], [0.0, 1.4]])
+        style = AREA_STYLES[("gebouwinstallatie", "luifel")]
+        vertices, triangles = _extrude_rings([ring], lambda x, y: np.full(len(x), 3.0), style)
+
+        self.assertGreater(
+            float(vertices[:, 2].min()) - 3.0, 2.0,
+            "the awning is sitting on the pavement",
+        )
+        # Its own thickness, not its thickness plus the ground embed. Burying a
+        # 12 cm awning by 15 cm more than doubles it and hangs it too low.
+        thickness = float(vertices[:, 2].max() - vertices[:, 2].min())
+        self.assertAlmostEqual(thickness, style.height_m, places=6)
+        # Floating, so it needs a floor as well as a lid.
+        boundary, nonmanifold = self._closed(vertices, triangles)
+        self.assertEqual(boundary, 0, "the awning has no underside")
+        self.assertEqual(nonmanifold, 0)
+
+    def test_a_wall_polygon_follows_the_ground_under_it(self):
+        """One height for a whole outline fails where these objects live: a quay
+        wall runs along a canal bank, and a single median buried one end by
+        0.65 m on a test surface."""
+        from src.barriers import AREA_STYLES, _extrude_rings
+
+        ring = np.array([[0.0, 0.0], [40.0, 0.0], [40.0, 0.4], [0.0, 0.4]])
+        style = AREA_STYLES[("scheiding_vlak", "kademuur")]
+        sampler = self._slope(0.05)
+        vertices, _ = _extrude_rings([ring], sampler, style)
+
+        below = vertices[:, 2] - sampler(vertices[:, 0], vertices[:, 1])
+        self.assertLess(
+            float(-below.min()), 0.30,
+            f"a corner is {-below.min():.2f} m underground",
+        )
+        self.assertGreater(
+            float(vertices[:, 2].max() - vertices[:, 2].min()), 1.9,
+            "the wall came out level across a two-metre rise",
+        )
+
+    def test_every_furniture_kind_has_a_shape(self):
+        """A type that reaches the export with no proxy is an invisible object
+        that still costs a fetch. A type with no *name* is worse."""
+        import re
+
+        from src.furniture import KIND_NAMES, WANTED
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text()
+        namespace = {"np": np}
+        for name in ("_box", "_furniture_pieces"):
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            self.assertIsNotNone(body, f"{name} moved")
+            exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
+
+        uv = {n: np.array([0.5, 0.5]) for n in
+              ("metal", "wood", "brick", "concrete", "hedge", "paint", "stone", "glass")}
+        for kind in sorted(KIND_NAMES):
+            pieces = namespace["_furniture_pieces"](kind, 0.0, 0.0, 0.0, 0.3, uv, {})
+            self.assertTrue(pieces, f"{KIND_NAMES[kind]} has no proxy shape")
+            corners = np.vstack([p[0][0] for p in pieces])
+            self.assertAlmostEqual(
+                float(corners[:, 2].min()), 0.0, places=6,
+                msg=f"{KIND_NAMES[kind]} does not stand on the ground",
+            )
+            self.assertLess(
+                float(corners[:, 2].max()), 12.0,
+                f"{KIND_NAMES[kind]} is {corners[:, 2].max():.0f} m tall",
+            )
+
+        # Every mapped BGT type lands on a kind that has a name.
+        for collection, mapping in WANTED.items():
+            for plus_type, kind in mapping.items():
+                self.assertIn(kind, KIND_NAMES, f"{collection}/{plus_type}")
+
+    def test_an_unmapped_type_draws_nothing(self):
+        """The BGT is full of "niet-bgt". Drawing something specific for
+        "unknown" is how a model ends up with seventy identical sheds."""
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text()
+        namespace = {"np": np}
+        for name in ("_box", "_furniture_pieces"):
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
+
+        uv = {n: np.array([0.5, 0.5]) for n in
+              ("metal", "wood", "brick", "concrete", "hedge", "paint", "stone", "glass")}
+        self.assertEqual(namespace["_furniture_pieces"](99, 0, 0, 0, 0, uv, {}), [])
+
+    def test_the_atlas_has_a_patch_for_every_material_in_use(self):
+        """The Blender stage addresses the atlas by name through the scene file.
+        A style naming a patch that is not there would take the fallback UV and
+        paint a hedge in dark metal."""
+        from src.barriers import AREA_STYLES, LINE_STYLES
+        from src.facade import FURNITURE_PATCHES, furniture_uv
+
+        available = {name for name, *_rest in FURNITURE_PATCHES}
+        for style in (*LINE_STYLES.values(), *AREA_STYLES.values()):
+            self.assertIn(style.material, available, style.name)
+            u, v = furniture_uv(style.material)
+            self.assertTrue(0.0 < u < 1.0 and 0.0 < v < 1.0)
+
+    def test_the_settings_reach_the_config(self):
+        from src.config import DEFAULTS
+
+        self.assertTrue(DEFAULTS["barriers"]["enabled"])
+        self.assertEqual(DEFAULTS["barriers"]["drape_tolerance_m"], 0.05)
+        self.assertEqual(DEFAULTS["furniture"]["flagpole_height_m"], 7.0)
+
+    def test_a_height_override_reaches_the_geometry(self):
+        """The heights are an assumption. Putting them in the config is the
+        whole point, so the config has to actually win."""
+        from src.barriers import LINE_STYLES, BarrierStyle
+
+        style = LINE_STYLES[("scheiding_lijn", "geluidsscherm")]
+        override = BarrierStyle(style.name, 6.0, style.thickness_m,
+                                style.material, style.lift_m)
+        self.assertNotEqual(override.height_m, style.height_m)
+        self.assertEqual(override.name, "noise_barrier")
 
 
 class TestRoadDrape(unittest.TestCase):

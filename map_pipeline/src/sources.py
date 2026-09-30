@@ -124,8 +124,23 @@ SOURCES: tuple[Source, ...] = (
         id="furniture",
         label="Street furniture (BGT)",
         provider="PDOK",
-        contributes="lampposts, bollards, sign posts and benches",
+        contributes=(
+            "lampposts, bollards, sign posts, benches, bus shelters, "
+            "advertising columns, art and monuments, playgrounds, cabinets, "
+            "waste points, flagpoles and catenary masts"
+        ),
         toggles=(("furniture", "enabled"),),
+        url_path=("trees", "api_url"),
+    ),
+    Source(
+        id="barriers",
+        label="Walls, fences and hedges (BGT)",
+        provider="PDOK",
+        contributes=(
+            "garden walls, fences, quay walls, noise barriers, hedges, "
+            "entrance steps, awnings and small outbuildings"
+        ),
+        toggles=(("barriers", "enabled"),),
         url_path=("trees", "api_url"),
     ),
     Source(

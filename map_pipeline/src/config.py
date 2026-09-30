@@ -236,6 +236,32 @@ DEFAULTS: dict[str, Any] = {
         "lamp_height_m": 5.0,
         "bollard_height_m": 0.9,
         "bench_length_m": 1.8,
+        # The BGT gives a position and a type but no size, so the proxies need
+        # a height from somewhere. These two are the only ones tall enough to
+        # be worth arguing about.
+        "flagpole_height_m": 7.0,
+        "catenary_height_m": 7.5,
+    },
+    "barriers": {
+        # Walls, fences, hedges and the small structures bolted onto buildings.
+        # The largest thing the BGT publishes that the model used to ignore:
+        # over one square kilometre of Utrecht centre, 1563 separations drawn
+        # as lines and 1450 more drawn as polygons.
+        "enabled": True,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+        # How finely a swept line is cut before the height profile is thinned.
+        "step_m": 1.0,
+        # How far a barrier may stray from the ground between vertices. Cutting
+        # at a fixed step instead more than doubled the geometry to hold
+        # straight lines straight.
+        "drape_tolerance_m": 0.05,
+        # The BGT surveys where a wall is, never how tall. These are the
+        # assumption, in one place, for someone to argue with. Keys are the
+        # names in barriers.LINE_STYLES and AREA_STYLES.
+        "heights": {},
     },
     "vehicles": {
         # Nobody publishes where cars are parked or boats are moored, but the
@@ -331,6 +357,7 @@ class PipelineConfig:
     trees: dict[str, Any]
     surfaces: dict[str, Any]
     furniture: dict[str, Any]
+    barriers: dict[str, Any]
     vehicles: dict[str, Any]
     rails: dict[str, Any]
     structures: dict[str, Any]
@@ -359,6 +386,7 @@ class PipelineConfig:
             "trees": self.trees,
             "surfaces": self.surfaces,
             "furniture": self.furniture,
+            "barriers": self.barriers,
             "vehicles": self.vehicles,
             "rails": self.rails,
             "structures": self.structures,
@@ -505,6 +533,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         trees=merged["trees"],
         surfaces=merged["surfaces"],
         furniture=merged["furniture"],
+        barriers=merged["barriers"],
         vehicles=merged["vehicles"],
         rails=merged["rails"],
         structures=merged["structures"],

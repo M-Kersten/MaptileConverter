@@ -147,6 +147,13 @@ def write_metadata(metadata: dict, out_dir: Path, filename: str) -> Path:
     return path
 
 
+def _atlas_uv() -> dict[str, list[float]]:
+    """The furniture atlas as a name to UV-centre map, for the scene file."""
+    from .facade import FURNITURE_PATCHES, furniture_uv
+
+    return {name: list(furniture_uv(name)) for name, *_rest in FURNITURE_PATCHES}
+
+
 def write_scene_description(
     *,
     name: str,
@@ -260,7 +267,19 @@ def write_scene_description(
                 "lamp_height_m": float(furniture_cfg.get("lamp_height_m", 5.0)),
                 "bollard_height_m": float(furniture_cfg.get("bollard_height_m", 0.9)),
                 "bench_length_m": float(furniture_cfg.get("bench_length_m", 1.8)),
+                # Where each material sits in the atlas. Passed rather than
+                # hard-coded on both sides, because the Blender script only
+                # gets what is bundled for it and two copies of a UV table is
+                # two copies to get wrong.
+                "atlas_uv": _atlas_uv(),
             }
+            if furniture_texture is not None
+            else {}
+        ),
+        # Barriers share the furniture atlas, so they are gated on the same
+        # texture existing rather than on one of their own.
+        "barriers": (
+            {"file": "barriers.npz", "texture": furniture_texture.name}
             if furniture_texture is not None
             else {}
         ),

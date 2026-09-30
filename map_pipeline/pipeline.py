@@ -56,6 +56,7 @@ from src.facade import (  # noqa: E402
     generate_vehicle_texture,
     generate_water_texture,
 )
+from src.barriers import BarrierSet, build_barriers  # noqa: E402
 from src.furniture import FurnitureSet, build_furniture  # noqa: E402
 from src.imagery import build_aerial  # noqa: E402
 from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
@@ -90,6 +91,7 @@ from src.validate import (  # noqa: E402
     check_built_terrain,
     check_export,
     check_fbx_reimport,
+    check_barriers,
     check_furniture,
     check_rails,
     check_structures,
@@ -165,6 +167,7 @@ def write_timings(
             "trees": bool(config.trees["enabled"]),
             "surfaces": bool(config.surfaces["water"] or config.surfaces["land_cover"]),
             "furniture": bool(config.furniture["enabled"]),
+            "barriers": bool(config.barriers["enabled"]),
             "usage": bool(config.usage["enabled"]),
             # Rendering previews costs more than every data stage put together,
             # and it happens outside the timed stages, so calibration needs to
@@ -436,6 +439,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_trees = bool(config.trees["enabled"])
     want_surfaces = bool(config.surfaces["water"] or config.surfaces["land_cover"])
     want_furniture = bool(config.furniture["enabled"])
+    want_barriers = bool(config.barriers["enabled"])
     want_usage = bool(config.usage["enabled"])
     want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
     want_rails = bool(config.rails["enabled"])
@@ -445,7 +449,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     total = 5 + sum(
         (
-            want_trees, want_surfaces, want_furniture, want_usage,
+            want_trees, want_surfaces, want_furniture, want_barriers,
+            want_usage,
             want_vehicles, want_rails, want_structures,
         )
     ) + (0 if args.skip_blender else 1)
@@ -589,6 +594,20 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             if len(furniture):
                 furniture_texture = generate_furniture_texture(work_dir)
 
+    barriers = BarrierSet()
+    if want_barriers:
+        with Stage("walls, fences and hedges (BGT)", next_step(), total):
+            barriers = build_barriers(
+                config.bbox,
+                work_dir,
+                barriers_cfg=config.barriers,
+                terrain=terrain,
+            )
+            # Shares the furniture atlas: the same eight flat patches cover a
+            # brick wall and a wooden bench, and one texture is one material.
+            if len(barriers) and furniture_texture is None:
+                furniture_texture = generate_furniture_texture(work_dir)
+
     vehicles = VehicleSet()
     vehicle_texture = None
     if want_vehicles:
@@ -702,6 +721,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             extra={
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
+                "barriers": barriers.stats(),
                 "vehicles": vehicles.stats(),
                 "railways": rails.stats(),
                 "structures": {
@@ -729,6 +749,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
+        check_barriers(
+            report, barriers if want_barriers else None, terrain.sample
+        )
         check_vehicles(
             report, vehicles if want_vehicles else None, config.bbox, surfaces
         )

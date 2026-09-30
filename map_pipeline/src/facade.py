@@ -802,39 +802,81 @@ def generate_rail_texture(
     return path
 
 
+# The furniture atlas is a 4x2 grid of flat patches, addressed by the UV centre
+# of a cell rather than by a real mapping: every piece of street detail is a
+# handful of boxes and none of them wants a unique texture. One atlas means one
+# material, and one material means a couple of thousand objects cost one draw
+# call.
+#
+# Order is (column, row) from the top left. Changing it changes every UV in the
+# Blender stage, so the names are the contract, not the numbers.
+FURNITURE_PATCHES = (
+    ("metal", (62, 64, 68), 0.16, 8),        # lampposts, bollards, sign posts
+    ("wood", (124, 92, 58), 0.26, 4),        # benches, picnic tables
+    ("brick", (146, 96, 78), 0.20, 6),       # garden walls
+    ("concrete", (166, 164, 158), 0.12, 6),  # quay walls, noise barriers
+    ("hedge", (74, 102, 54), 0.34, 3),       # clipped hedges
+    ("paint", (96, 112, 104), 0.14, 8),      # railings and fences
+    ("stone", (150, 146, 138), 0.18, 5),     # monuments and art
+    ("glass", (128, 150, 160), 0.10, 10),    # shelters, ad columns
+)
+
+FURNITURE_COLUMNS = 4
+FURNITURE_ROWS = 2
+
+
+def furniture_uv(name: str) -> tuple[float, float]:
+    """The UV centre of one atlas patch, by name."""
+    for index, (patch, *_rest) in enumerate(FURNITURE_PATCHES):
+        if patch == name:
+            column = index % FURNITURE_COLUMNS
+            row = index // FURNITURE_COLUMNS
+            return (
+                (column + 0.5) / FURNITURE_COLUMNS,
+                (row + 0.5) / FURNITURE_ROWS,
+            )
+    raise KeyError(f"no furniture atlas patch named {name!r}")
+
+
 def generate_furniture_texture(
     work_dir: Path, size_px: int = 256, seed: int = 33
 ) -> Path:
-    """Atlas for street furniture: dark metal on the left, wood on the right."""
+    """Atlas for street furniture and barriers, one flat patch per material."""
     from PIL import Image
 
     rng = np.random.default_rng(seed)
-    half = size_px // 2
     canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+    cell_w = size_px // FURNITURE_COLUMNS
+    cell_h = size_px // FURNITURE_ROWS
 
-    metal = np.zeros((size_px, half, 3), dtype=np.float64)
-    metal[:, :] = (62, 64, 68)
-    grain = _value_noise((size_px, half), cells=max(4, half // 8), rng=rng)
-    metal *= 1.0 + 0.16 * (grain - 0.5)[:, :, None] * 2.0
-    canvas[:, :half] = metal
-
-    wood = np.zeros((size_px, size_px - half, 3), dtype=np.float64)
-    wood[:, :] = (124, 92, 58)
-    streak = _value_noise((size_px, size_px - half), cells=max(3, half // 4), rng=rng)
-    wood *= 1.0 + 0.26 * (streak - 0.5)[:, :, None] * 2.0
-    canvas[:, half:] = wood
+    for index, (_name, colour, strength, cells) in enumerate(FURNITURE_PATCHES):
+        column = index % FURNITURE_COLUMNS
+        row = index // FURNITURE_COLUMNS
+        x0, y0 = column * cell_w, row * cell_h
+        patch = np.zeros((cell_h, cell_w, 3), dtype=np.float64)
+        patch[:, :] = colour
+        grain = _value_noise(
+            (cell_h, cell_w), cells=max(2, min(cells, cell_w // 4)), rng=rng
+        )
+        patch *= 1.0 + strength * (grain - 0.5)[:, :, None] * 2.0
+        canvas[y0 : y0 + cell_h, x0 : x0 + cell_w] = patch
 
     work_dir.mkdir(parents=True, exist_ok=True)
     path = work_dir / "furniture.png"
     Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB").save(path)
-    LOG.info("wrote %s (metal and wood atlas, %dpx)", path.name, size_px)
+    LOG.info(
+        "wrote %s (%d-patch furniture atlas, %dpx)",
+        path.name, len(FURNITURE_PATCHES), size_px,
+    )
     return path
 
 
 __all__ = [
     "CAR_PAINT",
+    "FURNITURE_PATCHES",
     "GROUND_STYLE",
     "GROUND_STYLES",
+    "furniture_uv",
     "generate_furniture_texture",
     "generate_rail_texture",
     "generate_structure_texture",
