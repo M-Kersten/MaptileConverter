@@ -215,11 +215,15 @@ DEFAULTS: dict[str, Any] = {
         # real one, which is a good trade at ten to one -- and it is only
         # applied to what the detector found, never to a surveyed trunk.
         #
-        # "footpath" is deliberately absent: a tree in a pit on a pedestrianised
-        # street is ordinary, and the BGT calls that surface a road.
+        # Footpaths included, on second thoughts. They were left out to protect
+        # the tree in a pit on a pedestrianised street -- but a surveyed tree is
+        # never filtered by this at all, so the exclusion protected nothing and
+        # cost a great deal: footpath is 305 of the 871 road parts over the
+        # Gelderland square, and in a park every winding path through the lawns
+        # is one. Trees were standing on them.
         "detect_off_surfaces": [
             "road_asphalt", "road_brick", "cycle_path", "parking",
-            "transit_lane",
+            "transit_lane", "footpath",
         ],
         "geometry": True,
         "texture_px": 512,

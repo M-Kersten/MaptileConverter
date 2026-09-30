@@ -1182,10 +1182,12 @@ found was standing on a drivable surface**. Avenues do exist and this costs the
 odd real one — a street tree whose crown leans far enough over the road for its
 peak to land there — which is a good trade at ten to one. It applies only to
 what the detector found: where the BGT has surveyed a trunk, the trunk is
-there, whatever surface the survey says it stands on. Footpaths are deliberately
-not in the set, because a tree in a pit on a pedestrianised street is ordinary
-and the BGT calls that surface a road. `trees.detect_off_surfaces` names the
-classes.
+there, whatever surface the survey says it stands on. Footpaths are in the set too: they
+were left out at first to protect the tree in a pit on a pedestrianised street,
+but a surveyed tree is never filtered by this at all, so the exclusion protected
+nothing and cost a great deal — footpath is 305 of the 871 road parts over that
+square, and in a park every winding path through the lawns is one.
+`trees.detect_off_surfaces` names the classes.
 
 **Detected trees arrive as their own object.** The model gets `Trees_registered`
 and `Trees_detected`, sharing one material. The detector is good rather than
@@ -1208,11 +1210,18 @@ tree — 42 to 46 on a real height mix:
 
 - **The crown is pushed out of round** by two frequencies of noise, so it lobes
   rather than merely leans.
-- **Roughly a third come out as conifers**, a stack of three cones. That is the
-  one silhouette a deformed ball will not give you, and a Dutch verge is not all
-  lime trees.
+- **A mature tree gets a second lobe**, offset sideways and vertically. One
+  deformed ellipsoid is still an ellipsoid — push it about as much as you like
+  and the outline stays convex, which is what makes a lollipop a lollipop. The
+  billowy mass photogrammetry gives you needs more than one lump, and stacking
+  the second lobe on the axis is not enough: from above that is still one round
+  crown.
 - **The trunk tapers, flares at the foot and leans a little**, because a
   cylinder meets the ground like a pipe.
+
+Everything is broadleaf. An earlier version made a third of them conifers, which
+is a fair description of a Dutch verge and the wrong thing for these models — a
+wood of spikes reads as a Christmas tree farm.
 
 All of it is seeded from the tree's **own position** rather than from a running
 generator, so the same tree is the same shape every run. Turning detection off,
@@ -1220,10 +1229,15 @@ or rebuilding one group and not the other, must not reshape the trees that were
 already there — and a sequential generator cannot promise that, because the
 order it is drawn in changes with the membership.
 
-Detail follows size: under four metres a crown is twelve faces, above it
-thirty-two. Over a wooded square kilometre only a seventh of what the canopy
-model finds is that small, so the saving is modest and it keeps the coarse
-shape off anything big enough to look at.
+Detail follows size through the lobe count rather than through a coarser
+primitive: one lobe under fourteen metres, two above. A cheaper ball was tried
+for saplings and only ever looked like a gem on a stick. The finished cluster is
+then scaled to exactly the crown it was asked for — lobes overlap, so their
+union is smaller than any one of them implies, and without the fit every tree
+came out a sixth shorter than the canopy model measured it to be.
+
+Over a wooded square kilometre that comes to **63 triangles a tree**, against 42
+for the sphere-on-a-prism it replaced.
 
 Trees leave in two forms, and you get both:
 

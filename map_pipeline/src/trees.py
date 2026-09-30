@@ -808,8 +808,12 @@ def _rasterize_roads(surfaces, bounds, shape, classes) -> np.ndarray | None:
     the detector found: where the BGT has surveyed a trunk, the trunk is there,
     whatever surface the survey says it stands on.
 
-    Footpaths are deliberately not in the default set. A tree in a pit on a
-    pedestrianised street is ordinary, and the BGT calls that surface a road.
+    Footpaths are in the default set too, on second thoughts. They were left
+    out to protect the tree in a pit on a pedestrianised street -- but a
+    surveyed tree is never filtered by this at all, so the exclusion protected
+    nothing and cost a great deal: footpath is 305 of the 871 road parts over
+    the Gelderland square, and in a park every winding path through the lawns
+    is one.
     """
     parts = getattr(surfaces, "roads", None) if surfaces is not None else None
     if not parts or not classes:

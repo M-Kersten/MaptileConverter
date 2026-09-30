@@ -928,10 +928,12 @@ class TestTreeDetection(unittest.TestCase):
         codes = _road_classes(DEFAULTS["trees"]["detect_off_surfaces"])
         self.assertIn(CLASS_ROAD, codes)
         self.assertIn(CLASS_CYCLE, codes)
-        self.assertNotIn(
-            CLASS_FOOTPATH, codes,
-            "a tree in a pit on a pedestrianised street is ordinary",
-        )
+        # Footpaths too. They were left out to protect the tree in a pit on a
+        # pedestrianised street -- but a surveyed tree is never filtered by
+        # this at all, so the exclusion protected nothing and cost a great
+        # deal: footpath is 305 of the 871 road parts over the Gelderland
+        # square, and in a park every winding path through the lawns is one.
+        self.assertIn(CLASS_FOOTPATH, codes)
         # A name that is not a surface class is dropped, not silently obeyed.
         self.assertEqual(_road_classes(["road_asphalt", "nonsense"]), {CLASS_ROAD})
         self.assertEqual(_road_classes(None), set())
@@ -3537,7 +3539,7 @@ class TestTreeShape(unittest.TestCase):
 
         source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
         namespace = {"np": np}
-        for name in ("_octahedron_canopy", "_tree_dice", "_blob", "_conifer",
+        for name in ("_octahedron_canopy", "_tree_dice", "_lobed_crown",
                      "_tree_group_mesh"):
             body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
             assert body is not None, f"{name} moved"
@@ -3576,16 +3578,41 @@ class TestTreeShape(unittest.TestCase):
                 f"die {column} barely varies, so every tree gets the same roll",
             )
 
-    def test_a_street_is_not_one_species(self):
-        """Roughly a third conifers. A Dutch verge is not all lime trees, and a
-        conifer is the one silhouette a deformed ball will not give you."""
+    def test_a_mature_crown_is_not_convex(self):
+        """One deformed ellipsoid is still an ellipsoid: push it about as much
+        as you like and the outline stays convex, which is what makes a
+        lollipop a lollipop. The reference is the billowy mass photogrammetry
+        gives you, and the only way to an outline like that is more than one
+        lump."""
         namespace = self._shapes()
-        dice = namespace["_tree_dice"]
-        rng = np.random.default_rng(5)
-        points = rng.uniform(100000, 500000, (2000, 2))
-        conifers = np.array([dice(x, y)[2] < 0.34 for x, y in points])
-        self.assertGreater(float(conifers.mean()), 0.2)
-        self.assertLess(float(conifers.mean()), 0.5)
+        big, _, _ = self._one(namespace, 5000.0, 900.0, 20.0)
+        small, _, _ = self._one(namespace, 5000.0, 900.0, 8.0)
+        crown_big = big[15:]
+        crown_small = small[15:]
+
+        # Two lobes on the mature tree, one on the young one, so the vertex
+        # count doubles rather than the shape merely stretching.
+        self.assertEqual(
+            len(crown_big), 2 * len(crown_small),
+            f"a 20 m crown has {len(crown_big)} vertices against "
+            f"{len(crown_small)} on an 8 m one, so it is not lobed",
+        )
+        # And the lobes are offset from each other rather than stacked.
+        half = len(crown_big) // 2
+        first = crown_big[:half].mean(axis=0)
+        second = crown_big[half:].mean(axis=0)
+        self.assertGreater(
+            float(np.linalg.norm(first - second)), 1.0,
+            "the two lobes sit on top of one another, which is one lobe",
+        )
+        # Sideways, not merely one above the other: two lobes stacked on the
+        # axis are still a single round outline seen from above, and the
+        # billowy look is what this is for.
+        self.assertGreater(
+            float(np.linalg.norm(first[:2] - second[:2])), 1.0,
+            f"the lobes are only {np.linalg.norm(first[:2] - second[:2]):.2f} m "
+            f"apart in plan, so the crown is round from above",
+        )
 
     def test_no_two_crowns_are_the_same_shape(self):
         """Two trees of the same height next to each other have to differ, or a
@@ -3622,8 +3649,11 @@ class TestTreeShape(unittest.TestCase):
         for x in np.arange(2000.0, 2400.0, 3.0):
             if namespace["_tree_dice"](x, 800.0)[2] >= 0.34:
                 break
-        vertices, _, _ = self._one(namespace, x, 800.0, 16.0)
-        crown = vertices[vertices[:, 2] > 8.0]
+        # A young tree, deliberately: it gets one lobe, so the deformation is
+        # the only thing that can make its crown irregular. On a lobed crown
+        # the lobes supply the spread and the wobble could be gone entirely.
+        vertices, _, _ = self._one(namespace, x, 800.0, 9.0)
+        crown = vertices[15:]
         centre = crown.mean(axis=0)
         radius = np.linalg.norm(crown - centre, axis=1)
         # A sphere has one radius; a lobed crown has a spread of them.
@@ -3651,53 +3681,49 @@ class TestTreeShape(unittest.TestCase):
                 self.assertEqual(len(uvs), len(faces) * 3)
 
     def test_detail_follows_size(self):
-        """A three-metre sapling is not worth the geometry of the oak next to
-        it, and over a wooded square kilometre a seventh of what the canopy
-        model finds is under four metres."""
+        """A sapling is not worth the geometry of the oak next to it. The
+        saving is in the lobe count rather than in a coarser primitive: a
+        cheaper ball only ever looked like a gem on a stick."""
         namespace = self._shapes()
-        counts = {}
-        for height in (3.0, 12.0):
-            for x in np.arange(3000.0, 3400.0, 3.0):
-                if namespace["_tree_dice"](x, 400.0)[2] >= 0.34:   # broadleaf
-                    break
-            _, faces, _ = self._one(namespace, x, 400.0, height)
-            counts[height] = len(faces)
+        counts = {
+            height: len(self._one(namespace, 3000.0, 400.0, height)[1])
+            for height in (5.0, 20.0)
+        }
         self.assertLess(
-            counts[3.0], counts[12.0],
-            f"a sapling costs {counts[3.0]} triangles and a mature tree "
-            f"{counts[12.0]}",
+            counts[5.0], counts[20.0],
+            f"a young tree costs {counts[5.0]} triangles and a mature one "
+            f"{counts[20.0]}",
         )
 
-    def test_a_conifer_tapers(self):
-        """The whole point of the second species: the silhouette is a triangle,
-        not a lollipop."""
+    def test_nothing_comes_out_pointy(self):
+        """Leafy, not coniferous. A wood of spikes reads as a Christmas tree
+        farm, and these models are of Dutch parks and streets.
+
+        A cone is narrow at the top and wide at the foot all the way down; a
+        leafy crown is widest in its middle. That is the difference, and it is
+        the one worth asserting.
+        """
         namespace = self._shapes()
-        for x in np.arange(4000.0, 4400.0, 3.0):
-            if namespace["_tree_dice"](x, 300.0)[2] < 0.34:
-                break
-        vertices, _, _ = self._one(namespace, x, 300.0, 18.0)
-        crown = vertices[15:]                       # the trunk is 3 x 5
-        axis = crown[:, :2].mean(axis=0)
-        radius = np.linalg.norm(crown[:, :2] - axis, axis=1)
-        low, high = crown[:, 2].min(), crown[:, 2].max()
+        for height in (6.0, 12.0, 20.0):
+            for x in (6000.0, 6003.0, 6006.0):
+                vertices, _, _ = self._one(namespace, x, 200.0, height)
+                crown = vertices[15:]
+                axis = crown[:, :2].mean(axis=0)
+                radius = np.linalg.norm(crown[:, :2] - axis, axis=1)
+                low, high = crown[:, 2].min(), crown[:, 2].max()
 
-        def widest(lo, hi):
-            band = (crown[:, 2] >= low + (high - low) * lo) & (
-                crown[:, 2] < low + (high - low) * hi
-            )
-            return float(radius[band].max()) if band.any() else 0.0
+                def widest(lo, hi):
+                    band = (crown[:, 2] >= low + (high - low) * lo) & (
+                        crown[:, 2] < low + (high - low) * hi
+                    )
+                    return float(radius[band].max()) if band.any() else 0.0
 
-        # The middle band is the one that tells the story. Comparing the foot
-        # against the tip says nothing -- a stack of equal-width cones has a
-        # point at the top too, and that was the first version of this test
-        # passing a mutation that made every tier the same width.
-        base, middle = widest(0.0, 0.3), widest(0.3, 0.6)
-        self.assertGreater(
-            base, middle * 1.8,
-            f"a conifer {base:.1f} m across at the foot and {middle:.1f} m "
-            f"halfway up is a cylinder with a lid",
-        )
-
+                foot, middle = widest(0.0, 0.3), widest(0.35, 0.65)
+                self.assertGreater(
+                    middle, foot * 0.85,
+                    f"a {height:.0f} m crown is {foot:.1f} m across at the "
+                    f"foot and {middle:.1f} m in the middle, which is a cone",
+                )
 
 class TestBlenderMeshContract(unittest.TestCase):
     """Every mesh handed to Blender has to be shaped the way Blender wants.

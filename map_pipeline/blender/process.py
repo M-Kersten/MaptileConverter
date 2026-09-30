@@ -922,51 +922,70 @@ def _tree_dice(x, y):
     return out
 
 
-def _blob(sides: int = 6):
-    """A low bipyramid with blunt poles, as (vertices, faces) in a unit box.
 
-    What a small tree gets instead of an octahedron. An octahedron has a point
-    at the top and another at the bottom, and at sapling size that is not a
-    shrub, it is a gem on a stick. Pulling both poles in and widening the waist
-    costs four triangles and reads as foliage.
+def _lobed_crown(shape, faces, lobes, crown_r, crown_h, squash, spin):
+    """A crown built from overlapping lobes, as (vertices, faces).
+
+    One deformed ellipsoid is still an ellipsoid: push it about as much as you
+    like and the outline stays convex, which is what makes a lollipop a
+    lollipop. A real broadleaf crown is a cluster of masses with sky showing
+    between them, and the only way to an outline like that is more than one
+    lump.
+
+    Lobes are placed around the axis and at different heights, overlapping
+    enough that the joins read as foliage rather than as separate balls, and
+    each is deformed on its own so no two match.
     """
-    angles = np.linspace(0, 2 * np.pi, sides, endpoint=False)
-    ring = np.column_stack([np.cos(angles), np.sin(angles), np.zeros(sides)])
-    # Blunt poles, close in to the waist. Pushed out to a proper apex this is
-    # a gem again, which is the thing it exists not to be.
-    verts = np.vstack([ring, [[0.0, 0.0, 0.58]], [[0.0, 0.0, -0.62]]])
-    top, bottom = sides, sides + 1
-    faces = [[i, (i + 1) % sides, top] for i in range(sides)]
-    faces += [[(i + 1) % sides, i, bottom] for i in range(sides)]
-    return verts, np.asarray(faces, dtype=np.int64)
+    all_verts: list[np.ndarray] = []
+    all_faces: list[np.ndarray] = []
+    offset = 0
 
+    for lobe in range(lobes):
+        turn = spin + lobe * 2.399963  # the golden angle, so nothing lines up
+        # A single lobe sits on the axis; several spread around it, and the
+        # spread stays well inside the crown radius or the tree reads as a
+        # bunch of balloons rather than one canopy.
+        half_h = crown_h * 0.5
+        out = 0.0 if lobes == 1 else crown_r * 0.34
+        rise = 0.0 if lobes == 1 else (lobe / (lobes - 1) - 0.5) * half_h * 0.50
+        centre = np.array([out * np.cos(turn), out * np.sin(turn), rise])
 
-def _conifer(tiers: int, sides: int = 7):
-    """A stack of cones, as (vertices, faces) in a unit box.
+        # Each lobe is a lump rather than a copy of the whole crown. Scaling a
+        # lobe by the full crown height is what turns three of them into three
+        # separate elongated diamonds floating above a stick: at 0.62 they are
+        # wider than the gaps between their centres, so the union closes up.
+        size = 1.0 if lobes == 1 else 0.62
+        radii = np.array([crown_r * size, crown_r * squash * size,
+                          half_h * size])
 
-    Half the trees in a Dutch verge are conifers, and a conifer is the one
-    shape a deformed ball cannot be made to look like: the silhouette is a
-    triangle, not a lollipop. Cheap, too -- three tiers of seven sides is 42
-    triangles, about what one subdivided sphere costs.
-    """
-    angles = np.linspace(0, 2 * np.pi, sides, endpoint=False)
-    ring = np.column_stack([np.cos(angles), np.sin(angles)])
-    verts: list[np.ndarray] = []
-    faces: list[list[int]] = []
+        wobble = (
+            1.0
+            + 0.28 * np.sin(shape[:, 0] * 2.1 + turn)
+            * np.cos(shape[:, 1] * 1.8 - turn * 0.7)
+            + 0.16 * np.sin(shape[:, 2] * 3.3 + shape[:, 0] * 1.4 + turn * 1.9)
+        )
+        all_verts.append(shape * wobble[:, None] * radii + centre)
+        all_faces.append(faces + offset)
+        offset += len(shape)
 
-    for tier in range(tiers):
-        # Each tier starts lower and wider than the one above it, and they
-        # overlap, so the join reads as foliage rather than as a seam.
-        base_z = tier / tiers * 0.85
-        top_z = base_z + 1.25 / tiers
-        width = 1.0 - 0.72 * (tier / max(tiers - 1, 1))
-        start = len(verts)
-        verts.extend(np.column_stack([ring * width, np.full(sides, base_z)]))
-        verts.append(np.array([0.0, 0.0, min(top_z, 1.0)]))
-        apex = start + sides
-        for side in range(sides):
-            faces.append([start + side, start + (side + 1) % sides, apex])
-    return np.asarray(verts, dtype=np.float64), np.asarray(faces, dtype=np.int64)
+    crown = np.vstack(all_verts)
+
+    # Fit the union to the crown it was asked for. Lobes overlap, so their
+    # union is smaller than any one of them implies -- three at 0.62 with a
+    # spread of 0.25 fill about 0.87 of the height, which made every tree a
+    # sixth shorter than the canopy model measured it to be. Scaling the
+    # finished cluster is robust to whatever the lobe numbers are, which
+    # picking them to add up to one is not.
+    low, high = crown.min(axis=0), crown.max(axis=0)
+    span = high - low
+    want = np.array([crown_r * 2.0, crown_r * squash * 2.0, crown_h])
+    # About the middle of the box, not about the mean of the vertices: a lobed
+    # crown is not symmetric, so its mean sits off-centre and scaling about it
+    # leaves one side longer than asked for. That is how a 28 m tree came out
+    # 28.7 m tall.
+    crown = (crown - (low + high) * 0.5) * (want / np.maximum(span, 1e-6))
+
+    return crown, np.vstack(all_faces)
 
 
 def _tree_group_mesh(members, fields, origin, rng):
@@ -974,22 +993,20 @@ def _tree_group_mesh(members, fields, origin, rng):
 
     A tree used to be a sphere on a prism, which from any distance reads as a
     lollipop and from close up reads as eight of them in a row. Three things
-    fix that without spending much: the crown is pushed out of round by noise
-    taken from the tree's own position, so no two match; the trunk tapers and
-    flares; and roughly a third come out as conifers, which is the one
-    silhouette a deformed ball will not give you.
+    fix that: the crown is pushed out of round by noise taken from the tree's
+    own position, so no two match; a mature tree gets a second lobe, so its
+    outline is not convex; and the trunk tapers, flares and leans a little,
+    because a cylinder meets the ground like a pipe.
 
-    Detail follows size. A three-metre sapling gets an eight-face crown and a
-    mature tree a thirty-two-face one, because over a wooded square kilometre a
-    third of what the canopy model finds is under five metres tall and none of
-    it is worth the same geometry as the oak next to it.
+    Everything is broadleaf. An earlier version made a third of them conifers,
+    which is a real Dutch verge but not what these models are for -- a wood of
+    spikes reads as a Christmas tree farm, and the reference is the billowy
+    leafy mass you get from photogrammetry.
     """
     xy, ground, heights, crowns, trunks = fields
     origin_x, origin_y, z_offset = origin
 
-    coarse_verts, coarse_faces = _blob(6)
     fine_verts, fine_faces = _octahedron_canopy(1)
-    conifer_verts, conifer_faces = _conifer(3)
     trunk_sides = 5
     angles = np.linspace(0, 2 * np.pi, trunk_sides, endpoint=False)
 
@@ -1010,12 +1027,11 @@ def _tree_group_mesh(members, fields, origin, rng):
         crown_r = float(crowns[index])
         trunk_h = float(trunks[index])
 
-        spin_d, squash_d, species_d, lean_d = _tree_dice(
+        spin_d, squash_d, _spare, lean_d = _tree_dice(
             xy[index, 0], xy[index, 1]
         )
         spin = spin_d * 2 * np.pi
         squash = 0.78 + 0.34 * squash_d
-        conifer = species_d < 0.34
         canopy_base = base_z + trunk_h
         crown_h = max(0.6, height - trunk_h)
 
@@ -1053,41 +1069,24 @@ def _tree_group_mesh(members, fields, origin, rng):
         all_uvs.append(np.tile(bark_uv, (trunk_sides * 4 * 3, 1)))
         offset += trunk_sides * 3
 
-        if conifer:
-            shape, faces = conifer_verts, conifer_faces
-            # A conifer carries its foliage most of the way down the trunk.
-            centre = np.array([base_x + lean, base_y, base_z + trunk_h * 0.35])
-            radii = np.array([crown_r * 0.95, crown_r * 0.95 * squash,
-                              height - trunk_h * 0.35])
-            crown = shape * radii + centre
-        else:
-            # Measured on the Gelderland square: only 14.6% of trees are
-            # under four metres, so reserving the coarse crown for those
-            # costs 6% of the tree budget and keeps it off anything big
-            # enough to look at. Everything above gets the lobed sphere.
-            fine = height >= 4.0
-            shape, faces = (
-                (fine_verts, fine_faces) if fine else (coarse_verts, coarse_faces)
-            )
-            centre = np.array([base_x + lean, base_y, canopy_base + crown_h * 0.5])
-            # A young tree is a round bush, not a narrow one: without this the
-            # coarse crown comes out taller than it is wide and reads as a
-            # spike however blunt its poles are.
-            spread = 1.0 if fine else 1.25
-            radii = np.array(
-                [crown_r * spread, crown_r * squash * spread, crown_h * 0.5]
-            )
-            # Push the crown out of round. Two frequencies, so it lobes rather
-            # than merely leans, and seeded off the tree's own position so the
-            # same tree is the same shape every run. A single ellipsoid reads
-            # as a lollipop at any distance you can still see the trunk at.
-            wobble = (
-                1.0
-                + 0.34 * np.sin(shape[:, 0] * 2.1 + spin)
-                * np.cos(shape[:, 1] * 1.8 - spin * 0.7)
-                + 0.20 * np.sin(shape[:, 2] * 3.3 + shape[:, 0] * 1.4 + spin * 1.9)
-            )
-            crown = shape * wobble[:, None] * radii + centre
+        # Lobes by size. A sapling is one lump; a mature tree is a cluster,
+        # which is the only way to an outline that is not convex. Three lobes
+        # of the blunt blob come to 36 triangles, about what one subdivided
+        # sphere used to cost.
+        # Two lobes on a big tree, one on the rest. The lobe has to be a
+        # round shape, not a bipyramid: two bipyramids whose centres overlap
+        # still cross rather than merge, because there is almost nothing
+        # between their six ring vertices and their poles, and the result is a
+        # pair of spikes rather than a canopy.
+        lobes = 2 if height >= 14.0 else 1
+        shape, faces = fine_verts, fine_faces
+        crown, crown_faces = _lobed_crown(
+            shape, faces, lobes, crown_r, crown_h, squash, spin
+        )
+        crown = crown + np.array(
+            [base_x + lean, base_y, canopy_base + crown_h * 0.5]
+        )
+        faces = crown_faces
 
         all_verts.append(crown)
         all_faces.append(faces + offset)
