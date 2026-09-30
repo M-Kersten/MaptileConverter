@@ -846,6 +846,53 @@ class TestTreeDetection(unittest.TestCase):
             self.assertIn("detected", data.files)
             self.assertEqual(list(data["detected"]), [False, False, True, True])
 
+    def test_a_found_tree_outside_the_area_is_dropped(self):
+        """The canopy model covers whatever raster the AHN service returned,
+        which need not stop where the bbox does. A tree outside the terrain is
+        a tree standing on nothing, and it stretches the model with it."""
+        from src.trees import detect_trees
+
+        # Two crowns: one inside a 60 m area, one well outside it.
+        grid = self._put(self._blank(), 30, 30, 12.0, radius=4.0, rough=0.9)
+        grid = self._put(grid, 85, 85, 12.0, radius=4.0, rough=0.9, seed=4)
+        found, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        self.assertGreater(
+            len(found), 1, "the detector works over the whole raster, as it must"
+        )
+        self.assertTrue(
+            any(x > 60 or y > 60 for x, y in found),
+            "the fixture has nothing outside the area to drop",
+        )
+
+        from src.geo import BBox
+
+        clipped, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            bbox=BBox(0.0, 0.0, 60.0, 60.0),
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        self.assertTrue(len(clipped), "the clip dropped everything")
+        self.assertLess(len(clipped), len(found), "nothing was clipped")
+        self.assertTrue(
+            all(0 <= x <= 60 and 0 <= y <= 60 for x, y in clipped),
+            "a tree survived the clip from outside the area",
+        )
+
+    def test_build_trees_hands_the_detector_the_area(self):
+        """The clip is only worth anything if the caller asks for it."""
+        import inspect
+
+        from src import trees as trees_module
+
+        source = inspect.getsource(trees_module.build_trees)
+        self.assertIn(
+            "bbox=bbox", source,
+            "build_trees no longer tells the detector what area it is in",
+        )
+
     def test_the_settings_reach_the_config(self):
         from src.config import DEFAULTS
 
@@ -4628,7 +4675,9 @@ class TestStreetDetail(unittest.TestCase):
 
         points = np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 6.0], [34.0, 6.0]])
         style = LINE_STYLES[("scheiding_lijn", "hek")]
-        vertices, triangles = _sweep_line(points, np.zeros(len(points)), style)
+        vertices, triangles = _sweep_line(
+            points, lambda x, y: np.zeros(len(np.atleast_1d(x))), style
+        )
 
         boundary, nonmanifold = self._closed(vertices, triangles)
         self.assertEqual(boundary, 0, f"{boundary} open edges: the prism is a tube")
@@ -4644,8 +4693,8 @@ class TestStreetDetail(unittest.TestCase):
 
         style = LINE_STYLES[("scheiding_lijn", "muur")]
         line = np.array([[0.0, 0.0], [60.0, 0.0]])
-        points, base = _drape_points(line, self._slope(0.05), 1.0, 0.05)
-        vertices, _ = _sweep_line(points, base, style)
+        points, _profile = _drape_points(line, self._slope(0.05), 1.0, 0.05)
+        vertices, _ = _sweep_line(points, self._slope(0.05), style)
 
         n = len(points)
         # The four rails are stacked in order: left-low, left-high, ...
@@ -4797,6 +4846,87 @@ class TestStreetDetail(unittest.TestCase):
             self.assertIn(style.material, available, style.name)
             u, v = furniture_uv(style.material)
             self.assertTrue(0.0 < u < 1.0 and 0.0 < v < 1.0)
+
+    def test_a_wall_on_a_bank_does_not_bury_itself(self):
+        """A wall has width, and the mitre at a corner widens it further -- up
+        to two and a half times the half-thickness, which on a half-metre quay
+        wall is half a metre sideways.
+
+        That is nothing on a pavement and a lot on a canal bank, which is
+        exactly where quay walls are. Sampling the ground along the centreline
+        and building the corners from it put a wall 0.96 m underground on a
+        real run.
+        """
+        from src.barriers import EMBED_M, LINE_STYLES, _sweep_line
+
+        # A bank: flat on one side, dropping steeply on the other.
+        def bank(x, y):
+            y = np.asarray(y, dtype=float)
+            return np.clip(y, 0.0, 3.0) - 3.0
+
+        style = LINE_STYLES[("scheiding_lijn", "kademuur")]
+        # Along the top of the bank, with a corner to engage the mitre.
+        line = np.array([[0.0, 3.0], [20.0, 3.0], [26.0, 9.0]])
+        vertices, _ = _sweep_line(line, bank, style)
+
+        # The four rails are stacked in order: left-low, left-high, right-high,
+        # right-low. Only the two low ones are meant to touch the ground.
+        n = len(line)
+        base = np.concatenate([vertices[:n], vertices[3 * n : 4 * n]])
+        offset = base[:, 2] - bank(base[:, 0], base[:, 1])
+        self.assertGreaterEqual(
+            float(offset.min()), -(EMBED_M + 0.05),
+            f"a corner is {-offset.min():.2f} m underground, against a "
+            f"{EMBED_M:.2f} m embed",
+        )
+        # And not floating either, which is the same mistake the other way up:
+        # sampling the middle and building the corners from it lifts the low
+        # side clear of the bank instead of burying the high one.
+        self.assertLessEqual(
+            float(offset.max()), 0.0,
+            f"a corner floats {offset.max():.2f} m above the bank",
+        )
+        # The top is level across the width and taken from the higher side, so
+        # the wall is never shorter than it claims on either bank.
+        top = vertices[n : 2 * n, 2]
+        higher = np.maximum(
+            bank(vertices[:n, 0], vertices[:n, 1]),
+            bank(vertices[3 * n : 4 * n, 0], vertices[3 * n : 4 * n, 1]),
+        )
+        self.assertGreaterEqual(
+            float((top - higher).min()), style.height_m - 1e-6,
+            f"the wall is only {(top - higher).min():.2f} m tall on its high "
+            f"side, against {style.height_m:.2f} m asked for",
+        )
+
+    def test_a_wall_is_cut_at_the_edge_of_the_area(self):
+        """A quay wall follows its canal, and the canal does not stop at the
+        bbox. Keeping any polygon whose middle was inside took the model 227 m
+        past its own terrain."""
+        from src.barriers import AREA_STYLES, _extrude_rings, _prepare_rings
+        from src.geo import BBox
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        # A wall running from inside the area to 200 m north of it.
+        # Centre inside the area, reaching 200 m past it: exactly the shape a
+        # centre test waves through.
+        ring = np.array([[49.0, -50.0], [51.0, -50.0], [51.0, 200.0], [49.0, 200.0]])
+        self.assertTrue(
+            bbox.ymin <= ring[:, 1].mean() <= bbox.ymax,
+            "the fixture's centre is outside, so a centre test would catch it",
+        )
+
+        rings = _prepare_rings([ring], bbox)
+        self.assertEqual(len(rings), 1, "the wall was dropped rather than cut")
+        vertices, _ = _extrude_rings(
+            rings, lambda x, y: np.zeros(len(x)),
+            AREA_STYLES[("scheiding_vlak", "kademuur")],
+        )
+        self.assertLessEqual(
+            float(vertices[:, 1].max()), bbox.ymax + 1e-6,
+            f"the wall reaches {vertices[:, 1].max():.0f} m into a "
+            f"{bbox.ymax:.0f} m area",
+        )
 
     def test_the_settings_reach_the_config(self):
         from src.config import DEFAULTS

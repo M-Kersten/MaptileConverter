@@ -47,6 +47,7 @@ import numpy as np
 from .bgt import fetch_current, polygon_rings
 from .geo import BBox
 from .rails import clip_line_to_bbox, densify, offset_normals
+from .surfaces import clip_ring_to_bbox
 
 LOG = logging.getLogger(__name__)
 
@@ -136,6 +137,27 @@ def _drape_points(points: np.ndarray, sampler, step_m: float, tolerance_m: float
     return dense[keep], height[keep]
 
 
+def _prepare_rings(group, bbox: BBox) -> list[np.ndarray]:
+    """One BGT polygon into rings the extruder can use, cut to the area.
+
+    Cut, not merely centre-tested. This used to keep any polygon whose middle
+    was inside, on the grounds that a wall poking a metre past the edge was not
+    worth a seam -- and then a quay wall followed its canal 227 m past the bbox
+    and took the model's bounding box with it. A wall is not a building:
+    cutting one at the edge shows a cut wall, which is what the edge of the
+    model looks like anyway.
+    """
+    rings = []
+    for ring in group:
+        ring = np.asarray(ring, dtype=np.float64)
+        if ring.ndim != 2 or len(ring) < 3:
+            continue
+        clipped = clip_ring_to_bbox(ring[:, :2], bbox)
+        if len(clipped) >= 3:
+            rings.append(clipped)
+    return rings
+
+
 def _span(base_z, style: BarrierStyle):
     """The bottom and top of a barrier, given where the ground is."""
     if style.lift_m > 0.0:
@@ -219,12 +241,19 @@ class BarrierSet:
         return {"triangles": len(self), "vertices": int(len(self.vertices)), **self.counts}
 
 
-def _sweep_line(points: np.ndarray, base_z: np.ndarray, style: BarrierStyle):
+def _sweep_line(points: np.ndarray, sampler, style: BarrierStyle):
     """One polyline into a closed prism, as ``(vertices, triangles)``.
 
     The base follows the terrain and the top follows the base, so a wall up a
     slope stays the same height all the way along rather than levelling off or
     burying itself.
+
+    The ground is sampled at each rail, not once along the centreline. A wall
+    has width, and the mitre at a corner widens it further -- up to two and a
+    half times the half-thickness, which on a half-metre quay wall is half a
+    metre sideways. That is nothing on a pavement and a lot on a canal bank,
+    which is exactly where quay walls are: sampling the middle and building the
+    corners from it put a wall 0.96 m underground.
     """
     if len(points) < 2:
         return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
@@ -234,17 +263,26 @@ def _sweep_line(points: np.ndarray, base_z: np.ndarray, style: BarrierStyle):
     left = points + normals * half
     right = points - normals * half
 
-    low, high = _span(base_z, style)
+    ground_left = np.asarray(sampler(left[:, 0], left[:, 1]), dtype=np.float64)
+    ground_right = np.asarray(sampler(right[:, 0], right[:, 1]), dtype=np.float64)
+    # Each base on its own ground, so neither side floats and neither is
+    # swallowed; the top level across the width, taken from the higher side, so
+    # the wall does not lean and is never shorter than it should be. Sharing
+    # one height for both would have to pick, and either choice is wrong on a
+    # bank: the lower buries the high side, the higher floats the low one.
+    low_left, _ = _span(ground_left, style)
+    low_right, _ = _span(ground_right, style)
+    _, high = _span(np.maximum(ground_left, ground_right), style)
 
     n = len(points)
     # Four rails: left-low, left-high, right-high, right-low. Ordered around
     # the cross-section, so consecutive rails bound one face of the prism and
     # the last wraps to the first.
     rails = [
-        np.column_stack([left, low]),
+        np.column_stack([left, low_left]),
         np.column_stack([left, high]),
         np.column_stack([right, high]),
-        np.column_stack([right, low]),
+        np.column_stack([right, low_right]),
     ]
     vertices = np.vstack(rails)
 
@@ -406,10 +444,10 @@ def build_barriers(
                     for piece in clip_line_to_bbox(line[:, :2], bbox):
                         if _length(piece) < MIN_LENGTH_M:
                             continue
-                        dense, base = _drape_points(
+                        dense, _profile = _drape_points(
                             piece, terrain.sample, step_m, drape_tolerance_m
                         )
-                        verts, tris = _sweep_line(dense, base, style)
+                        verts, tris = _sweep_line(dense, terrain.sample, style)
                         if len(tris):
                             chunks.append((verts, tris, style.material, style.name))
                             counts[style.name] = counts.get(style.name, 0) + 1
@@ -419,18 +457,8 @@ def build_barriers(
                 if style is None:
                     continue
                 for group in polygon_rings(geometry):
-                    rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in group]
-                    rings = [r for r in rings if len(r) >= 3]
+                    rings = _prepare_rings(group, bbox)
                     if not rings:
-                        continue
-                    # Clipped to the bbox by the base sample rather than
-                    # geometrically: a wall poking a metre past the edge is not
-                    # worth the seam that cutting it would leave.
-                    centre = rings[0].mean(axis=0)
-                    if not (
-                        bbox.xmin - 5 <= centre[0] <= bbox.xmax + 5
-                        and bbox.ymin - 5 <= centre[1] <= bbox.ymax + 5
-                    ):
                         continue
                     verts, tris = _extrude_rings(rings, terrain.sample, style)
                     if len(tris):

@@ -397,6 +397,7 @@ def detect_trees(
     *,
     registered_xy: np.ndarray,
     registered_reach: np.ndarray | None = None,
+    bbox: BBox | None = None,
     building_mask: np.ndarray | None = None,
     water_mask: np.ndarray | None = None,
     min_height_m: float = 2.5,
@@ -527,12 +528,29 @@ def detect_trees(
         keep_y.append(float(y))
         keep_h.append(float(height))
 
+    xy = np.column_stack([keep_x, keep_y]) if keep_x else np.zeros((0, 2))
+    found_h = np.asarray(keep_h)
+
+    # Cut to the area. The canopy model covers whatever raster the AHN service
+    # returned, which need not stop where the bbox does, and a tree outside the
+    # terrain is a tree standing on nothing -- it also drags the model's own
+    # bounding box out with it, which is what the span check measures.
+    if bbox is not None and len(xy):
+        inside = (
+            (xy[:, 0] >= bbox.xmin) & (xy[:, 0] <= bbox.xmax)
+            & (xy[:, 1] >= bbox.ymin) & (xy[:, 1] <= bbox.ymax)
+        )
+        if not inside.all():
+            LOG.info("dropped %d detected trees outside the bbox",
+                     int((~inside).sum()))
+        xy, found_h = xy[inside], found_h[inside]
+
     LOG.info(
         "detected %d trees the register does not have, from %d canopy peaks",
-        len(keep_x),
+        len(xy),
         len(seed_rows),
     )
-    return np.column_stack([keep_x, keep_y]), np.asarray(keep_h)
+    return xy, found_h
 
 
 def build_trees(
@@ -655,6 +673,7 @@ def build_trees(
             ndsm,
             bounds,
             registered_xy=coords,
+            bbox=bbox,
             registered_reach=np.array(
                 [t.crown_radius_m for t in result.trees], dtype=np.float64
             ),
