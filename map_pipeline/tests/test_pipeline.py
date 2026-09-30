@@ -3287,6 +3287,207 @@ class TestBlenderStageIsolation(unittest.TestCase):
             )
 
 
+def _blender_mesh_calls():
+    """Run every Blender builder against synthetic input, offline.
+
+    Yields `(function name, calls, error)`. Each call records the shapes handed
+    to `build_mesh_object`, so the contract can be checked without Blender.
+
+    The Blender stage is the one part of this pipeline the test suite cannot
+    execute: it needs `bpy`, which is 848 MB and CPython 3.11 only. So the
+    functions are exec'd against a stubbed `build_mesh_object` and stubbed
+    materials instead, which is enough to catch the shape mistakes -- and one
+    of those shipped: `build_structures` welded its corners and then handed
+    Blender loop indices for the unwelded buffer, which killed a real run with
+    "Array length mismatch (got 210, expected more)".
+    """
+    import re
+    import tempfile
+
+    source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+    calls: list[dict] = []
+
+    def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
+        calls.append({
+            "object": name,
+            "vertices": len(vertices),
+            "loops": len(loops),
+            "uvs": len(uvs),
+            "polygons": len(starts),
+            "totals": len(totals),
+            "loop_total_sum": int(np.sum(totals)),
+            "material_indices": len(mats),
+            "materials": len(materials),
+            "max_index": int(np.max(loops)) if len(loops) else -1,
+        })
+        return name
+
+    namespace = {
+        "np": np, "Path": Path, "log": lambda *a: None,
+        "build_mesh_object": record,
+        "make_material": lambda *a, **k: "M",
+        "make_textured_material": lambda *a, **k: "M",
+    }
+    # Pull in every helper the builders lean on, in file order.
+    for match in re.finditer(r"\ndef (\w+)\(.*?\n(?=\ndef |\n# ---|\Z)", source, re.S):
+        if match.group(1) == "build_mesh_object":
+            continue
+        try:
+            exec(match.group(0), namespace)  # noqa: S102 - our own source
+        except Exception:  # noqa: BLE001 - helpers needing bpy are not our target
+            pass
+
+    rng = np.random.default_rng(11)
+    folder = Path(tempfile.mkdtemp())
+    n = 12
+    xy = np.column_stack([rng.uniform(0, 200, n), rng.uniform(0, 200, n)])
+    # A strip sharing corners along its length, so a weld has something to
+    # merge. Random triangles share nothing and would let a broken weld pass.
+    strip = np.array([[i * 4.0, 0.0, 0.0] for i in range(n // 2 + 1)]
+                     + [[i * 4.0, 6.0, 0.0] for i in range(n // 2 + 1)])
+    top = n // 2 + 1
+    quads = [[i, i + 1, top + i + 1, top + i] for i in range(n // 2)]
+    triangles = np.array(
+        [[strip[a], strip[b], strip[c]] for a, b, c, d in quads]
+        + [[strip[a], strip[c], strip[d]] for a, b, c, d in quads]
+    )
+    n = len(triangles)
+
+    np.savez(folder / "trees.npz", xy=xy, ground_z_nap=np.zeros(n),
+             height_m=rng.uniform(3, 20, n), crown_radius_m=rng.uniform(1, 4, n),
+             trunk_height_m=rng.uniform(1, 3, n), detected=np.arange(n) >= 5)
+    np.savez(folder / "furniture.npz", xy=xy, ground_z_nap=np.zeros(n),
+             kind=np.arange(n) % 14)
+    verts = triangles.reshape(-1, 3)
+    np.savez(folder / "barriers.npz", vertices=verts,
+             triangles=np.arange(len(verts)).reshape(-1, 3).astype(np.int32),
+             material=np.zeros(n, np.int32), kind=(np.arange(n) % 3).astype(np.int32),
+             material_names=np.array(["brick", "hedge", "metal"], dtype=object),
+             kind_names=np.array(["wall", "hedge", "fence"], dtype=object))
+    np.savez(folder / "structures.npz", tris=triangles,
+             tri_kind=(np.arange(n) % 2).astype(np.int32))
+    np.savez(folder / "rails.npz",
+             ballast_tris=triangles, ballast_kind=np.zeros(n, np.int32),
+             ballast_uv=rng.uniform(0, 1, (n * 3, 2)),
+             rail_tris=triangles, rail_kind=np.zeros(n, np.int32),
+             rail_uv=rng.uniform(0, 1, (n * 3, 2)))
+    np.savez(folder / "vehicles.npz", xy=xy, z_nap=np.zeros(n),
+             heading=rng.uniform(0, 6, n), length=np.full(n, 4.2),
+             width=np.full(n, 1.8), kind=np.zeros(n, np.int32),
+             colour=rng.integers(0, 4, n))
+    np.savez(folder / "roads.npz", road_tris=triangles,
+             road_tri_class=(np.arange(n) % 2).astype(np.int32),
+             road_tri_level=np.zeros(n, np.int32), road_lift_m=0.06)
+
+    scene = {
+        "origin_rd": [100.0, 100.0],
+        "ground_z_offset_nap": 0.0,
+        "aerial": {"bbox_local": [-200.0, -200.0, 200.0, 200.0]},
+        "trees": {"file": "trees.npz", "texture": "t.png"},
+        "furniture": {"file": "furniture.npz", "texture": "f.png",
+                      "atlas_uv": {}},
+        "barriers": {"file": "barriers.npz", "texture": "f.png"},
+        "structures": {"file": "structures.npz", "kind_names": {"0": "bridge"}},
+        "rails": {"file": "rails.npz", "kind_names": {"0": "track"}},
+        "vehicles": {"file": "vehicles.npz", "texture": "v.png"},
+        "surfaces": {"file": "roads.npz",
+                     "road_class_names": {"0": "road_asphalt"}},
+    }
+
+    for name, args in (
+        ("build_trees", (scene, folder, "M")),
+        ("build_furniture", (scene, folder, "M")),
+        ("build_barriers", (scene, folder, "M")),
+        ("build_structures", (scene, folder, "M")),
+        ("build_rails", (scene, folder, "M")),
+        ("build_vehicles", (scene, folder, "M")),
+        ("build_roads", (scene, folder, lambda *a, **k: "M")),
+    ):
+        function = namespace.get(name)
+        if function is None:
+            yield name, [], "not found in process.py"
+            continue
+        calls.clear()
+        try:
+            function(*args)
+        except TypeError as exc:
+            # A signature this harness does not know about is worth saying so
+            # rather than passing quietly.
+            yield name, list(calls), f"{type(exc).__name__}: {exc}"
+            continue
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            yield name, list(calls), f"{type(exc).__name__}: {exc}"
+            continue
+        yield name, list(calls), None
+
+
+class TestBlenderMeshContract(unittest.TestCase):
+    """Every mesh handed to Blender has to be shaped the way Blender wants.
+
+    This exists because a real run died on it. `build_structures` welded its
+    corners -- turning 210 loose corners into 105 shared vertices -- and then
+    told Blender the loop indices still ran 0..209 and handed it one UV per
+    welded vertex instead of one per loop. Blender's answer was "Array length
+    mismatch (got 210, expected more)", six stack frames from the mistake.
+
+    The rules are small and none of them are checkable by reading:
+
+      * one UV per loop, not per vertex -- a weld breaks the two apart
+      * every loop index inside the vertex buffer
+      * the loop totals adding up to the number of loops
+    """
+
+    def test_every_builder_hands_blender_a_well_formed_mesh(self):
+        checked = 0
+        for name, calls, error in _blender_mesh_calls():
+            with self.subTest(builder=name):
+                self.assertIsNone(error, f"{name} raised: {error}")
+                for call in calls:
+                    checked += 1
+                    label = f"{name} -> {call['object']}"
+                    self.assertEqual(
+                        call["uvs"], call["loops"],
+                        f"{label}: {call['uvs']} UVs for {call['loops']} loops. "
+                        f"UVs are per loop; after a weld that is corners"
+                        f"[indices], not corners.",
+                    )
+                    self.assertLess(
+                        call["max_index"], call["vertices"],
+                        f"{label}: loop index {call['max_index']} into a buffer "
+                        f"of {call['vertices']} vertices. After a weld the loop "
+                        f"indices are the weld's own, not arange(3n).",
+                    )
+                    self.assertEqual(
+                        call["loop_total_sum"], call["loops"],
+                        f"{label}: loop totals sum to "
+                        f"{call['loop_total_sum']} for {call['loops']} loops",
+                    )
+                    self.assertEqual(
+                        call["totals"], call["polygons"],
+                        f"{label}: {call['totals']} loop totals for "
+                        f"{call['polygons']} polygons",
+                    )
+        self.assertGreater(checked, 8, f"only {checked} meshes were exercised")
+
+    def test_the_welded_builders_really_are_welded(self):
+        """A weld that returns as many vertices as loops has done nothing, and
+        the whole point of it was to stop every triangle carrying its own three
+        corners."""
+        welded = {"build_roads", "build_structures"}
+        seen = set()
+        for name, calls, error in _blender_mesh_calls():
+            if name not in welded or error:
+                continue
+            for call in calls:
+                seen.add(name)
+                self.assertLess(
+                    call["vertices"], call["loops"],
+                    f"{name} -> {call['object']}: {call['vertices']} vertices "
+                    f"for {call['loops']} loops, so nothing was shared",
+                )
+        self.assertEqual(seen, welded, f"only exercised {sorted(seen)}")
+
+
 class TestSourceRegistry(unittest.TestCase):
     """One registry drives the preflight and the UI's source picker."""
 

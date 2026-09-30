@@ -1610,7 +1610,7 @@ def build_structures(scene: dict, work_dir: Path, material):
         part = local[kinds == code]
         if not len(part):
             continue
-        # Welded, so the road arrives indexed. Every triangle used to carry its
+        # Welded, so a deck arrives indexed. Every triangle used to carry its
         # own three corners, which is three times the vertex buffer with no
         # reuse at all -- and no shared normals, so an engine cannot smooth the
         # surface even where it should be smooth.
@@ -1620,12 +1620,18 @@ def build_structures(scene: dict, work_dir: Path, material):
 
         # Metre UVs: a deck and a tunnel wall both want a tiling concrete, not
         # a photo stretched over them.
-        uvs = np.column_stack([corners[:, 0] / 6.0, corners[:, 1] / 6.0])
+        #
+        # Per loop, not per vertex. Blender's uv layer holds one pair for every
+        # corner of every face, so after a weld the UVs follow `indices` rather
+        # than `corners` -- and the loop indices have to be `indices` too, or
+        # they address a buffer that no longer exists at that length.
+        loop_xy = corners[indices][:, :2]
+        uvs = np.column_stack([loop_xy[:, 0] / 6.0, loop_xy[:, 1] / 6.0])
         objects.append(
             build_mesh_object(
                 f"Structures_{label}",
                 corners,
-                np.arange(n_triangles * 3),
+                indices,
                 np.arange(0, n_triangles * 3, 3),
                 np.full(n_triangles, 3),
                 uvs,
