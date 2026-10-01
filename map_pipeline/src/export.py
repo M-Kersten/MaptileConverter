@@ -327,6 +327,14 @@ def write_scene_description(
         "export": {
             "fbx_name": export_cfg["fbx_name"],
             "aerial_name": export_cfg["aerial_name"],
+            # Physics proxies, off by default: they cost FBX size and most
+            # people importing this want a picture. A drone or a vehicle sim
+            # wants them, because the thing it needs -- a fence a drone cannot
+            # tunnel through -- is not the thing a renderer wants.
+            "collision": bool(export_cfg.get("collision", False)),
+            "collision_tree_crowns": bool(
+                export_cfg.get("collision_tree_crowns", True)
+            ),
         },
     }
 

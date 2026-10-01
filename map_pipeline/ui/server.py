@@ -357,6 +357,19 @@ def build_config(payload: dict) -> dict:
             "road_simplify_m": float(payload.get("road_simplify_m", 0.25)),
             "road_max_edge_m": float(payload.get("road_max_edge_m", 12.0)),
         },
+        "export": {
+            # Physics proxies for a simulation. Off by default: they add to the
+            # FBX and most people want a picture.
+            "collision": bool(payload.get("collision", False)),
+            "collision_tree_crowns": bool(
+                payload.get("collision_tree_crowns", True)
+            ),
+        },
+        "barriers": {
+            "collision_thickness_m": float(
+                payload.get("collision_thickness_m", 0.30)
+            ),
+        },
     }
 
     # Optional sources come as a list of ids from the sources panel. Older

@@ -3467,7 +3467,12 @@ def _blender_mesh_calls():
              triangles=np.arange(len(verts)).reshape(-1, 3).astype(np.int32),
              material=np.zeros(n, np.int32), kind=(np.arange(n) % 3).astype(np.int32),
              material_names=np.array(["brick", "hedge", "metal"], dtype=object),
-             kind_names=np.array(["wall", "hedge", "fence"], dtype=object))
+             kind_names=np.array(["wall", "hedge", "fence"], dtype=object),
+             # The fattened physics proxy, in its own buffer: no UVs and no
+             # materials, because it is never drawn.
+             collision_vertices=verts + np.array([0.0, 0.0, 0.0]),
+             collision_triangles=np.arange(len(verts)).reshape(-1, 3).astype(np.int32),
+             collision_thickness_m=np.float64(0.30))
     np.savez(folder / "structures.npz", tris=triangles,
              tri_kind=(np.arange(n) % 2).astype(np.int32))
     np.savez(folder / "rails.npz",
@@ -3496,6 +3501,7 @@ def _blender_mesh_calls():
         "vehicles": {"file": "vehicles.npz", "texture": "v.png"},
         "surfaces": {"file": "roads.npz",
                      "road_class_names": {"0": "road_asphalt"}},
+        "export": {"collision": True, "collision_tree_crowns": True},
     }
 
     for name, args in (
@@ -3506,6 +3512,7 @@ def _blender_mesh_calls():
         ("build_rails", (scene, folder, "M")),
         ("build_vehicles", (scene, folder, "M")),
         ("build_roads", (scene, folder, lambda *a, **k: "M")),
+        ("build_collision", (scene, folder)),
     ):
         function = namespace.get(name)
         if function is None:
@@ -5298,6 +5305,738 @@ class TestPathsOverWater(unittest.TestCase):
         self.assertEqual(DEFAULTS["surfaces"]["road_water_clearance_m"], 0.25)
 
 
+class TestCollisionLayer(unittest.TestCase):
+    """Physics proxies, for a simulation rather than a picture.
+
+    One property decides whether any of this is worth shipping: a collider has
+    to *contain* what it stands in for. A proxy that is cheaper and smaller is
+    worse than no proxy at all, because the drone flies into visible foliage
+    and nothing happens, and it looks entirely reasonable in the viewport
+    while doing it. The first tree proxy here was an inscribed ellipsoid and
+    drawn foliage stuck 4.3 m out of it.
+    """
+
+    SIDES = 5
+
+    @staticmethod
+    def _tree_ns():
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        namespace = {"np": np}
+        for name in ("_octahedron_canopy", "_box", "_tree_dice", "_lobed_crown",
+                     "_tree_group_mesh", "_collision_tree_mesh"):
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            assert body is not None, f"{name} moved"
+            exec(body.group(0), namespace)  # noqa: S102 - our own source
+        return namespace
+
+    @staticmethod
+    def _fields(x, y, height):
+        return (
+            np.array([[x, y]]), np.zeros(1), np.array([float(height)]),
+            np.array([float(np.clip(0.26 * height, 0.8, 7.0))]),
+            np.array([float(np.clip(0.38 * height, 0.6, 6.0))]),
+        )
+
+    def _outside_by(self, points, proxy, has_crown):
+        """How far the worst point lies outside the proxy, in metres. Exact.
+
+        The trunk is a convex prism, so a point is inside it when it is behind
+        every side plane and between the two ends; the crown is an axis-aligned
+        box. Deliberately not sharing any code with the thing under test.
+        """
+        sides = self.SIDES
+        lo_ring = proxy[:sides]
+        hi_ring = proxy[sides:sides * 2]
+        z_lo, z_hi = lo_ring[0, 2], hi_ring[0, 2]
+        centre = lo_ring[:, :2].mean(axis=0)
+
+        planes = []
+        for i in range(sides):
+            a, b = lo_ring[i, :2], lo_ring[(i + 1) % sides, :2]
+            edge = b - a
+            normal = np.array([edge[1], -edge[0]])
+            normal = normal / np.linalg.norm(normal)
+            if normal @ (a - centre) < 0:
+                normal = -normal
+            planes.append((normal, normal @ a))
+
+        if has_crown:
+            box = proxy[sides * 2:]
+            box_lo, box_hi = box.min(axis=0), box.max(axis=0)
+
+        worst = 0.0
+        for p in points:
+            d = max(
+                [n @ p[:2] - off for n, off in planes]
+                + [z_lo - p[2], p[2] - z_hi]
+            )
+            if d <= 1e-9:
+                continue
+            if has_crown:
+                over = np.maximum(np.maximum(box_lo - p, p - box_hi), 0.0)
+                d = min(d, float(np.linalg.norm(over)))
+                if d <= 1e-9:
+                    continue
+            worst = max(worst, d)
+        return worst
+
+    # A position whose dice come out at the extreme of the lean, found by
+    # search. A tall tree leaning its hardest is the only case where the trunk
+    # proxy needs the lean added to its radius -- the flare covers the rest --
+    # and a sweep of ordinary positions never produces one, so it was missed:
+    # dropping the allowance passed every test until this went in.
+    LEANING = (104114.24, 556464.31)
+
+    def test_the_proxy_contains_every_drawn_vertex(self):
+        namespace = self._tree_ns()
+        rng = np.random.default_rng(3)
+        places = [tuple(rng.uniform(100000, 200000, 2)) for _ in range(9)]
+        for height, (x, y) in zip(
+            (3.0, 4.0, 7.0, 11.0, 13.9, 14.0, 18.0, 25.0, 32.0), places
+        ):
+            fields = self._fields(x, y, height)
+            drawn, _, _ = namespace["_tree_group_mesh"](
+                np.ones(1, bool), fields, (x, y, 0.0), np.random.default_rng(1)
+            )
+            proxy, _ = namespace["_collision_tree_mesh"](
+                np.ones(1, bool), fields, (x, y, 0.0), True
+            )
+            out = self._outside_by(drawn, proxy, True)
+            self.assertLess(
+                out, 1e-6,
+                f"a {height:.0f} m tree pokes {out:.2f} m out of its own "
+                f"collider, so a drone would fly through visible foliage",
+            )
+
+    def test_the_trunk_proxy_contains_the_drawn_trunk(self):
+        """With crowns off, wood still has to be solid."""
+        namespace = self._tree_ns()
+        rng = np.random.default_rng(8)
+        places = [tuple(rng.uniform(100000, 200000, 2)) for _ in range(4)]
+        for height, (x, y) in zip((4.0, 12.0, 22.0, 30.0), places):
+            fields = self._fields(x, y, height)
+            drawn, _, _ = namespace["_tree_group_mesh"](
+                np.ones(1, bool), fields, (x, y, 0.0), np.random.default_rng(1)
+            )
+            proxy, _ = namespace["_collision_tree_mesh"](
+                np.ones(1, bool), fields, (x, y, 0.0), False
+            )
+            # The drawn trunk is the first three rings of five vertices.
+            out = self._outside_by(drawn[: self.SIDES * 3], proxy, False)
+            self.assertLess(out, 1e-6, f"the trunk pokes {out:.2f} m out")
+
+    def test_the_hardest_leaning_tree_is_still_contained(self):
+        """The trunk proxy is a straight prism and the drawn trunk's top ring
+        is pushed sideways by the lean, which is why the lean goes into the
+        radius. On most trees the flare already covers it; on a tall one
+        leaning its hardest it does not, and dropping the allowance passed
+        every other test here."""
+        namespace = self._tree_ns()
+        x, y = self.LEANING
+        _spin, _squash, _spare, lean_d = namespace["_tree_dice"](x, y)
+        self.assertLess(
+            min(lean_d, 1.0 - lean_d), 0.01,
+            "this position no longer gives an extreme lean; search for another",
+        )
+        for height in (28.0, 30.0, 32.0):
+            fields = self._fields(x, y, height)
+            drawn, _, _ = namespace["_tree_group_mesh"](
+                np.ones(1, bool), fields, (x, y, 0.0), np.random.default_rng(1)
+            )
+            for crowns in (True, False):
+                proxy, _ = namespace["_collision_tree_mesh"](
+                    np.ones(1, bool), fields, (x, y, 0.0), crowns
+                )
+                points = drawn if crowns else drawn[: self.SIDES * 3]
+                out = self._outside_by(points, proxy, crowns)
+                self.assertLess(
+                    out, 1e-6,
+                    f"a {height:.0f} m tree leaning hard pokes {out:.2f} m out "
+                    f"of its collider (crowns={crowns})",
+                )
+
+    def test_it_is_cheaper_than_what_it_replaces(self):
+        """Containing the tree is not enough on its own -- the drawn mesh
+        contains it perfectly and is what this exists to avoid."""
+        namespace = self._tree_ns()
+        drawn_total = proxy_total = trunk_total = 0
+        for height in (5.0, 9.0, 16.0, 24.0):
+            fields = self._fields(150000.0, 450000.0, height)
+            _, drawn_faces, _ = namespace["_tree_group_mesh"](
+                np.ones(1, bool), fields, (150000.0, 450000.0, 0.0),
+                np.random.default_rng(1),
+            )
+            _, proxy_faces = namespace["_collision_tree_mesh"](
+                np.ones(1, bool), fields, (150000.0, 450000.0, 0.0), True
+            )
+            _, trunk_faces = namespace["_collision_tree_mesh"](
+                np.ones(1, bool), fields, (150000.0, 450000.0, 0.0), False
+            )
+            drawn_total += len(drawn_faces)
+            proxy_total += len(proxy_faces)
+            trunk_total += len(trunk_faces)
+        self.assertEqual(proxy_total, 28 * 4, "28 triangles a tree: 16 + 12")
+        self.assertEqual(trunk_total, 16 * 4)
+        self.assertGreater(
+            drawn_total / proxy_total, 1.8,
+            f"{drawn_total} drawn against {proxy_total} proxy is not a saving",
+        )
+
+    def test_the_proxy_follows_the_tree_it_stands_for(self):
+        """Both read the same dice. A proxy built from its own random numbers
+        is a proxy for a different tree in the same place."""
+        namespace = self._tree_ns()
+        # Two trees a metre apart get different spin, squash and lean, so a
+        # proxy that ignored position would contain one and miss the other.
+        for x, y in ((150000.0, 450000.0), (150001.0, 450000.0)):
+            fields = self._fields(x, y, 20.0)
+            drawn, _, _ = namespace["_tree_group_mesh"](
+                np.ones(1, bool), fields, (x, y, 0.0), np.random.default_rng(1)
+            )
+            mine, _ = namespace["_collision_tree_mesh"](
+                np.ones(1, bool), fields, (x, y, 0.0), True
+            )
+            other_fields = self._fields(x + 7.0, y + 13.0, 20.0)
+            theirs, _ = namespace["_collision_tree_mesh"](
+                np.ones(1, bool), other_fields, (x + 7.0, y + 13.0, 0.0), True
+            )
+            self.assertLess(self._outside_by(drawn, mine, True), 1e-6)
+            # The neighbour's proxy, moved here, should not fit: if it does,
+            # the proxy is not reading the tree's own dice at all.
+            shifted = theirs - np.array([7.0, 13.0, 0.0])
+            self.assertGreater(
+                self._outside_by(drawn, shifted, True), 1e-6,
+                "any tree's proxy fits any tree, so none of them is specific",
+            )
+
+    def test_a_fence_collider_is_too_thick_to_tunnel_through(self):
+        from src.barriers import (
+            DEFAULT_COLLISION_THICKNESS_M,
+            LINE_STYLES,
+            collision_style,
+        )
+
+        fence = LINE_STYLES[("scheiding_lijn", "hek")]
+        self.assertLess(fence.thickness_m, 0.1, "the drawn fence got thick")
+        fat = collision_style(fence, DEFAULT_COLLISION_THICKNESS_M)
+        self.assertGreaterEqual(fat.thickness_m, DEFAULT_COLLISION_THICKNESS_M)
+        # Everything else about it is untouched: the collider is the same
+        # fence, in the same place, at the same height.
+        self.assertEqual(fat.height_m, fence.height_m)
+        self.assertEqual(fat.lift_m, fence.lift_m)
+
+    def test_a_wall_already_thick_enough_is_left_alone(self):
+        """Fattening a 70 cm hedge would only move it off its own outline."""
+        from src.barriers import LINE_STYLES, collision_style
+
+        hedge = LINE_STYLES[("vegetatieobject_lijn", "haag")]
+        self.assertEqual(collision_style(hedge, 0.30), hedge)
+        quay = LINE_STYLES[("scheiding_lijn", "kademuur")]
+        self.assertEqual(collision_style(quay, 0.30), quay)
+
+    def test_an_awning_is_thickened_downwards_not_sideways(self):
+        """An area barrier takes its width from the surveyed outline, so the
+        thin direction is its height: a canopy is a 12 cm plate 2.4 m up, and
+        a drone climbing a facade goes straight through it."""
+        from src.barriers import AREA_STYLES, collision_style
+
+        awning = AREA_STYLES[("gebouwinstallatie", "luifel")]
+        self.assertLess(awning.height_m, 0.2)
+        fat = collision_style(awning, 0.30)
+        self.assertGreaterEqual(fat.height_m, 0.30)
+        self.assertEqual(fat.thickness_m, awning.thickness_m)
+        self.assertEqual(fat.lift_m, awning.lift_m, "it still hangs off the wall")
+
+    def test_a_shed_is_already_tall_enough(self):
+        from src.barriers import AREA_STYLES, collision_style
+
+        for key in (("overigbouwwerk", "bunker"), ("overigbouwwerk", "open loods")):
+            style = AREA_STYLES[key]
+            self.assertEqual(collision_style(style, 0.30), style)
+
+    def test_the_swept_collider_really_comes_out_thicker(self):
+        """`collision_style` only changes a number. What matters is that the
+        geometry built from it is wider on the ground than the drawn fence."""
+        from src.barriers import LINE_STYLES, _sweep_line, collision_style
+
+        fence = LINE_STYLES[("scheiding_lijn", "hek")]
+        run = np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
+        flat = lambda x, y: np.zeros(len(np.atleast_1d(x)))
+
+        thin, _, _ = _sweep_line(run, flat, fence)
+        fat, _, _ = _sweep_line(run, flat, collision_style(fence, 0.30))
+
+        # The run is along X, so the width is the Y span.
+        thin_w = float(thin[:, 1].max() - thin[:, 1].min())
+        fat_w = float(fat[:, 1].max() - fat[:, 1].min())
+        self.assertAlmostEqual(thin_w, fence.thickness_m, places=6)
+        self.assertAlmostEqual(fat_w, 0.30, places=6)
+        # And it still stands in the same place, at the same height.
+        self.assertAlmostEqual(
+            float(thin[:, 2].max()), float(fat[:, 2].max()), places=6
+        )
+        self.assertAlmostEqual(
+            float(thin[:, 0].max()), float(fat[:, 0].max()), places=6
+        )
+
+    def test_both_geometry_paths_build_a_collider(self):
+        """A fence is a line and an awning is a polygon, and they go through
+        different code. Wiring up only the line path is the obvious way to get
+        this half-right, and counting call sites in the source does not catch
+        it -- the count moves whenever the code is tidied."""
+        import tempfile
+
+        for only in ("line", "area"):
+            with tempfile.TemporaryDirectory() as tmp:
+                result = self._run_barriers(True, Path(tmp), only=only)
+                self.assertGreater(
+                    len(result.triangles), 0, f"the {only} fixture drew nothing"
+                )
+                self.assertGreater(
+                    len(result.collision_triangles), 0,
+                    f"the {only} path builds no collider",
+                )
+
+    @staticmethod
+    def _run_barriers(collision: bool | None, folder: Path, only: str | None = None):
+        """`build_barriers` against a stubbed BGT, so the sweep is real.
+
+        `collision=None` leaves the argument out altogether, which is how the
+        default gets exercised rather than asserted. `only` narrows the fixture
+        to one geometry kind: "line" for a fence and a quay wall, "area" for an
+        awning.
+        """
+        import src.barriers as barriers_module
+        from src.geo import BBox
+
+        lines = [
+            {"properties": {"type": "hek"},
+             "geometry": {"type": "LineString",
+                          "coordinates": [[10, 10], [50, 10], [50, 50]]}},
+            {"properties": {"type": "kademuur"},
+             "geometry": {"type": "LineString",
+                          "coordinates": [[10, 90], [80, 90]]}},
+        ]
+        areas = [
+            {"properties": {"type": "luifel"},
+             "geometry": {"type": "Polygon", "coordinates": [
+                 [[20, 20], [26, 20], [26, 24], [20, 24], [20, 20]]]}},
+        ]
+
+        def fake_fetch(collection, bbox, class_field=None, **kw):
+            if collection == "scheiding_lijn" and only != "area":
+                return lines, {}
+            if collection == "gebouwinstallatie" and only != "line":
+                return areas, {}
+            return [], {}
+
+        class Terrain:
+            def surface(self, x, y):
+                return 2.0 + 0.02 * np.atleast_1d(np.asarray(x, float))
+
+        real = barriers_module.fetch_current
+        barriers_module.fetch_current = fake_fetch
+        try:
+            return barriers_module.build_barriers(
+                BBox(0.0, 0.0, 100.0, 100.0), folder,
+                barriers_cfg={"page_limit": 10, "timeout_s": 1,
+                              "max_retries": 1, "max_pages": 1},
+                terrain=Terrain(),
+                **({} if collision is None else {"collision": collision}),
+            )
+        finally:
+            barriers_module.fetch_current = real
+
+    def test_no_collider_is_swept_when_it_was_not_asked_for(self):
+        """Another sweep of every thin run, and another copy in the npz, on a
+        run that will never export it."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            off = self._run_barriers(False, Path(tmp))
+            self.assertGreater(len(off.triangles), 0, "the fixture drew nothing")
+            self.assertEqual(len(off.collision_triangles), 0)
+            self.assertEqual(len(off.collision_vertices), 0)
+            self.assertNotIn("collision_triangles", off.stats())
+
+    def test_the_collider_is_swept_when_it_is(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            on = self._run_barriers(True, Path(tmp))
+            self.assertGreater(len(on.collision_triangles), 0)
+            self.assertEqual(on.collision_thickness_m, 0.30)
+            # Indices address the collider's own buffer, which is the mistake
+            # that killed a real Blender run once already.
+            self.assertLess(
+                int(on.collision_triangles.max()), len(on.collision_vertices)
+            )
+            # The quay wall is already 40 cm, so it gets no second prism: the
+            # collider is smaller than the drawn geometry, not a copy of it.
+            self.assertLess(
+                len(on.collision_triangles), len(on.triangles),
+                "every kind got a collider, including the thick ones",
+            )
+
+    def test_a_caller_that_says_nothing_gets_the_cheap_path(self):
+        """The default has to be the one that costs nothing, so forgetting the
+        argument cannot quietly add a sweep and a copy to every run."""
+        import inspect
+        import tempfile
+
+        from src import barriers
+
+        default = inspect.signature(barriers.build_barriers).parameters[
+            "collision"
+        ].default
+        self.assertIs(default, False)
+        with tempfile.TemporaryDirectory() as tmp:
+            # Called the same way, with the argument simply left out.
+            result = self._run_barriers(None, Path(tmp))
+            self.assertGreater(len(result.triangles), 0)
+            self.assertEqual(len(result.collision_triangles), 0)
+
+    def test_the_pipeline_asks_for_it_only_when_exporting_it(self):
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        self.assertIn('collision=bool(config.export.get("collision"', source)
+
+    def test_the_collider_rides_along_in_the_npz(self):
+        """Saved and loaded, not grepped for. Writing the right key with the
+        wrong value in it looks identical in the source."""
+        import tempfile
+
+        from src.barriers import BarrierSet, save_barriers
+
+        verts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+                          [5.0, 5.0, 2.0], [6.0, 5.0, 2.0], [5.0, 6.0, 2.0]])
+        barriers = BarrierSet(
+            vertices=verts[:3],
+            triangles=np.array([[0, 1, 2]], dtype=np.int32),
+            uv=np.zeros((3, 2)),
+            material=np.zeros(1, np.int32),
+            kind=np.zeros(1, np.int32),
+            material_names=["paint"],
+            kind_names=["fence"],
+            collision_vertices=verts[3:],
+            collision_triangles=np.array([[0, 1, 2]], dtype=np.int32),
+            collision_thickness_m=0.30,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_barriers(barriers, Path(tmp) / "barriers.npz")
+            data = np.load(path, allow_pickle=True)
+            self.assertEqual(len(data["collision_triangles"]), 1)
+            np.testing.assert_allclose(data["collision_vertices"], verts[3:])
+            self.assertAlmostEqual(float(data["collision_thickness_m"]), 0.30)
+
+    def test_an_empty_collider_round_trips_too(self):
+        """Most runs have export.collision off, so the arrays are empty and
+        the Blender stage has to read that without tripping."""
+        import tempfile
+
+        from src.barriers import BarrierSet, save_barriers
+
+        barriers = BarrierSet(
+            vertices=np.zeros((3, 3)),
+            triangles=np.array([[0, 1, 2]], dtype=np.int32),
+            uv=np.zeros((3, 2)),
+            material=np.zeros(1, np.int32), kind=np.zeros(1, np.int32),
+            material_names=["paint"], kind_names=["fence"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            data = np.load(
+                save_barriers(barriers, Path(tmp) / "b.npz"), allow_pickle=True
+            )
+            self.assertIn("collision_triangles", data.files)
+            self.assertEqual(len(data["collision_triangles"]), 0)
+
+    @staticmethod
+    def _collision_ns(on_build=None):
+        """`build_collision` and its helpers, with Blender stubbed out."""
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        namespace = {
+            "np": np, "Path": Path, "log": lambda *a: None,
+            "build_mesh_object": on_build or (lambda name, *a, **k: name),
+        }
+        for name in ("_octahedron_canopy", "_box", "_tree_dice", "_lobed_crown",
+                     "_collision_tree_mesh", "reused_colliders",
+                     "build_collision"):
+            body = re.search(
+                rf"\ndef {name}\(.*?\n(?=\ndef |\n# ---)", source, re.S
+            )
+            assert body is not None, f"{name} moved"
+            exec(body.group(0), namespace)  # noqa: S102 - our own source
+        return namespace
+
+    @staticmethod
+    def _collision_work_dir(folder: Path):
+        """A work dir with both inputs present, so "built nothing" can only
+        mean the flag was honoured and not that there was nothing to read."""
+        verts = np.array([[100010.0, 450010.0, 3.0], [100012.0, 450010.0, 3.0],
+                          [100010.0, 450012.0, 4.0]])
+        np.savez(
+            folder / "barriers.npz", vertices=verts,
+            triangles=np.array([[0, 1, 2]], dtype=np.int32),
+            collision_vertices=verts,
+            collision_triangles=np.array([[0, 1, 2]], dtype=np.int32),
+            collision_thickness_m=np.float64(0.30),
+        )
+        np.savez(
+            folder / "trees.npz",
+            xy=np.array([[100100.0, 450100.0], [100120.0, 450140.0]]),
+            ground_z_nap=np.zeros(2), height_m=np.array([8.0, 19.0]),
+            crown_radius_m=np.array([2.1, 4.9]),
+            trunk_height_m=np.array([3.0, 5.0]),
+        )
+        return {
+            "origin_rd": [100000.0, 450000.0],
+            "ground_z_offset_nap": 0.0,
+            "barriers": {"file": "barriers.npz"},
+            "trees": {"file": "trees.npz"},
+        }
+
+    def test_nothing_is_built_unless_it_is_asked_for(self):
+        """The proxies cost FBX size, and most imports want a picture.
+
+        Both inputs are on disk, so this cannot pass by there being nothing to
+        build -- which is how an earlier version of it passed with the flag
+        check removed entirely.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            scene = self._collision_work_dir(folder)
+            namespace = self._collision_ns(
+                on_build=lambda *a, **k: self.fail(
+                    "built a collider with export.collision off"
+                )
+            )
+            for export_cfg in ({}, {"collision": False}):
+                scene["export"] = export_cfg
+                self.assertEqual(
+                    namespace["build_collision"](scene, folder), {}
+                )
+            scene.pop("export")
+            self.assertEqual(namespace["build_collision"](scene, folder), {})
+
+    def test_both_proxies_are_built_when_it_is_asked_for(self):
+        """The other half: the flag on, from the same inputs."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            scene = self._collision_work_dir(folder)
+            scene["export"] = {"collision": True, "collision_tree_crowns": True}
+            namespace = self._collision_ns()
+            built = namespace["build_collision"](scene, folder)
+            self.assertEqual(
+                set(built), {"Collision_Barriers", "Collision_Trees"}
+            )
+            self.assertEqual(built["Collision_Barriers"], 1)
+            self.assertEqual(built["Collision_Trees"], 28 * 2)
+
+            scene["export"]["collision_tree_crowns"] = False
+            trunks = namespace["build_collision"](scene, folder)
+            self.assertEqual(trunks["Collision_Trees"], 16 * 2)
+
+    def test_the_barrier_collider_lands_in_local_coordinates(self):
+        """Everything in the FBX is relative to the bbox centre. A collider
+        left in six-figure RD would sit 100 km from the fence it is for."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            scene = self._collision_work_dir(folder)
+            scene["export"] = {"collision": True}
+            seen = {}
+            namespace = self._collision_ns(
+                on_build=lambda name, vertices, *a, **k: seen.setdefault(
+                    name, np.asarray(vertices)
+                )
+            )
+            namespace["build_collision"](scene, folder)
+            for name, vertices in seen.items():
+                self.assertLess(
+                    float(np.abs(vertices[:, :2]).max()), 10000.0,
+                    f"{name} is still in RD coordinates",
+                )
+
+    def test_the_default_is_off_and_the_knobs_exist(self):
+        from src.config import DEFAULTS
+
+        self.assertFalse(DEFAULTS["export"]["collision"])
+        self.assertTrue(DEFAULTS["export"]["collision_tree_crowns"])
+        self.assertEqual(DEFAULTS["barriers"]["collision_thickness_m"], 0.30)
+
+    def test_the_scene_carries_the_flags_to_blender(self):
+        """The Blender stage only gets scene.json, so a knob that does not
+        reach it is a knob that does nothing.
+
+        This writes a real scene.json and reads the flags back out of it.
+        Checking the source for the string instead let a mutation that renamed
+        the key to "collisionx" pass, because the name still appeared on the
+        line that read the config.
+        """
+        import json
+        import tempfile
+
+        for asked, crowns in ((True, True), (True, False), (False, True)):
+            with tempfile.TemporaryDirectory() as tmp:
+                scene = json.loads(
+                    self._write_scene(
+                        Path(tmp),
+                        {"collision": asked, "collision_tree_crowns": crowns},
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertIs(scene["export"]["collision"], asked)
+                self.assertIs(scene["export"]["collision_tree_crowns"], crowns)
+
+    def test_a_scene_written_without_the_flags_defaults_to_off(self):
+        """An older config, or one written by hand, must not turn this on."""
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scene = json.loads(
+                self._write_scene(Path(tmp), {}).read_text(encoding="utf-8")
+            )
+            self.assertIs(scene["export"]["collision"], False)
+            self.assertIs(scene["export"]["collision_tree_crowns"], True)
+
+    @staticmethod
+    def _write_scene(work_dir: Path, extra_export: dict) -> Path:
+        """A minimal real call to `write_scene_description`."""
+        from src.config import DEFAULTS
+        from src.elevation import TerrainResult
+        from src.export import write_scene_description
+        from src.geo import BBox, GeoContext
+        from src.imagery import AerialResult
+
+        bbox = BBox(100000.0, 450000.0, 100500.0, 450500.0)
+        xs = np.linspace(bbox.xmin, bbox.xmax, 9)
+        ys = np.linspace(bbox.ymin, bbox.ymax, 9)
+        terrain = TerrainResult(
+            heights=np.full((9, 9), 3.0, dtype=np.float32), xs=xs, ys=ys,
+            bbox=bbox, center_z_nap=3.0, nodata_fraction_raw=0.0,
+            filled_fraction=0.0, geotiff_path=None, coverage_id="dtm_05m",
+            resolution_m=0.5,
+        )
+        aerial = AerialResult(
+            path=work_dir / "aerial.png", bbox=bbox, size_px=256,
+            layer_name="Actueel_ortho25", layer_title="Luchtfoto",
+            source="wms",
+        )
+        facade = work_dir / "facade_00.png"
+        facade.write_bytes(b"")
+        (work_dir / "aerial.png").write_bytes(b"")
+        return write_scene_description(
+            name="test",
+            geo=GeoContext.from_bbox(bbox),
+            terrain=terrain,
+            aerial=aerial,
+            facade_paths=[(facade, None)],
+            # The real defaults, not a hand-rolled subset: a stub that
+            # happens to carry the keys this function reads today is a stub
+            # that breaks the next time it reads one more.
+            facade_cfg=DEFAULTS["facade"],
+            buildings_cfg=DEFAULTS["buildings"],
+            export_cfg={
+                "fbx_name": "model.fbx", "aerial_name": "aerial.png",
+                **extra_export,
+            },
+            work_dir=work_dir,
+        )
+
+    def test_the_metadata_beside_the_fbx_says_what_to_collide_with(self):
+        """`blender_summary.json` stays in work/; the designer reads
+        output/<area>/metadata.json. The guidance has to be in the second."""
+        import tempfile
+
+        import pipeline
+
+        block = {
+            "objects": {"Collision_Trees": 364204, "Collision_Barriers": 5120},
+            "reuses_its_own_mesh": {"Terrain": "already simplified"},
+            "note": "add a Mesh Collider and untick the renderer",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "blender_summary.json").write_text(
+                json.dumps({"collision": block}), encoding="utf-8"
+            )
+            got = pipeline._collision_metadata(work)
+        self.assertEqual(got, {"collision": block})
+
+    def test_no_collision_block_when_there_are_no_colliders(self):
+        """An empty "collision": {} in the metadata reads as a feature that
+        failed. Nothing built means the key stays out."""
+        import tempfile
+
+        import pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            # No Blender run at all, e.g. --skip-blender.
+            self.assertEqual(pipeline._collision_metadata(work), {})
+            for summary in ({}, {"collision": {}}, {"collision": {"objects": {}}}):
+                (work / "blender_summary.json").write_text(
+                    json.dumps(summary), encoding="utf-8"
+                )
+                self.assertEqual(pipeline._collision_metadata(work), {})
+            # And a half-written summary is not worth failing a run over.
+            (work / "blender_summary.json").write_text("{ truncated", encoding="utf-8")
+            self.assertEqual(pipeline._collision_metadata(work), {})
+
+    def test_the_pipeline_puts_the_block_in_the_metadata(self):
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        self.assertIn("_collision_metadata(work_dir)", source)
+
+    def test_the_barrier_stats_report_the_collider(self):
+        """metadata.json carries barriers.stats(), which is where the thickness
+        actually used belongs -- a number the reader cannot otherwise know."""
+        from src.barriers import BarrierSet
+
+        bare = BarrierSet(triangles=np.zeros((4, 3), np.int32))
+        self.assertNotIn("collision_triangles", bare.stats())
+
+        with_proxy = BarrierSet(
+            triangles=np.zeros((4, 3), np.int32),
+            collision_triangles=np.zeros((6, 3), np.int32),
+            collision_thickness_m=0.30,
+        )
+        stats = with_proxy.stats()
+        self.assertEqual(stats["collision_triangles"], 6)
+        self.assertEqual(stats["collision_thickness_m"], 0.30)
+
+    def test_the_layers_without_a_proxy_say_what_to_use(self):
+        """A designer with 25 objects and two colliders needs to be told what
+        the other 23 are for."""
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        body = re.search(r"\ndef reused_colliders\(.*?\n(?=\ndef )", source, re.S)
+        self.assertIsNotNone(body, "reused_colliders moved")
+        namespace: dict = {}
+        exec(body.group(0), namespace)  # noqa: S102 - our own source
+        reused = namespace["reused_colliders"]()
+        self.assertIn("Terrain", reused)
+        self.assertIn("Buildings", reused)
+        for name, why in reused.items():
+            self.assertGreater(len(why), 20, f"{name} has no reason given")
+
+
 class TestBarrierHeightOverride(unittest.TestCase):
     """`barriers.heights` changes a height and nothing else.
 
@@ -6127,6 +6866,35 @@ class TestUIServer(unittest.TestCase):
         self.assertEqual(config["terrain"]["ahn_model"], "DTM")
         self.assertEqual(config["buildings"]["lod"], "2.2")
 
+    def test_the_collision_toggle_reaches_a_loadable_config(self):
+        """The checkbox has to survive the whole trip: form payload, config
+        file, `load_config`, and on into scene.json."""
+        payload = {
+            "name": "sim",
+            "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+            "collision": True,
+            "collision_tree_crowns": False,
+            "collision_thickness_m": 0.45,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(self.server.build_config(payload)))
+            loaded = load_config(path)
+        self.assertTrue(loaded.export["collision"])
+        self.assertFalse(loaded.export["collision_tree_crowns"])
+        self.assertEqual(loaded.barriers["collision_thickness_m"], 0.45)
+
+    def test_collision_is_off_when_the_form_does_not_ask(self):
+        config = self.server.build_config(
+            {
+                "name": "bare",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+            }
+        )
+        self.assertFalse(config["export"]["collision"])
+        self.assertTrue(config["export"]["collision_tree_crowns"])
+        self.assertEqual(config["barriers"]["collision_thickness_m"], 0.30)
+
     def test_area_summary_is_none_for_unknown_area(self):
         self.assertIsNone(self.server.area_summary("no_such_area_xyz"))
 
@@ -6394,7 +7162,8 @@ class TestUIPage(unittest.TestCase):
         rather than one note at the top of the group."""
         for control in ("q", "size", "name", "preset", "aerialCm", "terrainM",
                         "terrainTol", "facadePx", "facade", "clip",
-                        "groundFloor", "normal", "photoTextures", "preview"):
+                        "groundFloor", "normal", "photoTextures", "preview",
+                        "collision", "collisionCrowns"):
             self.assertIn(
                 control, self.page.explained, f"the control {control} has no help marker"
             )

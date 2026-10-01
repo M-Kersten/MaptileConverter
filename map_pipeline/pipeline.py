@@ -368,6 +368,25 @@ def run_blender_stage(
     )
 
 
+def _collision_metadata(work_dir: Path) -> dict:
+    """The collision block for metadata.json, read back from Blender's summary.
+
+    Read back rather than rebuilt from the config, so it reports what the FBX
+    actually holds. A run with `--skip-blender`, or one where the proxies were
+    off, contributes nothing and the key stays out of the metadata entirely
+    rather than appearing empty.
+    """
+    path = work_dir / "blender_summary.json"
+    if not path.is_file():
+        return {}
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    collision = summary.get("collision") or {}
+    return {"collision": collision} if collision.get("objects") else {}
+
+
 def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     work_dir = config.work_dir(REPO_ROOT)
     out_dir = config.out_dir(REPO_ROOT)
@@ -607,6 +626,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 work_dir,
                 barriers_cfg=config.barriers,
                 terrain=terrain,
+                # Sweeping every thin run a second time, and carrying the
+                # result in barriers.npz, is pure waste on a run that is not
+                # going to export it.
+                collision=bool(config.export.get("collision", False)),
             )
             # Shares the furniture atlas: the same eight flat patches cover a
             # brick wall and a wooden bench, and one texture is one material.
@@ -744,6 +767,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     ),
                 },
                 "building_function": usage.stats(),
+                # What to collide with, which is a question about the FBX and
+                # so belongs next to it rather than in work/. Read back from
+                # the Blender stage's own summary: this says what was drawn,
+                # not what was asked for.
+                **_collision_metadata(work_dir),
             },
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))

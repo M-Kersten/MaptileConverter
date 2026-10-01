@@ -303,6 +303,9 @@ Other knobs worth knowing:
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
 | `furniture.enabled` | `true` | Lampposts, bollards, sign posts and benches. |
+| `export.collision` | `false` | Add invisible `Collision_*` shapes for physics. See [Collision shapes](#collision-shapes). |
+| `export.collision_tree_crowns` | `true` | Whether a tree's collider includes its canopy. `false` leaves the trunk alone, at a quarter of the triangles. |
+| `barriers.collision_thickness_m` | `0.30` | The thinnest a collider may be, which is not the thinnest a fence may look: a 6 cm panel is thin enough to tunnel through at 50 Hz. |
 | `vehicles.cars` | `true` | Lay cars out in the BGT parking bays. |
 | `vehicles.boats` | `true` | Moor boats between the BGT mooring posts. Needs `surfaces.water`. |
 | `vehicles.car_occupancy` | `0.72` | How full the bays are. 1 parks a car in every space. |
@@ -1401,6 +1404,69 @@ building, so the cut follows the terrain. Set `facade.ground_floor` to `false` t
 skip the split.
 
 Building `GroundSurface` faces are dropped — they sit under the terrain.
+
+## Collision shapes
+
+Off by default (`export.collision`, or "Add simplified shapes for physics" in
+the UI). This is for driving or flying something through the model rather than
+looking at it, and it costs FBX size that most imports do not want.
+
+Two extra objects appear, and **only** two, because only two earn their place:
+
+| Object | What it is | Against the drawn mesh |
+|---|---|---|
+| `Collision_Trees` | a trunk prism and a box round the canopy, per tree | 28 triangles against 52–84, so **2.3×** cheaper over a real height mix — or 16 with `export.collision_tree_crowns` off, **4×** |
+| `Collision_Barriers` | the same walls and fences, fattened | one extra prism per thin run |
+
+Everything else in the scene is already the right shape to collide with, and
+`metadata.json` names which object to use for each layer instead of shipping a
+copy of a mesh that is already minimal:
+
+```json
+"collision": {
+  "objects": {"Collision_Trees": 365204, "Collision_Barriers": 5120},
+  "reuses_its_own_mesh": {"Terrain": "...", "Buildings": "...", "Roads_*": "..."},
+  "note": "Add a Mesh Collider to each Collision_* object and untick ..."
+}
+```
+
+In Unity: select the `Collision_*` objects, add a Mesh Collider, untick Mesh
+Renderer. That is the whole setup, which is the point of the naming.
+
+**A fence is 6 cm thick, and that is thin enough to fly through.** This is the
+reason the barrier proxies exist. Unity's default physics step is 50 Hz with
+discrete collision detection, so a body doing 20 m/s moves 40 cm between steps:
+it starts one side of the panel, finishes the other, and no contact is ever
+generated. `barriers.collision_thickness_m` defaults to 0.30 m, which covers
+15 m/s and is invisible because the drawn fence stays 6 cm. Above that, set the
+moving body's Collision Detection to **Continuous Dynamic** as well — that
+cannot tunnel at any speed, and thickening is a mitigation rather than the cure.
+
+Which dimension gets fattened depends on how the barrier was surveyed. A line
+barrier is a swept prism, so its `thickness_m` is the thin direction. An area
+barrier takes its width from its own outline — the BGT only draws a wall as a
+polygon when it is wider than half a metre — so there the thin direction is
+`height_m`, and that matters for one family: an awning is a 12 cm plate hanging
+2.4 m up, and something climbing a facade goes straight through it.
+
+**A collider has to contain what it stands in for, and a plausible-looking one
+does not.** The first tree proxy here was the ellipsoid inscribed in the
+canopy's bounding box: 32 triangles, convex, a good visual fit. Measured
+against the drawn vertices, foliage stuck up to **4.3 m** out of it, because
+the drawn crown fills that box while an inscribed ellipsoid only touches it on
+the axes. A drone would have flown through visible leaves and felt nothing.
+
+So the canopy proxy is the box itself — fewer triangles, and it contains the
+drawn crown by construction, since that is the box the lobes were scaled to
+fit. Where it is wrong it is wrong in the safe direction. The cost is invisible
+margin at the corners: 2.2 m on a 7 m tree, 8.9 m on a 25 m one, measured to
+the nearest drawn foliage. If flying close to trees matters more than never
+clipping them, turn `export.collision_tree_crowns` off and only wood is solid.
+
+A test contains every drawn vertex inside its own proxy, over a height sweep
+and at the one position in the whole hash where a tall tree leans its hardest
+— the only case where the trunk prism needs the lean added to its radius, and
+one that a sweep of ordinary positions never produces.
 
 ## Choices worth knowing about
 

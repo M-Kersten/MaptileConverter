@@ -1822,6 +1822,215 @@ def build_structures(scene: dict, work_dir: Path, material):
 
 
 # ---------------------------------------------------------------------------
+# Collision
+# ---------------------------------------------------------------------------
+
+def reused_colliders() -> dict:
+    """Which visible object serves as its own collider, and why.
+
+    A simulation needs to know what to collide with for every layer, not only
+    for the two that get a proxy. Shipping a copy of a mesh that is already the
+    right shape is only a bigger FBX, so these are named instead.
+    """
+    return {
+        "Terrain": "already the simplified surface; a coarser one would not be "
+                   "the ground the drone is flying over",
+        "Buildings": "walls are a prism per footprint edge and the roof is a "
+                     "few triangles, so there is nothing to take out",
+        "Roads_*": "flat sheets, and a drone that lands wants the real camber",
+        "Water": "one flat quad per body",
+        "Structures_*": "bridge decks and piers, already low-poly prisms",
+    }
+
+
+def _collision_tree_mesh(members, fields, origin, crowns: bool):
+    """A trunk prism and a crown box per tree, as (vertices, faces).
+
+    This is not the drawn tree with fewer triangles -- it is the volume the
+    drawn tree occupies, and the difference decides whether it is any use. The
+    drawn crown is two overlapping lobes, deliberately concave and
+    self-intersecting so no two trees match; a physics engine wants neither.
+
+    **It has to enclose, and a plausible-looking proxy does not.** The first
+    attempt was the ellipsoid inscribed in the crown's bounding box -- 32
+    triangles, convex, visually a good fit. Measured against the drawn
+    vertices, foliage stuck out of it by up to 4.3 m, because the drawn crown
+    fills that box while the inscribed ellipsoid only touches it on the axes.
+    A drone would have flown through the visible canopy and felt nothing.
+
+    So the crown is the box itself. That is 12 triangles rather than 32, it
+    contains the drawn crown by construction -- `_lobed_crown` scales its
+    lobes to exactly this box -- and where it is wrong it is wrong in the safe
+    direction: a drone stops short at a corner instead of passing through
+    leaves. The trunk is a straight prism at the flare radius, widened by the
+    lean so it covers all three of the drawn trunk's rings, and spun to the
+    same angle so its five faces line up rather than cutting the corners off.
+
+    `crowns=False` leaves the canopy out: 16 triangles a tree instead of 28,
+    for a simulation that treats foliage as soft and only wants wood to be
+    solid.
+    """
+    xy, ground, heights, crown_radii, trunks = fields
+    origin_x, origin_y, z_offset = origin
+
+    sides = 5
+    angles = np.linspace(0, 2 * np.pi, sides, endpoint=False)
+
+    all_verts: list[np.ndarray] = []
+    all_faces: list[np.ndarray] = []
+    offset = 0
+
+    for index in np.flatnonzero(members):
+        base_x = float(xy[index, 0]) - origin_x
+        base_y = float(xy[index, 1]) - origin_y
+        base_z = float(ground[index]) - z_offset
+        height = float(heights[index])
+        crown_r = float(crown_radii[index])
+        trunk_h = float(trunks[index])
+
+        # The same dice the drawn tree rolls, so the proxy lands on that tree
+        # rather than near it. Matching `_tree_group_mesh` exactly is the whole
+        # job: a proxy built from different numbers is a proxy for nothing.
+        spin_d, squash_d, _spare, lean_d = _tree_dice(xy[index, 0], xy[index, 1])
+        spin = spin_d * 2 * np.pi
+        squash = 0.78 + 0.34 * squash_d
+        lean = (lean_d - 0.5) * 0.06 * height
+        canopy_base = base_z + trunk_h
+        crown_h = max(0.6, height - trunk_h)
+
+        # Trunk. The drawn one has three rings -- flared feet, plain middle,
+        # tapered top -- and the feet are the widest, so one prism at the flare
+        # radius covers all three. The top ring is also pushed sideways by the
+        # lean while the feet are not, so the lean goes into the radius instead
+        # of tilting the prism: cheaper than shearing it, and it still contains
+        # every drawn vertex.
+        trunk_r = max(0.08, crown_r * 0.12) * 1.5 + abs(lean)
+        cos_a = np.cos(angles + spin)
+        sin_a = np.sin(angles + spin)
+        rings = [
+            np.column_stack([
+                base_x + trunk_r * cos_a,
+                base_y + trunk_r * sin_a,
+                np.full(sides, z),
+            ])
+            for z in (base_z - 0.05, canopy_base + crown_r * 0.3)
+        ]
+        all_verts.append(np.vstack(rings))
+        for side in range(sides):
+            nxt = (side + 1) % sides
+            all_faces.append(np.array([
+                [offset + side, offset + nxt, offset + sides + nxt],
+                [offset + side, offset + sides + nxt, offset + sides + side],
+            ]))
+        # Caps, so the prism is a solid rather than a pipe. A fan off the first
+        # vertex is enough for a convex polygon.
+        for ring, flip in ((0, True), (sides, False)):
+            for side in range(1, sides - 1):
+                fan = [offset + ring, offset + ring + side,
+                       offset + ring + side + 1]
+                all_faces.append(np.array([fan[::-1] if flip else fan]))
+        offset += sides * 2
+
+        if crowns:
+            # Exactly the box `_lobed_crown` fits its lobes into.
+            box, box_faces = _box(
+                base_x + lean, base_y, canopy_base + crown_h * 0.5,
+                crown_r * 2.0, crown_r * squash * 2.0, crown_h,
+            )
+            all_verts.append(box)
+            all_faces.append(box_faces + offset)
+            offset += len(box)
+
+    if not all_verts:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+    return np.vstack(all_verts), np.vstack(all_faces)
+
+
+def build_collision(scene: dict, work_dir: Path):
+    """Physics proxies, named so a designer can set them up in one pass.
+
+    Two objects, and only two, because only two earn their place. Everything
+    else in the scene is already the right shape to collide with, and
+    `reused_colliders` records which object to use instead -- a copy of a
+    mesh that is already minimal is only a bigger file.
+
+    No materials: this geometry is never drawn. In Unity the pass is select the
+    Collision_* objects, add a Mesh Collider, untick Mesh Renderer.
+
+    Returns `{object name: triangle count}` rather than the objects the other
+    builders return, because the count is what the summary reports and reading
+    it back off a Blender object is the one thing that cannot be exercised
+    without Blender.
+    """
+    export_cfg = scene.get("export", {})
+    if not bool(export_cfg.get("collision", False)):
+        return {}
+
+    built: dict[str, int] = {}
+
+    def add(name: str, vertices, faces):
+        n = len(faces)
+        if not n:
+            return
+        build_mesh_object(
+            name,
+            vertices,
+            np.asarray(faces).reshape(-1),
+            np.arange(0, n * 3, 3),
+            np.full(n, 3),
+            np.zeros((n * 3, 2)),
+            np.zeros(n),
+            [],
+            shade_smooth=False,
+        )
+        built[name] = n
+        log(f"{name}: {n} triangles")
+
+    # Barriers. The reason this layer exists: a fence is drawn 6 cm thick, and
+    # at Unity's default 50 Hz discrete stepping a body doing 20 m/s crosses
+    # 40 cm between steps and never touches it.
+    barriers_file = scene.get("barriers", {}).get("file")
+    if barriers_file and (work_dir / barriers_file).is_file():
+        data = np.load(work_dir / barriers_file, allow_pickle=True)
+        if "collision_triangles" in data.files and len(data["collision_triangles"]):
+            origin_x, origin_y = scene["origin_rd"]
+            z_offset = float(scene["ground_z_offset_nap"])
+            add(
+                "Collision_Barriers",
+                data["collision_vertices"]
+                - np.array([origin_x, origin_y, z_offset]),
+                data["collision_triangles"],
+            )
+
+    # Trees. The drawn crown is two overlapping lobes on purpose, which is
+    # concave and self-intersecting; the proxy is the ellipsoid they fill.
+    tree_file = scene.get("trees", {}).get("file")
+    if tree_file and (work_dir / tree_file).is_file():
+        data = np.load(work_dir / tree_file)
+        xy = data["xy"]
+        if len(xy):
+            fields = (xy, data["ground_z_nap"], data["height_m"],
+                      data["crown_radius_m"], data["trunk_height_m"])
+            origin = (*scene["origin_rd"], float(scene["ground_z_offset_nap"]))
+            verts, faces = _collision_tree_mesh(
+                np.ones(len(xy), dtype=bool),
+                fields,
+                origin,
+                bool(export_cfg.get("collision_tree_crowns", True)),
+            )
+            add("Collision_Trees", verts, faces)
+
+    if built:
+        log(
+            "collision: "
+            + ", ".join(sorted(built))
+            + "; everything else collides with its own mesh ("
+            + ", ".join(sorted(reused_colliders())) + ")"
+        )
+    return built
+
+
+# ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
 
@@ -2026,6 +2235,10 @@ def main() -> int:
             ),
         )
 
+    # After everything visible, because the proxies are built from the same
+    # intermediates and the log reads better with them at the end.
+    collision = build_collision(scene, work_dir)
+
     # Report the scene bounds so a coordinate or scale error shows up in the log
     # rather than only in Unity.
     xs, ys, zs = [], [], []
@@ -2051,6 +2264,21 @@ def main() -> int:
         },
         "objects": [obj.name for obj in bpy.context.scene.objects],
         "materials": [m.name for m in bpy.data.materials],
+        "collision": {
+            "objects": collision,
+            # The layers with no proxy, and which object to collide with
+            # instead. Without this a designer has to guess from 25 names.
+            "reuses_its_own_mesh": reused_colliders(),
+            "note": (
+                "Add a Mesh Collider to each Collision_* object and untick its "
+                "Mesh Renderer. Barrier proxies are fattened so a body cannot "
+                "tunnel through a 6 cm fence at Unity's default 50 Hz discrete "
+                "stepping; above about 15 m/s set the moving body's Collision "
+                "Detection to Continuous Dynamic as well."
+            ),
+        }
+        if collision
+        else {},
         # What the terrain actually came out as. Every check upstream reads the
         # mesh the Python stages built in memory, which says nothing about what
         # this script drew: a scene.json missing its mesh_file shipped the

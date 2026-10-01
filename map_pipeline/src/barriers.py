@@ -244,6 +244,45 @@ COLLECTIONS = sorted(
 )
 
 
+# How thin a collider is allowed to be, for physics rather than for looks.
+#
+# A fence is drawn 6 cm thick because that is roughly what a fence is. Unity's
+# default physics step is 50 Hz with discrete collision detection, so a body
+# moving at 20 m/s travels 40 cm between steps: if it starts one side of a 6 cm
+# slab and ends the other, no contact is ever generated and the drone flies
+# through the fence. 30 cm covers 15 m/s, which is most survey flying, and the
+# collider is invisible so the fence still looks like a fence.
+#
+# This is a mitigation and not the cure. Faster than that and the fix is
+# Continuous Dynamic collision detection on the drone's rigidbody, which costs
+# CPU but cannot tunnel at any speed. Both are in the README.
+DEFAULT_COLLISION_THICKNESS_M = 0.30
+
+
+def collision_style(style: BarrierStyle, min_thickness_m: float) -> BarrierStyle:
+    """The same barrier, fattened to the thinnest a collider may be.
+
+    Which dimension is the thin one depends on how the barrier was drawn, and
+    they are both handled because a drone can hit either:
+
+    * A **line** barrier is a prism swept along a run, so `thickness_m` is its
+      width and a fence's 6 cm is the thin direction.
+    * An **area** barrier takes its width from the surveyed outline -- the BGT
+      only draws a wall as a polygon when it is wider than half a metre, so
+      there is nothing to fix there -- and `height_m` is the thin direction.
+      That matters for exactly one family: an awning or a canopy is a 12 cm
+      plate hanging 2.4 m up, and a drone climbing a facade goes through it.
+
+    Widening an area barrier's outline would be a polygon offset, which this
+    does not attempt: nothing in AREA_STYLES is thin horizontally.
+    """
+    if style.thickness_m > 0.0:
+        return replace(
+            style, thickness_m=max(style.thickness_m, float(min_thickness_m))
+        )
+    return replace(style, height_m=max(style.height_m, float(min_thickness_m)))
+
+
 def apply_height_override(
     style: BarrierStyle | None, heights: dict
 ) -> BarrierStyle | None:
@@ -285,12 +324,30 @@ class BarrierSet:
     # Which kinds need the alpha-clipped fence material rather than the atlas.
     see_through: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
+    # The same barriers, fattened to the thinnest a collider may be, and empty
+    # when nothing needed it. No UVs and no materials: this geometry is never
+    # drawn. See `collision_style`.
+    collision_vertices: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3))
+    )
+    collision_triangles: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3), np.int32)
+    )
+    collision_thickness_m: float = 0.0
 
     def __len__(self) -> int:
         return int(len(self.triangles))
 
     def stats(self) -> dict:
-        return {"triangles": len(self), "vertices": int(len(self.vertices)), **self.counts}
+        out = {
+            "triangles": len(self),
+            "vertices": int(len(self.vertices)),
+            **self.counts,
+        }
+        if len(self.collision_triangles):
+            out["collision_triangles"] = int(len(self.collision_triangles))
+            out["collision_thickness_m"] = round(self.collision_thickness_m, 3)
+        return out
 
 
 def _sweep_line(points: np.ndarray, sampler, style: BarrierStyle):
@@ -475,8 +532,15 @@ def build_barriers(
     *,
     barriers_cfg: dict,
     terrain,
+    collision: bool = False,
 ) -> BarrierSet:
-    """Fetch every barrier collection and turn it into draped geometry."""
+    """Fetch every barrier collection and turn it into draped geometry.
+
+    `collision` adds a second, fattened prism per thin run, for a simulation
+    that needs a fence something cannot tunnel through. It costs another sweep
+    and another copy in the npz, so it is off unless `export.collision` asked
+    for it.
+    """
     result = BarrierSet()
     if not bool(barriers_cfg.get("enabled", True)):
         LOG.info("barriers disabled")
@@ -491,11 +555,22 @@ def build_barriers(
     step_m = float(barriers_cfg.get("step_m", DEFAULT_STEP_M))
     drape_tolerance_m = float(barriers_cfg.get("drape_tolerance_m", 0.05))
     heights = barriers_cfg.get("heights") or {}
+    collision_m = float(
+        barriers_cfg.get("collision_thickness_m", DEFAULT_COLLISION_THICKNESS_M)
+    )
+
+    def collider_for(style):
+        """The fattened style to sweep as well, or None for neither."""
+        if not collision:
+            return None
+        fat = collision_style(style, collision_m)
+        return fat if fat != style else None
 
     def styled(table, collection, plus_type):
         return apply_height_override(table.get((collection, plus_type)), heights)
 
     chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray, BarrierStyle]] = []
+    collision_chunks: list[tuple[np.ndarray, np.ndarray]] = []
     counts: dict[str, int] = {}
 
     for collection in COLLECTIONS:
@@ -539,6 +614,13 @@ def build_barriers(
                                 (verts, tris, uvs, style)
                             )
                             counts[style.name] = counts.get(style.name, 0) + 1
+                            fat = collider_for(style)
+                            if fat is not None:
+                                c_verts, c_tris, _ = _sweep_line(
+                                    dense, terrain.surface, fat
+                                )
+                                if len(c_tris):
+                                    collision_chunks.append((c_verts, c_tris))
 
             elif geometry_type in ("Polygon", "MultiPolygon"):
                 style = styled(AREA_STYLES, collection, plus_type)
@@ -554,6 +636,13 @@ def build_barriers(
                     if len(tris):
                         chunks.append((verts, tris, uvs, style))
                         counts[style.name] = counts.get(style.name, 0) + 1
+                        fat = collider_for(style)
+                        if fat is not None:
+                            c_verts, c_tris, _ = _extrude_rings(
+                                rings, terrain.surface, fat, step_m
+                            )
+                            if len(c_tris):
+                                collision_chunks.append((c_verts, c_tris))
 
     if not chunks:
         LOG.info("no barriers found")
@@ -606,12 +695,28 @@ def build_barriers(
     )
     result.counts = counts
 
+    if collision_chunks:
+        c_verts, c_tris, c_offset = [], [], 0
+        for verts, tris in collision_chunks:
+            c_verts.append(verts)
+            c_tris.append(tris + c_offset)
+            c_offset += len(verts)
+        result.collision_vertices = np.vstack(c_verts)
+        result.collision_triangles = np.vstack(c_tris).astype(np.int32)
+        result.collision_thickness_m = collision_m
+
     LOG.info(
         "barriers: %s (%d triangles, %d vertices)",
         ", ".join(f"{v} {k}" for k, v in sorted(counts.items())),
         len(result.triangles),
         len(result.vertices),
     )
+    if len(result.collision_triangles):
+        LOG.info(
+            "barrier colliders: %d triangles, nothing thinner than %.2f m",
+            len(result.collision_triangles),
+            collision_m,
+        )
     save_barriers(result, work_dir / "barriers.npz")
     return result
 
@@ -634,6 +739,9 @@ def save_barriers(barriers: BarrierSet, path: Path) -> Path:
         material_names=np.array(barriers.material_names, dtype=object),
         kind_names=np.array(barriers.kind_names, dtype=object),
         see_through=np.array(barriers.see_through, dtype=object),
+        collision_vertices=barriers.collision_vertices,
+        collision_triangles=barriers.collision_triangles,
+        collision_thickness_m=np.float64(barriers.collision_thickness_m),
     )
     LOG.info("wrote %s (%d triangles)", path, len(barriers))
     return path
@@ -642,11 +750,13 @@ def save_barriers(barriers: BarrierSet, path: Path) -> Path:
 __all__ = [
     "AREA_STYLES",
     "COLLECTIONS",
+    "DEFAULT_COLLISION_THICKNESS_M",
     "LINE_STYLES",
     "BarrierSet",
     "BarrierStyle",
     "apply_height_override",
     "build_barriers",
+    "collision_style",
     "feature_type",
     "save_barriers",
 ]

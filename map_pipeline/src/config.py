@@ -314,6 +314,10 @@ DEFAULTS: dict[str, Any] = {
         # How long one tile of the fence texture is. The uprights keep this
         # spacing however long the run, which is the point of tiling it.
         "fence_tile_m": 2.5,
+        # The thinnest a physics proxy may be, which is not the thinnest a
+        # fence may look. Only used when export.collision is on; see
+        # barriers.DEFAULT_COLLISION_THICKNESS_M for why 30 cm.
+        "collision_thickness_m": 0.30,
     },
     "vehicles": {
         # Nobody publishes where cars are parked or boats are moored, but the
@@ -380,6 +384,15 @@ DEFAULTS: dict[str, Any] = {
         "fbx_name": "model.fbx",
         "aerial_name": "aerial.png",
         "metadata_name": "metadata.json",
+        # Collision_* objects alongside the visible ones, for a simulation
+        # rather than a picture. Off by default because they cost FBX size and
+        # most imports do not want them.
+        "collision": False,
+        # Whether a tree's collider includes its canopy. True encloses the
+        # crown, which is what stops a drone flying through foliage; false
+        # leaves the trunk alone at a quarter of the triangles, for a sim that
+        # treats leaves as soft.
+        "collision_tree_crowns": True,
     },
 }
 

@@ -553,6 +553,19 @@
         data-tip="Renders a few pictures of the finished model so you can see what you got without opening anything. Adds a little time at the end.">?</span>
     </div>
 
+    <div class="inline">
+      <input type="checkbox" id="collision">
+      <label for="collision">Add simplified shapes for physics</label>
+      <span class="help" tabindex="0" role="button" aria-label="About collision shapes"
+        data-tip="For driving or flying something through the model rather than looking at it. Adds invisible <b>Collision_</b> objects: simple blocks around the trees, and fences thickened so a fast-moving object cannot slip through a 6 cm panel between two physics frames. In Unity, select them, add a Mesh Collider and switch off the Mesh Renderer. Everything else &mdash; the ground, the buildings, the roads &mdash; is already simple enough to collide with directly, and <b>metadata.json</b> lists which object to use for each. Leave this off if you only want a picture; it makes the file bigger.">?</span>
+    </div>
+    <div class="inline" id="crownsRow" style="display:none; margin-left:22px">
+      <input type="checkbox" id="collisionCrowns" checked>
+      <label for="collisionCrowns">Tree canopies are solid too</label>
+      <span class="help" tabindex="0" role="button" aria-label="About canopy collision"
+        data-tip="On, a box around each canopy stops anything flying through the leaves &mdash; safe, but it also stops short of the visible foliage near the box corners, by a metre or two on a big tree. Off, only the trunk is solid, at a quarter of the shapes, which suits a simulation that treats leaves as soft.">?</span>
+    </div>
+
     <button class="primary" id="run" style="margin-top:12px">Build model</button>
     <div class="hint" id="estimate" style="text-align:center"></div>
     <button class="danger" id="cancel" style="margin-top:6px; display:none">Cancel</button>
@@ -1376,6 +1389,11 @@ for (const id of ["aerialCm", "terrainM", "terrainTol", "facadePx", "size", "pre
 }
 $("preview").addEventListener("change", refreshEstimate);
 
+/* The canopy choice only means anything once physics shapes are on. */
+$("collision").addEventListener("change", () => {
+  $("crownsRow").style.display = $("collision").checked ? "" : "none";
+});
+
 /* ---------- running ---------- */
 const logEl = $("log");
 let job = null, offset = 0, poller = null;
@@ -1441,6 +1459,8 @@ $("run").onclick = async () => {
     sources: selectedSources(),
     clip_mode: $("clip").value,
     preview: $("preview").checked,
+    collision: $("collision").checked,
+    collision_tree_crowns: $("collisionCrowns").checked,
     // Terrain shape. See updateShape: none of this changes accuracy.
     road_simplify_m: sh.roadDetail,
     road_max_edge_m: sh.roadFace,
