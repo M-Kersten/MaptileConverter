@@ -484,6 +484,12 @@ def build_surfaces(
             max_edge_m=float(surfaces_cfg.get("road_max_edge_m", 12.0)),
             min_angle_deg=float(surfaces_cfg.get("road_min_angle_deg", 22.0)),
             snap_m=float(surfaces_cfg.get("road_snap_m", 0.05)),
+            # Already fetched above, and the only thing that knows where the
+            # surface of each body is.
+            water=result.water,
+            water_clearance_m=float(
+                surfaces_cfg.get("road_water_clearance_m", 0.25)
+            ),
             # One cell of the height grid: nothing below that is measured.
             min_edge_m=(
                 float(abs(terrain.xs[1] - terrain.xs[0]))
@@ -708,6 +714,45 @@ def _robust_deck_level(points, deck_sampler, ground) -> float | None:
     return float(np.median(usable))
 
 
+def _hold_above_water(points, z, water, clearance_m: float):
+    """Stop a path crossing a ditch from diving into it.
+
+    Lidar does not reflect off water, so the bare-earth grid has a hole over
+    every body and the gap filler interpolates across it. The result dips:
+    measured over a square kilometre of Gelderland the filled ground mid-water
+    sits 1.45 m below its own bank. A footpath draped on that follows it down
+    and disappears under the surface it is supposed to cross.
+
+    A path over water is a culvert or a little bridge, so it is held at the
+    body's own surface level plus a clearance. Not pinned to it -- a real
+    bridge rides higher, and anything already above the water is left alone.
+    """
+    if not water or clearance_m is None:
+        return z
+
+    out = np.asarray(z, dtype=np.float64).copy()
+    px, py = points[:, 0], points[:, 1]
+    for body in water:
+        inside = np.zeros(len(points), dtype=bool)
+        for ring in body.rings:
+            ring = np.asarray(ring, dtype=np.float64)[:, :2]
+            if len(ring) < 3:
+                continue
+            ax, ay = ring[:-1, 0], ring[:-1, 1]
+            bx, by = ring[1:, 0], ring[1:, 1]
+            for i in range(len(ax)):
+                if by[i] == ay[i]:
+                    continue
+                straddles = (ay[i] > py) != (by[i] > py)
+                inside ^= straddles & (
+                    px < (bx[i] - ax[i]) * (py - ay[i]) / (by[i] - ay[i]) + ax[i]
+                )
+        if inside.any():
+            floor = body.level_nap + clearance_m
+            out[inside] = np.maximum(out[inside], floor)
+    return out
+
+
 def triangulate_roads(
     roads: list[RoadPart],
     sampler,
@@ -719,6 +764,8 @@ def triangulate_roads(
     max_edge_m: float = 12.0,
     min_angle_deg: float = 22.0,
     snap_m: float = 0.05,
+    water: list | None = None,
+    water_clearance_m: float = 0.25,
     deck_sampler=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Road polygons into ``(triangles, surface class)``, draped on the ground.
@@ -793,6 +840,7 @@ def triangulate_roads(
         if not len(tris):
             continue
         z = np.asarray(sampler(points[:, 0], points[:, 1]), dtype=np.float64) + lift_m
+        z = _hold_above_water(points, z, water, water_clearance_m)
         placed = np.column_stack([points, z])[tris]
         out_tris.append(placed)
         out_class.append(np.full(len(tris), code, dtype=np.int32))

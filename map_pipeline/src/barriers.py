@@ -137,6 +137,22 @@ def _drape_points(points: np.ndarray, sampler, step_m: float, tolerance_m: float
     return dense[keep], height[keep]
 
 
+def _ring_steps(ring: np.ndarray, step_m: float) -> np.ndarray:
+    """Insert vertices along a closed ring so no edge is longer than `step_m`.
+
+    The survey's own vertices all survive: they are the shape of the wall,
+    where the inserted ones are only there to let the ground be followed.
+    """
+    closed = np.vstack([ring, ring[:1]])
+    out = [closed[:1]]
+    for start, end in zip(closed[:-1], closed[1:]):
+        span = float(np.hypot(*(end - start)))
+        cuts = max(1, int(np.ceil(span / step_m)))
+        t = np.arange(1, cuts + 1) / cuts
+        out.append(start + (end - start) * t[:, None])
+    return np.vstack(out)[:-1]
+
+
 def _prepare_rings(group, bbox: BBox) -> list[np.ndarray]:
     """One BGT polygon into rings the extruder can use, cut to the area.
 
@@ -173,6 +189,11 @@ class BarrierStyle:
     height_m: float
     thickness_m: float
     material: str
+    # A fence is mostly holes. Drawn as a solid slab it reads as a hoarding,
+    # and a railing and a hedge come out the same object. See-through styles
+    # get their own alpha-clipped material and a texture that tiles along the
+    # run, so the uprights stay the same width whatever the fence's length.
+    see_through: bool = False
     # Awnings and canopies hang off a facade. Drawn from the ground they are a
     # solid block against the wall, which is worse than leaving them out.
     lift_m: float = 0.0
@@ -184,7 +205,9 @@ class BarrierStyle:
 # entry here whose height is nearly reliable -- a Dutch hedge is clipped to
 # about the height of the fence it hides.
 LINE_STYLES: dict[tuple[str, str], BarrierStyle] = {
-    ("scheiding_lijn", "hek"): BarrierStyle("fence", 1.8, 0.06, "paint"),
+    ("scheiding_lijn", "hek"): BarrierStyle(
+        "fence", 1.8, 0.06, "paint", see_through=True
+    ),
     ("scheiding_lijn", "muur"): BarrierStyle("wall", 2.0, 0.24, "brick"),
     ("scheiding_lijn", "kademuur"): BarrierStyle("quay_wall", 1.1, 0.40, "concrete"),
     ("scheiding_lijn", "walbescherming"): BarrierStyle(
@@ -205,10 +228,10 @@ AREA_STYLES: dict[tuple[str, str], BarrierStyle] = {
     ("gebouwinstallatie", "toegangstrap"): BarrierStyle("steps", 0.9, 0.0, "stone"),
     ("gebouwinstallatie", "bordes"): BarrierStyle("stoop", 0.4, 0.0, "stone"),
     ("gebouwinstallatie", "luifel"): BarrierStyle(
-        "awning", 0.12, 0.0, "metal", lift_m=2.6
+        "awning", 0.12, 0.0, "metal", lift_m=2.4
     ),
     ("overigbouwwerk", "overkapping"): BarrierStyle(
-        "canopy", 0.14, 0.0, "metal", lift_m=2.8
+        "canopy", 0.14, 0.0, "metal", lift_m=2.6
     ),
     ("overigbouwwerk", "lage trafo"): BarrierStyle("transformer", 2.4, 0.0, "brick"),
     ("overigbouwwerk", "open loods"): BarrierStyle("shed", 2.8, 0.0, "metal"),
@@ -226,12 +249,17 @@ class BarrierSet:
     """Triangles with a material name each, ready for the Blender stage."""
 
     vertices: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))
+    # Metres along the run and up from the base. The Blender stage divides by
+    # the tile size, so a fence keeps the same upright spacing at any length.
+    uv: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
     triangles: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), np.int32))
     # One per triangle: which atlas patch it wears, and which BGT type it is.
     material: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int32))
     kind: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int32))
     material_names: list[str] = field(default_factory=list)
     kind_names: list[str] = field(default_factory=list)
+    # Which kinds need the alpha-clipped fence material rather than the atlas.
+    see_through: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
 
     def __len__(self) -> int:
@@ -286,6 +314,25 @@ def _sweep_line(points: np.ndarray, sampler, style: BarrierStyle):
     ]
     vertices = np.vstack(rails)
 
+    # U in metres along the run, V normalised over the height.
+    #
+    # The two are not the same thing on purpose. Along the run the texture has
+    # to tile, so that a four-hundred-metre fence gets four hundred metres of
+    # uprights rather than eight stretched across it -- and the Blender stage
+    # divides U by the tile size to get there. Up the height it must not tile:
+    # one fence is one texture, top rail to bottom rail, or the top rail lands
+    # wherever the height happens to fall and most fences simply have no top.
+    steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    along = np.concatenate([[0.0], np.cumsum(steps)])
+    top = np.ones(n)
+    bottom = np.zeros(n)
+    uvs = np.vstack([
+        np.column_stack([along, bottom]),
+        np.column_stack([along, top]),
+        np.column_stack([along, top]),
+        np.column_stack([along, bottom]),
+    ])
+
     triangles = []
     for r in range(4):
         a0 = r * n
@@ -305,11 +352,11 @@ def _sweep_line(points: np.ndarray, sampler, style: BarrierStyle):
             triangles.append([quad[0], quad[2], quad[1]])
             triangles.append([quad[0], quad[3], quad[2]])
 
-    return vertices, np.asarray(triangles, dtype=np.int64)
+    return vertices, np.asarray(triangles, dtype=np.int64), uvs
 
 
 def _extrude_rings(
-    rings: list[np.ndarray], sampler, style: BarrierStyle
+    rings: list[np.ndarray], sampler, style: BarrierStyle, step_m: float = 1.0
 ):
     """A polygon into a prism, as ``(vertices, triangles)``.
 
@@ -335,10 +382,25 @@ def _extrude_rings(
     if not rings:
         return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
 
+    # Cut the ring up before sampling the ground along it. A survey draws a
+    # thirty-metre wall as a four-vertex rectangle, and sampling the ground
+    # only at the corners leaves the base a straight chord over whatever the
+    # ground does in between: measured over the Gelderland square, one ring
+    # edge in five departed from its chord by more than the fifteen-centimetre
+    # embed, and the worst by 3.9 m. Walls floated, steps buried themselves.
+    #
+    # The swept lines have always done this. Polygons were the ones left out.
+    if step_m > 0:
+        rings = [_ring_steps(ring, step_m) for ring in rings]
+
     flat = np.vstack(rings)
     ground = np.asarray(sampler(flat[:, 0], flat[:, 1]), dtype=np.float64)
     if style.lift_m > 0.0:
-        ground = np.full(len(flat), float(np.median(ground)))
+        # Flat, and clear of the ground at its worst corner. The median looks
+        # like the fair choice and is not: an awning whose footprint straddles
+        # a slope ends up half buried, by 1.43 m on the Gelderland square.
+        # Too high at one end is a thing nobody notices; underground is not.
+        ground = np.full(len(flat), float(ground.max()))
     low, high = _span(ground, style)
 
     n = len(flat)
@@ -373,7 +435,14 @@ def _extrude_rings(
         if style.lift_m > 0.0:
             triangles.extend(cap[:, ::-1].tolist())
 
-    return vertices, np.asarray(triangles, dtype=np.int64)
+    # Metres from the outline's own corner rather than RD eastings, which
+    # would be six-figure UVs for anything that ever reads them. The solid
+    # styles take a flat atlas patch instead, so these only matter if one of
+    # them is ever given a tiling texture of its own.
+    local = flat - flat.min(axis=0)
+    uvs = np.vstack([local, local])
+
+    return vertices, np.asarray(triangles, dtype=np.int64), uvs
 
 
 def build_barriers(
@@ -411,7 +480,7 @@ def build_barriers(
             style.material, style.lift_m,
         )
 
-    chunks: list[tuple[np.ndarray, np.ndarray, str, str]] = []
+    chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray, BarrierStyle]] = []
     counts: dict[str, int] = {}
 
     for collection in COLLECTIONS:
@@ -447,9 +516,13 @@ def build_barriers(
                         dense, _profile = _drape_points(
                             piece, terrain.sample, step_m, drape_tolerance_m
                         )
-                        verts, tris = _sweep_line(dense, terrain.sample, style)
+                        verts, tris, uvs = _sweep_line(
+                            dense, terrain.sample, style
+                        )
                         if len(tris):
-                            chunks.append((verts, tris, style.material, style.name))
+                            chunks.append(
+                                (verts, tris, uvs, style)
+                            )
                             counts[style.name] = counts.get(style.name, 0) + 1
 
             elif geometry_type in ("Polygon", "MultiPolygon"):
@@ -460,30 +533,37 @@ def build_barriers(
                     rings = _prepare_rings(group, bbox)
                     if not rings:
                         continue
-                    verts, tris = _extrude_rings(rings, terrain.sample, style)
+                    verts, tris, uvs = _extrude_rings(
+                        rings, terrain.sample, style, step_m
+                    )
                     if len(tris):
-                        chunks.append((verts, tris, style.material, style.name))
+                        chunks.append((verts, tris, uvs, style))
                         counts[style.name] = counts.get(style.name, 0) + 1
 
     if not chunks:
         LOG.info("no barriers found")
         return result
 
-    materials = sorted({material for _, _, material, _ in chunks})
-    kinds = sorted({kind for _, _, _, kind in chunks})
+    materials = sorted({style.material for _, _, _, style in chunks})
+    kinds = sorted({style.name for _, _, _, style in chunks})
     material_index = {name: i for i, name in enumerate(materials)}
     kind_index = {name: i for i, name in enumerate(kinds)}
 
-    all_vertices, all_triangles, material_of, kind_of = [], [], [], []
+    all_vertices, all_triangles, all_uvs = [], [], []
+    material_of, kind_of = [], []
     offset = 0
-    for verts, tris, material, kind in chunks:
+    for verts, tris, uvs, style in chunks:
         all_vertices.append(verts)
+        all_uvs.append(uvs)
         all_triangles.append(tris + offset)
-        material_of.append(np.full(len(tris), material_index[material], np.int32))
-        kind_of.append(np.full(len(tris), kind_index[kind], np.int32))
+        material_of.append(
+            np.full(len(tris), material_index[style.material], np.int32)
+        )
+        kind_of.append(np.full(len(tris), kind_index[style.name], np.int32))
         offset += len(verts)
 
     vertices = np.vstack(all_vertices)
+    uv = np.vstack(all_uvs)
     triangles = np.vstack(all_triangles)
     material_of = np.concatenate(material_of)
     kind_of = np.concatenate(kind_of)
@@ -500,11 +580,15 @@ def build_barriers(
         LOG.debug("dropped %d zero-area barrier triangles", dropped)
 
     result.vertices = vertices
+    result.uv = uv
     result.triangles = triangles[real].astype(np.int32)
     result.material = material_of[real]
     result.kind = kind_of[real]
     result.material_names = materials
     result.kind_names = kinds
+    result.see_through = sorted(
+        {style.name for _, _, _, style in chunks if style.see_through}
+    )
     result.counts = counts
 
     LOG.info(
@@ -531,8 +615,10 @@ def save_barriers(barriers: BarrierSet, path: Path) -> Path:
         triangles=barriers.triangles,
         material=barriers.material,
         kind=barriers.kind,
+        uv=barriers.uv,
         material_names=np.array(barriers.material_names, dtype=object),
         kind_names=np.array(barriers.kind_names, dtype=object),
+        see_through=np.array(barriers.see_through, dtype=object),
     )
     LOG.info("wrote %s (%d triangles)", path, len(barriers))
     return path

@@ -172,6 +172,8 @@ def write_scene_description(
     road_class_names: dict | None = None,
     surface_class_names: dict | None = None,
     furniture_cfg: dict | None = None,
+    fence_texture: Path | None = None,
+    barriers_cfg: dict | None = None,
     vehicle_texture: Path | None = None,
     vehicles_cfg: dict | None = None,
     rail_texture: Path | None = None,
@@ -279,8 +281,16 @@ def write_scene_description(
         # Barriers share the furniture atlas, so they are gated on the same
         # texture existing rather than on one of their own.
         "barriers": (
-            {"file": "barriers.npz", "texture": furniture_texture.name}
-            if furniture_texture is not None
+            {
+                "file": "barriers.npz",
+                # The alpha-clipped fence texture, not the furniture atlas:
+                # a fence is mostly holes and the atlas has none.
+                "texture": fence_texture.name,
+                "fence_tile_m": float(
+                    (barriers_cfg or {}).get("fence_tile_m", 2.5)
+                ),
+            }
+            if fence_texture is not None
             else {}
         ),
         "vehicles": (

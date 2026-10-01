@@ -954,7 +954,7 @@ class TestTreeDetection(unittest.TestCase):
         from src.config import DEFAULTS
 
         self.assertTrue(DEFAULTS["trees"]["detect"])
-        self.assertEqual(DEFAULTS["trees"]["detect_min_height_m"], 2.5)
+        self.assertEqual(DEFAULTS["trees"]["detect_min_height_m"], 3.0)
         self.assertEqual(DEFAULTS["trees"]["detect_max_height_m"], 30.0)
 
 
@@ -4871,6 +4871,109 @@ class TestRoadTopology(unittest.TestCase):
         self.assertEqual(DEFAULTS["surfaces"]["road_snap_m"], 0.05)
 
 
+class TestPathsOverWater(unittest.TestCase):
+    """Lidar does not reflect off water, so the bare-earth grid has a hole over
+    every body and the filler interpolates across it. The result dips: measured
+    over a square kilometre of Gelderland the filled ground mid-water sits
+    1.45 m below its own bank, and a footpath draped on that follows it down
+    and disappears under the surface it is meant to cross."""
+
+    @staticmethod
+    def _body(level, ring):
+        from src.surfaces import WaterBody
+
+        return WaterBody(rings=[np.asarray(ring, dtype=float)],
+                         level_nap=level, area_m2=100.0, measured=True)
+
+    def test_a_path_does_not_dive_into_the_ditch_it_crosses(self):
+        from src.surfaces import _hold_above_water
+
+        ditch = self._body(
+            4.0, [[10, -5], [20, -5], [20, 25], [10, 25], [10, -5]]
+        )
+        points = np.array([[5.0, 10.0], [15.0, 10.0], [25.0, 10.0]])
+        # Bank, dip, bank: what the gap filler leaves behind.
+        draped = np.array([5.0, 2.6, 5.0])
+
+        held = _hold_above_water(points, draped, [ditch], 0.25)
+        self.assertAlmostEqual(held[1], 4.25, places=6)
+        # The banks are above water already and are left exactly alone.
+        self.assertAlmostEqual(held[0], 5.0, places=6)
+        self.assertAlmostEqual(held[2], 5.0, places=6)
+
+    def test_a_bridge_already_clear_of_the_water_is_left_alone(self):
+        """Held, not pinned: a real bridge rides higher than a culvert."""
+        from src.surfaces import _hold_above_water
+
+        ditch = self._body(4.0, [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]])
+        points = np.array([[5.0, 5.0]])
+        held = _hold_above_water(points, np.array([9.0]), [ditch], 0.25)
+        self.assertAlmostEqual(held[0], 9.0, places=6)
+
+    def test_each_body_holds_its_own_level(self):
+        """Levels across one area run to metres. A shared floor would lift a
+        low canal's path into the air to clear a high one."""
+        from src.surfaces import _hold_above_water
+
+        low = self._body(1.0, [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]])
+        high = self._body(8.0, [[20, 0], [30, 0], [30, 10], [20, 10], [20, 0]])
+        points = np.array([[5.0, 5.0], [25.0, 5.0]])
+        held = _hold_above_water(points, np.array([-2.0, -2.0]), [low, high], 0.25)
+        self.assertAlmostEqual(held[0], 1.25, places=6)
+        self.assertAlmostEqual(held[1], 8.25, places=6)
+
+    def test_no_water_changes_nothing(self):
+        from src.surfaces import _hold_above_water
+
+        z = np.array([1.0, 2.0, 3.0])
+        points = np.zeros((3, 2))
+        self.assertTrue(np.array_equal(_hold_above_water(points, z, [], 0.25), z))
+        self.assertTrue(np.array_equal(_hold_above_water(points, z, None, 0.25), z))
+
+    def test_the_road_builder_actually_applies_it(self):
+        """The rule is only worth anything if triangulate_roads runs it, and
+        every other test here calls the helper directly."""
+        from src.surfaces import RoadPart, triangulate_roads
+
+        level = 4.0
+        ditch = self._body(
+            level, [[40, -50], [60, -50], [60, 150], [40, 150], [40, -50]]
+        )
+
+        def dips(x, y):
+            """Bank at 6 m, dipping to 2.6 m across the ditch, as the filler
+            leaves it."""
+            x = np.asarray(x, dtype=float)
+            across = np.clip((x - 40.0) / 20.0, 0.0, 1.0)
+            return 6.0 - 3.4 * np.sin(np.pi * across)
+
+        # A footpath running east, straight over the ditch.
+        path = RoadPart(
+            [np.array([[0.0, 45.0], [100.0, 45.0], [100.0, 55.0], [0.0, 55.0],
+                       [0.0, 45.0]])],
+            surface_class=8,
+            level=0,
+        )
+        triangles, _classes, _levels = triangulate_roads(
+            [path], dips, lift_m=0.0, water=[ditch], water_clearance_m=0.25,
+        )
+        self.assertTrue(len(triangles), "the path did not triangulate at all")
+
+        corners = triangles.reshape(-1, 3)
+        over = (corners[:, 0] > 42) & (corners[:, 0] < 58)
+        self.assertTrue(over.any(), "no part of the path is over the ditch")
+        self.assertGreaterEqual(
+            float(corners[over, 2].min()), level + 0.25 - 1e-6,
+            f"the path drops to {corners[over, 2].min():.2f} m over water "
+            f"sitting at {level:.2f} m",
+        )
+
+    def test_the_setting_reaches_the_config(self):
+        from src.config import DEFAULTS
+
+        self.assertEqual(DEFAULTS["surfaces"]["road_water_clearance_m"], 0.25)
+
+
 class TestStreetDetail(unittest.TestCase):
     """The small things a street is not a street without.
 
@@ -4932,7 +5035,7 @@ class TestStreetDetail(unittest.TestCase):
 
         points = np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 6.0], [34.0, 6.0]])
         style = LINE_STYLES[("scheiding_lijn", "hek")]
-        vertices, triangles = _sweep_line(
+        vertices, triangles, _uv = _sweep_line(
             points, lambda x, y: np.zeros(len(np.atleast_1d(x))), style
         )
 
@@ -4951,7 +5054,7 @@ class TestStreetDetail(unittest.TestCase):
         style = LINE_STYLES[("scheiding_lijn", "muur")]
         line = np.array([[0.0, 0.0], [60.0, 0.0]])
         points, _profile = _drape_points(line, self._slope(0.05), 1.0, 0.05)
-        vertices, _ = _sweep_line(points, self._slope(0.05), style)
+        vertices, _, _uv = _sweep_line(points, self._slope(0.05), style)
 
         n = len(points)
         # The four rails are stacked in order: left-low, left-high, ...
@@ -5006,7 +5109,7 @@ class TestStreetDetail(unittest.TestCase):
 
         ring = np.array([[0.0, 0.0], [6.0, 0.0], [6.0, 1.4], [0.0, 1.4]])
         style = AREA_STYLES[("gebouwinstallatie", "luifel")]
-        vertices, triangles = _extrude_rings([ring], lambda x, y: np.full(len(x), 3.0), style)
+        vertices, triangles, _uv = _extrude_rings([ring], lambda x, y: np.full(len(x), 3.0), style)
 
         self.assertGreater(
             float(vertices[:, 2].min()) - 3.0, 2.0,
@@ -5030,7 +5133,7 @@ class TestStreetDetail(unittest.TestCase):
         ring = np.array([[0.0, 0.0], [40.0, 0.0], [40.0, 0.4], [0.0, 0.4]])
         style = AREA_STYLES[("scheiding_vlak", "kademuur")]
         sampler = self._slope(0.05)
-        vertices, _ = _extrude_rings([ring], sampler, style)
+        vertices, _, _uv = _extrude_rings([ring], sampler, style)
 
         below = vertices[:, 2] - sampler(vertices[:, 0], vertices[:, 1])
         self.assertLess(
@@ -5124,7 +5227,7 @@ class TestStreetDetail(unittest.TestCase):
         style = LINE_STYLES[("scheiding_lijn", "kademuur")]
         # Along the top of the bank, with a corner to engage the mitre.
         line = np.array([[0.0, 3.0], [20.0, 3.0], [26.0, 9.0]])
-        vertices, _ = _sweep_line(line, bank, style)
+        vertices, _, _uv = _sweep_line(line, bank, style)
 
         # The four rails are stacked in order: left-low, left-high, right-high,
         # right-low. Only the two low ones are meant to touch the ground.
@@ -5175,7 +5278,7 @@ class TestStreetDetail(unittest.TestCase):
 
         rings = _prepare_rings([ring], bbox)
         self.assertEqual(len(rings), 1, "the wall was dropped rather than cut")
-        vertices, _ = _extrude_rings(
+        vertices, _, _uv = _extrude_rings(
             rings, lambda x, y: np.zeros(len(x)),
             AREA_STYLES[("scheiding_vlak", "kademuur")],
         )
@@ -5185,10 +5288,155 @@ class TestStreetDetail(unittest.TestCase):
             f"{bbox.ymax:.0f} m area",
         )
 
+    def test_a_long_wall_follows_the_ground_between_its_corners(self):
+        """A survey draws a thirty-metre wall as a four-vertex rectangle.
+
+        Sampling the ground only at those corners leaves the base a straight
+        chord over whatever the ground does in between: measured over the
+        Gelderland square, one ring edge in five departed from its chord by
+        more than the fifteen-centimetre embed and the worst by 3.9 m. The
+        swept lines had always been cut up before sampling; polygons were the
+        ones left out.
+        """
+        from src.barriers import AREA_STYLES, EMBED_M, _extrude_rings
+
+        def hummocky(x, y):
+            x = np.asarray(x, dtype=float)
+            return 1.5 * np.sin(x / 5.0)
+
+        # A 40 m wall, four corners, over ground that rolls underneath it.
+        ring = np.array([[0.0, 0.0], [40.0, 0.0], [40.0, 0.5], [0.0, 0.5]])
+        style = AREA_STYLES[("scheiding_vlak", "muur")]
+
+        coarse, _, _uv = _extrude_rings([ring], hummocky, style, step_m=0.0)
+        fine, _, _uv = _extrude_rings([ring], hummocky, style, step_m=1.0)
+
+        def worst_float(vertices):
+            """How far the base *surface* rises above the ground.
+
+            Measured along the edges, not at the vertices: the whole fault is
+            that the base is a straight chord between two corners that are
+            themselves correct, so a vertex sample cannot see it.
+            """
+            half = len(vertices) // 2
+            base = vertices[:half]
+            worst = -np.inf
+            for start, end in zip(base, np.roll(base, -1, axis=0)):
+                t = np.linspace(0, 1, 60)[:, None]
+                along = start + (end - start) * t
+                gap = along[:, 2] - hummocky(along[:, 0], along[:, 1])
+                worst = max(worst, float(gap.max()))
+            return worst
+
+        self.assertGreater(
+            worst_float(coarse), 0.5,
+            "the fixture's ground is too flat to show the difference",
+        )
+        self.assertLessEqual(
+            worst_float(fine), 0.0,
+            f"the wall still floats {worst_float(fine):.2f} m above the ground",
+        )
+        gap = fine[:, 2] - hummocky(fine[:, 0], fine[:, 1])
+        self.assertGreaterEqual(
+            float(gap.min()), -(EMBED_M + 1e-6),
+            f"and buries itself {-gap.min():.2f} m at the worst corner",
+        )
+
+    def test_an_awning_clears_the_ground_at_every_corner(self):
+        """An awning is flat, and its footprint can straddle a slope. Taking
+        the median ground looks like the fair choice and is not: it left one
+        half buried by 1.43 m on the Gelderland square. Too high at one end is
+        a thing nobody notices; underground is not."""
+        from src.barriers import AREA_STYLES, _extrude_rings
+
+        # Steep enough that the median really does bury the high end: the
+        # footprint has to span more than twice the lift, or the two rules
+        # agree and the fixture proves nothing.
+        def slope(x, y):
+            return np.asarray(x, dtype=float) * 0.8
+
+        ring = np.array([[0.0, 0.0], [8.0, 0.0], [8.0, 2.0], [0.0, 2.0]])
+        style = AREA_STYLES[("gebouwinstallatie", "luifel")]
+        vertices, _, _uv = _extrude_rings([ring], slope, style, step_m=1.0)
+
+        above = vertices[:, 2] - slope(vertices[:, 0], vertices[:, 1])
+        self.assertGreater(
+            float(above.min()), 0.0,
+            f"the awning is {-above.min():.2f} m underground at its low end",
+        )
+        # Still flat: an awning that ripples with the pavement is worse than
+        # one that does not.
+        self.assertLess(
+            float(vertices[:, 2].max() - vertices[:, 2].min()),
+            style.height_m + 1e-6,
+            "the awning follows the slope instead of hanging level",
+        )
+
+    def test_a_fence_is_mostly_holes(self):
+        """Drawn as a solid slab a railing is a hoarding, and a fence and a
+        hedge come out the same object."""
+        import tempfile
+
+        from PIL import Image
+
+        from src.facade import generate_fence_texture
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = generate_fence_texture(Path(folder), size_px=128)
+            image = Image.open(path)
+            self.assertEqual(image.mode, "RGBA", "the fence has no alpha at all")
+            alpha = np.asarray(image)[:, :, 3]
+
+        open_fraction = float((alpha <= 127).mean())
+        self.assertGreater(open_fraction, 0.4, "the fence is nearly solid")
+        self.assertLess(open_fraction, 0.85, "the fence is nearly nothing")
+        # Uprights: a row across the middle alternates between bar and gap
+        # several times, which a plain slab or a plain hole does not.
+        middle = alpha[int(len(alpha) * 0.3)] > 127
+        crossings = int(np.count_nonzero(np.diff(middle.astype(np.int8))))
+        self.assertGreaterEqual(
+            crossings, 6, f"only {crossings} bar edges across the tile",
+        )
+
+    def test_only_the_fences_are_see_through(self):
+        """A wall is not. Nor is a quay wall, a noise barrier or a hedge."""
+        from src.barriers import AREA_STYLES, LINE_STYLES
+
+        by_name = {
+            style.name: style
+            for style in (*LINE_STYLES.values(), *AREA_STYLES.values())
+        }
+        self.assertTrue(by_name["fence"].see_through)
+        for solid in ("wall", "quay_wall", "noise_barrier", "hedge", "awning"):
+            self.assertFalse(
+                by_name[solid].see_through, f"{solid} should not be see-through"
+            )
+
+    def test_the_fence_texture_tiles_along_the_run(self):
+        """Stretched instead of tiled, a four-hundred-metre fence gets eight
+        uprights. Up the height it must not tile: one fence is one texture, top
+        rail to bottom rail, or most fences simply have no top."""
+        from src.barriers import LINE_STYLES, _sweep_line
+
+        style = LINE_STYLES[("scheiding_lijn", "hek")]
+        flat = lambda x, y: np.zeros(len(np.atleast_1d(x)))
+
+        short = np.array([[0.0, 0.0], [10.0, 0.0]])
+        long = np.array([[0.0, 0.0], [200.0, 0.0]])
+        _, _, short_uv = _sweep_line(short, flat, style)
+        _, _, long_uv = _sweep_line(long, flat, style)
+
+        self.assertAlmostEqual(float(short_uv[:, 0].max()), 10.0, delta=0.5)
+        self.assertAlmostEqual(float(long_uv[:, 0].max()), 200.0, delta=0.5)
+        for uv in (short_uv, long_uv):
+            self.assertAlmostEqual(float(uv[:, 1].min()), 0.0, places=6)
+            self.assertAlmostEqual(float(uv[:, 1].max()), 1.0, places=6)
+
     def test_the_settings_reach_the_config(self):
         from src.config import DEFAULTS
 
         self.assertTrue(DEFAULTS["barriers"]["enabled"])
+        self.assertEqual(DEFAULTS["barriers"]["fence_tile_m"], 2.5)
         self.assertEqual(DEFAULTS["barriers"]["drape_tolerance_m"], 0.05)
         self.assertEqual(DEFAULTS["furniture"]["flagpole_height_m"], 7.0)
 

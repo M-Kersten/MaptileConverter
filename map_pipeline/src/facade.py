@@ -838,6 +838,58 @@ def furniture_uv(name: str) -> tuple[float, float]:
     raise KeyError(f"no furniture atlas patch named {name!r}")
 
 
+def generate_fence_texture(
+    work_dir: Path, size_px: int = 256, seed: int = 71
+) -> Path:
+    """A fence, with the gaps actually transparent.
+
+    Written as RGBA and read through an alpha-clipped material, because a fence
+    is mostly holes: drawn as a solid slab it reads as a hoarding, and a hedge
+    and a railing come out the same object. The pattern is a palisade -- a top
+    and bottom rail with uprights between them -- which covers the Dutch park
+    railing, the industrial mesh and the garden fence well enough at the
+    distance any of them are seen from.
+
+    Tiled along the run rather than stretched, so the uprights stay the same
+    width whether the fence is four metres long or four hundred.
+    """
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    canvas = np.zeros((size_px, size_px, 4), dtype=np.float64)
+
+    bar = np.array([108, 116, 112], dtype=np.float64)
+    grain = _value_noise((size_px, size_px), cells=max(4, size_px // 16), rng=rng)
+    colour = bar[None, None, :] * (1.0 + 0.18 * (grain - 0.5)[:, :, None] * 2.0)
+    canvas[:, :, :3] = colour
+
+    # Eight uprights across the tile, each an eighth of its spacing wide, and
+    # rails across the top and the bottom. Row 0 is the top of the fence.
+    uprights = 8
+    pitch = size_px / uprights
+    columns = np.arange(size_px)
+    on_upright = (columns % pitch) < max(2.0, pitch * 0.18)
+    alpha = np.zeros((size_px, size_px), dtype=np.float64)
+    alpha[:, on_upright] = 1.0
+
+    rail = max(3, size_px // 22)
+    alpha[:rail, :] = 1.0                       # top rail
+    alpha[-rail * 2 :, :] = 1.0                 # bottom rail, a little deeper
+    alpha[int(size_px * 0.45) : int(size_px * 0.45) + rail, :] = 1.0   # mid rail
+
+    canvas[:, :, 3] = alpha * 255.0
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "fence.png"
+    Image.fromarray(
+        np.clip(canvas, 0, 255).astype(np.uint8), mode="RGBA"
+    ).save(path)
+    LOG.info(
+        "wrote %s (palisade, %.0f%% open, %dpx)",
+        path.name, 100.0 * (1.0 - alpha.mean()), size_px,
+    )
+    return path
+
+
 def generate_furniture_texture(
     work_dir: Path, size_px: int = 256, seed: int = 33
 ) -> Path:
@@ -877,6 +929,7 @@ __all__ = [
     "GROUND_STYLE",
     "GROUND_STYLES",
     "furniture_uv",
+    "generate_fence_texture",
     "generate_furniture_texture",
     "generate_rail_texture",
     "generate_structure_texture",

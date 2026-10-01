@@ -189,7 +189,7 @@ DEFAULTS: dict[str, Any] = {
         # own object, because the detector is good rather than perfect.
         "detect": True,
         # Below this a crown is a shrub, and shrubs are not worth a tree mesh.
-        "detect_min_height_m": 2.5,
+        "detect_min_height_m": 3.0,
         # And above this it is a structure, not a tree. Urban trees top out
         # around thirty metres; the forty-metre "trees" the first run found
         # were one tower the building footprints do not cover.
@@ -261,6 +261,11 @@ DEFAULTS: dict[str, Any] = {
         # drawings disagree by a few millimetres the pair becomes a ribbon of
         # near-zero triangles that welding cannot see.
         "road_snap_m": 0.05,
+        # How far above a water surface a path crossing it is held. The
+        # bare-earth grid has a hole over every body and the filler dips across
+        # it -- 1.45 m below its own bank over the Gelderland square -- so a
+        # footpath draped on that follows it under the water.
+        "road_water_clearance_m": 0.25,
         # How far the bed is sunk below the water surface.
         "water_depth_m": 1.2,
         # Grain mixed into the aerial per surface class, to counter how mushy
@@ -306,6 +311,9 @@ DEFAULTS: dict[str, Any] = {
         # assumption, in one place, for someone to argue with. Keys are the
         # names in barriers.LINE_STYLES and AREA_STYLES.
         "heights": {},
+        # How long one tile of the fence texture is. The uprights keep this
+        # spacing however long the run, which is the point of tiling it.
+        "fence_tile_m": 2.5,
     },
     "vehicles": {
         # Nobody publishes where cars are parked or boats are moored, but the

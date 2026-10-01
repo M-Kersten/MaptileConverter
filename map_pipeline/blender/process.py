@@ -124,6 +124,43 @@ def make_textured_material(
     return material
 
 
+def make_cutout_material(name: str, image_path: Path, roughness: float):
+    """Textured material whose transparent pixels are actually cut away.
+
+    A fence is mostly holes. Wiring the image's alpha into the Principled
+    BSDF's alpha socket and setting the blend method to a clip is what makes
+    them holes rather than grey; without it a railing is a hoarding, and FBX
+    carries the texture reference, so the receiving engine can read the same
+    alpha out of the same PNG.
+    """
+    material = make_textured_material(name, image_path, roughness)
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    bsdf = nodes.get("Principled BSDF")
+    texture = next(
+        (n for n in nodes if n.type == "TEX_IMAGE" and n.image
+         and n.image.name == image_path.name),
+        None,
+    )
+    if bsdf is not None and texture is not None and "Alpha" in bsdf.inputs:
+        links.new(texture.outputs["Alpha"], bsdf.inputs["Alpha"])
+
+    # The attribute moved about between versions and is gone in some; none of
+    # them are worth failing the whole export over.
+    for attribute, value in (
+        ("blend_method", "CLIP"),
+        ("shadow_method", "CLIP"),
+        ("alpha_threshold", 0.5),
+        ("use_backface_culling", False),
+    ):
+        try:
+            setattr(material, attribute, value)
+        except (AttributeError, TypeError):
+            pass
+    return material
+
+
 def build_mesh_object(
     name: str,
     vertices: np.ndarray,
@@ -1292,14 +1329,16 @@ def _furniture_pieces(kind, x, y, base, spin, uv, cfg):
     return []
 
 
-def build_barriers(scene: dict, work_dir: Path, material):
+def build_barriers(scene: dict, work_dir: Path, material, fence_material=None):
     """Walls, fences and hedges, one object per BGT type.
 
     Split by type rather than delivered as one mesh, because that is the
     difference between "a wall" and "every wall": a designer can hide the
     fences to see the plots, swap the hedge material for a real one, or put
     the quay walls on their own collision layer without selecting anything by
-    hand. They still share one material, so the split costs nothing to draw.
+    hand. Nearly all of them share one material, so the split costs nothing to
+    draw; the see-through ones get a second, alpha-clipped one, because a fence
+    is mostly holes and a solid slab reads as a hoarding.
     """
     barriers_file = scene.get("barriers", {}).get("file")
     if not barriers_file or not (work_dir / barriers_file).is_file():
@@ -1316,6 +1355,11 @@ def build_barriers(scene: dict, work_dir: Path, material):
     material_of = data["material"]
     material_names = [str(n) for n in data["material_names"]]
 
+    uv = data["uv"] if "uv" in data.files else None
+    cutout = (
+        {str(n) for n in data["see_through"]} if "see_through" in data.files else set()
+    )
+    tile_m = float(scene.get("barriers", {}).get("fence_tile_m", 2.5))
     table = scene.get("furniture", {}).get("atlas_uv") or {}
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
@@ -1337,10 +1381,20 @@ def build_barriers(scene: dict, work_dir: Path, material):
         indices = renumber[part]
         n_triangles = len(part)
 
-        patch = np.asarray(
-            table.get(material_names[int(material_of[mask][0])], (0.125, 0.25)),
-            dtype=np.float64,
-        )
+        see_through = name in cutout and fence_material is not None and uv is not None
+        if see_through:
+            # Metres in the file, tiles here: a fence four hundred metres long
+            # gets four hundred metres of uprights rather than eight stretched
+            # across the whole run.
+            loop_uv = uv[used][indices.reshape(-1)].copy()
+            loop_uv[:, 0] /= tile_m      # U tiles along the run; V does not
+        else:
+            patch = np.asarray(
+                table.get(material_names[int(material_of[mask][0])], (0.125, 0.25)),
+                dtype=np.float64,
+            )
+            loop_uv = np.tile(patch, (n_triangles * 3, 1))
+
         objects.append(
             build_mesh_object(
                 f"Barriers_{name}",
@@ -1348,9 +1402,9 @@ def build_barriers(scene: dict, work_dir: Path, material):
                 indices.reshape(-1),
                 np.arange(0, n_triangles * 3, 3),
                 np.full(n_triangles, 3),
-                np.tile(patch, (n_triangles * 3, 1)),
+                loop_uv,
                 np.zeros(n_triangles),
-                [material],
+                [fence_material if see_through else material],
                 shade_smooth=False,
             )
         )
@@ -1842,6 +1896,7 @@ def copy_textures(
         ("tree", "trees"),
         ("water", "surfaces"),
         ("furniture", "furniture"),
+        ("fence", "barriers"),
         ("vehicle", "vehicles"),
         ("rail", "rails"),
         ("structure", "structures"),
@@ -1936,7 +1991,14 @@ def main() -> int:
             "M_furniture", extra_textures["furniture"], roughness=0.55
         )
         build_furniture(scene, work_dir, furniture_material)
-        build_barriers(scene, work_dir, furniture_material)
+        build_barriers(
+            scene,
+            work_dir,
+            furniture_material,
+            make_cutout_material("M_fence", extra_textures["fence"], roughness=0.6)
+            if "fence" in extra_textures
+            else None,
+        )
 
     if "vehicle" in extra_textures:
         # Car paint is the one glossy thing out here.

@@ -49,6 +49,7 @@ from src.sources import (  # noqa: E402
 from src.facade import (  # noqa: E402
     CAR_PAINT,
     generate_facade_textures,
+    generate_fence_texture,
     generate_furniture_texture,
     generate_rail_texture,
     generate_structure_texture,
@@ -598,6 +599,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 furniture_texture = generate_furniture_texture(work_dir)
 
     barriers = BarrierSet()
+    fence_texture = None
     if want_barriers:
         with Stage("walls, fences and hedges (BGT)", next_step(), total):
             barriers = build_barriers(
@@ -608,8 +610,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             )
             # Shares the furniture atlas: the same eight flat patches cover a
             # brick wall and a wooden bench, and one texture is one material.
-            if len(barriers) and furniture_texture is None:
-                furniture_texture = generate_furniture_texture(work_dir)
+            if len(barriers):
+                if furniture_texture is None:
+                    furniture_texture = generate_furniture_texture(work_dir)
+                # Its own texture, with real holes in it: a fence drawn on the
+                # opaque atlas is a hoarding.
+                fence_texture = generate_fence_texture(work_dir)
 
     vehicles = VehicleSet()
     vehicle_texture = None
@@ -692,6 +698,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
             road_class_names={str(k): v for k, v in CLASS_NAMES.items()},
             furniture_cfg=config.furniture,
+            fence_texture=fence_texture,
+            barriers_cfg=config.barriers,
             vehicle_texture=vehicle_texture,
             vehicles_cfg=config.vehicles,
             car_colours=len(CAR_PAINT),

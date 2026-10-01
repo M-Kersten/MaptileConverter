@@ -791,6 +791,16 @@ pixel-identical to what it replaced — including road markings and crossings,
 which a tiling texture would lose. The point of the split is that the material
 is now yours to replace.
 
+**A path crossing water does not dive into it.** Lidar does not reflect off
+water, so the bare-earth grid has a hole over every body and the gap filler
+interpolates across it — and the result dips: over the Gelderland square the
+filled ground mid-water sits 1.45 m below its own bank. A footpath draped on
+that follows it down and vanishes under the surface it is meant to cross. Any
+road over a body is now held at that body's own level plus
+`surfaces.road_water_clearance_m`, per body rather than shared, because levels
+across one area run to metres. Held, not pinned: a real bridge rides higher and
+is left alone.
+
 **The road surface floats 6 cm above the terrain**, so the two do not fight for
 the same depth. That is safe here and only here: the terrain sits directly
 underneath wearing the same photograph, so any gap shows the ground rather than
@@ -945,12 +955,27 @@ Three things about the geometry are worth knowing:
   triangles against 88,324 for the same walls followed to 5 cm. The survey's own
   vertices are anchors and always survive, because those are the shape of the
   fence rather than the shape of the ground under it.
+- **A polygon is cut up before its ground is sampled.** A survey draws a 30 m
+  wall as a four-vertex rectangle, and sampling only at the corners leaves the
+  base a straight chord over whatever the ground does in between: one ring edge
+  in five departed from its chord by more than the 15 cm embed, and the worst by
+  3.9 m. The swept lines had always been cut up first; polygons were the ones
+  left out.
 - **A polygon's base is sampled per vertex.** One height for a whole outline
   fails exactly where these objects live — a quay wall runs along a canal bank,
   the steepest ground in a Dutch city — and on a test surface a single median
   buried one end of a wall by 0.65 m. Awnings are the exception: they hang off a
-  facade at one height and take the median, because an awning that ripples with
-  the pavement is worse than one that does not.
+  facade at one height, so they stay flat — taken from the *highest* ground
+  under their footprint, not the median. The median looks like the fair choice
+  and is not: an awning whose footprint straddles a slope ends up half buried,
+  by 1.43 m on the Gelderland square. Too high at one end is a thing nobody
+  notices; underground is not.
+- **A fence is see-through.** It gets its own alpha-clipped material and a
+  palisade texture that tiles along the run — about two thirds open, so the
+  uprights read as uprights. Drawn as a solid slab a railing is a hoarding, and
+  a fence and a hedge come out the same object. `barriers.fence_tile_m` sets how
+  long one tile is; the texture maps once over the height, so every fence gets
+  its top rail wherever that height falls.
 
 Over the demo square kilometre that comes to 2,799 objects and 88,329 triangles,
 with no non-manifold edges and no degenerate faces. They arrive as one object per
