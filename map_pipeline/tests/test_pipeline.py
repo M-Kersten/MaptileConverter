@@ -5298,6 +5298,105 @@ class TestPathsOverWater(unittest.TestCase):
         self.assertEqual(DEFAULTS["surfaces"]["road_water_clearance_m"], 0.25)
 
 
+class TestBarrierHeightOverride(unittest.TestCase):
+    """`barriers.heights` changes a height and nothing else.
+
+    It used to change rather more. The override built a fresh BarrierStyle
+    positionally, so inserting `see_through` into the middle of the dataclass
+    shifted every later field along one: an overridden fence came out solid,
+    and an overridden awning lost its 2.4 m lift *and* picked up the fence's
+    cutout material, landing on the pavement as an alpha-clipped slab against
+    the wall. Nothing failed, because the default for the knob is empty.
+    """
+
+    @staticmethod
+    def _styled(name, table_key, table, override):
+        """The real override, not a local copy of it.
+
+        A first draft of these tests called `dataclasses.replace` here. All
+        three passed against the broken code, because the broken code was in
+        `build_barriers` and this helper never went near it.
+        """
+        from src.barriers import apply_height_override
+
+        return apply_height_override(table[table_key], {name: override})
+
+    def test_a_taller_fence_is_still_see_through(self):
+        from src.barriers import LINE_STYLES
+
+        got = self._styled(
+            "fence", ("scheiding_lijn", "hek"), LINE_STYLES, 2.5
+        )
+        self.assertEqual(got.height_m, 2.5)
+        self.assertIs(got.see_through, True, "a taller fence came out solid")
+        self.assertEqual(got.lift_m, 0.0)
+        self.assertEqual(got.material, "paint")
+
+    def test_a_thinner_awning_still_hangs_off_the_wall(self):
+        from src.barriers import AREA_STYLES
+
+        got = self._styled(
+            "awning", ("gebouwinstallatie", "luifel"), AREA_STYLES, 0.2
+        )
+        self.assertEqual(got.height_m, 0.2)
+        self.assertEqual(
+            got.lift_m, 2.4, "an overridden awning fell to the ground"
+        )
+        self.assertIs(
+            got.see_through, False, "an awning is not a fence"
+        )
+
+    def test_the_override_is_the_only_thing_that_changes(self):
+        """Whatever fields BarrierStyle grows next, they survive an override."""
+        import dataclasses
+
+        from src.barriers import AREA_STYLES, LINE_STYLES
+
+        for key, table in (
+            (("scheiding_lijn", "hek"), LINE_STYLES),
+            (("gebouwinstallatie", "luifel"), AREA_STYLES),
+            (("vegetatieobject_lijn", "haag"), LINE_STYLES),
+        ):
+            before = table[key]
+            after = self._styled(before.name, key, table, 9.5)
+            for f in dataclasses.fields(before):
+                if f.name == "height_m":
+                    continue
+                self.assertEqual(
+                    getattr(after, f.name), getattr(before, f.name),
+                    f"overriding the height of {before.name} also changed "
+                    f"{f.name}",
+                )
+
+    def test_build_barriers_applies_overrides_through_it(self):
+        """The tests above reach the real override only while `build_barriers`
+        still calls it, and the whole fault was logic living in a closure that
+        no test could see."""
+        import inspect
+
+        from src import barriers
+
+        source = inspect.getsource(barriers.build_barriers)
+        self.assertIn("apply_height_override(", source)
+        self.assertNotIn(
+            "BarrierStyle(", source,
+            "build_barriers constructs a style of its own again",
+        )
+
+    def test_an_unmapped_type_stays_unmapped(self):
+        from src.barriers import apply_height_override
+
+        self.assertIsNone(apply_height_override(None, {"fence": 2.0}))
+
+    def test_no_override_hands_back_the_table_entry(self):
+        """Untouched means untouched: the same object, not a copy of it."""
+        from src.barriers import LINE_STYLES, apply_height_override
+
+        style = LINE_STYLES[("scheiding_lijn", "muur")]
+        self.assertIs(apply_height_override(style, {}), style)
+        self.assertIs(apply_height_override(style, {"fence": 9.0}), style)
+
+
 class TestStreetDetail(unittest.TestCase):
     """The small things a street is not a street without.
 

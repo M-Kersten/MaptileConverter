@@ -39,7 +39,7 @@ Two families of geometry, and they need different treatment:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -242,6 +242,30 @@ AREA_STYLES: dict[tuple[str, str], BarrierStyle] = {
 COLLECTIONS = sorted(
     {collection for collection, _ in (*LINE_STYLES, *AREA_STYLES)}
 )
+
+
+def apply_height_override(
+    style: BarrierStyle | None, heights: dict
+) -> BarrierStyle | None:
+    """`barriers.heights` changes a height, and deliberately nothing else.
+
+    `replace`, rather than building a fresh BarrierStyle: this was written
+    positionally, and adding `see_through` to the middle of the dataclass then
+    shifted every later field along by one. An overridden fence came out solid,
+    and an overridden awning lost its 2.4 m lift *and* inherited the fence's
+    cutout material, so it sat on the pavement as an alpha-clipped slab against
+    the wall. Nothing failed, because the knob defaults to empty.
+
+    It is a named function rather than a closure in `build_barriers` so that a
+    test can reach the real thing. Testing a local copy of this logic is how it
+    went unnoticed.
+    """
+    if style is None:
+        return None
+    override = heights.get(style.name)
+    if override is None:
+        return style
+    return replace(style, height_m=float(override))
 
 
 @dataclass
@@ -469,16 +493,7 @@ def build_barriers(
     heights = barriers_cfg.get("heights") or {}
 
     def styled(table, collection, plus_type):
-        style = table.get((collection, plus_type))
-        if style is None:
-            return None
-        override = heights.get(style.name)
-        if override is None:
-            return style
-        return BarrierStyle(
-            style.name, float(override), style.thickness_m,
-            style.material, style.lift_m,
-        )
+        return apply_height_override(table.get((collection, plus_type)), heights)
 
     chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray, BarrierStyle]] = []
     counts: dict[str, int] = {}
@@ -630,6 +645,7 @@ __all__ = [
     "LINE_STYLES",
     "BarrierSet",
     "BarrierStyle",
+    "apply_height_override",
     "build_barriers",
     "feature_type",
     "save_barriers",
