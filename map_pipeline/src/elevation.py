@@ -67,6 +67,10 @@ class TerrainResult:
     resolution_m: float
     mesh: "TerrainMesh | None" = None
     constrained: "ConstrainedMesh | None" = None
+    # Normally left alone: `surface` builds this from `constrained` the first
+    # time it is asked, so there is no wiring step between having a mesh and
+    # draping on it. Set it to override that. See `surface` below.
+    surface_sampler: object | None = None
 
     @property
     def n(self) -> int:
@@ -75,6 +79,50 @@ class TerrainResult:
     def sample(self, x, y):
         """Bilinear height lookup at RD coordinates, clamped to the grid."""
         return _bilinear_on_grid(self.heights, self.xs, self.ys, x, y)
+
+    def surface(self, x, y):
+        """Heights off the ground the model actually shows.
+
+        Usually the same thing as `sample`, and deliberately not always. When
+        the terrain is a constrained mesh, the grid and the mesh agree exactly
+        along every breakline -- a kerb is an edge of the mesh -- and differ by
+        up to the simplification tolerance everywhere else, because inside a
+        triangle the mesh is a plane where the grid curves. Anything placed on
+        the ground wants the mesh; anything measuring the terrain's own error
+        wants the grid, which is why both are here.
+
+        The sampler is built from the mesh this result already carries rather
+        than handed in beside it, because the two can then never disagree: a
+        terrain with a mesh drapes on it by construction, and there is no
+        separate assignment to forget.
+        """
+        sampler = self._surface_sampler()
+        if sampler is None:
+            return self.sample(x, y)
+        return sampler(x, y)
+
+    def _surface_sampler(self):
+        """The mesh sampler, built once on demand.
+
+        Indexing a square kilometre's triangles costs a quarter of a second,
+        which is nothing against a pipeline run but is worth not paying in the
+        runs -- the checks, mostly -- that only ever ask for the grid.
+        """
+        if self.surface_sampler is None and self.constrained is not None:
+            if not len(self.constrained.triangles):
+                return None
+            from .terrain_mesh import MeshSampler
+
+            self.surface_sampler = MeshSampler(
+                self.constrained.vertices,
+                self.constrained.triangles,
+                fallback=self.sample,
+            )
+            LOG.info(
+                "draping on the terrain mesh: %d triangles indexed",
+                len(self.constrained.triangles),
+            )
+        return self.surface_sampler
 
     def stats(self) -> dict:
         h = self.heights
@@ -701,6 +749,12 @@ def build_terrain(
         center_z_nap=np.float64(center_z),
     )
 
+    # Everything laid on the ground drapes on the mesh when there is one, so
+    # the model agrees with itself by construction rather than to within a
+    # tolerance. Nothing is wired up for that here: `TerrainResult.surface`
+    # builds the sampler from the mesh below. The grid stays available for the
+    # checks that measure how far the mesh strays from it, which cannot be
+    # done against the mesh itself.
     return TerrainResult(
         heights=heights,
         xs=xs,

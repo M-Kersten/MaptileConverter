@@ -514,10 +514,10 @@ def build_barriers(
                         if _length(piece) < MIN_LENGTH_M:
                             continue
                         dense, _profile = _drape_points(
-                            piece, terrain.sample, step_m, drape_tolerance_m
+                            piece, terrain.surface, step_m, drape_tolerance_m
                         )
                         verts, tris, uvs = _sweep_line(
-                            dense, terrain.sample, style
+                            dense, terrain.surface, style
                         )
                         if len(tris):
                             chunks.append(
@@ -534,7 +534,7 @@ def build_barriers(
                     if not rings:
                         continue
                     verts, tris, uvs = _extrude_rings(
-                        rings, terrain.sample, style, step_m
+                        rings, terrain.surface, style, step_m
                     )
                     if len(tris):
                         chunks.append((verts, tris, uvs, style))

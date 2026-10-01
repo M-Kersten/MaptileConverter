@@ -1467,7 +1467,112 @@ def save_terrain_mesh(mesh: TerrainMesh, path) -> "Path":
     return path
 
 
+
+
+class MeshSampler:
+    """Heights read off the terrain mesh itself, rather than off the grid.
+
+    The two are not the same surface, and the difference is exactly the mesh's
+    simplification tolerance. Along a breakline they agree to the millimetre --
+    a kerb is an edge of the mesh, so the mesh passes through the grid's own
+    value there -- but inside a triangle the mesh is a plane where the grid
+    curves, and everything that is not on a breakline lands in the middle of
+    one: every refinement vertex a road picked up, every fence post, every
+    tree. At walking height nobody notices ten centimetres. Hovering a drone
+    over a kerb, it is the difference between resting on the ground and
+    hanging above it.
+
+    Point location is a uniform grid of triangle bounding boxes. No scipy in
+    this project, and nothing here needs a quadtree: the triangles are all
+    roughly the size of the ground features they describe, so a grid sized to
+    the median one holds a handful of candidates per cell.
+    """
+
+    def __init__(self, vertices: np.ndarray, triangles: np.ndarray, fallback=None):
+        self.vertices = np.asarray(vertices, dtype=np.float64)
+        self.triangles = np.asarray(triangles, dtype=np.int64)
+        self.fallback = fallback
+
+        corners = self.vertices[self.triangles]
+        self.low = corners[:, :, :2].min(axis=1)
+        self.high = corners[:, :, :2].max(axis=1)
+
+        span = self.high - self.low
+        self.cell = max(float(np.median(span)), 1e-3)
+        self.origin = self.low.min(axis=0)
+
+        # Every triangle filed under every cell its bounding box touches, so a
+        # lookup is one cell rather than a neighbourhood search.
+        self.buckets: dict[tuple[int, int], list[int]] = {}
+        lo = np.floor((self.low - self.origin) / self.cell).astype(np.int64)
+        hi = np.floor((self.high - self.origin) / self.cell).astype(np.int64)
+        for index in range(len(self.triangles)):
+            for cx in range(lo[index, 0], hi[index, 0] + 1):
+                for cy in range(lo[index, 1], hi[index, 1] + 1):
+                    self.buckets.setdefault((cx, cy), []).append(index)
+
+        # Barycentric denominators, once.
+        a, b, c = corners[:, 0], corners[:, 1], corners[:, 2]
+        self.ax, self.ay, self.az = a[:, 0], a[:, 1], a[:, 2]
+        self.v0 = b[:, :2] - a[:, :2]
+        self.v1 = c[:, :2] - a[:, :2]
+        self.bz = b[:, 2] - a[:, 2]
+        self.cz = c[:, 2] - a[:, 2]
+        cross = self.v0[:, 0] * self.v1[:, 1] - self.v0[:, 1] * self.v1[:, 0]
+        self.inv = np.where(np.abs(cross) > 1e-12, 1.0 / np.where(cross == 0, 1, cross), 0.0)
+        self.degenerate = np.abs(cross) <= 1e-12
+
+    def __call__(self, x, y):
+        x = np.atleast_1d(np.asarray(x, dtype=np.float64)).ravel()
+        y = np.atleast_1d(np.asarray(y, dtype=np.float64)).ravel()
+        out = np.full(len(x), np.nan)
+
+        cells = np.floor(
+            (np.column_stack([x, y]) - self.origin) / self.cell
+        ).astype(np.int64)
+        order: dict[tuple[int, int], list[int]] = {}
+        for index, (cx, cy) in enumerate(cells):
+            order.setdefault((int(cx), int(cy)), []).append(index)
+
+        for key, members in order.items():
+            candidates = self.buckets.get(key)
+            if not candidates:
+                continue
+            tri = np.asarray(candidates)
+            who = np.asarray(members)
+            px = x[who][:, None] - self.ax[tri][None, :]
+            py = y[who][:, None] - self.ay[tri][None, :]
+            # Barycentric coordinates of each point in each candidate.
+            u = (px * self.v1[tri, 1][None, :] - py * self.v1[tri, 0][None, :]) \
+                * self.inv[tri][None, :]
+            v = (py * self.v0[tri, 0][None, :] - px * self.v0[tri, 1][None, :]) \
+                * self.inv[tri][None, :]
+            inside = (
+                (u >= -1e-9) & (v >= -1e-9) & (u + v <= 1 + 1e-9)
+                & ~self.degenerate[tri][None, :]
+            )
+            hit = np.argmax(inside, axis=1)
+            found = inside[np.arange(len(who)), hit]
+            if not found.any():
+                continue
+            chosen = tri[hit[found]]
+            rows = who[found]
+            out[rows] = (
+                self.az[chosen]
+                + u[found, hit[found]] * self.bz[chosen]
+                + v[found, hit[found]] * self.cz[chosen]
+            )
+
+        missing = ~np.isfinite(out)
+        if missing.any() and self.fallback is not None:
+            out[missing] = np.asarray(
+                self.fallback(x[missing], y[missing]), dtype=np.float64
+            )
+        return out
+
+
 __all__ = [
+    "MeshSampler",
     "TerrainMesh",
     "build_rtin",
     "is_grid_size",

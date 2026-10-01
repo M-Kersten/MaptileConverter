@@ -530,7 +530,7 @@ def build_rails(
 
     build_track_geometry(
         result,
-        terrain.sample,
+        terrain.surface,
         step_m=float(rails_cfg.get("step_m", DEFAULT_STEP_M)),
         deck_sampler=deck_sampler,
     )

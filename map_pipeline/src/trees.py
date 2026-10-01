@@ -666,7 +666,7 @@ def build_trees(
             float(trees_cfg["crown_search_m"]),
         )
         ground = np.asarray(
-            terrain.sample(coords[:, 0], coords[:, 1]), dtype=np.float64
+            terrain.surface(coords[:, 0], coords[:, 1]), dtype=np.float64
         )
         for index, (x, y) in enumerate(coords):
             raw = canopy[index]
@@ -702,7 +702,7 @@ def build_trees(
         )
         if len(found):
             ground = np.asarray(
-                terrain.sample(found[:, 0], found[:, 1]), dtype=np.float64
+                terrain.surface(found[:, 0], found[:, 1]), dtype=np.float64
             )
             for index, (x, y) in enumerate(found):
                 add(x, y, heights[index], ground[index], True, True)

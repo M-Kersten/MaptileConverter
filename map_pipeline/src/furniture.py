@@ -170,7 +170,7 @@ def build_furniture(
     result.xy = np.asarray(points, dtype=np.float64)
     result.kind = np.asarray(kinds, dtype=np.int32)
     result.ground_z_nap = np.asarray(
-        terrain.sample(result.xy[:, 0], result.xy[:, 1]), dtype=np.float64
+        terrain.surface(result.xy[:, 0], result.xy[:, 1]), dtype=np.float64
     )
     result.counts = {
         KIND_NAMES[k]: int((result.kind == k).sum()) for k in KIND_NAMES

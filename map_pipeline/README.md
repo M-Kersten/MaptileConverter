@@ -677,9 +677,66 @@ grid buries nothing and needs no clearance, and the worst single triangle is not
 a statistic to apply to every road in a model. Taking the maximum pinned the
 lift to its 0.2 m cap over 4 km² and left every carriageway floating 22 cm.
 
-This is a mitigation, not a cure. The real fix is to drape roads, rails and
-water on the terrain mesh itself rather than on the grid, so the two agree by
-construction and the lift can go back to 6 cm.
+**And draping them on the mesh does not fix it.** That was the obvious next
+move — put the roads on the surface that is actually drawn, and the lift goes
+back to 6 cm — so it was built and measured, and it does not work. Over a
+kilometre of road on a 127k-triangle mesh the terrain poked up through the
+carriageway by 25.5 cm draped on the mesh, against 25.4 cm draped on the grid.
+No difference, and 4.5 s a square kilometre to find out.
+
+The reason is in `drape_to_terrain`: a road triangle is split while the error
+*at its centroid* is over tolerance, and a mesh can bulge in the middle of a
+road triangle whose centroid sits exactly on it. Which surface was sampled
+never enters into it. The residual is the drape tolerance, not the grid, and
+the lift is the only thing that clears it.
+
+There is a second reason to leave roads on the grid, and it is the stronger
+one: the lift is sized from how far the mesh rises above *the grid*. That
+number describes the road's clearance only while the road is on the grid.
+Draping on the mesh would leave the lift sized by a statistic about something
+else. So `src/surfaces.py` passes `terrain.sample` on purpose, with the
+measurement written next to it and a test holding it there.
+
+### Two surfaces, and which one a thing lands on
+
+With breaklines on, the terrain carries a height grid *and* a constrained mesh,
+and they are not the same surface. Along every breakline they agree to the
+millimetre — a kerb is an edge of the mesh, so the mesh passes through the
+grid's own value there. Inside a triangle the mesh is a plane where the grid
+curves. `TerrainResult` therefore offers both:
+
+| | Reads | Used by |
+|---|---|---|
+| `terrain.sample` | the height grid | road and water drape, and every check |
+| `terrain.surface` | the mesh, where there is one | trees, street furniture, barriers, rails |
+
+The split is not stylistic. It follows from whether a thing is **placed** or
+**draped**:
+
+* **Placed** — a tree, a lamppost, a bollard, a fence post, a sleeper. One
+  point, one height, no tolerance loop and no lift to absorb a mistake, so
+  whichever surface was sampled *is* the error. Measured over 40,000 points on
+  a kilometre of lumpy ground, placing on the grid instead of the mesh is out
+  by a median of 0.9 cm and a maximum of 9.6 cm, with 2.8% out by more than
+  5 cm. Those are the posts that hang in the air or sink to the knee.
+* **Draped** — a road, a water surface. Split until flat triangles follow the
+  ground within tolerance, then lifted clear of it. The tolerance dominates,
+  and the measurement above says the mesh buys nothing. The grid it is lifted
+  off is the grid it is draped on.
+
+The checks in `src/validate.py` keep the grid for a different reason: they
+measure how far the mesh strays from the ground it was simplified from. Against
+the mesh itself that error is zero by construction, so a check that drapes on
+the mesh is a check that cannot fail. A test asserts the string never appears
+there.
+
+`TerrainResult.surface` builds the sampler from the mesh the result already
+carries, on first use, rather than taking one handed in beside it. That is
+deliberate: there is then no assignment between having a mesh and draping on
+it, so the two cannot drift apart. Point location is a uniform grid of triangle
+bounding boxes, sized to the median triangle — about 7 triangles a cell on a
+real km², 0.07 s to index 25k triangles and 0.6 s for 40,000 queries. No
+quadtree, and no scipy.
 
 ## Adaptive terrain mesh (no breaklines)
 

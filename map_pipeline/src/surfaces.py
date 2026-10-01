@@ -477,6 +477,20 @@ def build_surfaces(
             result.road_tri_level,
         ) = triangulate_roads(
             result.roads,
+            # The grid, and deliberately not the mesh that everything else laid
+            # on the ground uses. A road is not placed at a height, it is
+            # draped: `drape_to_terrain` splits it until a flat triangle is
+            # within tolerance of the ground beneath, and that residual is what
+            # the lift above has to clear.
+            #
+            # Measured over a km of road on a 127k-triangle mesh, draping on the
+            # mesh instead left the terrain poking through by 25.5 cm against
+            # 25.4 cm -- no difference, because the test is the error at the
+            # centroid and the mesh can bulge inside a road triangle whichever
+            # surface was sampled. It cost 4.5 s a square kilometre to learn
+            # that. Worse, the lift is sized from how far the mesh rises above
+            # *the grid*, which is a statistic about the road only while the
+            # road is on the grid.
             terrain.sample,
             lift_m=result.road_lift_m,
             tolerance_m=float(surfaces_cfg.get("road_drape_tolerance_m", 0.08)),

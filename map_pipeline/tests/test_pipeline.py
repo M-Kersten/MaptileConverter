@@ -4871,6 +4871,330 @@ class TestRoadTopology(unittest.TestCase):
         self.assertEqual(DEFAULTS["surfaces"]["road_snap_m"], 0.05)
 
 
+def _height_by_brute_force(vertices, triangles, query):
+    """The height of a triangulation at each query point, found the slow way.
+
+    Every triangle tested against every point, no spatial index, no shared code
+    with the sampler under test. It is the reference that makes "the sampler
+    picked a triangle the point is not inside" a visible failure rather than a
+    plausible-looking height.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    out = np.full(len(query), np.nan)
+    for row, (px, py) in enumerate(np.asarray(query, dtype=np.float64)):
+        for tri in triangles:
+            a, b, c = vertices[tri[0]], vertices[tri[1]], vertices[tri[2]]
+            v0, v1 = b[:2] - a[:2], c[:2] - a[:2]
+            cross = v0[0] * v1[1] - v0[1] * v1[0]
+            if abs(cross) <= 1e-12:
+                continue
+            dx, dy = px - a[0], py - a[1]
+            u = (dx * v1[1] - dy * v1[0]) / cross
+            v = (dy * v0[0] - dx * v0[1]) / cross
+            if u >= -1e-9 and v >= -1e-9 and u + v <= 1 + 1e-9:
+                out[row] = a[2] + u * (b[2] - a[2]) + v * (c[2] - a[2])
+                break
+    return out
+
+
+class TestMeshDrape(unittest.TestCase):
+    """What a thing is laid on has to be what the model draws.
+
+    The terrain is a constrained mesh. Along a breakline it and the height grid
+    agree to the millimetre -- a kerb is an edge of the mesh, so the mesh passes
+    through the grid's own value there -- but inside a triangle the mesh is a
+    plane where the grid curves. Everything not on a breakline lands in the
+    middle of one: every refinement vertex a road picked up, every fence post,
+    every tree. At walking height nobody notices ten centimetres. Hovering a
+    drone over a kerb, it is the difference between resting on the ground and
+    hanging above it.
+    """
+
+    @staticmethod
+    def _mesh(fn, n=18, span=100.0):
+        """A coarse triangulation of `fn`, so it differs from a fine grid."""
+        from src.cdt import triangulate
+
+        grid = np.linspace(0.0, span, n)
+        xx, yy = np.meshgrid(grid, grid)
+        points = np.column_stack([xx.ravel(), yy.ravel()])
+        result = triangulate(
+            points, np.zeros((0, 2), dtype=np.int64),
+            origin=(span / 2, span / 2), skip_crossing=True,
+        )
+        world = result.world_points()
+        vertices = np.column_stack([world, fn(world[:, 0], world[:, 1])])
+        return vertices, result.triangles
+
+    def test_it_lands_on_the_mesh_plane_not_near_it(self):
+        from src.terrain_mesh import MeshSampler
+
+        plane = lambda x, y: 2.0 * x - 3.0 * y + 5.0
+        vertices, triangles = self._mesh(plane)
+        sampler = MeshSampler(vertices, triangles)
+
+        rng = np.random.default_rng(4)
+        q = rng.uniform(5.0, 95.0, (400, 2))
+        got = sampler(q[:, 0], q[:, 1])
+        self.assertTrue(np.isfinite(got).all(), "points inside the mesh were lost")
+        self.assertLess(
+            float(np.abs(got - plane(q[:, 0], q[:, 1])).max()), 1e-9,
+            "a plane is the one surface a triangulation reproduces exactly",
+        )
+
+    def test_it_differs_from_the_grid_where_the_mesh_does(self):
+        """The whole point. On a curved surface a coarse mesh is not the grid,
+        and a thing laid on the grid hangs above or sinks into what is drawn."""
+        from src.elevation import _bilinear_on_grid
+        from src.terrain_mesh import MeshSampler
+
+        bumpy = lambda x, y: 3.0 * np.sin(np.asarray(x) / 9.0) * np.cos(
+            np.asarray(y) / 11.0
+        )
+        vertices, triangles = self._mesh(bumpy)
+        sampler = MeshSampler(vertices, triangles)
+
+        fine = np.linspace(0.0, 100.0, 201)
+        grid = bumpy(*np.meshgrid(fine, fine))
+
+        rng = np.random.default_rng(9)
+        q = rng.uniform(5.0, 95.0, (500, 2))
+        on_mesh = sampler(q[:, 0], q[:, 1])
+        on_grid = _bilinear_on_grid(grid, fine, fine, q[:, 0], q[:, 1])
+
+        self.assertGreater(
+            float(np.abs(on_mesh - on_grid).max()), 0.05,
+            "the fixture's mesh is too fine to differ from its grid",
+        )
+
+    def test_outside_the_mesh_falls_back(self):
+        """A bbox corner can fall outside the triangulated hull, and a tree
+        there has to stand somewhere rather than at NaN."""
+        from src.terrain_mesh import MeshSampler
+
+        vertices, triangles = self._mesh(lambda x, y: np.zeros(len(np.atleast_1d(x))))
+        sampler = MeshSampler(
+            vertices, triangles,
+            fallback=lambda x, y: np.full(len(np.atleast_1d(x)), -7.0),
+        )
+        self.assertAlmostEqual(float(sampler(500.0, 500.0)[0]), -7.0)
+        self.assertAlmostEqual(float(sampler(50.0, 50.0)[0]), 0.0)
+
+    def test_it_locates_the_triangle_a_point_is_actually_in(self):
+        """A cell holds every triangle whose bounding box touches it, most of
+        which the point is outside. Taking the nearest candidate rather than
+        the containing one is a mistake a plane cannot show -- every triangle
+        of a plane agrees -- so the fixture has to be a surface that folds."""
+        from src.terrain_mesh import MeshSampler
+
+        folded = lambda x, y: (
+            np.abs(np.asarray(x) % 23.0 - 11.5) * 1.7
+            - np.abs(np.asarray(y) % 17.0 - 8.5) * 1.3
+        )
+        vertices, triangles = self._mesh(folded, n=14)
+        sampler = MeshSampler(vertices, triangles)
+
+        rng = np.random.default_rng(17)
+        q = rng.uniform(2.0, 98.0, (300, 2))
+        got = sampler(q[:, 0], q[:, 1])
+
+        # Brute force: the containing triangle, found by testing all of them.
+        want = _height_by_brute_force(vertices, triangles, q)
+        self.assertTrue(np.isfinite(want).all(), "the fixture lost points")
+        worst = float(np.abs(got - want).max())
+        self.assertLess(
+            worst, 1e-9,
+            f"the sampler picked the wrong triangle; off by {worst:.3f} m",
+        )
+
+    def test_a_terrain_with_a_mesh_drapes_on_it_without_being_told_to(self):
+        """The grid and the mesh are two different surfaces, and a terrain that
+        carries a mesh has to hand out the mesh's heights -- with no assignment
+        in between for a caller to forget."""
+        from src.elevation import TerrainResult
+        from src.geo import BBox
+        from src.terrain_mesh import ConstrainedMesh
+
+        bumpy = lambda x, y: 3.0 * np.sin(np.asarray(x) / 9.0) * np.cos(
+            np.asarray(y) / 11.0
+        )
+        vertices, triangles = self._mesh(bumpy)
+        fine = np.linspace(0.0, 100.0, 201)
+
+        terrain = TerrainResult(
+            heights=bumpy(*np.meshgrid(fine, fine)).astype(np.float32),
+            xs=fine, ys=fine, bbox=BBox(0.0, 0.0, 100.0, 100.0),
+            center_z_nap=0.0, nodata_fraction_raw=0.0, filled_fraction=0.0,
+            geotiff_path=None, coverage_id="test", resolution_m=0.5,
+            constrained=ConstrainedMesh(
+                vertices=vertices, triangles=triangles, breakline_edges=0,
+                height_points=len(vertices), tolerance_m=0.1, max_error_m=0.1,
+                counts={},
+            ),
+        )
+
+        rng = np.random.default_rng(23)
+        q = rng.uniform(5.0, 95.0, (400, 2))
+        on_mesh = terrain.surface(q[:, 0], q[:, 1])
+        on_grid = terrain.sample(q[:, 0], q[:, 1])
+
+        want = _height_by_brute_force(vertices, triangles, q)
+        self.assertLess(
+            float(np.abs(on_mesh - want).max()), 1e-6,
+            "surface() did not read off the mesh the terrain carries",
+        )
+        self.assertGreater(
+            float(np.abs(on_mesh - on_grid).max()), 0.05,
+            "the fixture's two surfaces are too alike to tell apart",
+        )
+
+    def test_a_terrain_without_a_mesh_still_answers(self):
+        """Not every run has breaklines, and the grid is the surface then."""
+        from src.elevation import TerrainResult
+        from src.geo import BBox
+
+        fine = np.linspace(0.0, 100.0, 51)
+        heights = np.full((51, 51), 4.0, dtype=np.float32)
+        terrain = TerrainResult(
+            heights=heights, xs=fine, ys=fine,
+            bbox=BBox(0.0, 0.0, 100.0, 100.0), center_z_nap=4.0,
+            nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
+            coverage_id="test", resolution_m=0.5,
+        )
+        self.assertAlmostEqual(float(np.ravel(terrain.surface(50.0, 50.0))[0]), 4.0)
+
+    def test_a_real_run_comes_back_carrying_its_mesh(self):
+        """`build_terrain` is the only thing that ever constructs a terrain, so
+        a mesh it builds and then drops is a mesh nothing drapes on -- and the
+        grid it falls back to looks perfectly reasonable, which is what makes
+        that worth a test rather than a glance. Only the two IO boundaries are
+        stubbed; the grid, the hole filling and the triangulation are real."""
+        import tempfile
+        import unittest.mock as mock
+
+        from src import elevation
+        from src.geo import BBox
+
+        bbox = BBox(0.0, 0.0, 200.0, 200.0)
+        # A raster with a dike across it, so the mesh has something to fold on
+        # and is not just a plane the grid happens to reproduce.
+        res = 0.5
+        edge = bbox.buffered(8.0)
+        nx = int(round((edge.xmax - edge.xmin) / res))
+        ny = int(round((edge.ymax - edge.ymin) / res))
+        rx = edge.xmin + (np.arange(nx) + 0.5) * res
+        ry = edge.ymax - (np.arange(ny) + 0.5) * res
+        gx, gy = np.meshgrid(rx, ry)
+        raw = 2.0 + 1.5 * np.exp(-((gx - 100.0) ** 2) / 200.0) + 0.004 * gy
+
+        class FakeDataset:
+            def __init__(self):
+                self.bounds = type(
+                    "B", (), {"left": edge.xmin, "bottom": edge.ymin,
+                              "right": edge.xmax, "top": edge.ymax},
+                )()
+                self.crs = None
+                self.res = (res, res)
+
+            def read(self, _band):
+                return raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        cfg = {
+            "mesh_vertices_per_side": 65, "resolution_m": res,
+            "ahn_model": "DTM", "wcs_url": "https://example.invalid/wcs",
+            "timeout_s": 1.0, "max_retries": 1, "max_nodata_fraction": 0.5,
+            "smooth_iterations": 0, "simplify_tolerance_m": 0.1,
+        }
+        ring = np.array(
+            [[60.0, 20.0], [140.0, 20.0], [140.0, 180.0], [60.0, 180.0],
+             [60.0, 20.0]]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(elevation, "fetch_dtm_geotiff"), \
+                mock.patch("rasterio.open", return_value=FakeDataset()):
+            terrain = elevation.build_terrain(
+                bbox, Path(tmp), terrain_cfg=cfg,
+                breakline_rings={"road": [ring]},
+            )
+
+        self.assertIsNotNone(
+            terrain.constrained,
+            "build_terrain triangulated the ground and threw the mesh away",
+        )
+        rng = np.random.default_rng(31)
+        q = rng.uniform(10.0, 190.0, (300, 2))
+        on_mesh = terrain.surface(q[:, 0], q[:, 1])
+        on_grid = terrain.sample(q[:, 0], q[:, 1])
+        self.assertTrue(np.isfinite(on_mesh).all())
+        want = _height_by_brute_force(
+            terrain.constrained.vertices, terrain.constrained.triangles, q
+        )
+        inside = np.isfinite(want)
+        self.assertGreater(inside.sum(), 200, "the fixture's hull lost points")
+        self.assertLess(
+            float(np.abs(on_mesh[inside] - want[inside]).max()), 1e-6,
+            "a terrain from a real run does not drape on its own mesh",
+        )
+        self.assertGreater(
+            float(np.abs(on_mesh - on_grid).max()), 0.01,
+            "this bbox's mesh and grid are too alike to tell apart",
+        )
+
+    def test_the_grid_stays_reachable_for_the_checks(self):
+        """The checks measure how far the mesh strays from the ground it was
+        simplified from. Against the mesh itself that error is zero by
+        construction, so they have to keep asking the grid."""
+        text = (REPO_ROOT / "src" / "validate.py").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "terrain.surface", text,
+            "a check that drapes on the mesh is a check that cannot fail",
+        )
+
+    def test_everything_placed_on_the_ground_uses_it(self):
+        """A sampler nothing calls is a sampler that fixes nothing.
+
+        Everything here puts an object at a height: a tree, a post, a fence
+        rail, a sleeper. There is no tolerance loop and no lift to absorb the
+        difference, so whichever surface was sampled is the error, and placing
+        on the grid leaves 2.8% of them out by over 5 cm (max 9.6 cm measured
+        on a km of lumpy ground).
+        """
+        for module, count in (
+            ("barriers", 3), ("furniture", 1), ("rails", 1), ("trees", 2),
+        ):
+            text = (REPO_ROOT / "src" / f"{module}.py").read_text(encoding="utf-8")
+            self.assertGreaterEqual(
+                text.count("terrain.surface"), count,
+                f"src/{module}.py places objects on the grid, not on the mesh",
+            )
+
+    def test_roads_stay_on_the_grid_they_are_lifted_off(self):
+        """The one deliberate exception, and it needs saying so nobody tidies
+        it into line with the rest.
+
+        A road is draped, not placed: it is split until a flat triangle is
+        within tolerance of the ground, and the lift clears what is left.
+        Measured, draping on the mesh moved the terrain's poke-through from
+        25.4 cm to 25.5 cm -- nothing -- because the split tests the centroid
+        and the mesh bulges inside a triangle either way. And the lift is sized
+        from how far the mesh rises above the *grid*, which only describes the
+        road while the road is on the grid.
+        """
+        text = (REPO_ROOT / "src" / "surfaces.py").read_text(encoding="utf-8")
+        self.assertIn("terrain.sample", text)
+        self.assertNotIn(
+            "terrain.surface", text,
+            "roads drape on the grid on purpose; see the comment there",
+        )
+
+
 class TestPathsOverWater(unittest.TestCase):
     """Lidar does not reflect off water, so the bare-earth grid has a hole over
     every body and the filler interpolates across it. The result dips: measured
