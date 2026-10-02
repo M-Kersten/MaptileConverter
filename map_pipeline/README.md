@@ -283,7 +283,8 @@ Other knobs worth knowing:
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `facade.variants` | `1` | How many era styles to assign by construction year, up to `5`. The monumental and industrial styles are always present on top of these. |
+| `facade.variants` | `5` | How many era styles to assign by construction year, up to `5`. The monumental and industrial styles are always present on top of these. |
+| `facade.looks_per_era` | `3` | Looks within one era, so neighbours of the same age are not the same texture. Each costs one texture and one material slot; `1` makes a terrace repeat. Clamped to 12. |
 | `facade.ground_floor` | `true` | Split walls at the first-floor line and give the ground storey its own material. Churches and sheds are left whole. |
 | `facade.ground_floor_height_m` | `3.6` | Where that cut sits above each building's own ground level. |
 | `facade.photo_textures` | `true` | Photographed CC0 masonry under the generated windows, downloaded once and cached in `work/_textures/`. |
@@ -1369,6 +1370,50 @@ better than height does. A 1890s canal house and a 1970s office block can be the
 same height and look nothing alike. Five styles run from pre-1920 brick with
 tall narrow windows, through interbellum brick, post-war plaster, and 1975-2000
 panel, to contemporary glass. Height is only the fallback when a year is missing.
+
+**And the era is not the whole story, because it was also the whole texture.**
+Era deciding the character of a wall is right. Era deciding its *pixels* meant
+every building of an age was the same building: a terrace of twelve 1890s
+houses came out identical along its whole length, which is exactly what reads
+as generated however good one house looks.
+
+So each era now has `facade.looks_per_era` looks, three by default. A look
+varies the wall colour, the trim colour, the window count across, the window
+proportions and the bay width. Measured, two looks of one era differ by 19–52
+mean absolute levels where two completely *different* eras differ by 50 — these
+are different buildings, not tints. Five eras at three looks is 17 wall
+textures, which took 2.0 s and 1.4 MB to generate.
+
+A building picks its look from **its own BAG identifier**, not from a counter,
+so it keeps the same wall when the area is rebuilt, re-tiled, or fetched in a
+different order — the same reasoning as the trees taking their shape from their
+position. The hash is FNV-1a over the identifier rather than `hash()`, which is
+salted per process and would hand the same building a different wall on every
+run while the textures it indexes stayed put.
+
+Three details worth knowing:
+
+* **The colours are hand-picked per era, not jittered.** Dutch brick runs red
+  to purple-brown to yellow IJsselsteen, which is a range with gaps in it, and
+  a random walk through RGB lands in the gaps.
+* **The geometry table has three entries against four wall colours.** Four
+  would turn over in step with them, and look 4 would come out as look 0
+  wearing a different window frame. Three against four gives twelve distinct
+  combinations, which is `MAX_LOOKS_PER_ERA`; asking for more is clamped.
+* **A look borrows its era's photograph.** The photographed wall surface below
+  is keyed by style, and a look is a new style name, so `historic_1` found no
+  photograph and fell back to drawn brick — one house in three with real grain
+  and its neighbours without. `FacadeStyle.family` resolves a look back to its
+  era, and only the tint differs.
+
+Slots are laid out `era * looks + look`, with the two archetype specials after
+all of them, so an extra look does not move an era and an extra era does not
+move the specials. Materials are named after their texture —
+`M_facade_04_historic_1` — because with seventeen of them a designer
+reassigning one has to be able to tell them apart in a list.
+
+`facade.looks_per_era: 1` gives exactly what this gave before any of it
+existed, down to the texture filenames.
 
 **Two kinds of building are not a stack of storeys, and get their own
 composition.** A church has one tall volume with arched openings; dividing its

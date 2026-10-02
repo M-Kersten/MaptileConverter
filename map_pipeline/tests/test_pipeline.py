@@ -12,6 +12,7 @@ Run only the offline tests:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import tempfile
@@ -1188,6 +1189,444 @@ class TestServiceFailures(unittest.TestCase):
         self.assertEqual(len(down), 1)
         self.assertIn("api.3dbag.nl", down[0])
         self.assertIn("buildings (3DBAG)", down[0])
+
+
+class TestFacadeLooks(unittest.TestCase):
+    """A street is not one house drawn twelve times, and it was.
+
+    Era decides the character of a facade and that part was right -- build year
+    predicts a wall far better than height does. But era also decided the
+    pixels, so every building of an age shared one texture and a terrace came
+    out identical along its whole length. Each era now has several looks, and a
+    building picks one from its own BAG identifier.
+    """
+
+    @staticmethod
+    def _distinct(styles):
+        """How many of these differ in something other than their name."""
+        import dataclasses
+
+        seen = set()
+        for style in styles:
+            fields = dataclasses.asdict(style)
+            fields.pop("name")
+            fields.pop("base_name")
+            seen.add(tuple(sorted((k, str(v)) for k, v in fields.items())))
+        return len(seen)
+
+    def test_one_look_is_the_era_untouched(self):
+        """`looks_per_era: 1` has to give exactly what it gave before any of
+        this existed, or every area built so far changes under its owner."""
+        from src.facade import STYLES, looks_for_style
+
+        for style in STYLES:
+            looks = looks_for_style(style, 1)
+            self.assertEqual(len(looks), 1)
+            self.assertIs(looks[0], style)
+
+    def test_look_zero_is_always_the_era_itself(self):
+        from src.facade import STYLES, looks_for_style
+
+        for style in STYLES:
+            self.assertIs(looks_for_style(style, 5)[0], style)
+
+    def test_the_looks_of_one_era_differ(self):
+        """Not just in name: a texture is generated per look, so two looks
+        that agree on every field are two copies of one image."""
+        from src.facade import STYLES, looks_for_style
+
+        for style in STYLES:
+            looks = looks_for_style(style, 3)
+            self.assertEqual(
+                self._distinct(looks), 3,
+                f"the three {style.name} looks are not three looks",
+            )
+
+    def test_every_field_meant_to_vary_actually_varies(self):
+        """Recolouring alone does not break up a terrace: the window rhythm is
+        what the eye reads as "the same house again". Each field is checked on
+        its own, because a tuple of three only has to differ in one of them --
+        freezing any two of these passed a combined check.
+        """
+        from src.facade import STYLES, looks_for_style
+
+        for field in ("wall_rgb", "trim_rgb", "windows_across",
+                      "window_width_frac", "window_height_frac", "sill_frac",
+                      "tile_width_m"):
+            for style in STYLES:
+                looks = looks_for_style(style, 4)
+                seen = {
+                    getattr(s, field) if not isinstance(getattr(s, field), float)
+                    else round(getattr(s, field), 6)
+                    for s in looks
+                }
+                self.assertGreater(
+                    len(seen), 1,
+                    f"all four {style.name} looks share one {field}: {seen}",
+                )
+
+    def test_a_look_is_not_one_change_away_from_its_neighbour(self):
+        """Three cycles of different lengths -- walls 4, trims 2 or 3,
+        geometry 3 -- so consecutive looks differ in more than one thing."""
+        from src.facade import STYLES, looks_for_style
+
+        for style in STYLES:
+            looks = looks_for_style(style, 4)
+            for a, b in zip(looks, looks[1:]):
+                changed = sum((
+                    a.wall_rgb != b.wall_rgb,
+                    a.trim_rgb != b.trim_rgb,
+                    (a.windows_across, a.tile_width_m)
+                    != (b.windows_across, b.tile_width_m),
+                ))
+                self.assertGreaterEqual(
+                    changed, 2,
+                    f"{a.name} and {b.name} differ in only {changed} of "
+                    f"wall, trim and layout",
+                )
+
+    def test_nothing_repeats_before_the_palette_runs_out(self):
+        """Four wall colours against a three-entry geometry table gives
+        twelve. A four-entry table would turn over in step with the colours
+        and look 4 would be look 0 in a different window frame."""
+        from src.facade import MAX_LOOKS_PER_ERA, STYLES, looks_for_style
+
+        self.assertEqual(MAX_LOOKS_PER_ERA, 12)
+        for style in STYLES:
+            looks = looks_for_style(style, MAX_LOOKS_PER_ERA)
+            self.assertEqual(
+                self._distinct(looks), MAX_LOOKS_PER_ERA,
+                f"{style.name} runs out of looks before {MAX_LOOKS_PER_ERA}",
+            )
+
+    def test_every_era_carries_enough_colours_to_fill_them(self):
+        from src.facade import STYLES
+
+        for style in STYLES:
+            self.assertGreaterEqual(
+                len(style.wall_alternates), 3,
+                f"{style.name} has no alternative wall colours",
+            )
+            self.assertGreaterEqual(
+                len(style.trim_alternates), 1,
+                f"{style.name} has no alternative trim colours",
+            )
+
+    def test_the_slot_layout_holds(self):
+        """Blender addresses a style by index, so the layout is a contract:
+        era * looks + look, then the two specials. An extra look must not move
+        an era, and an extra era must not move the specials."""
+        from src.facade import style_for_archetype, wall_styles
+
+        ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
+        for variants in (1, 3, 5):
+            for looks in (1, 2, 4):
+                styles = wall_styles(variants, looks)
+                self.assertEqual(len(styles), variants * looks + 2)
+                monumental = style_for_archetype(
+                    ARCH_MONUMENTAL, variants, looks
+                )
+                industrial = style_for_archetype(
+                    ARCH_INDUSTRIAL, variants, looks
+                )
+                self.assertEqual(styles[monumental].name, "monumental")
+                self.assertEqual(styles[industrial].name, "industrial")
+                self.assertIsNone(style_for_archetype(0, variants, looks))
+
+    def test_the_old_two_argument_calls_still_work(self):
+        """Both functions are called with one argument elsewhere, and a
+        default of one look is what keeps that meaning the same thing."""
+        from src.facade import style_for_archetype, wall_styles
+
+        self.assertEqual(len(wall_styles(5)), 7)
+        self.assertEqual(style_for_archetype(5, 5), 5)
+        self.assertEqual(style_for_archetype(4, 5), 6)
+
+    def test_a_building_keeps_its_look(self):
+        """From the identifier, not a counter, so re-running an area or
+        fetching it in another order does not reshuffle the street."""
+        from src.facade import look_for_building
+
+        identifier = "NL.IMBAG.Pand.0362100012345678"
+        first = look_for_building(identifier, 3)
+        for _ in range(5):
+            self.assertEqual(look_for_building(identifier, 3), first)
+
+    def test_the_look_survives_a_fresh_process(self):
+        """`hash()` is salted per process, so a style index built with it
+        would differ between two runs of the same pipeline -- and the textures
+        are generated once and referred to by index."""
+        import subprocess
+
+        code = (
+            "import sys; sys.path.insert(0, '.');"
+            "from src.facade import look_for_building;"
+            "print([look_for_building(f'NL.IMBAG.Pand.{n}', 3) for n in range(12)])"
+        )
+        runs = {
+            subprocess.run(
+                [sys.executable, "-c", code], cwd=REPO_ROOT,
+                capture_output=True, text=True, check=True,
+                env={**os.environ, "PYTHONHASHSEED": seed},
+            ).stdout.strip()
+            for seed in ("0", "1", "random")
+        }
+        self.assertEqual(
+            len(runs), 1, f"the look depends on the hash seed: {runs}"
+        )
+
+    def test_a_terrace_does_not_all_get_the_same_look(self):
+        """The whole point. Twelve neighbours of one era, twelve identifiers
+        a digit apart."""
+        from src.facade import look_for_building
+
+        ids = [f"NL.IMBAG.Pand.03621000{n:06d}" for n in range(12)]
+        looks = [look_for_building(i, 3) for i in ids]
+        self.assertGreater(
+            len(set(looks)), 1, f"a whole terrace took one look: {looks}"
+        )
+
+    def test_the_looks_are_used_about_evenly(self):
+        """A hash that piles 90% of buildings onto one look has broken up
+        nothing. Not a uniformity proof -- just a check that it is not
+        lopsided."""
+        from src.facade import look_for_building
+
+        for n_looks in (2, 3, 5):
+            counts = [0] * n_looks
+            for n in range(3000):
+                counts[look_for_building(f"NL.IMBAG.Pand.{n}", n_looks)] += 1
+            share = min(counts) / 3000.0
+            self.assertGreater(
+                share, 0.5 / n_looks,
+                f"with {n_looks} looks the rarest got {share:.1%}: {counts}",
+            )
+
+    def test_one_look_means_slot_zero(self):
+        from src.facade import look_for_building
+
+        for identifier in ("NL.IMBAG.Pand.1", "NL.IMBAG.Pand.2", None, ""):
+            self.assertEqual(look_for_building(identifier, 1), 0)
+
+    def test_a_building_with_no_identifier_still_gets_one(self):
+        """3DBAG supplies an identifier for everything in practice, but a
+        missing one must not put every nameless building on look 0."""
+        from src.facade import look_for_building
+
+        self.assertEqual(look_for_building(None, 3, fallback=4), 1)
+        self.assertEqual(look_for_building("", 3, fallback=5), 2)
+
+    def test_every_look_resolves_to_its_era_photograph(self):
+        """The photographed wall surface is keyed by style, and a look is a
+        new style name. Before `family` existed, `historic_1` found no
+        photograph and fell back to drawn brick -- so one house in three had
+        real grain and its neighbours did not."""
+        from src.facade import GROUND_STYLES, wall_styles
+        from src.textures import WALL_TEXTURES
+
+        for style in list(wall_styles(5, 4)) + list(GROUND_STYLES):
+            self.assertIn(
+                style.family, WALL_TEXTURES,
+                f"{style.name} resolves to {style.family!r}, which has no "
+                f"photographed wall",
+            )
+
+    def test_the_texture_loader_resolves_a_look_to_its_era(self):
+        """The map having the right keys is not the same as `wall_base` using
+        them. It asks by style, and a look is a new style name -- checking the
+        map alone left that unexercised."""
+        import tempfile
+
+        from src.facade import STYLES, looks_for_style
+        from src.textures import WALL_TEXTURES, TextureUnavailable, wall_base
+
+        reached = []
+
+        def fake_fetch(slug, work_dir, *, timeout_s=60.0):
+            reached.append(slug)
+            raise TextureUnavailable("stopped before the network")
+
+        import src.textures as textures_module
+
+        real = textures_module.fetch_texture
+        textures_module.fetch_texture = fake_fetch
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                for look in looks_for_style(STYLES[0], 4):
+                    reached.clear()
+                    with self.assertRaises(TextureUnavailable):
+                        wall_base(
+                            look, 64, Path(tmp),
+                            tile_width_m=look.tile_width_m, tile_height_m=3.0,
+                        )
+                    # It got as far as asking for the era's photograph, rather
+                    # than giving up because "historic_1" is not in the map.
+                    self.assertEqual(
+                        reached, [WALL_TEXTURES["historic"]],
+                        f"{look.name} asked for {reached} instead of its "
+                        f"era's brick",
+                    )
+        finally:
+            textures_module.fetch_texture = real
+
+    def test_a_look_borrows_its_era_brick(self):
+        from src.facade import STYLES, looks_for_style
+
+        for style in STYLES:
+            for look in looks_for_style(style, 4)[1:]:
+                self.assertEqual(look.family, style.name)
+                self.assertNotEqual(look.name, style.name)
+        # An era is its own family, so nothing else has to special-case it.
+        for style in STYLES:
+            self.assertEqual(style.family, style.name)
+
+    def test_the_textures_really_are_different_images(self):
+        """Different parameters are not different pixels. Measured: looks of
+        one era differ by 19-52 mean absolute levels, where two completely
+        different eras differ by 50."""
+        import tempfile
+
+        from PIL import Image
+
+        from src.config import DEFAULTS
+        from src.facade import generate_facade_textures
+
+        cfg = dict(
+            DEFAULTS["facade"], texture_px=128, looks_per_era=3,
+            photo_textures=False, normal_map=False,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = generate_facade_textures(Path(tmp), facade_cfg=cfg)
+            images = {
+                colour.stem: np.asarray(Image.open(colour), dtype=np.float64)
+                for colour, _ in paths
+            }
+            for era in ("historic", "postwar", "contemporary"):
+                names = sorted(k for k in images if era in k)
+                self.assertEqual(len(names), 3, f"{era} did not get 3 looks")
+                base = next(k for k in names if k.endswith(era))
+                for other in names:
+                    if other == base:
+                        continue
+                    gap = float(np.abs(images[base] - images[other]).mean())
+                    self.assertGreater(
+                        gap, 8.0,
+                        f"{other} is the same image as {base} (gap {gap:.1f})",
+                    )
+
+    def test_each_texture_gets_its_own_noise(self):
+        """Two looks differ in colour and layout, but the grain is noise and
+        with one seed they would share it, so a street would repeat a brick
+        pattern it never repeats in life. The seed advances per slot."""
+        from src.facade import STYLES, render_facade_layers
+
+        first, _ = render_facade_layers(STYLES[0], 96, seed=100)
+        second, _ = render_facade_layers(STYLES[0], 96, seed=101)
+        gap = float(np.abs(first.astype(float) - second.astype(float)).mean())
+        self.assertGreater(
+            gap, 0.5, "the seed does not change the texture at all"
+        )
+
+        import inspect
+
+        from src import facade
+
+        source = inspect.getsource(facade.generate_facade_textures)
+        self.assertIn("seed=seed + index", source)
+
+    def test_the_texture_set_is_the_size_the_slots_expect(self):
+        """One texture per slot, in slot order, or a building wears the wrong
+        wall."""
+        import tempfile
+
+        from src.config import DEFAULTS
+        from src.facade import generate_facade_textures, wall_styles
+
+        for looks in (1, 3):
+            cfg = dict(
+                DEFAULTS["facade"], texture_px=64, looks_per_era=looks,
+                photo_textures=False, normal_map=False,
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = generate_facade_textures(Path(tmp), facade_cfg=cfg)
+            # The walls, plus one ground storey.
+            self.assertEqual(len(paths), len(wall_styles(5, looks)) + 1)
+
+    def test_buildings_spread_one_era_across_its_looks(self):
+        """`build_buildings` is where the slot is actually chosen, and a test
+        of `look_for_building` alone says nothing about whether it is used."""
+        from src.facade import (
+            look_for_building,
+            looks_per_era,
+            style_for_archetype,
+            style_for_building,
+        )
+
+        # The slot rule, as src/buildings.py applies it.
+        looks = looks_per_era({"looks_per_era": 3})
+        self.assertEqual(looks, 3)
+        slots = []
+        for n in range(12):
+            identifier = f"NL.IMBAG.Pand.03621000{n:06d}"
+            self.assertIsNone(style_for_archetype(0, 5, looks))
+            era = style_for_building(11.0, 1890, 5)
+            slots.append(era * looks + look_for_building(identifier, looks))
+        self.assertEqual(
+            {s // looks for s in slots}, {0},
+            "the terrace left the historic era",
+        )
+        self.assertGreater(len(set(slots)), 1, "one slot for the whole row")
+
+    def test_the_pipeline_chooses_the_slot_this_way(self):
+        import inspect
+
+        from src import buildings
+
+        source = inspect.getsource(buildings.build_buildings)
+        self.assertIn("era * looks + look_for_building(", source)
+        self.assertIn("looks_per_era(facade_cfg or {})", source)
+        self.assertIn("style_for_archetype(building.archetype, facade_variants, looks)",
+                      source)
+
+    def test_the_count_is_clamped_to_what_the_palettes_fill(self):
+        from src.facade import MAX_LOOKS_PER_ERA, looks_per_era
+
+        self.assertEqual(looks_per_era({}), 1, "the default here is one look")
+        self.assertEqual(looks_per_era({"looks_per_era": 3}), 3)
+        self.assertEqual(looks_per_era({"looks_per_era": 0}), 1)
+        self.assertEqual(looks_per_era({"looks_per_era": -4}), 1)
+        self.assertEqual(
+            looks_per_era({"looks_per_era": 99}), MAX_LOOKS_PER_ERA
+        )
+
+    def test_the_config_default_asks_for_more_than_one(self):
+        """Shipping the feature switched off would be shipping nothing."""
+        from src.config import DEFAULTS
+
+        self.assertGreater(DEFAULTS["facade"]["looks_per_era"], 1)
+
+    def test_the_config_rejects_nonsense_and_clamps_excess(self):
+        import tempfile
+
+        from src.facade import MAX_LOOKS_PER_ERA
+
+        def load(looks):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({
+                    "name": "t",
+                    "bbox": {"xmin": 136000, "ymin": 455000,
+                             "xmax": 137000, "ymax": 456000},
+                    "facade": {"looks_per_era": looks},
+                }))
+                return load_config(path)
+
+        self.assertEqual(load(4).facade["looks_per_era"], 4)
+        self.assertEqual(
+            load(500).facade["looks_per_era"], MAX_LOOKS_PER_ERA
+        )
+        with self.assertRaises(ValueError):
+            load(0)
 
 
 class TestFacade(unittest.TestCase):
@@ -6884,6 +7323,34 @@ class TestUIServer(unittest.TestCase):
         self.assertFalse(loaded.export["collision_tree_crowns"])
         self.assertEqual(loaded.barriers["collision_thickness_m"], 0.45)
 
+    def test_the_facade_variety_picker_reaches_the_config(self):
+        """Three looks is the default in the form and in the config, and the
+        form's choice has to win over the config's."""
+        payload = {
+            "name": "street",
+            "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+            "facade_variants": 5,
+            "facade_looks_per_era": 5,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(self.server.build_config(payload)))
+            loaded = load_config(path)
+        self.assertEqual(loaded.facade["looks_per_era"], 5)
+        self.assertEqual(loaded.facade["variants"], 5)
+
+    def test_one_look_still_reaches_the_config(self):
+        """Switching the variety off is the one choice a source-defaulting
+        `or` would silently overrule."""
+        config = self.server.build_config(
+            {
+                "name": "flat",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                "facade_looks_per_era": 1,
+            }
+        )
+        self.assertEqual(config["facade"]["looks_per_era"], 1)
+
     def test_collision_is_off_when_the_form_does_not_ask(self):
         config = self.server.build_config(
             {
@@ -7163,7 +7630,7 @@ class TestUIPage(unittest.TestCase):
         for control in ("q", "size", "name", "preset", "aerialCm", "terrainM",
                         "terrainTol", "facadePx", "facade", "clip",
                         "groundFloor", "normal", "photoTextures", "preview",
-                        "collision", "collisionCrowns"):
+                        "collision", "collisionCrowns", "looks"):
             self.assertIn(
                 control, self.page.explained, f"the control {control} has no help marker"
             )

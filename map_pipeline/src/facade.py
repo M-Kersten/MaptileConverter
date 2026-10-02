@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import colorsys
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +54,26 @@ class FacadeStyle:
     # Metres of wall one tile covers vertically. Only used where the facade is
     # not divided into storeys.
     tile_height_m: float = 0.0
+    # Other wall and trim colours the same era genuinely comes in. One colour
+    # per era is what makes a street of twelve houses read as one house drawn
+    # twelve times: they are the same age, so they all picked the same style,
+    # and then they all got the same pixels. See `looks_for_style`.
+    #
+    # Hand-picked rather than jittered, for the same reason the base colour is:
+    # Dutch brick runs red to purple-brown to yellow IJsselsteen, which is a
+    # range with gaps in it, and a random walk through RGB lands in the gaps.
+    wall_alternates: tuple[tuple[int, int, int], ...] = ()
+    trim_alternates: tuple[tuple[int, int, int], ...] = ()
+    # The era this is a look of, when it is one. Anything keyed by style --
+    # the photographed wall surface, above all -- has to resolve a look back
+    # to its era, or `historic_1` finds no photograph and one house in three
+    # comes out with drawn brick next to its neighbours' real grain.
+    base_name: str = ""
+
+    @property
+    def family(self) -> str:
+        """The name to look this style up by: its era, not its look."""
+        return self.base_name or self.name
 
 
 # Ordered oldest to newest. A building picks the first style whose era covers
@@ -71,6 +91,12 @@ STYLES: tuple[FacadeStyle, ...] = (
         window_height_frac=0.56,
         sill_frac=0.18,
         grain=0.13,
+        # Red brick, yellow IJsselsteen and the darker purple-brown that
+        # Amsterdam and Utrecht canal fronts actually run through.
+        wall_alternates=((152, 78, 60), (186, 162, 122), (112, 72, 64)),
+        # White, cream, and the dark green that half the pre-war window
+        # frames in the country are painted.
+        trim_alternates=((226, 214, 190), (56, 74, 62)),
     ),
     FacadeStyle(
         name="interbellum",
@@ -84,6 +110,9 @@ STYLES: tuple[FacadeStyle, ...] = (
         window_height_frac=0.46,
         sill_frac=0.22,
         grain=0.10,
+        # Amsterdam School brick: orange-red, purple-brown, and a lighter red.
+        wall_alternates=((174, 104, 74), (126, 84, 80), (182, 128, 104)),
+        trim_alternates=((226, 214, 190), (56, 74, 62)),
     ),
     FacadeStyle(
         name="postwar",
@@ -97,6 +126,9 @@ STYLES: tuple[FacadeStyle, ...] = (
         window_height_frac=0.50,
         sill_frac=0.20,
         grain=0.06,
+        # Grey concrete, pale yellow render, pale green panel.
+        wall_alternates=((178, 176, 170), (208, 198, 164), (178, 188, 176)),
+        trim_alternates=((210, 210, 208),),
     ),
     FacadeStyle(
         name="modern",
@@ -110,6 +142,9 @@ STYLES: tuple[FacadeStyle, ...] = (
         window_height_frac=0.54,
         sill_frac=0.16,
         grain=0.07,
+        # Brown brick, grey-brown panel, red brick.
+        wall_alternates=((150, 120, 102), (158, 148, 140), (168, 112, 94)),
+        trim_alternates=((208, 206, 202), (118, 104, 94)),
     ),
     FacadeStyle(
         name="contemporary",
@@ -123,6 +158,10 @@ STYLES: tuple[FacadeStyle, ...] = (
         window_height_frac=0.66,
         sill_frac=0.10,
         grain=0.03,
+        # Charcoal, warm grey, and the dark brick that newer Dutch housing
+        # uses to sit next to older streets.
+        wall_alternates=((84, 88, 94), (134, 130, 124), (104, 76, 70)),
+        trim_alternates=((96, 100, 104),),
     ),
 )
 
@@ -425,32 +464,135 @@ def relief_to_normal_map(relief: np.ndarray, depth: float = RELIEF_DEPTH) -> np.
     return np.clip((normal * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
 
 
-def wall_styles(n_variants: int) -> list[FacadeStyle]:
-    """Wall styles in slot order: the eras, then the archetype specials.
+# How the looks of one era differ apart from colour. Entry 0 is the identity,
+# so look 0 is the base style untouched and a run asking for one look gets
+# exactly what it got before any of this existed.
+#
+# Window rhythm leads, because it is the strongest cue: a row of houses with
+# the same window count across reads as one house repeated whatever the
+# colours do. The proportions move a little, and the bay width moves enough to
+# shift where the windows land without making a 5 m front look like a 7 m one.
+#
+# **Three entries, not four, and that matters.** Each era carries four wall
+# colours, so a four-entry table would turn over in step with them and look 4
+# would come out as look 0 wearing a different window frame. Three against
+# four gives twelve distinct combinations before anything repeats.
+LOOK_WINDOW_STEP = (0, 1, -1)
+LOOK_WIDTH_SCALE = (1.0, 0.92, 1.08)
+LOOK_HEIGHT_SCALE = (1.0, 1.06, 0.94)
+LOOK_SILL_SCALE = (1.0, 1.15, 0.85)
+LOOK_TILE_SCALE = (1.0, 1.12, 0.90)
 
-    The extras go last so their indices stay put when the number of era
-    variants changes.
+
+def looks_for_style(style: FacadeStyle, n_looks: int) -> list[FacadeStyle]:
+    """`n_looks` variations on one era, the first being the era itself.
+
+    A street is not twelve copies of one house, and before this it was: every
+    building of an era took the same style, so it took the same texture, and a
+    terrace came out pixel-identical along its whole length. The era is still
+    what decides the character -- that part was right, and build year predicts
+    a facade far better than height does -- but within it a wall now gets its
+    own colour, window rhythm and bay width.
+
+    Deterministic and ordered, not sampled: look 3 of the historic era is the
+    same look in every run and every area, which is what lets the texture be
+    generated once and a building refer to it by index.
     """
-    return list(STYLES[:n_variants]) + [
-        EXTRA_STYLES["monumental"],
-        EXTRA_STYLES["industrial"],
-    ]
+    walls = (style.wall_rgb, *style.wall_alternates)
+    trims = (style.trim_rgb, *style.trim_alternates)
+    looks = [style]
+    for k in range(1, max(1, int(n_looks))):
+        step = k % len(LOOK_WINDOW_STEP)
+        looks.append(
+            replace(
+                style,
+                name=f"{style.name}_{k}",
+                base_name=style.name,
+                # Three cycles of different lengths -- walls 4, trims 2 or 3,
+                # geometry 3 -- so neighbouring looks never differ in only one
+                # thing, and the first repeat is a long way out.
+                wall_rgb=walls[k % len(walls)],
+                trim_rgb=trims[k % len(trims)],
+                windows_across=max(2, style.windows_across + LOOK_WINDOW_STEP[step]),
+                window_width_frac=style.window_width_frac * LOOK_WIDTH_SCALE[step],
+                window_height_frac=min(
+                    0.82, style.window_height_frac * LOOK_HEIGHT_SCALE[step]
+                ),
+                sill_frac=style.sill_frac * LOOK_SILL_SCALE[step],
+                tile_width_m=style.tile_width_m * LOOK_TILE_SCALE[step],
+            )
+        )
+    return looks
 
 
-def style_for_archetype(archetype: int, n_variants: int) -> int | None:
+def wall_styles(n_variants: int, n_looks: int = 1) -> list[FacadeStyle]:
+    """Wall styles in slot order: the eras and their looks, then the specials.
+
+    Slot `era * n_looks + look`, with the two archetype specials after all of
+    them, so an extra look does not move an era and an extra era does not move
+    the specials.
+    """
+    out: list[FacadeStyle] = []
+    for style in STYLES[:n_variants]:
+        out.extend(looks_for_style(style, n_looks))
+    return out + [EXTRA_STYLES["monumental"], EXTRA_STYLES["industrial"]]
+
+
+def style_for_archetype(
+    archetype: int, n_variants: int, n_looks: int = 1
+) -> int | None:
     """Slot for an archetype that needs its own composition, else None.
 
     Only the two the era styles get wrong are special-cased. Housing, offices
     and shops are all stacks of storeys, so era is the better predictor for
-    them and they keep it.
+    them and they keep it. Neither gets looks: there is rarely more than one
+    church or gasholder in an area, so there is nothing to repeat.
     """
     # Matches src/buildings.py.
     ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
+    base = max(1, n_variants) * max(1, n_looks)
     if archetype == ARCH_MONUMENTAL:
-        return n_variants
+        return base
     if archetype == ARCH_INDUSTRIAL:
-        return n_variants + 1
+        return base + 1
     return None
+
+
+# The most looks one era can have before they start repeating: four wall
+# colours against a three-entry geometry table.
+MAX_LOOKS_PER_ERA = 12
+
+
+def looks_per_era(facade_cfg: dict) -> int:
+    """How many looks each era gets, clamped to what the palettes can fill.
+
+    Asking for more than `MAX_LOOKS_PER_ERA` would generate textures that are
+    duplicates of earlier ones, which costs memory and a material slot for
+    nothing.
+    """
+    return max(1, min(int(facade_cfg.get("looks_per_era", 1)), MAX_LOOKS_PER_ERA))
+
+
+def look_for_building(identifier: str | None, n_looks: int, fallback: int = 0) -> int:
+    """Which look of its era one building wears.
+
+    From the BAG identifier rather than from a counter, so a building keeps
+    its look when the area is rebuilt, re-tiled, or fetched in a different
+    order -- the same reason the trees take their shape from their position.
+    The identifier is better than the position here because it survives 3DBAG
+    redrawing a footprint by a few centimetres between releases.
+    """
+    # No early return for a single look: `digest % 1` is already 0, and a
+    # guard that cannot change an answer is a line that cannot be tested.
+    n_looks = max(1, int(n_looks))
+    if not identifier:
+        return int(fallback) % n_looks
+    # FNV-1a over the identifier: stable across runs and Python versions,
+    # which `hash()` is not -- it is salted per process.
+    digest = 2166136261
+    for byte in str(identifier).encode("utf-8"):
+        digest = ((digest ^ byte) * 16777619) & 0xFFFFFFFF
+    return digest % n_looks
 
 
 def style_for_building(
@@ -525,10 +667,11 @@ def generate_facade_textures(
     work_dir.mkdir(parents=True, exist_ok=True)
     size_px = int(facade_cfg["texture_px"])
     variants = min(int(facade_cfg["variants"]), len(STYLES))
+    looks = looks_per_era(facade_cfg)
     seed = int(facade_cfg["seed"])
     want_normal = bool(facade_cfg.get("normal_map", True))
 
-    styles = wall_styles(variants)
+    styles = wall_styles(variants, looks)
     ground_styles: list[FacadeStyle] = []
     if bool(facade_cfg.get("ground_floor", True)):
         # Both ground variants are written when building function is available,
@@ -556,7 +699,7 @@ def generate_facade_textures(
             stem = "facade_ground" if single_ground else f"facade_{style.name}"
         elif style.name in EXTRA_STYLES:
             stem = f"facade_{index:02d}_{style.name}"
-        elif variants == 1:
+        elif variants == 1 and looks == 1:
             stem = "facade"
         else:
             stem = f"facade_{index:02d}_{style.name}"
@@ -928,6 +1071,12 @@ __all__ = [
     "FURNITURE_PATCHES",
     "GROUND_STYLE",
     "GROUND_STYLES",
+    "MAX_LOOKS_PER_ERA",
+    "look_for_building",
+    "looks_for_style",
+    "looks_per_era",
+    "style_for_archetype",
+    "wall_styles",
     "furniture_uv",
     "generate_fence_texture",
     "generate_furniture_texture",

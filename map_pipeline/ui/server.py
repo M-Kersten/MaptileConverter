@@ -343,6 +343,8 @@ def build_config(payload: dict) -> dict:
         },
         "facade": {
             "variants": int(payload.get("facade_variants", 1)),
+            # Looks within one style, so a terrace is not one house repeated.
+            "looks_per_era": int(payload.get("facade_looks_per_era", 3)),
             "texture_px": int(payload.get("facade_texture_px", 512)),
             "normal_map": bool(payload.get("facade_normal_map", True)),
             "ground_floor": bool(payload.get("facade_ground_floor", True)),

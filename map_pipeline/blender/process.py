@@ -2148,12 +2148,19 @@ def main() -> int:
     aerial_material = make_textured_material("M_aerial", aerial_texture, roughness=0.9)
     facade_materials = [
         make_textured_material(
-            "M_facade" if len(wall_textures) == 1 else f"M_facade_{i:02d}",
+            # Named after the texture, so the slot says which era and which
+            # look it is -- "M_facade_04_historic_1" rather than
+            # "M_facade_04". With three looks an area carries seventeen wall
+            # materials, and a designer reassigning one has to be able to tell
+            # them apart in a list.
+            "M_facade"
+            if len(wall_textures) == 1
+            else f"M_facade_{colour.stem.replace('facade_', '')}",
             colour,
             roughness=0.75,
             normal_path=normal,
         )
-        for i, (colour, normal) in enumerate(wall_textures)
+        for colour, normal in wall_textures
     ]
     ground_materials = [
         make_textured_material(

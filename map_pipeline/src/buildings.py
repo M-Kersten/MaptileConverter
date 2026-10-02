@@ -1220,20 +1220,40 @@ def build_buildings(
     if ground_floor_height_m:
         apply_ground_floor_split(result, ground_floor_height_m)
 
-    from .facade import style_for_archetype, style_for_building
+    from .facade import (
+        look_for_building,
+        looks_per_era,
+        style_for_archetype,
+        style_for_building,
+    )
 
-    def slot(building: Building) -> int:
-        # An archetype with its own composition wins; otherwise era decides.
-        special = style_for_archetype(building.archetype, facade_variants)
+    looks = looks_per_era(facade_cfg or {})
+
+    def slot(building: Building, index: int) -> int:
+        # An archetype with its own composition wins; otherwise era decides
+        # the character and the building's own identifier decides which of
+        # that era's looks it wears, so a terrace is not one house repeated.
+        special = style_for_archetype(building.archetype, facade_variants, looks)
         if special is not None:
             return special
-        return style_for_building(
+        era = style_for_building(
             building.height_m, building.build_year, facade_variants
+        )
+        return era * looks + look_for_building(
+            building.identifier, looks, fallback=index
         )
 
     style_index = np.array(
-        [slot(b) for b in result.buildings], dtype=np.int32
+        [slot(b, i) for i, b in enumerate(result.buildings)], dtype=np.int32
     )
+    if looks > 1:
+        chosen = np.unique(style_index)
+        LOG.info(
+            "facade looks: %d of %d slots used across %d buildings",
+            len(chosen),
+            facade_variants * looks + 2,
+            len(result.buildings),
+        )
     years = [b.build_year for b in result.buildings if b.build_year]
     if years:
         LOG.info(

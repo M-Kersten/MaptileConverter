@@ -203,9 +203,12 @@ def wall_base(
     Raises :class:`TextureUnavailable` when there is nothing to load, which is
     the caller's cue to draw the procedural wall instead.
     """
-    slug = WALL_TEXTURES.get(style.name)
+    # By era, not by look: a look is the same brick in a different colour, so
+    # it shares its era's photograph and only the tint differs below.
+    family = getattr(style, "family", None) or style.name
+    slug = WALL_TEXTURES.get(family)
     if not slug:
-        raise TextureUnavailable(f"no texture is mapped to the {style.name} style")
+        raise TextureUnavailable(f"no texture is mapped to the {family} style")
 
     from PIL import Image
 

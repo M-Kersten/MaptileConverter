@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .facade import MAX_LOOKS_PER_ERA
 from .geo import BBox, GeoContext, parse_bbox, validate_bbox
 from .terrain_mesh import is_grid_size, next_grid_size
 
@@ -138,6 +139,14 @@ DEFAULTS: dict[str, Any] = {
         # every building, and era predicts a facade far better than height.
         # Set to 1 for a single wall material.
         "variants": 5,
+        # Looks within one era. An era decides the character of a wall, and
+        # before this it also decided its pixels, so every building of an age
+        # was the same building: a terrace of twelve came out identical along
+        # its whole length. Each look varies the wall colour, the trim, the
+        # window rhythm and the bay width, and a building picks one from its
+        # own BAG identifier. Costs one texture and one material slot each.
+        # 1 keeps the old behaviour exactly.
+        "looks_per_era": 3,
         "seed": 20240501,
         # A normal map gives the windows and storey bands real relief under a
         # moving light. It costs one extra texture and exports through FBX.
@@ -572,6 +581,24 @@ def load_config(path: str | Path) -> PipelineConfig:
     if variants < 1:
         raise ValueError(f"facade.variants must be at least 1, got {variants}")
     merged["facade"]["variants"] = variants
+
+    looks = int(merged["facade"]["looks_per_era"])
+    if looks < 1:
+        raise ValueError(
+            f"facade.looks_per_era must be at least 1, got {looks}"
+        )
+    if looks > MAX_LOOKS_PER_ERA:
+        # Clamped rather than refused: the extra textures would be duplicates
+        # of earlier ones, so the only cost of asking for them is memory.
+        LOG.warning(
+            "facade.looks_per_era %d is above the %d the palettes can fill; "
+            "using %d",
+            looks,
+            MAX_LOOKS_PER_ERA,
+            MAX_LOOKS_PER_ERA,
+        )
+        looks = MAX_LOOKS_PER_ERA
+    merged["facade"]["looks_per_era"] = looks
 
     merge_mode = str(merged["buildings"]["merge"]).strip().lower()
     if merge_mode not in ("single", "per_building"):

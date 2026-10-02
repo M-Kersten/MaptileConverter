@@ -493,6 +493,20 @@
           </select>
         </div>
         <div>
+          <label for="looks">Variety within a style
+            <span class="help" tabindex="0" role="button" aria-label="About facade variety"
+              data-tip="Buildings of the same age share a style, and with <b>1</b> they also share the exact same wall, so a terrace of twelve houses comes out as one house repeated twelve times. Each extra look gives that age another wall colour, window frame colour, window count and spacing, and a building picks one by its own address &mdash; so it keeps the same wall every time you rebuild the area. Costs one texture per look.">?</span>
+          </label>
+          <select id="looks">
+            <option value="3" selected>3 looks per style</option>
+            <option value="5">5 looks per style</option>
+            <option value="1">1, neighbours look identical</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:14px">
+        <div>
           <label for="clip">Buildings on the edge
             <span class="help" tabindex="0" role="button" aria-label="About edge buildings"
               data-tip="What to do with a building the square cuts through. <b>Whole ones only</b> keeps a building when its centre is inside, so nothing is sliced in half. <b>Anything it touches</b> keeps every building that overlaps, and those will hang over the edge.">?</span>
@@ -1325,12 +1339,21 @@ $("normal").addEventListener("change", () => { $("preset").value = "custom"; });
 $("name").addEventListener("input", updateAreaPlain);
 
 function updateFacadeNote() {
-  $("facadeNote").textContent = +$("facade").value > 1
+  const styles = +$("facade").value, looks = +$("looks").value;
+  const era = styles > 1
     ? "Walls follow the era rather than the height: pre-1920 brick, through "
       + "post-war concrete, to contemporary glass."
-    : "One wall material for every building, whatever its age.";
+    : "One wall style for every building, whatever its age.";
+  const variety = looks > 1
+    ? ` Each style comes in ${looks} looks, so neighbours of the same age `
+      + `differ in colour and window layout. ${styles * looks + 2} wall `
+      + `textures in total.`
+    : " Buildings sharing a style share the exact same wall, so a terrace "
+      + "repeats.";
+  $("facadeNote").textContent = era + variety;
 }
 $("facade").addEventListener("change", updateFacadeNote);
+$("looks").addEventListener("change", updateFacadeNote);
 updateFacadeNote();
 
 /* ---------- estimate ---------- */
@@ -1454,6 +1477,7 @@ $("run").onclick = async () => {
     facade_texture_px: q.facadePx,
     facade_normal_map: $("normal").checked,
     facade_variants: +$("facade").value,
+    facade_looks_per_era: +$("looks").value,
     facade_ground_floor: $("groundFloor").checked,
     facade_photo_textures: $("photoTextures").checked,
     sources: selectedSources(),
