@@ -190,6 +190,13 @@ DEFAULTS: dict[str, Any] = {
         "default_height_m": 7.0,
         "crown_radius_ratio": 0.26,
         "trunk_height_ratio": 0.38,
+        # How far the aerial is darkened under a canopy, 0 to 1. Dutch orthos
+        # are flown leaf-off on purpose, so the ground under a tree is
+        # photographed in full sun and the leafy tree the model then stands
+        # over it reads as not touching the ground. Ambient occlusion, not a
+        # sun shadow: it is correct at any time of day and adds to a
+        # real-time shadow instead of fighting it. 0 leaves the photo alone.
+        "ground_shade": 0.35,
         # The BGT tree register is a municipal asset list, not a survey of
         # vegetation: over one square kilometre of Utrecht centre 45% of the
         # canopy above 2.5 m is nowhere near a registered tree, and the

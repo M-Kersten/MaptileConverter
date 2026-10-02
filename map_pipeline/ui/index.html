@@ -568,6 +568,13 @@
     </div>
 
     <div class="inline">
+      <input type="checkbox" id="treeShade" checked>
+      <label for="treeShade">Shade the ground under trees</label>
+      <span class="help" tabindex="0" role="button" aria-label="About shading under trees"
+        data-tip="The aerial photo is flown in winter on purpose, with the leaves off, so the ground is visible and can be used as the ground texture. That also means the pavement under a tree is photographed in full sun, and the leafy tree the model puts over it looks like it is hovering. This darkens the photo under each canopy. It is <b>ambient shade</b>, not a sun shadow, so it stays right at any time of day and adds to a real shadow rather than fighting it.">?</span>
+    </div>
+
+    <div class="inline">
       <input type="checkbox" id="collision">
       <label for="collision">Add simplified shapes for physics</label>
       <span class="help" tabindex="0" role="button" aria-label="About collision shapes"
@@ -1485,6 +1492,7 @@ $("run").onclick = async () => {
     preview: $("preview").checked,
     collision: $("collision").checked,
     collision_tree_crowns: $("collisionCrowns").checked,
+    tree_ground_shade: $("treeShade").checked ? 0.35 : 0,
     // Terrain shape. See updateShape: none of this changes accuracy.
     road_simplify_m: sh.roadDetail,
     road_max_edge_m: sh.roadFace,

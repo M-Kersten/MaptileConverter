@@ -353,6 +353,11 @@ def build_config(payload: dict) -> dict:
         "vehicles": {
             "car_occupancy": float(payload.get("car_occupancy", 0.72)),
         },
+        "trees": {
+            # The aerial is flown leaf-off, so without this the ground under a
+            # tree is lit as if the tree were not there.
+            "ground_shade": float(payload.get("tree_ground_shade", 0.35)),
+        },
         "surfaces": {
             # Road topology. These decide what the carriageway is like to use
             # in an engine, not how accurate it is.

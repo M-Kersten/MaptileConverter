@@ -75,7 +75,12 @@ from src.surfaces import (  # noqa: E402
     build_surfaces,
     write_land_cover,
 )
-from src.trees import TreeSet, build_trees, write_tree_list  # noqa: E402
+from src.trees import (  # noqa: E402
+    TreeSet,
+    bake_canopy_shade,
+    build_trees,
+    write_tree_list,
+)
 from src.usage import UsageSet, fetch_usage  # noqa: E402
 from src.vehicles import (  # noqa: E402
     VehicleSet,
@@ -599,6 +604,15 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             )
             if len(trees):
                 write_tree_list(trees, config.geo, out_dir)
+                # After the surface detail pass, which also writes the aerial
+                # in place, and from the trees the model is about to draw --
+                # so the mark on the ground and the canopy over it agree.
+                bake_canopy_shade(
+                    aerial.path,
+                    trees,
+                    config.bbox,
+                    strength=float(config.trees.get("ground_shade", 0.35)),
+                )
                 if bool(config.trees["geometry"]):
                     tree_texture = generate_tree_texture(
                         work_dir, size_px=int(config.trees["texture_px"])

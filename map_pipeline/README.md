@@ -296,6 +296,7 @@ Other knobs worth knowing:
 | `trees.enabled` | `true` | Fetch BGT trees and give them AHN heights. |
 | `trees.geometry` | `true` | Also bake low-poly tree meshes into the FBX. `trees.json` is written either way. |
 | `trees.crown_search_m` | `3.0` | Radius the canopy height is taken as a maximum over. |
+| `trees.ground_shade` | `0.35` | How far the aerial is darkened under each canopy. The photo is flown leaf-off, so without this the ground under a tree is lit as if the tree were not there. Ambient occlusion, not a sun shadow. `0` leaves the photo alone. |
 | `surfaces.water` | `true` | Replace the interpolated canal bulge with real water surfaces. |
 | `surfaces.road_geometry` | `true` | Build roads as their own objects, one per class, instead of only as raster class. |
 | `surfaces.road_lift_m` | `0.06` | How far the road surface floats above the terrain, so the two do not fight for depth. |
@@ -1231,6 +1232,40 @@ Summer foliage would read +0.6. Dutch national orthos are flown deliberately
 rather than hidden under canopy — which makes them excellent for everything else
 this pipeline does and useless for finding trees by colour. A quarter of an index
 point between a tree and a road is not a detector. Height is the signal.
+
+### The leaf-off photo, under the leafy trees
+
+That same decision leaves the model disagreeing with itself. The ground under a
+tree is photographed in full sun through bare branches, and then a leafy canopy
+is stood over it, so the eye gets a tree that is not touching the ground. The
+missing term is **ambient occlusion**, and `trees.ground_shade` bakes it into
+the aerial: the photo is darkened under each canopy, to 65% of its brightness
+by default.
+
+**Occlusion, not a sun shadow, and the distinction is the whole design.** AO is
+how much sky a patch of ground can see, so it is right at any hour and *adds*
+to a real-time shadow. Baking a sun shadow at one angle would give every scene
+lit from another angle two shadows pointing different ways, which is worse than
+none — and for a drone sim the time of day is the user's to set.
+
+Three details:
+
+* **It comes from the trees that are drawn**, not from the canopy height model
+  they were found in, so the mark on the ground and the thing above it cannot
+  disagree. Same reasoning as draping on the terrain mesh rather than the grid.
+* **Overlapping crowns take the strongest cover, not the sum.** A copse is one
+  canopy with one sky above it; adding four crowns at 0.35 each would take the
+  ground past black.
+* **The falloff is a smoothstep over 0.7 of the crown radius.** Picked by
+  looking at it: at 0.35 the mark is a disk, and a disk on grass reads as paint
+  rather than shade; at 1.1 an avenue merges into one band and the trees above
+  stop lining up with anything. Smoothstep rather than a linear ramp because a
+  linear falloff has the same slope right up to where it stops, leaving a
+  visible ring.
+
+Measured over the Gelderland square kilometre — 13,043 trees — it takes 3.3 s
+at 4096 px and 11.2 s at 8192 px, and shades 77% of the photo, which is what a
+wooded kilometre looks like. `trees.ground_shade: 0` leaves the aerial alone.
 
 **Difference against the filled ground, not the raw download.** The bare-earth
 DTM arrives **51% measured** over this square, and its holes are exactly under

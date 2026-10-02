@@ -1191,6 +1191,372 @@ class TestServiceFailures(unittest.TestCase):
         self.assertIn("buildings (3DBAG)", down[0])
 
 
+class TestCanopyShade(unittest.TestCase):
+    """The aerial is flown leaf-off and the trees are leafy.
+
+    That is not an accident on either side: Dutch orthos are flown in winter so
+    the ground is visible, which is what makes the photo usable as a ground
+    texture and what the tree detector reads the canopy model against. The
+    model then stands a leafy tree over pavement photographed in full sun, and
+    the eye reads a tree that is not touching the ground.
+    """
+
+    PX = 240
+
+    def _aerial(self, folder: Path, value=150):
+        from PIL import Image
+
+        path = folder / "aerial.png"
+        Image.fromarray(
+            np.full((self.PX, self.PX, 3), value, np.uint8), mode="RGB"
+        ).save(path)
+        return path
+
+    @staticmethod
+    def _trees(*spec):
+        from src.trees import Tree, TreeSet
+
+        return TreeSet(trees=[
+            Tree(x=float(x), y=float(y), ground_z_nap=2.0, height_m=14.0,
+                 crown_radius_m=float(r), trunk_height_m=5.0, measured=True)
+            for x, y, r in spec
+        ])
+
+    def _bake(self, folder, trees, strength=0.35, bbox=None):
+        from PIL import Image
+
+        from src.geo import BBox
+        from src.trees import bake_canopy_shade
+
+        path = self._aerial(folder)
+        before = np.asarray(Image.open(path), dtype=np.float64)
+        changed = bake_canopy_shade(
+            path, trees, bbox or BBox(0.0, 0.0, 100.0, 100.0), strength=strength
+        )
+        after = np.asarray(Image.open(path), dtype=np.float64)
+        return changed, before, after
+
+    def _at(self, image, x, y, bbox_size=100.0):
+        """The pixel at an RD position, north-up."""
+        col = int(x / bbox_size * self.PX)
+        row = int((bbox_size - y) / bbox_size * self.PX)
+        return float(image[row, col].mean())
+
+    def test_the_ground_under_a_tree_gets_darker(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            changed, before, after = self._bake(
+                Path(tmp), self._trees((50.0, 50.0, 6.0))
+            )
+        self.assertTrue(changed)
+        self.assertLess(
+            self._at(after, 50.0, 50.0), self._at(before, 50.0, 50.0) * 0.8,
+            "the ground under the canopy is as bright as open pavement",
+        )
+
+    def test_it_lands_where_the_tree_is(self):
+        """North is up in an image and up in RD, so the row axis runs the
+        other way. Getting that wrong mirrors every shadow in the model about
+        the middle of the area, which on a symmetric fixture looks fine."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, after = self._bake(
+                Path(tmp), self._trees((25.0, 75.0, 6.0))
+            )
+        self.assertLess(self._at(after, 25.0, 75.0), self._at(before, 25.0, 75.0) * 0.8)
+        # The point this would land on if north were flipped, or x and y swapped.
+        for x, y in ((25.0, 25.0), (75.0, 75.0), (75.0, 25.0)):
+            self.assertAlmostEqual(
+                self._at(after, x, y), self._at(before, x, y), delta=0.5,
+                msg=f"shade appeared at ({x}, {y}) as well as at (25, 75)",
+            )
+
+    def test_ground_away_from_any_tree_is_untouched(self):
+        """It darkens the photo, and a photo is the thing you see. A pass that
+        dims the whole image is worse than no pass."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, after = self._bake(
+                Path(tmp), self._trees((50.0, 50.0, 4.0))
+            )
+        untouched = np.isclose(after, before).all(axis=2)
+        self.assertGreater(
+            untouched.mean(), 0.8,
+            f"only {untouched.mean():.0%} of the photo was left alone",
+        )
+        for x, y in ((5.0, 5.0), (95.0, 95.0), (5.0, 95.0)):
+            self.assertAlmostEqual(
+                self._at(after, x, y), self._at(before, x, y), delta=0.5
+            )
+
+    def test_two_crowns_overlapping_are_one_canopy(self):
+        """Summing coverage drives a copse to black: three trees over one spot
+        would take 1 - 3 * strength, which at 0.35 is negative. One canopy has
+        one sky above it, so the strongest cover wins."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, alone = self._bake(
+                Path(tmp), self._trees((50.0, 50.0, 8.0))
+            )
+            _, _, clumped = self._bake(
+                Path(tmp),
+                self._trees((50.0, 50.0, 8.0), (51.0, 50.0, 8.0),
+                            (50.0, 51.0, 8.0), (49.0, 49.0, 8.0)),
+            )
+        self.assertAlmostEqual(
+            self._at(clumped, 50.0, 50.0), self._at(alone, 50.0, 50.0), delta=0.5,
+            msg="four overlapping crowns shaded harder than one",
+        )
+        self.assertGreater(
+            clumped.min(), 0.0, "the shade drove pixels to black"
+        )
+
+    def test_the_strength_is_what_it_says(self):
+        import tempfile
+
+        for strength in (0.2, 0.35, 0.6):
+            with tempfile.TemporaryDirectory() as tmp:
+                _, before, after = self._bake(
+                    Path(tmp), self._trees((50.0, 50.0, 10.0)), strength=strength
+                )
+            ratio = self._at(after, 50.0, 50.0) / self._at(before, 50.0, 50.0)
+            self.assertAlmostEqual(
+                ratio, 1.0 - strength, delta=0.02,
+                msg=f"strength {strength} left {ratio:.3f} of the brightness",
+            )
+
+    def test_zero_leaves_the_photo_alone(self):
+        """The knob has to reach all the way to off, or someone who does not
+        want their aerial touched has no way out."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            changed, before, after = self._bake(
+                Path(tmp), self._trees((50.0, 50.0, 8.0)), strength=0.0
+            )
+        self.assertFalse(changed)
+        np.testing.assert_array_equal(after, before)
+
+    def test_no_trees_is_not_an_error(self):
+        import tempfile
+
+        from src.trees import TreeSet
+
+        with tempfile.TemporaryDirectory() as tmp:
+            changed, before, after = self._bake(Path(tmp), TreeSet())
+        self.assertFalse(changed)
+        np.testing.assert_array_equal(after, before)
+
+    def test_the_edge_is_soft(self):
+        """A hard disk reads as paint on grass rather than as shade. Measured
+        across the crown edge, the darkening has to fall off gradually."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, after = self._bake(
+                Path(tmp), self._trees((50.0, 50.0, 10.0))
+            )
+        ratios = [
+            self._at(after, 50.0 + d, 50.0) / self._at(before, 50.0 + d, 50.0)
+            for d in (0.0, 6.0, 10.0, 13.0, 16.0, 19.0)
+        ]
+        # Monotone from dark at the trunk to untouched outside the feather.
+        for near, far in zip(ratios, ratios[1:]):
+            self.assertLessEqual(near, far + 1e-6, f"not monotone: {ratios}")
+        self.assertLess(ratios[0], 0.7, "the middle is not shaded")
+        self.assertGreater(ratios[-1], 0.99, "the shade never stops")
+        # And genuinely gradual rather than one step: at least three distinct
+        # levels across the edge.
+        self.assertGreaterEqual(
+            len({round(r, 2) for r in ratios}), 4, f"a hard edge: {ratios}"
+        )
+
+    def test_a_tree_outside_the_area_does_not_wrap_round(self):
+        """Trees are kept slightly outside the bbox on purpose -- a canopy
+        overhangs the edge. Its shade has to clip, not appear on the far
+        side."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, after = self._bake(
+                Path(tmp), self._trees((-3.0, 50.0, 5.0))
+            )
+        # It reaches in from the west edge.
+        self.assertLess(self._at(after, 1.0, 50.0), self._at(before, 1.0, 50.0))
+        # And not from the east.
+        self.assertAlmostEqual(
+            self._at(after, 98.0, 50.0), self._at(before, 98.0, 50.0), delta=0.5
+        )
+
+    def test_a_rectangular_area_is_not_assumed_square(self):
+        """Metres per pixel differ between the axes when the bbox is not
+        square, and using one for both both stretches every canopy and puts it
+        in the wrong place. Both halves are checked: an aspect ratio on its own
+        passes when the mark has been pushed off the edge and clipped."""
+        import tempfile
+
+        from src.geo import BBox
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, after = self._bake(
+                Path(tmp), self._trees((50.0, 120.0, 8.0)),
+                bbox=BBox(0.0, 0.0, 100.0, 200.0),
+            )
+        touched = ~np.isclose(after, before).all(axis=2)
+        rows = np.where(touched.any(axis=1))[0]
+        cols = np.where(touched.any(axis=0))[0]
+        self.assertTrue(len(rows) and len(cols), "nothing was shaded at all")
+
+        # Centred on the tree: x=50 of 100 is half way across, y=120 of 200 is
+        # 40% down from the top.
+        self.assertAlmostEqual(
+            float(rows.mean()) / self.PX, 0.40, delta=0.03,
+            msg="the mark is not centred on the tree's northing",
+        )
+        self.assertAlmostEqual(
+            float(cols.mean()) / self.PX, 0.50, delta=0.03,
+            msg="the mark is not centred on the tree's easting",
+        )
+        # 8 m is 8/100 of the width but 8/200 of the height, so in pixels the
+        # mark is twice as wide as it is tall.
+        self.assertAlmostEqual(
+            len(cols) / len(rows), 2.0, delta=0.25,
+            msg=f"{len(cols)} columns by {len(rows)} rows is not a circle on "
+                f"the ground",
+        )
+
+    def test_the_shaded_patch_is_round_and_not_square(self):
+        """Each tree is drawn into the box its shade can reach, and the
+        rounding happens inside that box. A falloff that never reaches zero
+        leaves the whole box faintly dark, which is a square halo round every
+        tree -- and sampling along an axis never crosses one."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, after = self._bake(
+                Path(tmp), self._trees((50.0, 50.0, 10.0))
+            )
+        from src.trees import SHADE_FEATHER
+
+        # Just inside the corner of the box, so well outside the circle.
+        edge = 10.0 * (1.0 + SHADE_FEATHER) * 0.92
+        for dx, dy in ((edge, edge), (-edge, edge), (edge, -edge), (-edge, -edge)):
+            self.assertAlmostEqual(
+                self._at(after, 50.0 + dx, 50.0 + dy),
+                self._at(before, 50.0 + dx, 50.0 + dy), delta=0.5,
+                msg=f"the corner of the patch box at ({dx:+.1f}, {dy:+.1f}) "
+                    f"is shaded, so the mark is a square",
+            )
+
+    def test_the_falloff_eases_out_rather_than_stopping(self):
+        """Smoothstep, not a linear ramp. A linear falloff has the same slope
+        right up to where it stops, which leaves a visible ring at the outer
+        edge; smoothstep flattens into it. Both are monotone and both reach
+        zero, so only the shape tells them apart."""
+        import tempfile
+
+        from src.trees import SHADE_FEATHER
+
+        crown = 10.0
+        with tempfile.TemporaryDirectory() as tmp:
+            _, before, after = self._bake(
+                Path(tmp), self._trees((50.0, 50.0, crown))
+            )
+
+        def coverage(distance_m):
+            ratio = (
+                self._at(after, 50.0 + distance_m, 50.0)
+                / self._at(before, 50.0 + distance_m, 50.0)
+            )
+            return (1.0 - ratio) / 0.35
+
+        # A tenth of the way in from the outer edge. Linear would give 0.1
+        # there; smoothstep gives 3 * 0.1^2 - 2 * 0.1^3 = 0.028.
+        reach = crown * (1.0 + SHADE_FEATHER)
+        near_edge = coverage(reach - 0.1 * SHADE_FEATHER * crown)
+        self.assertLess(
+            near_edge, 0.06,
+            f"coverage {near_edge:.3f} just inside the edge is a linear ramp, "
+            f"not an ease",
+        )
+        # And symmetrically flat at the inner end of the feather.
+        inner = coverage(crown + 0.1 * SHADE_FEATHER * crown)
+        self.assertGreater(
+            inner, 0.94, f"coverage {inner:.3f} just inside the crown is not full"
+        )
+
+    def test_a_canopy_crossing_a_strip_boundary_is_whole(self):
+        """The photo is shaded in horizontal strips to bound memory, and a
+        tree is only drawn into the strips its shade reaches. Testing the
+        reach with an image shorter than one strip exercises none of that."""
+        import tempfile
+
+        from PIL import Image
+
+        from src.geo import BBox
+        from src.trees import SHADE_STRIP_PX, bake_canopy_shade
+
+        height = SHADE_STRIP_PX * 2 + 64
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "aerial.png"
+            Image.fromarray(
+                np.full((height, 256, 3), 150, np.uint8), mode="RGB"
+            ).save(path)
+            before = np.asarray(Image.open(path), dtype=np.float64)
+            # Metres per pixel on the long axis, so the tree sits exactly on
+            # the first strip boundary.
+            bbox = BBox(0.0, 0.0, 256.0, float(height))
+            y = float(height) - SHADE_STRIP_PX
+            bake_canopy_shade(
+                path, self._trees((128.0, y, 40.0)), bbox, strength=0.35
+            )
+            after = np.asarray(Image.open(path), dtype=np.float64)
+
+        column = after[:, 128].mean(axis=1) / np.maximum(
+            before[:, 128].mean(axis=1), 1
+        )
+        above = column[SHADE_STRIP_PX - 30 : SHADE_STRIP_PX]
+        below = column[SHADE_STRIP_PX : SHADE_STRIP_PX + 30]
+        self.assertLess(above.max(), 0.9, "nothing above the boundary")
+        self.assertLess(below.max(), 0.9, "nothing below the boundary")
+        self.assertAlmostEqual(
+            float(above.mean()), float(below[::-1].mean()), delta=0.02,
+            msg="the canopy is cut off at the strip boundary",
+        )
+
+    def test_the_pipeline_shades_after_the_detail_pass(self):
+        """Both write the aerial in place, so the order is load-bearing: the
+        detail pass reads the photo it is given, and reading a shaded one
+        would mix the grain into the shade."""
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        self.assertIn("bake_canopy_shade(", source)
+        self.assertLess(
+            source.index("blend_surface_detail("),
+            source.index("bake_canopy_shade("),
+            "the canopy shade is baked before the surface detail",
+        )
+
+    def test_the_knob_exists_and_reaches_the_pipeline(self):
+        import inspect
+
+        import pipeline
+        from src.config import DEFAULTS
+
+        self.assertGreater(DEFAULTS["trees"]["ground_shade"], 0.0)
+        self.assertLess(DEFAULTS["trees"]["ground_shade"], 1.0)
+        self.assertIn(
+            'config.trees.get("ground_shade"', inspect.getsource(pipeline.run)
+        )
+
+
 class TestFacadeLooks(unittest.TestCase):
     """A street is not one house drawn twelve times, and it was.
 
@@ -7630,7 +7996,7 @@ class TestUIPage(unittest.TestCase):
         for control in ("q", "size", "name", "preset", "aerialCm", "terrainM",
                         "terrainTol", "facadePx", "facade", "clip",
                         "groundFloor", "normal", "photoTextures", "preview",
-                        "collision", "collisionCrowns", "looks"):
+                        "collision", "collisionCrowns", "looks", "treeShade"):
             self.assertIn(
                 control, self.page.explained, f"the control {control} has no help marker"
             )

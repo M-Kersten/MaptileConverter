@@ -909,7 +909,144 @@ def write_tree_list(trees: TreeSet, geo, out_dir: Path, filename: str = "trees.j
     return path
 
 
+# How far past the crown radius the shade reaches, as a fraction of it. A
+# canopy does not end at a line: the outer branches thin out, and the sky
+# reaches further in under the edge than under the middle, so the ground under
+# a crown edge is already half lit.
+#
+# Chosen by looking at it. At 0.35 the mark is a disk, and a disk on grass
+# reads as paint rather than as shade. At 1.1 an avenue merges into one
+# continuous band and the individual trees above it stop lining up with
+# anything. 0.7 keeps a tree a tree.
+#
+# It scales with the crown rather than being a fixed distance, which is also
+# roughly how it scales with height: the crown radius here is already derived
+# from the tree's height.
+SHADE_FEATHER = 0.7
+
+# Rows of aerial handled at once, matching the surface detail pass. A 16384 px
+# ortho is 800 MB as float32 and the strip keeps it to tens of megabytes.
+SHADE_STRIP_PX = 512
+
+
+def bake_canopy_shade(
+    aerial_path: Path,
+    trees: TreeSet,
+    bbox: BBox,
+    *,
+    strength: float = 0.35,
+) -> bool:
+    """Darken the aerial under every canopy the model draws, in place.
+
+    Dutch orthos are flown leaf-off on purpose, so the ground is photographed
+    in full sun through bare branches -- which is what makes the aerial usable
+    as a ground texture at all, and what the tree detector relies on. The model
+    then stands a leafy tree over that lit pavement, and the eye reads a tree
+    that is not touching the ground.
+
+    What is missing is **ambient occlusion**, and deliberately not a sun
+    shadow. AO is how much sky a patch of ground can see, so it is correct
+    under any lighting and composes with a real-time shadow instead of
+    fighting it: bake a sun shadow at one angle and every engine lighting the
+    scene from another gets two shadows pointing different ways, which is
+    worse than none. It is also what a drone sim needs, where the time of day
+    is the user's to set.
+
+    The shade comes from the trees that are actually drawn, not from the
+    canopy height model they were found in, so the mark on the ground and the
+    thing above it cannot disagree.
+    """
+    if strength <= 0 or not len(trees):
+        return False
+
+    from PIL import Image
+
+    from .imagery import _allow_large_images
+
+    _allow_large_images()
+    with Image.open(aerial_path) as opened:
+        image = opened.convert("RGB")
+    width, height = image.size
+    if width < 2 or height < 2:
+        return False
+
+    px_per_m_x = width / bbox.width
+    px_per_m_y = height / bbox.height
+
+    # Pixel centres, so a tree at a pixel's middle lands on that pixel.
+    cx = (np.array([t.x for t in trees.trees]) - bbox.xmin) * px_per_m_x - 0.5
+    # North is up in the image, so the row axis runs the other way.
+    cy = (bbox.ymax - np.array([t.y for t in trees.trees])) * px_per_m_y - 0.5
+    radius = np.array([t.crown_radius_m for t in trees.trees])
+    rx = np.maximum(radius * px_per_m_x, 0.5)
+    ry = np.maximum(radius * px_per_m_y, 0.5)
+    reach = 1.0 + SHADE_FEATHER
+
+    strips = -(-height // SHADE_STRIP_PX)
+    LOG.info(
+        "shading the ground under %d canopies into %d x %d px, in %d strips",
+        len(trees),
+        width,
+        height,
+        strips,
+    )
+
+    columns = np.arange(width, dtype=np.float64)
+    for strip_index in range(strips):
+        top = strip_index * SHADE_STRIP_PX
+        bottom = min(height, top + SHADE_STRIP_PX)
+        rows = np.arange(top, bottom, dtype=np.float64)
+
+        # Only the trees whose shade can reach this strip.
+        near = (cy + ry * reach >= top) & (cy - ry * reach < bottom)
+        if not near.any():
+            continue
+
+        cover = np.zeros((bottom - top, width), dtype=np.float32)
+        for index in np.flatnonzero(near):
+            # The box this one tree can touch, so a 4 m crown costs a 40 px
+            # patch rather than a pass over the whole strip.
+            x0 = max(0, int(np.floor(cx[index] - rx[index] * reach)))
+            x1 = min(width, int(np.ceil(cx[index] + rx[index] * reach)) + 1)
+            y0 = max(top, int(np.floor(cy[index] - ry[index] * reach)))
+            y1 = min(bottom, int(np.ceil(cy[index] + ry[index] * reach)) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            dx = (columns[x0:x1] - cx[index]) / rx[index]
+            dy = (rows[y0 - top : y1 - top] - cy[index]) / ry[index]
+            distance = np.sqrt(dx[None, :] ** 2 + dy[:, None] ** 2)
+            # Solid to the crown radius, fading to nothing over the feather.
+            # Smoothstep rather than linear: a linear edge leaves a visible
+            # ring where the gradient stops.
+            t = np.clip((reach - distance) / SHADE_FEATHER, 0.0, 1.0)
+            patch = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+            np.maximum(
+                cover[y0 - top : y1 - top, x0:x1], patch,
+                out=cover[y0 - top : y1 - top, x0:x1],
+            )
+
+        if not cover.any():
+            continue
+
+        block = np.asarray(image.crop((0, top, width, bottom)), dtype=np.float32)
+        # `maximum` above, not a sum: two overlapping crowns are one canopy
+        # with one sky above it, and adding them drives a copse to black.
+        block *= (1.0 - float(strength) * cover)[:, :, None]
+        image.paste(
+            Image.fromarray(np.clip(block, 0, 255).astype(np.uint8), mode="RGB"),
+            (0, top),
+        )
+
+    image.save(aerial_path)
+    LOG.info("shaded the ground under the canopies in %s", aerial_path.name)
+    return True
+
+
 __all__ = [
+    "SHADE_FEATHER",
+    "SHADE_STRIP_PX",
+    "bake_canopy_shade",
     "detect_trees",
     "Tree",
     "TreeSet",
