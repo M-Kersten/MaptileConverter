@@ -76,6 +76,7 @@ from src.surfaces import (  # noqa: E402
     build_surfaces,
     write_land_cover,
 )
+from src.relight import remove_cast_shadows  # noqa: E402
 from src.trees import (  # noqa: E402
     TreeSet,
     bake_canopy_shade,
@@ -473,7 +474,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         config.structures["bridges"] or config.structures["tunnels"]
     )
 
-    total = 5 + sum(
+    # Five fixed stages, plus one for aerial relighting, plus the optional
+    # sources, plus Blender.
+    total = 6 + sum(
         (
             want_trees, want_surfaces, want_furniture, want_barriers,
             want_usage,
@@ -559,12 +562,6 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             )
             if surfaces.class_grid is not None:
                 write_land_cover(surfaces, config.bbox, out_dir)
-                blend_surface_detail(
-                    aerial.path,
-                    surfaces,
-                    config.bbox,
-                    strength=float(config.surfaces["detail_strength"]),
-                )
             if surfaces.water:
                 water_texture = generate_water_texture(work_dir)
 
@@ -605,19 +602,46 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             )
             if len(trees):
                 write_tree_list(trees, config.geo, out_dir)
-                # After the surface detail pass, which also writes the aerial
-                # in place, and from the trees the model is about to draw --
-                # so the mark on the ground and the canopy over it agree.
-                bake_canopy_shade(
-                    aerial.path,
-                    trees,
-                    config.bbox,
-                    strength=float(config.trees.get("ground_shade", 0.35)),
-                )
                 if bool(config.trees["geometry"]):
                     tree_texture = generate_tree_texture(
                         work_dir, size_px=int(config.trees["texture_px"])
                     )
+
+    # Everything that rewrites the aerial, in one place and in this order,
+    # because each pass reads what the one before it wrote.
+    #
+    #   1. The flown sun comes out first, while the photo still holds only
+    #      what the camera saw. It needs the buildings and the trees to cast
+    #      shadows from, which is why none of this can sit in the aerial
+    #      stage.
+    #   2. The per-class grain goes onto an evenly lit photo, so it is not
+    #      itself amplified where a shadow used to be.
+    #   3. The canopy occlusion goes on last. It is the one shading term that
+    #      belongs in a ground texture, because it is true at any hour.
+    with Stage("aerial relighting", next_step(), total):
+        shadow_info = remove_cast_shadows(
+            aerial.path,
+            config.bbox,
+            terrain=terrain,
+            buildings=buildings,
+            trees=trees if len(trees) else None,
+            class_grid=surfaces.class_grid,
+            strength=float(config.aerial.get("deshadow", 1.0)),
+        )
+        if surfaces.class_grid is not None:
+            blend_surface_detail(
+                aerial.path,
+                surfaces,
+                config.bbox,
+                strength=float(config.surfaces["detail_strength"]),
+            )
+        if len(trees):
+            bake_canopy_shade(
+                aerial.path,
+                trees,
+                config.bbox,
+                strength=float(config.trees.get("ground_shade", 0.35)),
+            )
 
     furniture = FurnitureSet()
     furniture_texture = None
@@ -790,6 +814,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     ),
                 },
                 "building_function": usage.stats(),
+                # What was taken out of the aerial and what was left in it.
+                # Anyone lighting this model needs to know the photo is no
+                # longer carrying its own sun -- and, when it still is, at
+                # what angle, so they can match it.
+                **({"aerial_relighting": shadow_info} if shadow_info else {}),
                 # What to collide with, which is a question about the FBX and
                 # so belongs next to it rather than in work/. Read back from
                 # the Blender stage's own summary: this says what was drawn,

@@ -28,6 +28,13 @@ DEFAULTS: dict[str, Any] = {
     "aerial": {
         "layer": "Luchtfoto Actueel Ortho 8cm RGB",
         "size_px": 4096,
+        # How much of the flown sun to take back out, 0 to 1. The ortho is
+        # shot on one morning in late winter, so every roof and every square
+        # metre of ground carries a hard shadow at one sun angle -- measured
+        # over Bronbeek, about 20 m long at 23 degrees elevation, across 29%
+        # of the photo. An engine lighting the scene at any other hour then
+        # has two suns disagreeing. 0 leaves the photo as flown.
+        "deshadow": 1.0,
         # The PDOK WMS advertises MaxWidth/MaxHeight of 2500 and answers
         # anything larger with a ServiceException, so the mosaic is not
         # optional above 2500 px. Kept below the cap for headroom.

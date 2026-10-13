@@ -1191,6 +1191,893 @@ class TestServiceFailures(unittest.TestCase):
         self.assertIn("buildings (3DBAG)", down[0])
 
 
+class TestShadowCasting(unittest.TestCase):
+    """Shadows cast from the geometry the model already has.
+
+    A shadow detector working from pixels alone cannot tell a dark roof from
+    a dark roof's shadow. This pipeline knows where the buildings and the
+    trees are in three dimensions, so it computes the shadow from the thing
+    that casts it, which is the whole reason the relighting can be trusted
+    not to stain a dark surface.
+    """
+
+    @staticmethod
+    def _one_box(height=10.0, size=100):
+        surface = np.zeros((size, size))
+        surface[size // 2 - 2 : size // 2 + 2, size // 2 - 2 : size // 2 + 2] = height
+        return surface
+
+    def _shadow_centre(self, mask):
+        rows, cols = np.where(mask > 0.5)
+        if not len(rows):
+            return None
+        half = mask.shape[0] / 2.0
+        # East and north offsets in cells from the middle of the raster.
+        return float(cols.mean() - half), float(half - rows.mean())
+
+    def test_the_shadow_falls_away_from_the_sun(self):
+        from src.relight import cast_shadow
+
+        surface = self._one_box()
+        for azimuth, east, north in (
+            (180.0, 0.0, +1.0),   # sun due south, shadow to the north
+            (0.0, 0.0, -1.0),     # sun due north, shadow to the south
+            (90.0, -1.0, 0.0),    # sun due east, shadow to the west
+            (270.0, +1.0, 0.0),   # sun due west, shadow to the east
+            (225.0, +1.0, +1.0),  # sun south-west, shadow north-east
+        ):
+            centre = self._shadow_centre(cast_shadow(surface, 1.0, azimuth, 45.0))
+            self.assertIsNotNone(centre, f"no shadow at azimuth {azimuth}")
+            got_east, got_north = centre
+            self.assertGreater(
+                got_east * east + got_north * north, 1.0,
+                f"sun at {azimuth} deg put the shadow {got_east:+.1f} east "
+                f"{got_north:+.1f} north",
+            )
+
+    def test_a_lower_sun_casts_a_longer_shadow(self):
+        """And by the right amount: height over the tangent of the elevation."""
+        from src.relight import cast_shadow
+
+        surface = self._one_box(height=10.0, size=160)
+        for elevation, expect in ((45.0, 10.0), (26.565, 20.0), (18.435, 30.0)):
+            mask = cast_shadow(surface, 1.0, 180.0, elevation)
+            rows = np.where(mask.any(axis=1))[0]
+            # The box occupies four rows; the shadow runs north of it.
+            length = (160 // 2 - 2) - rows.min()
+            self.assertAlmostEqual(
+                length, expect, delta=2.0,
+                msg=f"at {elevation} deg the shadow ran {length} m, not {expect}",
+            )
+
+    def test_a_taller_building_casts_a_longer_shadow(self):
+        from src.relight import cast_shadow
+
+        short = cast_shadow(self._one_box(5.0), 1.0, 180.0, 30.0)
+        tall = cast_shadow(self._one_box(20.0), 1.0, 180.0, 30.0)
+        self.assertGreater(tall.sum(), short.sum() * 2.0)
+
+    def test_nothing_shadows_itself_round_the_edge(self):
+        """A roll would let a tower on the north edge darken the south one."""
+        from src.relight import cast_shadow
+
+        surface = np.zeros((80, 80))
+        surface[0:3, 38:42] = 30.0  # a tower on the north edge
+        # Sun in the south, so the shadow would run north -- off the raster.
+        mask = cast_shadow(surface, 1.0, 180.0, 20.0)
+        self.assertEqual(
+            float(mask[40:].sum()), 0.0,
+            "the shadow wrapped round to the far side of the area",
+        )
+
+    def test_flat_ground_casts_nothing(self):
+        from src.relight import cast_shadow
+
+        self.assertEqual(
+            float(cast_shadow(np.zeros((60, 60)), 1.0, 180.0, 30.0).sum()), 0.0
+        )
+
+    def test_a_slope_shadows_itself(self):
+        """Heights are absolute NAP, not height above ground, so a hillside
+        shades its own far slope. Arnhem is on a moraine and Bronbeek is on
+        the side of it."""
+        from src.relight import cast_shadow
+
+        rows = np.arange(100)
+        # A ridge: climbs to the middle, drops away north of it.
+        surface = np.minimum(rows, 100 - rows)[:, None] * np.ones((1, 100)) * 0.8
+        mask = cast_shadow(surface, 1.0, 180.0, 20.0)
+        self.assertGreater(
+            float(mask[:50].mean()), 0.3,
+            "the north-facing slope is not in its own shadow",
+        )
+        self.assertLess(float(mask[55:].mean()), 0.05, "the sunlit side is shaded")
+
+    def test_a_pitched_roof_is_burned_at_its_real_slope(self):
+        """Averaging a triangle's three corner heights gets a flat roof right
+        and a pitched one wrong, which is most Dutch houses."""
+        from src.geo import BBox
+        from src.relight import burn_triangles
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        raster = np.zeros((100, 100))
+        # A slope climbing from 4 m at y=20 to 16 m at y=60.
+        pitch = np.array([
+            [[20.0, 20.0, 4.0], [80.0, 20.0, 4.0], [80.0, 60.0, 16.0]],
+            [[20.0, 20.0, 4.0], [80.0, 60.0, 16.0], [20.0, 60.0, 16.0]],
+        ])
+        burn_triangles(pitch, bbox, raster)
+        low = float(raster[78, 50])    # y ~ 22, near the eaves
+        high = float(raster[42, 50])   # y ~ 58, near the ridge
+        self.assertAlmostEqual(low, 4.0, delta=1.0)
+        self.assertAlmostEqual(high, 16.0, delta=1.0)
+        self.assertGreater(
+            high - low, 8.0,
+            "the roof was burned flat; a pitch of 12 m came out as "
+            f"{high - low:.1f} m",
+        )
+
+    def test_only_the_triangle_is_burned_not_its_bounding_box(self):
+        """A thin diagonal covers an eighth of the box it sits in. Filling the
+        box instead would have every building shadow a square."""
+        from src.geo import BBox
+        from src.relight import burn_triangles
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        raster = np.zeros((100, 100))
+        wedge = np.array([
+            [[10.0, 10.0, 9.0], [90.0, 10.0, 9.0], [90.0, 20.0, 9.0]],
+        ])
+        burn_triangles(wedge, bbox, raster)
+        covered = float((raster > 1.0).sum())
+        # Half of an 80 x 10 m box.
+        self.assertAlmostEqual(covered, 400.0, delta=80.0)
+        self.assertLess(
+            covered, 600.0,
+            f"{covered:.0f} cells burned for a triangle of about 400",
+        )
+        # The corner outside the hypotenuse stays clear.
+        self.assertAlmostEqual(float(raster[82, 15]), 0.0, places=6)
+
+    def test_a_low_sun_over_regular_streets_is_still_found(self):
+        """Shadows merge into a sheet there, which flattens the score surface
+        into basins. Refining only the best coarse candidate settled 20
+        degrees off this case."""
+        from src.relight import cast_shadow, fit_sun
+
+        rng = np.random.default_rng(3)
+        surface = np.zeros((600, 600))
+        for row in range(30, 570, 44):
+            for col in range(30, 570, 70):
+                surface[row : row + 20, col : col + 50] = rng.uniform(7, 14)
+        mask = cast_shadow(surface, 0.5, 300.0, 14.0)
+        luminance = np.full(surface.shape, 150.0)
+        luminance[surface > 0.5] = 90.0
+        luminance -= 55.0 * mask
+        luminance += rng.normal(0, 8, luminance.shape)
+
+        azimuth, elevation, _ = fit_sun(surface, luminance, 0.5)
+        gap = min(abs(azimuth - 300.0), 360.0 - abs(azimuth - 300.0))
+        self.assertLess(gap, 8.0, f"azimuth {azimuth} against 300")
+        self.assertLess(abs(elevation - 14.0), 8.0)
+
+    def test_a_mask_that_covers_everything_scores_nothing(self):
+        """A mask with almost no variance cannot be scored -- the
+        correlation's denominator goes to zero and the answer is noise. So a
+        sun low enough to shadow the whole area must never win, however well
+        'everything' happens to correlate with a dark photo.
+
+        The bound is deliberately loose. A tighter one would be a belief about
+        how much of a city is in shadow rather than a numerical guard, and
+        would reject the right answer for a dense area under a low sun:
+        Bronbeek alone comes to 44%.
+        """
+        from src.relight import cast_shadow, fit_sun
+
+        rng = np.random.default_rng(17)
+        # One tall wall along the south edge. At the bottom of the elevation
+        # range its shadow runs the length of the area and covers all of it.
+        surface = np.zeros((500, 500))
+        surface[-10:, :] = 60.0
+        saturating = float(cast_shadow(surface, 0.5, 180.0, 8.0).mean())
+        self.assertGreater(
+            saturating, 0.95, "the fixture cannot saturate; nothing to guard"
+        )
+        # A photo that is dark nearly everywhere, for reasons that are not
+        # this shadow -- so 'shadow everything' correlates with it.
+        luminance = np.full(surface.shape, 58.0) + rng.normal(0, 7, surface.shape)
+        luminance[surface > 1.0] = 150.0
+
+        azimuth, elevation, score = fit_sun(surface, luminance, 0.5)
+        if score > 0.05:
+            covered = float(cast_shadow(surface, 0.5, azimuth, elevation).mean())
+            self.assertLess(
+                covered, 0.95,
+                f"the fit accepted a sun shadowing {covered:.0%} of the area",
+            )
+
+    def test_a_legitimately_shadowed_area_is_still_fitted(self):
+        """The other side of that bound: a real answer may cover a lot of
+        ground, and must not be thrown away for it."""
+        from src.relight import cast_shadow, fit_sun
+
+        rng = np.random.default_rng(23)
+        surface = np.zeros((500, 500))
+        for row in range(20, 480, 26):
+            for col in range(20, 480, 30):
+                surface[row : row + 14, col : col + 20] = rng.uniform(14, 22)
+        mask = cast_shadow(surface, 0.5, 200.0, 16.0)
+        self.assertGreater(
+            float(mask.mean()), 0.55,
+            "the fixture is not densely enough shadowed to test the bound",
+        )
+        luminance = np.full(surface.shape, 150.0)
+        luminance[surface > 0.5] = 95.0
+        luminance -= 58.0 * mask
+        luminance += rng.normal(0, 7, luminance.shape)
+
+        azimuth, _, score = fit_sun(surface, luminance, 0.5)
+        self.assertGreater(score, 0.05, "a heavily shadowed area found no sun")
+        gap = min(abs(azimuth - 200.0), 360.0 - abs(azimuth - 200.0))
+        self.assertLess(gap, 10.0, f"azimuth {azimuth} against 200")
+
+    def test_the_sun_is_recovered_from_the_shadows_it_cast(self):
+        """No flight metadata: the WMS does not publish a capture time, so
+        the sun is fitted against the area's own geometry."""
+        from src.relight import cast_shadow, fit_sun
+
+        rng = np.random.default_rng(3)
+        surface = np.zeros((600, 600))
+        for row in range(30, 570, 44):
+            for col in range(30, 570, 70):
+                surface[row : row + 20, col : col + 50] = rng.uniform(7, 14)
+
+        for true_azimuth, true_elevation in ((225.0, 23.0), (150.0, 30.0)):
+            mask = cast_shadow(surface, 0.5, true_azimuth, true_elevation)
+            luminance = np.full(surface.shape, 150.0)
+            luminance[surface > 0.5] = 90.0      # dark roofs, to mislead
+            luminance -= 55.0 * mask
+            luminance += rng.normal(0, 8, luminance.shape)
+
+            azimuth, elevation, score = fit_sun(surface, luminance, 0.5)
+            gap = min(
+                abs(azimuth - true_azimuth), 360.0 - abs(azimuth - true_azimuth)
+            )
+            self.assertLess(gap, 6.0, f"azimuth {azimuth} against {true_azimuth}")
+            self.assertLess(
+                abs(elevation - true_elevation), 6.0,
+                f"elevation {elevation} against {true_elevation}",
+            )
+            self.assertGreater(score, 0.05)
+
+    def test_an_overcast_flight_fits_no_sun(self):
+        """Nothing to remove, and a confident guess would stain the photo
+        wherever the buildings happen to be."""
+        from src.relight import fit_sun
+
+        rng = np.random.default_rng(11)
+        surface = np.zeros((400, 400))
+        for row in range(30, 370, 44):
+            for col in range(30, 370, 70):
+                surface[row : row + 20, col : col + 50] = 10.0
+        flat_light = np.full(surface.shape, 140.0) + rng.normal(0, 8, surface.shape)
+        _, _, score = fit_sun(surface, flat_light, 0.5)
+        self.assertLess(score, 0.05, f"found a sun in an overcast photo: r={score}")
+
+    def test_a_roof_lands_at_its_own_height_over_its_own_footprint(self):
+        from src.geo import BBox
+        from src.relight import burn_triangles
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        raster = np.zeros((100, 100))
+        roof = np.array([
+            [[20.0, 20.0, 12.0], [40.0, 20.0, 12.0], [40.0, 40.0, 12.0]],
+            [[20.0, 20.0, 12.0], [40.0, 40.0, 12.0], [20.0, 40.0, 12.0]],
+        ])
+        burn_triangles(roof, bbox, raster)
+        # North is up: y=20..40 is rows 60..80, x=20..40 is columns 20..40.
+        self.assertAlmostEqual(float(raster[65, 25]), 12.0, places=6)
+        self.assertAlmostEqual(float(raster[10, 10]), 0.0, places=6)
+        self.assertAlmostEqual(float(raster.max()), 12.0, places=6)
+        self.assertAlmostEqual(
+            float((raster > 6.0).sum()), 400.0, delta=45.0,
+            msg="the 20 x 20 m roof did not cover about 400 cells",
+        )
+
+    def test_the_tallest_thing_over_a_cell_wins(self):
+        """A roof and the wall under it project onto the same cells, and what
+        casts a shadow is the top."""
+        from src.geo import BBox
+        from src.relight import burn_triangles
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        raster = np.zeros((100, 100))
+        low = np.array([[[10.0, 10.0, 3.0], [60.0, 10.0, 3.0], [60.0, 60.0, 3.0]]])
+        high = np.array([[[10.0, 10.0, 18.0], [60.0, 10.0, 18.0], [60.0, 60.0, 18.0]]])
+        burn_triangles(np.concatenate([high, low]), bbox, raster)
+        self.assertAlmostEqual(float(raster.max()), 18.0, places=6)
+        burn_triangles(low, bbox, raster)
+        self.assertAlmostEqual(
+            float(raster.max()), 18.0, places=6,
+            msg="a later, lower triangle overwrote a taller one",
+        )
+
+    def test_a_canopy_stands_at_the_top_of_its_crown(self):
+        from src.geo import BBox
+        from src.relight import burn_canopies
+
+        class Trees:
+            trees = [type("T", (), {
+                "x": 50.0, "y": 50.0, "ground_z_nap": 4.0,
+                "height_m": 16.0, "crown_radius_m": 6.0,
+            })()]
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        raster = np.zeros((100, 100))
+        burn_canopies(Trees(), bbox, raster)
+        self.assertAlmostEqual(float(raster[50, 50]), 20.0, places=6)
+        self.assertAlmostEqual(float(raster[10, 10]), 0.0, places=6)
+        self.assertAlmostEqual(
+            float((raster > 1.0).sum()), np.pi * 36.0, delta=20.0
+        )
+
+    def test_the_ground_is_the_floor_and_things_stand_on_it(self):
+        from src.geo import BBox
+        from src.relight import surface_raster
+
+        class Sloped:
+            def sample(self, x, y):
+                return 2.0 + 0.05 * np.asarray(x)
+
+        class Buildings:
+            buildings = [type("B", (), {"roof_tris": np.array([
+                [[40.0, 40.0, 30.0], [60.0, 40.0, 30.0], [60.0, 60.0, 30.0]],
+            ])})()]
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        raster = surface_raster(bbox, 1.0, terrain=Sloped(), buildings=Buildings())
+        self.assertAlmostEqual(float(raster[50, 5]), 2.0 + 0.05 * 5.5, delta=0.1)
+        self.assertAlmostEqual(float(raster.max()), 30.0, places=6)
+
+
+class TestDeShadowing(unittest.TestCase):
+    """Taking the flown sun back out of the photo.
+
+    A Dutch ortho is shot on one morning in late winter, so every roof and
+    every square metre of ground carries a hard shadow at one sun angle. An
+    engine lighting the model at any other hour then has two suns disagreeing.
+    """
+
+    PX = 480
+    SPAN = 200.0
+    AZIMUTH, ELEVATION = 225.0, 25.0
+    # How much darker, per channel, a shadow is in these fixtures. Bluer than
+    # it is dark: a shadow is lit by sky alone, so it loses more red.
+    SHADE_RGB = (0.42, 0.48, 0.62)
+    WEIGHTS = np.array([0.2126, 0.7152, 0.0722])
+
+    class _Flat:
+        def sample(self, x, y):
+            return np.zeros(len(np.atleast_1d(x)))
+
+    @staticmethod
+    def _buildings(boxes, height=10.0):
+        tris = []
+        for x0, y0, x1, y1 in boxes:
+            tris.append([[x0, y0, height], [x1, y0, height], [x1, y1, height]])
+            tris.append([[x0, y0, height], [x1, y1, height], [x0, y1, height]])
+        roof = np.array(tris, dtype=float)
+        return type("Buildings", (), {
+            "buildings": [type("B", (), {"roof_tris": roof})()]
+        })()
+
+    def _scene(self, folder, *, overcast=False, dark_roofs=True,
+               classes=None, inverted=None):
+        """A photo of flat ground with boxes on it, shadows and all.
+
+        Returns `(path, shadow mask, roof mask)` with the masks at photo
+        resolution, so a test can say what should and should not have moved.
+        """
+        from PIL import Image
+
+        from src.geo import BBox
+        from src.relight import cast_shadow, surface_raster
+
+        bbox = BBox(0.0, 0.0, self.SPAN, self.SPAN)
+        boxes = [
+            (x, y, x + 12.0, y + 8.0)
+            for x in range(20, 180, 30) for y in range(20, 180, 30)
+        ]
+        buildings = self._buildings(boxes)
+
+        surface = surface_raster(bbox, 0.5, terrain=self._Flat(), buildings=buildings)
+        mask = cast_shadow(surface, 0.5, self.AZIMUTH, self.ELEVATION) > 0.5
+        roof = surface_raster(bbox, 0.5, buildings=buildings) > 0.5
+
+        def grow(small):
+            rows = np.arange(self.PX) * small.shape[0] // self.PX
+            cols = np.arange(self.PX) * small.shape[1] // self.PX
+            return small[rows[:, None], cols[None, :]]
+
+        shadow, roofs = grow(mask), grow(roof)
+        rng = np.random.default_rng(5)
+        image = np.zeros((self.PX, self.PX, 3))
+        image[:, :] = (110.0, 130.0, 85.0)
+        if classes is not None:
+            # A second surface with its own albedo, so the per-class gains
+            # have something to tell apart.
+            image[grow(classes) == 1] = (150.0, 148.0, 145.0)
+        if dark_roofs:
+            # Darker than the shadowed grass below, on purpose: that is the
+            # case a brightness threshold cannot get right.
+            image[roofs] = (45.0, 40.0, 38.0)
+        if not overcast:
+            image = image * np.where(shadow[:, :, None], self.SHADE_RGB, 1.0)
+        if inverted is not None:
+            # Painted after the shadow, so this class comes out *brighter*
+            # where it is shadowed than where it is lit: its measured gain is
+            # below one.
+            image[inverted & shadow] = (170.0, 168.0, 165.0)
+            image[inverted & ~shadow] = (100.0, 98.0, 96.0)
+            # And a minority of its shadowed pixels are genuinely dark, so
+            # they are the ones a gain below one would actually darken.
+            # Without them the photometric guard alone keeps the clamp from
+            # ever being reached, and the clamp goes untested.
+            speckle = np.zeros(inverted.shape, dtype=bool)
+            speckle[::3] = True
+            image[inverted & shadow & speckle] = (30.0, 29.0, 28.0)
+        image += rng.normal(0, 4, image.shape)
+
+        path = Path(folder) / "aerial.png"
+        Image.fromarray(np.clip(image, 0, 255).astype(np.uint8)).save(path)
+        return path, shadow, roofs, buildings, bbox
+
+    def _luminance(self, path):
+        from PIL import Image
+
+        return np.asarray(Image.open(path), dtype=np.float64) @ self.WEIGHTS
+
+    def test_shadowed_ground_is_brought_back_up_to_lit_ground(self):
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = self._luminance(path)
+            info = remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings
+            )
+            after = self._luminance(path)
+
+        ground = ~roofs
+        lit, shaded = ground & ~shadow, ground & shadow
+        target = float(before[lit].mean())
+        was = float(before[shaded].mean())
+        now = float(after[shaded].mean())
+        self.assertLess(was, target * 0.7, "the fixture has no shadow in it")
+        self.assertGreater(
+            now, target * 0.85,
+            f"shadowed ground only came back to {now:.0f} against {target:.0f}",
+        )
+        self.assertGreater(info["fit_r"], 0.05)
+
+    def test_sunlit_ground_is_left_alone(self):
+        """It rewrites the photo, and the photo is the thing you see."""
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = self._luminance(path)
+            remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings
+            )
+            after = self._luminance(path)
+
+        lit = (~roofs) & (~shadow)
+        self.assertAlmostEqual(
+            float(after[lit].mean()), float(before[lit].mean()), delta=1.0
+        )
+
+    def test_a_dark_roof_in_the_sun_is_not_mistaken_for_a_shadow(self):
+        """The property that makes this safe. These roofs are *darker* than
+        the shadowed grass, so anything thresholding on brightness alone
+        brightens them; the geometry says no shadow was cast there, and the
+        photo agrees they are not shadow-coloured."""
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = self._luminance(path)
+            roof_lit = roofs & (~shadow)
+            ground_shaded = (~roofs) & shadow
+            self.assertLess(
+                float(before[roof_lit].mean()),
+                float(before[ground_shaded].mean()),
+                "the fixture's roofs are not darker than its shadows",
+            )
+            remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings
+            )
+            after = self._luminance(path)
+
+        lifted = float(after[roof_lit].mean()) / float(before[roof_lit].mean())
+        self.assertLess(
+            lifted, 1.15,
+            f"a lit dark roof was brightened {lifted:.2f}x as if it were shade",
+        )
+
+    def test_the_blue_cast_of_skylight_comes_out_too(self):
+        """A shadow is lit by sky alone, so it loses more red than blue. Three
+        separate channel gains undo that without naming a colour temperature;
+        one luminance gain would leave every shadow blue."""
+        import tempfile
+
+        from PIL import Image
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = np.asarray(Image.open(path), dtype=np.float64)
+            remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings
+            )
+            after = np.asarray(Image.open(path), dtype=np.float64)
+
+        ground = ~roofs
+        def blueness(image, selector):
+            return float(
+                (image[selector][:, 2] / np.maximum(image[selector][:, 0], 1)).mean()
+            )
+
+        lit = blueness(before, ground & ~shadow)
+        was = blueness(before, ground & shadow)
+        now = blueness(after, ground & shadow)
+        self.assertGreater(was, lit * 1.2, "the fixture's shadows are not blue")
+        self.assertLess(
+            abs(now - lit), abs(was - lit) * 0.4,
+            f"shadow blue/red went {was:.2f} -> {now:.2f}, against {lit:.2f} lit",
+        )
+
+    def test_each_surface_gets_its_own_gain(self):
+        """How much darker a shadow is depends on what is under it. One gain
+        for the whole photo is grass-in-shade measured against asphalt-in-sun.
+        """
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        # The right half is a brighter surface, as its own class.
+        classes = np.zeros((400, 400), dtype=np.int32)
+        classes[:, 200:] = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp, classes=classes)
+            before = self._luminance(path)
+            # `class_grid` is handed over the way the surfaces stage holds it,
+            # with row 0 at the south edge.
+            remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings,
+                class_grid=np.flipud(classes),
+            )
+            after = self._luminance(path)
+
+        half = self.PX // 2
+        for name, columns in (("left", slice(0, half)), ("right", slice(half, None))):
+            side = np.zeros((self.PX, self.PX), dtype=bool)
+            side[:, columns] = True
+            ground = side & ~roofs
+            lit, shaded = ground & ~shadow, ground & shadow
+            target = float(before[lit].mean())
+            now = float(after[shaded].mean())
+            self.assertGreater(
+                now, target * 0.85,
+                f"the {name} surface came back to {now:.0f} of {target:.0f}",
+            )
+
+    def test_an_overcast_photo_is_left_alone(self):
+        """Nothing to remove. Guessing at a sun would stain the photo
+        wherever the buildings happen to be."""
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _, _, buildings, bbox = self._scene(tmp, overcast=True)
+            before = self._luminance(path)
+            info = remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings
+            )
+            after = self._luminance(path)
+        self.assertEqual(info, {})
+        np.testing.assert_array_equal(after, before)
+
+    def test_it_can_be_switched_off(self):
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _, _, buildings, bbox = self._scene(tmp)
+            before = self._luminance(path)
+            info = remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings, strength=0.0
+            )
+            after = self._luminance(path)
+        self.assertEqual(info, {})
+        np.testing.assert_array_equal(after, before)
+
+    def test_with_nothing_standing_up_there_is_nothing_to_do(self):
+        """And it does not go looking. Fitting a sun means a few hundred
+        trial shadow casts; over open country where nothing stands up they
+        all come back empty, which is half a minute spent proving it.
+
+        The fit is replaced with a trap rather than merely checking the
+        answer, because returning `{}` the slow way looks identical from
+        outside.
+        """
+        import tempfile
+
+        import src.relight as relight_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _, _, _, bbox = self._scene(tmp)
+            before = self._luminance(path)
+            # Buildings present but flat: no geometry can cast anything.
+            flat = self._buildings([(10.0, 10.0, 90.0, 90.0)], height=0.2)
+            real_fit = relight_module.fit_sun
+            relight_module.fit_sun = lambda *a, **k: self.fail(
+                "fitted a sun over ground with nothing standing up on it"
+            )
+            try:
+                info = relight_module.remove_cast_shadows(
+                    path, bbox, terrain=self._Flat(), buildings=flat
+                )
+            finally:
+                relight_module.fit_sun = real_fit
+            after = self._luminance(path)
+        self.assertEqual(info, {})
+        np.testing.assert_array_equal(after, before)
+
+    def test_no_geometry_means_no_guessing(self):
+        import tempfile
+
+        from src.geo import BBox
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _, _, _, _ = self._scene(tmp)
+            before = self._luminance(path)
+            info = remove_cast_shadows(
+                path, BBox(0.0, 0.0, self.SPAN, self.SPAN), terrain=self._Flat()
+            )
+            after = self._luminance(path)
+        self.assertEqual(info, {})
+        np.testing.assert_array_equal(after, before)
+
+    def test_the_gain_is_capped(self):
+        """Deep shade holds no detail to recover, so past the cap the gain is
+        amplifying sensor noise and JPEG blocks."""
+        import tempfile
+
+        from PIL import Image
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = np.asarray(Image.open(path), dtype=np.float64)
+            info = remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings,
+                max_gain=1.4,
+            )
+            after = np.asarray(Image.open(path), dtype=np.float64)
+
+        self.assertLessEqual(info["mean_gain"], 1.4 + 1e-6)
+        ratio = float(
+            after[shadow & ~roofs].mean() / before[shadow & ~roofs].mean()
+        )
+        self.assertLessEqual(
+            ratio, 1.45, f"shadow was lifted {ratio:.2f}x against a 1.4 cap"
+        )
+
+    def test_it_reports_what_it_did(self):
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _, _, buildings, bbox = self._scene(tmp)
+            info = remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings
+            )
+        gap = min(
+            abs(info["sun_azimuth_deg"] - self.AZIMUTH),
+            360.0 - abs(info["sun_azimuth_deg"] - self.AZIMUTH),
+        )
+        self.assertLess(gap, 8.0, f"reported azimuth {info['sun_azimuth_deg']}")
+        self.assertLess(abs(info["sun_elevation_deg"] - self.ELEVATION), 8.0)
+        self.assertGreater(info["shadow_fraction"], 0.05)
+        self.assertGreater(
+            info["shadow_luminance_after"], info["shadow_luminance_before"]
+        )
+
+    def test_half_strength_does_half_the_work(self):
+        """0 and 1 are the easy cases; the knob has to mean something in
+        between, and a pass that ignored it would still satisfy both ends."""
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        lifts = {}
+        for strength in (0.5, 1.0):
+            with tempfile.TemporaryDirectory() as tmp:
+                path, shadow, roofs, buildings, bbox = self._scene(tmp)
+                before = self._luminance(path)
+                remove_cast_shadows(
+                    path, bbox, terrain=self._Flat(), buildings=buildings,
+                    strength=strength,
+                )
+                after = self._luminance(path)
+            shaded = shadow & ~roofs
+            lifts[strength] = float(
+                after[shaded].mean() - before[shaded].mean()
+            )
+        self.assertGreater(lifts[0.5], 5.0, "half strength did nothing")
+        self.assertAlmostEqual(
+            lifts[0.5] / lifts[1.0], 0.5, delta=0.12,
+            msg=f"half strength lifted {lifts[0.5]:.1f} against "
+                f"{lifts[1.0]:.1f} at full",
+        )
+
+    def test_the_mask_edge_is_feathered(self):
+        """A hard mask boundary prints a seam into the photo that was not
+        there before. Across a shadow edge the correction has to ramp."""
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = self._luminance(path)
+            remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings
+            )
+            after = self._luminance(path)
+
+        lift = after - before
+        # Along the boundary of the mask, how many pixels got a partial lift?
+        edge = shadow ^ np.roll(shadow, 1, axis=0)
+        touched = lift > 1.0
+        full = float(np.percentile(lift[shadow & ~roofs], 75))
+        partial = ((lift > 1.0) & (lift < full * 0.6))[edge & ~roofs]
+        self.assertGreater(
+            float(partial.mean()), 0.12,
+            "the correction steps straight from nothing to full at the edge",
+        )
+
+    def test_a_shadow_is_never_made_darker(self):
+        """The gain is clamped at the bottom as well as the top.
+
+        A class whose statistics come out backwards -- too few samples, an odd
+        surface, something repainted between the flight and the survey -- has
+        a measured ratio below one. Applying it would *darken* ground the
+        geometry says is already in shadow, which is the opposite of the job.
+        """
+        import tempfile
+
+        from PIL import Image
+
+        from src.relight import remove_cast_shadows
+
+        # A class painted bright where it is shadowed and dark where it is lit.
+        inverted = np.zeros((self.PX, self.PX), dtype=bool)
+        inverted[self.PX // 3 : 2 * self.PX // 3] = True
+        classes = np.zeros((400, 400), dtype=np.int32)
+        classes[400 // 3 : 2 * 400 // 3] = 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(
+                tmp, inverted=inverted
+            )
+            before = np.asarray(Image.open(path), dtype=np.float64)
+            weights = self.WEIGHTS
+            backwards = inverted & shadow
+            forwards = inverted & ~shadow
+            self.assertGreater(
+                float(np.median(before[backwards] @ weights)),
+                float(np.median(before[forwards] @ weights)),
+                "the fixture's odd class is not actually backwards",
+            )
+            # The dark minority inside it: these are what a gain below one
+            # would darken, and what the clamp has to protect.
+            darkest = before[backwards] @ weights
+            self.assertGreater(
+                float((darkest < 60.0).mean()), 0.2,
+                "the fixture has no dark pixels inside the backwards class",
+            )
+            remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings,
+                class_grid=np.flipud(classes),
+            )
+            after = np.asarray(Image.open(path), dtype=np.float64)
+
+        darkened = float((after < before - 3.0).mean())
+        self.assertLess(
+            darkened, 0.01,
+            f"{darkened:.1%} of the photo was made darker by a de-shadow pass",
+        )
+
+    def test_terrain_alone_is_not_enough_to_start_relighting(self):
+        """Sloped ground self-shades, so the fit would find something. It is
+        still not a reason to rewrite the photo when the thing that casts most
+        of the shadow -- the buildings, the trees -- was not fetched."""
+        import tempfile
+
+        from src.relight import remove_cast_shadows
+
+        class Ridge:
+            def sample(self, x, y):
+                x = np.asarray(x, dtype=float)
+                return 20.0 - np.abs(x - 100.0) * 0.3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _, _, _, bbox = self._scene(tmp)
+            before = self._luminance(path)
+            info = remove_cast_shadows(path, bbox, terrain=Ridge())
+            after = self._luminance(path)
+        self.assertEqual(info, {})
+        np.testing.assert_array_equal(after, before)
+
+    def test_the_pipeline_relights_in_the_right_order(self):
+        """Three passes rewrite the aerial and each reads what the one before
+        wrote. The sun comes out first, while the photo holds only what the
+        camera saw; the grain goes onto evenly lit ground rather than being
+        amplified where a shadow was; the canopy occlusion goes on last,
+        because it is the one shading term that belongs in a ground texture.
+        """
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        order = [
+            source.index("remove_cast_shadows("),
+            source.index("blend_surface_detail("),
+            source.index("bake_canopy_shade("),
+        ]
+        self.assertEqual(order, sorted(order), "the aerial passes are out of order")
+
+    def test_the_metadata_says_the_photo_no_longer_carries_a_sun(self):
+        """Anyone lighting this model needs to know the texture is not
+        carrying its own sun any more -- and, when it still is, at what angle,
+        so they can match it."""
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        self.assertIn('"aerial_relighting": shadow_info', source)
+        # Not reported as an empty block when nothing was done: that reads as
+        # a feature that failed rather than one that stood down.
+        self.assertIn("if shadow_info else {}", source)
+
+    def test_the_knob_exists_and_reaches_the_pipeline(self):
+        import inspect
+
+        import pipeline
+        from src.config import DEFAULTS
+
+        self.assertEqual(DEFAULTS["aerial"]["deshadow"], 1.0)
+        self.assertIn(
+            'config.aerial.get("deshadow"', inspect.getsource(pipeline.run)
+        )
+
+
 class TestCanopyShade(unittest.TestCase):
     """The aerial is flown leaf-off and the trees are leafy.
 
@@ -7888,6 +8775,24 @@ class TestUIServer(unittest.TestCase):
         )
         self.assertEqual(config["facade"]["looks_per_era"], 3)
 
+    def test_the_deshadow_toggle_reaches_the_config(self):
+        for asked, expect in ((True, 1.0), (False, 0.0)):
+            config = self.server.build_config({
+                "name": "sun",
+                "bbox": {"xmin": 136000, "ymin": 455000,
+                         "xmax": 137000, "ymax": 456000},
+                "deshadow": 1.0 if asked else 0,
+            })
+            self.assertEqual(config["aerial"]["deshadow"], expect)
+
+    def test_deshadowing_is_on_when_the_form_says_nothing(self):
+        config = self.server.build_config({
+            "name": "bare",
+            "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+        })
+        self.assertEqual(config["aerial"]["deshadow"], 1.0)
+        self.assertEqual(config["aerial"]["size_px"], 4096)
+
     def test_collision_is_off_when_the_form_does_not_ask(self):
         config = self.server.build_config(
             {
@@ -8167,7 +9072,8 @@ class TestUIPage(unittest.TestCase):
         for control in ("q", "size", "name", "preset", "aerialCm", "terrainM",
                         "terrainTol", "facadePx", "facade", "clip",
                         "groundFloor", "normal", "photoTextures", "preview",
-                        "collision", "collisionCrowns", "looks", "treeShade"):
+                        "collision", "collisionCrowns", "looks", "treeShade",
+                        "deshadow"):
             self.assertIn(
                 control, self.page.explained, f"the control {control} has no help marker"
             )

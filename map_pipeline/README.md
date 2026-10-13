@@ -335,6 +335,7 @@ Other knobs worth knowing:
 | `terrain.breakline_simplify_m` | `0.15` | How far a simplified outline may stray from the surveyed one. Applied to the whole outline network at once, not ring by ring, so a boundary two polygons share stays one line. |
 | `terrain.contour_interval_m` | `0.5` | Contour spacing. Contours are then thinned against `simplify_tolerance_m`, so flat ground contributes none. `0` leaves them out entirely. |
 | `terrain.simplify_tolerance_m` | `0.10` | How far the terrain mesh may stray from the height grid. Drops the vertices sitting on ground their neighbours already describe, which over a Dutch bbox is most of them. `0` keeps the full grid. |
+| `aerial.deshadow` | `1.0` | How much of the flown sun to take back out of the photo, 0 to 1. See [The flown sun](#the-flown-sun-and-taking-it-back-out). `0` leaves it as flown. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
 
 ## How it fits together
@@ -1233,6 +1234,73 @@ Summer foliage would read +0.6. Dutch national orthos are flown deliberately
 rather than hidden under canopy — which makes them excellent for everything else
 this pipeline does and useless for finding trees by colour. A quarter of an index
 point between a tree and a road is not a detector. Height is the signal.
+
+### The flown sun, and taking it back out
+
+A Dutch ortho is shot on one morning. Over Bronbeek the pipeline fits that
+morning at **140 degrees azimuth, 25 degrees up** — a mid-morning late-winter
+flight at 52 degrees north — and 29% of the photo sits below a luminance of
+85. Those shadows are painted onto every roof and every square metre of
+ground, at one time of one day. An engine lighting the model at any other hour
+then has two suns disagreeing, and for a drone sim the hour is the user's to
+set. `aerial.deshadow` takes the flown one out.
+
+**The shadow is computed from the thing that casts it.** That is the whole
+reason this can be trusted. A detector working from pixels alone cannot tell a
+dark roof from a dark roof's shadow, and will brighten slate, asphalt and
+water. This pipeline already knows where the buildings and the trees are in
+three dimensions, so it marches a ray toward the sun across a height raster
+built from the terrain, the 3DBAG roofs and the detected canopies. Heights are
+absolute NAP rather than above-ground, so a hillside shades its own far slope —
+Arnhem is on a moraine and Bronbeek is on the side of it.
+
+**The sun is fitted, not looked up.** The WMS publishes no capture time, so a
+few hundred trial shadows are cast across a grid of sun positions and the one
+whose shadows best explain the dark pixels wins. Two resolutions: the sweep is
+pooled to 4 m because recovering a *direction* needs no more, and the
+refinement runs at 1 m because pooling by maximum fattens every caster, which
+lengthens its shadow, which the fit answers by choosing a sun 2.5 to 4.5
+degrees too high. The best four coarse candidates are refined rather than the
+best one — a low sun over regular streets merges its shadows into a sheet and
+flattens the score surface into basins a local refinement cannot climb out of,
+and on a test grid of terraces at 14 degrees it settled 20 degrees off.
+
+The fit is worth trusting over intuition here. A crude correlation of dark
+against bright pixels on this same photo says the sun is in the south-west;
+looking at the Bronbeek building, its shadow plainly falls north-west, so the
+sun is south-east and the fit is right. The correlation was reading the tree
+canopy, not the buildings. Adding 11,921 detected trees to the height raster
+moves the fitted sun not at all — 140/25 either way — which is the better
+check.
+
+**The gain is measured off the photo, per land-cover class, per channel.** How
+much darker a shadow is depends on what is under it: grass in shade against
+grass in sun is a fair comparison, grass in shade against asphalt in sun is
+not, and one global gain is exactly that comparison. Per *channel* because a
+shadow is lit by sky alone, so it loses more red than blue, and three separate
+gains undo the cast without anyone naming a colour temperature.
+
+Two guards:
+
+* **Capped at 3x.** Deep shade holds no detail to recover, so past that the
+  gain amplifies sensor noise and JPEG blocks.
+* **The photo has a veto.** A pixel is only brightened to the extent it
+  actually looks shadowed, measured against its own class's lit and shadowed
+  medians. Where the geometry and the photo disagree — a tree the detector
+  missed, a building 3DBAG has a metre out of place, a car parked since the
+  flight — nothing gets stained. Tested with roofs painted *darker* than the
+  shadows around them: they move by under 15%.
+
+Measured over Bronbeek with buildings and trees, 41.6 s:
+
+| | before | after |
+|---|---|---|
+| shadowed ground, luminance | 96.0 | **115.4** (sunlit: 123.4) |
+| below luminance 85 | 29.4% | **15.3%** |
+| contrast, p90 − p10 | 97.4 | 80.7 |
+
+It is a mitigation, not a cure, and the limit is information rather than
+effort. `aerial.deshadow: 0` leaves the photo as flown.
 
 ### The leaf-off photo, under the leafy trees
 

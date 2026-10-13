@@ -332,10 +332,6 @@ def build_config(payload: dict) -> dict:
             "xmax": float(bbox["xmax"]),
             "ymax": float(bbox["ymax"]),
         },
-        "aerial": {
-            "layer": "Luchtfoto Actueel Ortho 8cm RGB",
-            "size_px": int(payload.get("size_px", 4096)),
-        },
         "terrain": {
             "ahn_model": payload.get("ahn_model", "DTM"),
             "resolution_m": 0.5,
@@ -374,6 +370,13 @@ def build_config(payload: dict) -> dict:
         },
         "vehicles": {
             "car_occupancy": float(payload.get("car_occupancy", 0.72)),
+        },
+        "aerial": {
+            "layer": "Luchtfoto Actueel Ortho 8cm RGB",
+            "size_px": int(payload.get("size_px", 4096)),
+            # The photo is shot on one morning; without this the model
+            # carries that morning's shadows into every other hour.
+            "deshadow": float(payload.get("deshadow", 1.0)),
         },
         "trees": {
             # The aerial is flown leaf-off, so without this the ground under a

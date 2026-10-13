@@ -569,6 +569,13 @@
     </div>
 
     <div class="inline">
+      <input type="checkbox" id="deshadow" checked>
+      <label for="deshadow">Remove the photo's own shadows</label>
+      <span class="help" tabindex="0" role="button" aria-label="About removing shadows"
+        data-tip="The aerial photo was taken on one morning, so hard shadows are painted into it &mdash; over this area about 20 m long, from a sun low in the south-east. Light your scene at any other time of day and those shadows point the wrong way and fight your own. This finds the sun the photo was shot under, works out which ground each building and tree was shading, and lifts it back to daylight. It uses the buildings and trees it already has rather than guessing from dark pixels, so dark roofs, asphalt and water stay dark. Turn it off to keep the photo exactly as flown.">?</span>
+    </div>
+
+    <div class="inline">
       <input type="checkbox" id="treeShade" checked>
       <label for="treeShade">Shade the ground under trees</label>
       <span class="help" tabindex="0" role="button" aria-label="About shading under trees"
@@ -1495,6 +1502,7 @@ $("run").onclick = async () => {
     collision: $("collision").checked,
     collision_tree_crowns: $("collisionCrowns").checked,
     tree_ground_shade: $("treeShade").checked ? 0.35 : 0,
+    deshadow: $("deshadow").checked ? 1.0 : 0,
     // Terrain shape. See updateShape: none of this changes accuracy.
     road_simplify_m: sh.roadDetail,
     road_max_edge_m: sh.roadFace,
