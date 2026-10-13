@@ -139,14 +139,19 @@ DEFAULTS: dict[str, Any] = {
         # every building, and era predicts a facade far better than height.
         # Set to 1 for a single wall material.
         "variants": 5,
-        # Looks within one era. An era decides the character of a wall, and
-        # before this it also decided its pixels, so every building of an age
-        # was the same building: a terrace of twelve came out identical along
-        # its whole length. Each look varies the wall colour, the trim, the
-        # window rhythm and the bay width, and a building picks one from its
-        # own BAG identifier. Costs one texture and one material slot each.
-        # 1 keeps the old behaviour exactly.
-        "looks_per_era": 3,
+        # The most looks any one era may get. Looks are handed out per era in
+        # proportion to how many buildings that era actually holds, so this is
+        # a ceiling rather than a count: an area with sixteen pre-1920 houses
+        # spends one texture on them however high this goes. Measured over
+        # Bronbeek -- 1322 buildings, 73% of them interbellum -- a flat 12
+        # would cost 62 wall textures where the allocation costs 20.
+        # 1 switches the whole thing off and gives one wall per era.
+        "looks_per_era": 12,
+        # How many buildings of one era should share a texture. The lever that
+        # actually decides how repetitive a street looks; lower buys variety
+        # with textures. At Bronbeek 80 puts 81 houses on the busiest wall,
+        # against 967 before any of this.
+        "buildings_per_look": 80,
         "seed": 20240501,
         # A normal map gives the windows and storey bands real relief under a
         # moving light. It costs one extra texture and exports through FBX.

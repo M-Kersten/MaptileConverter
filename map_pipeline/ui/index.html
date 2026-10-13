@@ -495,12 +495,13 @@
         <div>
           <label for="looks">Variety within a style
             <span class="help" tabindex="0" role="button" aria-label="About facade variety"
-              data-tip="Buildings of the same age share a style, and with <b>1</b> they also share the exact same wall, so a terrace of twelve houses comes out as one house repeated twelve times. Each extra look gives that age another wall colour, window frame colour, window count and spacing, and a building picks one by its own address &mdash; so it keeps the same wall every time you rebuild the area. Costs one texture per look.">?</span>
+              data-tip="Buildings of the same age share a style, and with <b>off</b> they share the exact same wall, so a street of houses built in one go comes out as one house repeated. Each extra look gives that age another wall colour, window frame colour, window count and spacing; a building picks one by its own address, so it keeps the same wall every time you rebuild the area. The number here is roughly how many buildings may end up sharing a wall &mdash; lower buys variety at one extra texture each. Looks are handed out per age group in proportion to how many buildings are in it, so an age with only a handful of buildings never wastes textures.">?</span>
           </label>
           <select id="looks">
-            <option value="3" selected>3 looks per style</option>
-            <option value="5">5 looks per style</option>
-            <option value="1">1, neighbours look identical</option>
+            <option value="80" selected>Normal</option>
+            <option value="40">High &mdash; more textures</option>
+            <option value="160">Low &mdash; fewer textures</option>
+            <option value="0">Off &mdash; neighbours identical</option>
           </select>
         </div>
       </div>
@@ -1346,17 +1347,17 @@ $("normal").addEventListener("change", () => { $("preset").value = "custom"; });
 $("name").addEventListener("input", updateAreaPlain);
 
 function updateFacadeNote() {
-  const styles = +$("facade").value, looks = +$("looks").value;
+  const styles = +$("facade").value, budget = +$("looks").value;
   const era = styles > 1
     ? "Walls follow the era rather than the height: pre-1920 brick, through "
       + "post-war concrete, to contemporary glass."
     : "One wall style for every building, whatever its age.";
-  const variety = looks > 1
-    ? ` Each style comes in ${looks} looks, so neighbours of the same age `
-      + `differ in colour and window layout. ${styles * looks + 2} wall `
-      + `textures in total.`
-    : " Buildings sharing a style share the exact same wall, so a terrace "
-      + "repeats.";
+  const variety = budget > 0
+    ? ` Within a style, roughly every ${budget} buildings get their own wall `
+      + `colour and window layout, so neighbours of the same age differ. `
+      + `Ages with few buildings use fewer textures.`
+    : " Buildings sharing a style share the exact same wall, so a street "
+      + "built in one go repeats.";
   $("facadeNote").textContent = era + variety;
 }
 $("facade").addEventListener("change", updateFacadeNote);
@@ -1484,7 +1485,8 @@ $("run").onclick = async () => {
     facade_texture_px: q.facadePx,
     facade_normal_map: $("normal").checked,
     facade_variants: +$("facade").value,
-    facade_looks_per_era: +$("looks").value,
+    // 0 means off; otherwise it is the buildings-per-wall budget.
+    facade_buildings_per_look: +$("looks").value,
     facade_ground_floor: $("groundFloor").checked,
     facade_photo_textures: $("photoTextures").checked,
     sources: selectedSources(),

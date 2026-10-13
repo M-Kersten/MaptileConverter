@@ -300,6 +300,26 @@ def register(job: Job) -> None:
             JOBS.pop(old, None)
 
 
+def _facade_variety(payload: dict) -> dict:
+    """Turn the form's buildings-per-wall budget into the facade settings.
+
+    The form asks the question the user can answer -- how many buildings may
+    share a wall -- rather than how many textures to generate, because the
+    second depends on what is actually in the area. 0 is the off switch.
+
+    `facade_looks_per_era` is still read for a caller written against the
+    older form.
+    """
+    budget = payload.get("facade_buildings_per_look")
+    if budget is None:
+        looks = int(payload.get("facade_looks_per_era", 12))
+        return {"looks_per_era": max(1, looks)}
+    budget = int(budget)
+    if budget <= 0:
+        return {"looks_per_era": 1}
+    return {"looks_per_era": 12, "buildings_per_look": budget}
+
+
 def build_config(payload: dict) -> dict:
     """Turn the form payload into a pipeline config."""
     bbox = payload["bbox"]
@@ -343,8 +363,10 @@ def build_config(payload: dict) -> dict:
         },
         "facade": {
             "variants": int(payload.get("facade_variants", 1)),
-            # Looks within one style, so a terrace is not one house repeated.
-            "looks_per_era": int(payload.get("facade_looks_per_era", 3)),
+            # The form sends a buildings-per-wall budget, with 0 meaning "one
+            # wall per era". Looks are allocated per era from that; the cap
+            # only binds where an era is dense enough to need it.
+            **_facade_variety(payload),
             "texture_px": int(payload.get("facade_texture_px", 512)),
             "normal_map": bool(payload.get("facade_normal_map", True)),
             "ground_floor": bool(payload.get("facade_ground_floor", True)),

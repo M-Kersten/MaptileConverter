@@ -284,7 +284,8 @@ Other knobs worth knowing:
 | Key | Default | What it does |
 | --- | --- | --- |
 | `facade.variants` | `5` | How many era styles to assign by construction year, up to `5`. The monumental and industrial styles are always present on top of these. |
-| `facade.looks_per_era` | `3` | Looks within one era, so neighbours of the same age are not the same texture. Each costs one texture and one material slot; `1` makes a terrace repeat. Clamped to 12. |
+| `facade.looks_per_era` | `12` | The most looks any one era may get. A ceiling, not a count: looks are handed out per era in proportion to how many buildings wear them, so a sparse era spends one texture however high this goes. `1` switches the whole thing off. Clamped to 12. |
+| `facade.buildings_per_look` | `80` | How many buildings of one era should share a wall. The lever that actually decides how repetitive a street looks; lower buys variety at one texture each. |
 | `facade.ground_floor` | `true` | Split walls at the first-floor line and give the ground storey its own material. Churches and sheds are left whole. |
 | `facade.ground_floor_height_m` | `3.6` | Where that cut sits above each building's own ground level. |
 | `facade.photo_textures` | `true` | Photographed CC0 masonry under the generated windows, downloaded once and cached in `work/_textures/`. |
@@ -1412,12 +1413,37 @@ every building of an age was the same building: a terrace of twelve 1890s
 houses came out identical along its whole length, which is exactly what reads
 as generated however good one house looks.
 
-So each era now has `facade.looks_per_era` looks, three by default. A look
-varies the wall colour, the trim colour, the window count across, the window
-proportions and the bay width. Measured, two looks of one era differ by 19–52
-mean absolute levels where two completely *different* eras differ by 50 — these
-are different buildings, not tints. Five eras at three looks is 17 wall
-textures, which took 2.0 s and 1.4 MB to generate.
+So each era now gets several looks. A look varies the wall colour, the trim
+colour, the window count across, the window proportions and the bay width.
+Measured, two looks of one era differ by 19–52 mean absolute levels where two
+completely *different* eras differ by 50 — these are different buildings, not
+tints.
+
+**The looks are allocated, not spread evenly, because buildings are not.**
+Over the Bronbeek square kilometre: 1,322 buildings, **73% of them built
+between 1920 and 1945**, 580 of those between 1930 and 1934 alone. It is one
+interwar estate built in two waves. Giving every era the same count there
+spends a dozen textures on sixteen pre-1920 houses that cannot repeat, and
+still leaves the interbellum era with eighty-one buildings per wall.
+
+Each era instead gets one look per `facade.buildings_per_look` buildings *of
+that era*, capped at `facade.looks_per_era`. On Bronbeek that comes out
+`historic 1, interbellum 12, postwar 3, modern 1, contemporary 1` — 20 wall
+textures against the 62 a flat twelve would cost:
+
+| | textures | busiest wall |
+|---|---|---|
+| one wall per era | 7 | **966** buildings (73%) |
+| a flat three | 17 | 345 (26%) |
+| allocated | **20** | **91** (6.9%) |
+
+`facade.LookPlan` owns the slot arithmetic — `offsets[era] + look`, specials
+after all of them — because three places used to do it independently and a
+layout only works while they all agree. The buildings stage measures the
+allocation and the facade stage is *handed* it rather than recomputing it from
+config: a building carries a slot number, not a style, so two sides disagreeing
+about the layout puts the wrong wall on every building after the first era
+whose count changed, and nothing looks broken.
 
 A building picks its look from **its own BAG identifier**, not from a counter,
 so it keeps the same wall when the area is rebuilt, re-tiled, or fetched in a

@@ -48,6 +48,7 @@ from src.sources import (  # noqa: E402
 )
 from src.facade import (  # noqa: E402
     CAR_PAINT,
+    LookPlan,
     generate_facade_textures,
     generate_fence_texture,
     generate_furniture_texture,
@@ -710,7 +711,15 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
         facade_cfg["ground_by_function"] = bool(len(usage))
-        facade_paths = generate_facade_textures(work_dir, facade_cfg=facade_cfg)
+        # The look allocation the buildings were numbered against. Generating
+        # a different set here would put the wrong wall on every building
+        # after the first era whose count changed.
+        plan = (
+            LookPlan(buildings.facade_looks) if buildings.facade_looks else None
+        )
+        facade_paths = generate_facade_textures(
+            work_dir, facade_cfg=facade_cfg, plan=plan
+        )
         ground_variants = (
             (2 if len(usage) else 1) if config.facade["ground_floor"] else 0
         )

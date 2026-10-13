@@ -1918,41 +1918,201 @@ class TestFacadeLooks(unittest.TestCase):
             # The walls, plus one ground storey.
             self.assertEqual(len(paths), len(wall_styles(5, looks)) + 1)
 
+    @staticmethod
+    def _buildings(spec):
+        """A BuildingSet from (identifier, year, archetype) triples."""
+        from src.buildings import Building, BuildingSet
+
+        tri = np.zeros((1, 3, 3))
+        return BuildingSet(buildings=[
+            Building(
+                identifier=ident, wall_tris=tri, roof_tris=tri,
+                ground_z_nap=0.0, roof_max_nap=9.0, floors=3,
+                wall_top_nap=7.0, build_year=year, archetype=arch,
+            )
+            for ident, year, arch in spec
+        ])
+
     def test_buildings_spread_one_era_across_its_looks(self):
-        """`build_buildings` is where the slot is actually chosen, and a test
-        of `look_for_building` alone says nothing about whether it is used."""
-        from src.facade import (
-            look_for_building,
-            looks_per_era,
-            style_for_archetype,
-            style_for_building,
-        )
+        """`assign_facade_slots` is where the slot is actually chosen, and a
+        test of `look_for_building` alone says nothing about whether it is
+        used. This calls the real rule."""
+        from src.buildings import assign_facade_slots
 
-        # The slot rule, as src/buildings.py applies it.
-        looks = looks_per_era({"looks_per_era": 3})
-        self.assertEqual(looks, 3)
-        slots = []
-        for n in range(12):
-            identifier = f"NL.IMBAG.Pand.03621000{n:06d}"
-            self.assertIsNone(style_for_archetype(0, 5, looks))
-            era = style_for_building(11.0, 1890, 5)
-            slots.append(era * looks + look_for_building(identifier, looks))
+        terrace = self._buildings([
+            (f"NL.IMBAG.Pand.03621000{n:06d}", 1890, 0) for n in range(300)
+        ])
+        slots, plan = assign_facade_slots(
+            terrace, 5, {"looks_per_era": 12, "buildings_per_look": 80}
+        )
+        self.assertEqual(len(slots), 300)
+        # 300 buildings at 80 apiece is four looks, all inside era 0.
+        self.assertEqual(plan.per_era[0], 4)
+        self.assertEqual(set(np.unique(slots).tolist()), {0, 1, 2, 3})
+
+    def test_the_looks_go_where_the_buildings_are(self):
+        """The whole point of allocating rather than spreading evenly. Over
+        the real Bronbeek mix -- 73% of 1322 buildings interbellum -- an even
+        allocation spends a dozen textures on sixteen pre-1920 houses and
+        still leaves the interbellum era repeating."""
+        from src.buildings import assign_facade_slots
+
+        # The measured Bronbeek era counts.
+        mix = []
+        for era_year, count in ((1890, 16), (1933, 967), (1960, 240),
+                                (1985, 27), (2010, 72)):
+            mix += [
+                (f"NL.IMBAG.Pand.{era_year}{n:07d}", era_year, 0)
+                for n in range(count)
+            ]
+        slots, plan = assign_facade_slots(
+            self._buildings(mix), 5,
+            {"looks_per_era": 12, "buildings_per_look": 80},
+        )
         self.assertEqual(
-            {s // looks for s in slots}, {0},
-            "the terrace left the historic era",
+            plan.per_era, (1, 12, 3, 1, 1),
+            "the looks were not allocated by how many buildings wear them",
         )
-        self.assertGreater(len(set(slots)), 1, "one slot for the whole row")
+        # 20 textures, not the 62 a flat twelve would cost.
+        self.assertEqual(plan.total_slots, 20)
+        busiest = max(np.bincount(slots))
+        self.assertLess(
+            busiest, 120,
+            f"the busiest wall is still worn by {busiest} buildings",
+        )
 
-    def test_the_pipeline_chooses_the_slot_this_way(self):
+    def test_a_sparse_era_is_not_given_looks_it_cannot_use(self):
+        from src.buildings import assign_facade_slots
+
+        # Three pre-1920 houses and nothing else.
+        _, plan = assign_facade_slots(
+            self._buildings([
+                (f"NL.IMBAG.Pand.{n}", 1890, 0) for n in range(3)
+            ]),
+            5, {"looks_per_era": 12, "buildings_per_look": 80},
+        )
+        self.assertEqual(plan.per_era, (1, 1, 1, 1, 1))
+        self.assertEqual(plan.total_slots, 7)
+
+    def test_an_archetype_special_takes_no_era_look(self):
+        """A church does not make the houses around it repeat less."""
+        from src.buildings import assign_facade_slots
+
+        ARCH_MONUMENTAL = 5
+        mix = [(f"NL.IMBAG.Pand.h{n}", 1933, 0) for n in range(160)]
+        mix += [(f"NL.IMBAG.Pand.church{n}", 1450, ARCH_MONUMENTAL)
+                for n in range(40)]
+        slots, plan = assign_facade_slots(
+            self._buildings(mix), 5,
+            {"looks_per_era": 12, "buildings_per_look": 80},
+        )
+        # 160 houses is two looks; the 40 churches must not buy a third.
+        self.assertEqual(plan.per_era[1], 2)
+        self.assertEqual(
+            set(slots[160:].tolist()), {plan.archetype_slot(ARCH_MONUMENTAL)},
+            "the monumental buildings did not all land on the monumental slot",
+        )
+
+    def test_the_slots_index_the_textures_that_get_generated(self):
+        """A building carries a slot number, not a style. Generating a
+        different set of textures than the slots were numbered against puts
+        the wrong wall on every building after the first era whose count
+        changed -- and nothing would look broken, just wrong."""
+        import tempfile
+
+        from src.buildings import assign_facade_slots
+        from src.config import DEFAULTS
+        from src.facade import generate_facade_textures
+
+        mix = []
+        for era_year, count in ((1890, 16), (1933, 400), (1960, 90)):
+            mix += [(f"NL.IMBAG.Pand.{era_year}{n:07d}", era_year, 0)
+                    for n in range(count)]
+        slots, plan = assign_facade_slots(
+            self._buildings(mix), 5,
+            {"looks_per_era": 12, "buildings_per_look": 80},
+        )
+        cfg = dict(DEFAULTS["facade"], texture_px=64, photo_textures=False,
+                   normal_map=False, ground_floor=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = generate_facade_textures(
+                Path(tmp), facade_cfg=cfg, plan=plan
+            )
+        self.assertEqual(
+            len(paths), plan.total_slots,
+            "the texture set is not the size the slots address",
+        )
+        self.assertLess(
+            int(slots.max()), len(paths),
+            f"slot {slots.max()} addresses a texture that was never written",
+        )
+
+    def test_both_allocation_levers_do_something(self):
+        """The cap and the budget are separate knobs and every test here used
+        one setting of each, so freezing either passed. The cap only binds
+        once an era is dense enough to ask for more than it allows."""
+        from src.facade import LookPlan
+
+        # 2000 buildings in one era: 25 looks at a budget of 80, which the
+        # cap has to cut down.
+        dense = [0, 2000, 0, 0, 0]
+        self.assertEqual(LookPlan.from_counts(dense, cap=12, target=80).per_era[1], 12)
+        self.assertEqual(LookPlan.from_counts(dense, cap=4, target=80).per_era[1], 4)
+        self.assertEqual(LookPlan.from_counts(dense, cap=1, target=80).per_era[1], 1)
+
+        # The budget decides it below the cap.
+        moderate = [0, 480, 0, 0, 0]
+        for target, expect in ((40, 12), (80, 6), (120, 4), (240, 2), (960, 1)):
+            self.assertEqual(
+                LookPlan.from_counts(moderate, cap=12, target=target).per_era[1],
+                expect,
+                f"480 buildings at {target} apiece should be {expect} looks",
+            )
+
+    def test_the_cap_cannot_exceed_what_the_palettes_fill(self):
+        """Past twelve the looks repeat, so the textures would be duplicates
+        taking a material slot each."""
+        from src.facade import MAX_LOOKS_PER_ERA, LookPlan
+
+        plan = LookPlan.from_counts([0, 100000, 0, 0, 0], cap=500, target=1)
+        self.assertEqual(plan.per_era[1], MAX_LOOKS_PER_ERA)
+
+    def test_the_shipped_budget_is_the_measured_one(self):
+        """80 is not arbitrary: it is what puts the busiest Bronbeek wall on
+        81 of 1322 buildings rather than 967, at 20 textures."""
+        from src.config import DEFAULTS
+        from src.facade import LookPlan
+
+        budget = DEFAULTS["facade"]["buildings_per_look"]
+        self.assertEqual(budget, 80)
+        plan = LookPlan.from_counts(
+            [16, 967, 240, 27, 72],
+            cap=DEFAULTS["facade"]["looks_per_era"], target=budget,
+        )
+        self.assertEqual(plan.per_era, (1, 12, 3, 1, 1))
+        self.assertEqual(plan.total_slots, 20)
+        self.assertLess(max(967 / 12, 240 / 3), 100)
+
+    def test_the_pipeline_hands_the_plan_to_the_texture_stage(self):
+        """Both sides have to use one allocation. The buildings stage
+        measures it; the facade stage has to be given it rather than
+        recomputing from config and hoping they agree."""
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        self.assertIn("LookPlan(buildings.facade_looks)", source)
+        self.assertIn("plan=plan", source)
+
+    def test_build_buildings_uses_the_shared_rule(self):
         import inspect
 
         from src import buildings
 
         source = inspect.getsource(buildings.build_buildings)
-        self.assertIn("era * looks + look_for_building(", source)
-        self.assertIn("looks_per_era(facade_cfg or {})", source)
-        self.assertIn("style_for_archetype(building.archetype, facade_variants, looks)",
-                      source)
+        self.assertIn("assign_facade_slots(", source)
+        self.assertIn("result.facade_looks = plan.per_era", source)
 
     def test_the_count_is_clamped_to_what_the_palettes_fill(self):
         from src.facade import MAX_LOOKS_PER_ERA, looks_per_era
@@ -5182,7 +5342,7 @@ class TestEvenFaceSize(unittest.TestCase):
         """
         def top_end(mesh):
             p = mesh.vertices[mesh.triangles][:, :, :2]
-            area = 0.5 * np.abs(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]))
+            area = 0.5 * np.abs(cross2d(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]))
             return float(np.percentile(area, 99))
 
         adaptive = top_end(self._build(0.0))
@@ -7690,32 +7850,43 @@ class TestUIServer(unittest.TestCase):
         self.assertEqual(loaded.barriers["collision_thickness_m"], 0.45)
 
     def test_the_facade_variety_picker_reaches_the_config(self):
-        """Three looks is the default in the form and in the config, and the
-        form's choice has to win over the config's."""
+        """The form asks how many buildings may share a wall, because that is
+        the question someone can answer; how many textures that costs depends
+        on what is in the area."""
         payload = {
             "name": "street",
             "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
             "facade_variants": 5,
-            "facade_looks_per_era": 5,
+            "facade_buildings_per_look": 40,
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps(self.server.build_config(payload)))
             loaded = load_config(path)
-        self.assertEqual(loaded.facade["looks_per_era"], 5)
+        self.assertEqual(loaded.facade["buildings_per_look"], 40)
+        self.assertEqual(loaded.facade["looks_per_era"], 12)
         self.assertEqual(loaded.facade["variants"], 5)
 
-    def test_one_look_still_reaches_the_config(self):
-        """Switching the variety off is the one choice a source-defaulting
-        `or` would silently overrule."""
+    def test_turning_the_variety_off_reaches_the_config(self):
+        """The one choice a budget-shaped control could silently overrule."""
         config = self.server.build_config(
             {
                 "name": "flat",
                 "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
-                "facade_looks_per_era": 1,
+                "facade_buildings_per_look": 0,
             }
         )
         self.assertEqual(config["facade"]["looks_per_era"], 1)
+
+    def test_the_older_form_field_still_works(self):
+        config = self.server.build_config(
+            {
+                "name": "old",
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                "facade_looks_per_era": 3,
+            }
+        )
+        self.assertEqual(config["facade"]["looks_per_era"], 3)
 
     def test_collision_is_off_when_the_form_does_not_ask(self):
         config = self.server.build_config(

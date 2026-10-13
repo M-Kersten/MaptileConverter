@@ -525,37 +525,123 @@ def looks_for_style(style: FacadeStyle, n_looks: int) -> list[FacadeStyle]:
     return looks
 
 
-def wall_styles(n_variants: int, n_looks: int = 1) -> list[FacadeStyle]:
-    """Wall styles in slot order: the eras and their looks, then the specials.
+@dataclass(frozen=True)
+class LookPlan:
+    """How many looks each era gets, and where each one's slot sits.
 
-    Slot `era * n_looks + look`, with the two archetype specials after all of
-    them, so an extra look does not move an era and an extra era does not move
-    the specials.
+    Looks are not spread evenly across the eras, because buildings are not.
+    Measured over the Bronbeek square kilometre: 1,322 buildings, of which
+    **73% were built between 1920 and 1945** -- 580 of them between 1930 and
+    1934 alone. It is one interwar estate built in two waves. Giving every era
+    the same number of looks there spends twelve textures on the sixteen
+    pre-1920 houses, which cannot repeat, and still leaves the interbellum era
+    with eighty-one buildings per texture.
+
+    So the allocation is measured from the buildings in hand. This class owns
+    the slot arithmetic, because three places used to do it independently and
+    a layout only works while they all agree.
     """
-    out: list[FacadeStyle] = []
-    for style in STYLES[:n_variants]:
-        out.extend(looks_for_style(style, n_looks))
-    return out + [EXTRA_STYLES["monumental"], EXTRA_STYLES["industrial"]]
+
+    # Looks for era 0, era 1, ... in `STYLES` order.
+    per_era: tuple[int, ...]
+
+    @classmethod
+    def uniform(cls, n_variants: int, n_looks: int = 1) -> "LookPlan":
+        """The same number of looks for every era."""
+        return cls((max(1, int(n_looks)),) * max(1, int(n_variants)))
+
+    @classmethod
+    def from_counts(
+        cls, era_counts, *, cap: int = 1, target: int = 80
+    ) -> "LookPlan":
+        """One look per `target` buildings in that era, up to `cap`.
+
+        Rounded rather than floored, and never below one: an era with three
+        buildings in it still needs a wall.
+        """
+        cap = max(1, min(int(cap), MAX_LOOKS_PER_ERA))
+        target = max(1, int(target))
+        return cls(tuple(
+            max(1, min(cap, int(round(count / target))))
+            for count in era_counts
+        ))
+
+    @property
+    def n_variants(self) -> int:
+        return len(self.per_era)
+
+    @property
+    def offsets(self) -> tuple[int, ...]:
+        """The first slot of each era."""
+        out, running = [], 0
+        for looks in self.per_era:
+            out.append(running)
+            running += looks
+        return tuple(out)
+
+    @property
+    def wall_slots(self) -> int:
+        """Slots the eras take, before the archetype specials."""
+        return sum(self.per_era)
+
+    def looks_in(self, era: int) -> int:
+        return self.per_era[min(max(era, 0), self.n_variants - 1)]
+
+    def slot(self, era: int, look: int) -> int:
+        era = min(max(era, 0), self.n_variants - 1)
+        return self.offsets[era] + (look % self.per_era[era])
+
+    def slot_for(self, era: int, identifier, fallback: int = 0) -> int:
+        """The slot one building takes, look and all."""
+        era = min(max(era, 0), self.n_variants - 1)
+        return self.offsets[era] + look_for_building(
+            identifier, self.per_era[era], fallback
+        )
+
+    def archetype_slot(self, archetype: int) -> int | None:
+        """Slot for an archetype with its own composition, else None.
+
+        Only the two the era styles get wrong are special-cased. Housing,
+        offices and shops are all stacks of storeys, so era is the better
+        predictor for them. Neither gets looks: there is rarely more than one
+        church or gasholder in an area, so there is nothing to repeat.
+        """
+        # Matches src/buildings.py.
+        ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
+        if archetype == ARCH_MONUMENTAL:
+            return self.wall_slots
+        if archetype == ARCH_INDUSTRIAL:
+            return self.wall_slots + 1
+        return None
+
+    @property
+    def total_slots(self) -> int:
+        return self.wall_slots + 2
+
+    def styles(self) -> list["FacadeStyle"]:
+        """Every wall style in slot order: the eras' looks, then the specials."""
+        out: list[FacadeStyle] = []
+        for era, looks in enumerate(self.per_era):
+            out.extend(looks_for_style(STYLES[era], looks))
+        return out + [EXTRA_STYLES["monumental"], EXTRA_STYLES["industrial"]]
+
+    def summary(self) -> str:
+        return ", ".join(
+            f"{STYLES[era].name} {looks}"
+            for era, looks in enumerate(self.per_era)
+        )
+
+
+def wall_styles(n_variants: int, n_looks: int = 1) -> list[FacadeStyle]:
+    """Wall styles in slot order, with every era given the same look count."""
+    return LookPlan.uniform(n_variants, n_looks).styles()
 
 
 def style_for_archetype(
     archetype: int, n_variants: int, n_looks: int = 1
 ) -> int | None:
-    """Slot for an archetype that needs its own composition, else None.
-
-    Only the two the era styles get wrong are special-cased. Housing, offices
-    and shops are all stacks of storeys, so era is the better predictor for
-    them and they keep it. Neither gets looks: there is rarely more than one
-    church or gasholder in an area, so there is nothing to repeat.
-    """
-    # Matches src/buildings.py.
-    ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
-    base = max(1, n_variants) * max(1, n_looks)
-    if archetype == ARCH_MONUMENTAL:
-        return base
-    if archetype == ARCH_INDUSTRIAL:
-        return base + 1
-    return None
+    """Slot for an archetype that needs its own composition, else None."""
+    return LookPlan.uniform(n_variants, n_looks).archetype_slot(archetype)
 
 
 # The most looks one era can have before they start repeating: four wall
@@ -652,9 +738,16 @@ def _wall_bases(
 
 
 def generate_facade_textures(
-    work_dir: Path, *, facade_cfg: dict
+    work_dir: Path, *, facade_cfg: dict, plan: "LookPlan | None" = None
 ) -> list[tuple[Path, Path | None]]:
     """Write the facade textures, returning ``(colour, normal)`` per variant.
+
+    `plan` is the look allocation the buildings were given slots from, and
+    passing it is how the two stay in step: a building carries a slot index,
+    not a style, so generating a different set of textures than the slots were
+    numbered against puts the wrong wall on every building after the first era
+    whose count changed. Without one, every era gets the configured number of
+    looks, which is what a run with no buildings to measure can do.
 
     When the ground storey is enabled its texture comes last, so the Blender
     stage can address it as the final material slot.
@@ -667,11 +760,13 @@ def generate_facade_textures(
     work_dir.mkdir(parents=True, exist_ok=True)
     size_px = int(facade_cfg["texture_px"])
     variants = min(int(facade_cfg["variants"]), len(STYLES))
-    looks = looks_per_era(facade_cfg)
+    if plan is None:
+        plan = LookPlan.uniform(variants, looks_per_era(facade_cfg))
+    looks = max(plan.per_era)
     seed = int(facade_cfg["seed"])
     want_normal = bool(facade_cfg.get("normal_map", True))
 
-    styles = wall_styles(variants, looks)
+    styles = plan.styles()
     ground_styles: list[FacadeStyle] = []
     if bool(facade_cfg.get("ground_floor", True)):
         # Both ground variants are written when building function is available,
@@ -1072,6 +1167,7 @@ __all__ = [
     "GROUND_STYLE",
     "GROUND_STYLES",
     "MAX_LOOKS_PER_ERA",
+    "LookPlan",
     "look_for_building",
     "looks_for_style",
     "looks_per_era",

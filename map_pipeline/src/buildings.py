@@ -117,6 +117,10 @@ class BuildingSet:
     # model built during an outage can differ from one built the week before.
     source: str = "api"
     source_version: str = ""
+    # Looks allocated to each era, filled in once the buildings are known.
+    # The facade stage has to generate exactly these textures, in this order,
+    # or a building wears the wrong wall. See facade.LookPlan.
+    facade_looks: tuple[int, ...] = ()
 
     def __len__(self) -> int:
         return len(self.buildings)
@@ -1158,6 +1162,55 @@ def save_buildings(
     return path
 
 
+def assign_facade_slots(buildings: BuildingSet, facade_variants: int, facade_cfg: dict):
+    """Which wall texture each building wears, as ``(style_index, plan)``.
+
+    Two decisions in one pass, because the second depends on the first. Era
+    decides the character of a wall -- build year predicts a facade far better
+    than height does -- and the building's own identifier decides which of
+    that era's looks it wears, so a terrace is not one house repeated.
+
+    The looks are allocated *after* counting, not before, because buildings
+    are not spread evenly across the eras. Over the Bronbeek square kilometre
+    73% of 1,322 buildings are interbellum; a flat allocation there spends a
+    dozen textures on sixteen pre-1920 houses and still leaves the interbellum
+    era repeating. See `facade.LookPlan`.
+
+    A named function rather than a closure inside `build_buildings` so a test
+    can reach the real rule. Testing a local copy of it is how an earlier
+    version of this went wrong twice.
+    """
+    from .facade import LookPlan, looks_per_era, style_for_building
+
+    # Which era each building belongs to, before any look is chosen, so the
+    # looks go where the buildings are. An archetype with its own composition
+    # takes none: there is rarely more than one church in an area.
+    probe = LookPlan.uniform(facade_variants)
+    era_of = [
+        None
+        if probe.archetype_slot(b.archetype) is not None
+        else style_for_building(b.height_m, b.build_year, facade_variants)
+        for b in buildings.buildings
+    ]
+    counts = [sum(1 for e in era_of if e == era) for era in range(facade_variants)]
+    plan = LookPlan.from_counts(
+        counts,
+        cap=looks_per_era(facade_cfg),
+        target=int(facade_cfg.get("buildings_per_look", 80)),
+    )
+
+    style_index = np.array(
+        [
+            plan.archetype_slot(b.archetype)
+            if era is None
+            else plan.slot_for(era, b.identifier, fallback=index)
+            for index, (b, era) in enumerate(zip(buildings.buildings, era_of))
+        ],
+        dtype=np.int32,
+    )
+    return style_index, plan
+
+
 def build_buildings(
     bbox: BBox,
     work_dir: Path,
@@ -1220,38 +1273,21 @@ def build_buildings(
     if ground_floor_height_m:
         apply_ground_floor_split(result, ground_floor_height_m)
 
-    from .facade import (
-        look_for_building,
-        looks_per_era,
-        style_for_archetype,
-        style_for_building,
+    style_index, plan = assign_facade_slots(
+        result, facade_variants, facade_cfg or {}
     )
-
-    looks = looks_per_era(facade_cfg or {})
-
-    def slot(building: Building, index: int) -> int:
-        # An archetype with its own composition wins; otherwise era decides
-        # the character and the building's own identifier decides which of
-        # that era's looks it wears, so a terrace is not one house repeated.
-        special = style_for_archetype(building.archetype, facade_variants, looks)
-        if special is not None:
-            return special
-        era = style_for_building(
-            building.height_m, building.build_year, facade_variants
+    result.facade_looks = plan.per_era
+    if plan.wall_slots > facade_variants:
+        busiest = max(
+            (int((style_index == s).sum()) for s in np.unique(style_index)),
+            default=0,
         )
-        return era * looks + look_for_building(
-            building.identifier, looks, fallback=index
-        )
-
-    style_index = np.array(
-        [slot(b, i) for i, b in enumerate(result.buildings)], dtype=np.int32
-    )
-    if looks > 1:
-        chosen = np.unique(style_index)
         LOG.info(
-            "facade looks: %d of %d slots used across %d buildings",
-            len(chosen),
-            facade_variants * looks + 2,
+            "facade looks by era: %s -- %d wall textures, busiest worn by %d "
+            "of %d buildings",
+            plan.summary(),
+            plan.total_slots,
+            busiest,
             len(result.buildings),
         )
     years = [b.build_year for b in result.buildings if b.build_year]
@@ -1276,6 +1312,7 @@ def build_buildings(
 __all__ = [
     "Building",
     "BuildingSet",
+    "assign_facade_slots",
     "apply_ground_floor_split",
     "apply_ground_skirt",
     "split_walls_at_height",
