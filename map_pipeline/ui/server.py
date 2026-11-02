@@ -320,10 +320,36 @@ def _facade_variety(payload: dict) -> dict:
     return {"looks_per_era": 12, "buildings_per_look": budget}
 
 
+# Payload keys a caller may still set one by one, and where each goes. The
+# form sends a detail level instead; these are for scripts and older callers,
+# and win over the level when present.
+_OVERRIDES = {
+    "size_px": ("aerial", "size_px", int),
+    "terrain_grid_m": ("terrain", "grid_m", float),
+    "facade_texture_px": ("facade", "texture_px", int),
+    "facade_normal_map": ("facade", "normal_map", bool),
+    "facade_variants": ("facade", "variants", int),
+    "facade_ground_floor": ("facade", "ground_floor", bool),
+    "facade_photo_textures": ("facade", "photo_textures", bool),
+    "clip_mode": ("buildings", "clip_mode", str),
+    "deshadow": ("aerial", "deshadow", float),
+    "tree_ground_shade": ("trees", "ground_shade", float),
+    "car_occupancy": ("vehicles", "car_occupancy", float),
+    "collision_tree_crowns": ("export", "collision_tree_crowns", bool),
+    "collision_thickness_m": ("barriers", "collision_thickness_m", float),
+}
+
+
 def build_config(payload: dict) -> dict:
-    """Turn the form payload into a pipeline config."""
+    """Turn the form payload into a pipeline config.
+
+    The form sends an area, a detail level, the layers wanted and whether to
+    add collision shapes. Everything else is the pipeline's default, which is
+    the point: the settings that used to be sliders either follow from the
+    detail level or have one right answer.
+    """
     bbox = payload["bbox"]
-    config = {
+    config: dict = {
         "name": payload["name"],
         "bbox": {
             "crs": "EPSG:28992",
@@ -332,62 +358,19 @@ def build_config(payload: dict) -> dict:
             "xmax": float(bbox["xmax"]),
             "ymax": float(bbox["ymax"]),
         },
-        "terrain": {
-            "ahn_model": payload.get("ahn_model", "DTM"),
-            "resolution_m": 0.5,
-            "grid_m": float(payload.get("terrain_grid_m", 2.0)),
-        },
-        "buildings": {
-            "lod": "2.2",
-            "clip_mode": payload.get("clip_mode", "centroid"),
-            "merge": payload.get("merge", "single"),
-        },
-        "facade": {
-            "variants": int(payload.get("facade_variants", 1)),
-            # The form sends a buildings-per-wall budget, with 0 meaning "one
-            # wall per era". Looks are allocated per era from that; the cap
-            # only binds where an era is dense enough to need it.
-            **_facade_variety(payload),
-            "texture_px": int(payload.get("facade_texture_px", 512)),
-            "normal_map": bool(payload.get("facade_normal_map", True)),
-            "ground_floor": bool(payload.get("facade_ground_floor", True)),
-            "photo_textures": bool(payload.get("facade_photo_textures", True)),
-        },
-        "vehicles": {
-            "car_occupancy": float(payload.get("car_occupancy", 0.72)),
-        },
-        "aerial": {
-            "layer": "Luchtfoto Actueel Ortho 8cm RGB",
-            "size_px": int(payload.get("size_px", 4096)),
-            # The photo is shot on one morning; without this the model
-            # carries that morning's shadows into every other hour.
-            "deshadow": float(payload.get("deshadow", 1.0)),
-        },
-        "trees": {
-            # The aerial is flown leaf-off, so without this the ground under a
-            # tree is lit as if the tree were not there.
-            "ground_shade": float(payload.get("tree_ground_shade", 0.35)),
-        },
-        "surfaces": {
-            # Road topology. These decide what the carriageway is like to use
-            # in an engine, not how accurate it is.
-            "road_simplify_m": float(payload.get("road_simplify_m", 0.25)),
-            "road_max_edge_m": float(payload.get("road_max_edge_m", 12.0)),
-        },
+        # Resolved by load_config against DETAIL_PRESETS.
+        "detail": str(payload.get("detail", "standard")),
         "export": {
             # Physics proxies for a simulation. Off by default: they add to the
             # FBX and most people want a picture.
             "collision": bool(payload.get("collision", False)),
-            "collision_tree_crowns": bool(
-                payload.get("collision_tree_crowns", True)
-            ),
-        },
-        "barriers": {
-            "collision_thickness_m": float(
-                payload.get("collision_thickness_m", 0.30)
-            ),
         },
     }
+    for key, (section, field, kind) in _OVERRIDES.items():
+        if key in payload and payload[key] is not None:
+            config.setdefault(section, {})[field] = kind(payload[key])
+    if "facade_buildings_per_look" in payload or "facade_looks_per_era" in payload:
+        config.setdefault("facade", {}).update(_facade_variety(payload))
 
     # Optional sources come as a list of ids from the sources panel. Older
     # callers passing one flag per source still work.

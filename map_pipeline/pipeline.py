@@ -31,7 +31,18 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.bgt import use_cache as bgt_cache  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402
-from src.elevation import build_terrain, ensure_dsm, raster_sampler  # noqa: E402
+from src.elevation import (  # noqa: E402
+    build_terrain,
+    ensure_dsm,
+    lower_under,
+    raster_sampler,
+)
+from src.nwb import NWB_URL, fetch_centrelines  # noqa: E402
+from src.roads import (  # noqa: E402
+    TERRAIN_CLEARANCE_M,
+    road_top,
+    road_underside,
+)
 from src.export import (  # noqa: E402
     build_metadata,
     write_attribution,
@@ -516,13 +527,38 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 )
                 deck_dsm = raster_sampler(bridge_dsm) if bridge_dsm else None
 
+            # The national road network, for where to cut across each street.
+            # A failed fetch is an empty network, not a failed run.
+            network = None
+            if bool(config.surfaces.get("road_geometry", True)):
+                network = fetch_centrelines(
+                    config.bbox,
+                    url=str(config.surfaces.get("nwb_url", NWB_URL)),
+                    timeout=float(config.surfaces["timeout_s"]),
+                    max_retries=int(config.surfaces["max_retries"]),
+                    cache_dir=work_dir / "_bgt",
+                )
+
             surfaces = build_surfaces(
                 config.bbox,
                 work_dir,
                 surfaces_cfg=config.surfaces,
                 terrain=terrain,
                 deck_sampler=deck_dsm,
+                network=network,
             )
+            if surfaces.road_mesh is not None and len(surfaces.road_mesh):
+                # The roads are a separate surface laid on top, so the ground
+                # gets out of their way rather than the other way round, and
+                # everything placed from here on stands on the road where
+                # there is one.
+                terrain.road_top = road_top(surfaces.road_mesh, config.bbox)
+                lower_under(
+                    terrain,
+                    road_underside(surfaces.road_mesh, config.bbox),
+                    clearance_m=TERRAIN_CLEARANCE_M,
+                )
+                terrain.save(work_dir)
             if surfaces.class_grid is not None:
                 write_land_cover(surfaces, config.bbox, out_dir)
             if surfaces.water:
@@ -650,7 +686,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 config.bbox,
                 work_dir,
                 vehicles_cfg=config.vehicles,
-                terrain_sampler=terrain.sample,
+                # On the road where there is one: a parked car stands on the
+                # bay, not on the ground under it.
+                terrain_sampler=terrain.surface,
                 surfaces=surfaces if want_surfaces else None,
             )
             if len(vehicles):
@@ -803,8 +841,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
+        # Against what they were placed on: the model's own surface, which
+        # is the road where there is one and the terrain as drawn elsewhere.
         check_barriers(
-            report, barriers if want_barriers else None, terrain.sample
+            report, barriers if want_barriers else None, terrain.surface
         )
         check_vehicles(
             report, vehicles if want_vehicles else None, config.bbox, surfaces
@@ -824,6 +864,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 fbx_name=str(config.export["fbx_name"]),
                 aerial_name=str(config.export["aerial_name"]),
                 metadata_name=str(config.export["metadata_name"]),
+                blend_name=str(config.export.get("blend_name", "model.blend")),
             )
             if not args.skip_reimport_check:
                 check_fbx_reimport(

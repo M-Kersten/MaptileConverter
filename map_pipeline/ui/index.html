@@ -256,9 +256,9 @@
 
   <div class="intro">
     Pick a square anywhere in the Netherlands. This downloads the official open
-    data for it &mdash; the buildings, the height of the ground, the aerial
-    photograph &mdash; and builds a <b>model.fbx</b> with an <b>aerial.png</b>
-    to go on it. Everything comes out life-size in metres, standing at its real
+    data for it &mdash; the buildings, the height of the ground, the roads, the
+    aerial photograph &mdash; and builds a <b>model.blend</b> to edit and a
+    <b>model.fbx</b> for Unity. Everything comes out life-size in metres, standing at its real
     height above sea level.
     <br><br>
     You do not need to know anything about maps or 3D modelling to use it:
@@ -321,225 +321,20 @@
       <span class="step"><span class="stepnum">2</span><span class="steptitle">Choose how much detail</span></span>
     </legend>
 
-    <label for="preset">Detail preset
-      <span class="help" tabindex="0" role="button" aria-label="About the preset"
-        data-tip="Sets all four detail sliders at once. <b>Standard</b> is a sensible default for a square kilometre. Move any slider afterwards and this reads <b>Custom</b> &mdash; nothing has gone wrong, it just means your settings no longer match a preset.">?</span>
+    <label for="detail">Detail
+      <span class="help" tabindex="0" role="button" aria-label="About detail"
+        data-tip="One choice sets everything that trades detail for time and file size: how sharp the aerial photo is, how closely spaced the ground's grid is, and how large the wall images are. <b>Standard</b> suits a square kilometre. <b>Draft</b> is for checking an area quickly; <b>High</b> for close-up work on a smaller one.">?</span>
     </label>
-    <select id="preset">
+    <select id="detail">
       <option value="draft">Draft &mdash; quick test</option>
       <option value="standard" selected>Standard &mdash; recommended</option>
-      <option value="high">High &mdash; sharper photo and ground</option>
-      <option value="max">Maximum &mdash; as fine as the data goes</option>
-      <option value="custom">Custom</option>
+      <option value="high">High &mdash; close-up work</option>
     </select>
-
-    <label for="aerialCm" style="margin-top:14px">
-      Aerial photo
-      <span class="help" tabindex="0" role="button" aria-label="About aerial photo detail"
-        data-tip="How sharp the photograph laid over the ground is. It is one big image draped across the whole square, so this is what you see looking straight down. The source photo is <b>8 cm per pixel</b>; asking for finer only enlarges it. Sharper also means a much bigger PNG.">?</span>
-      <span class="derived" id="aerialDerived"></span>
-    </label>
-    <input type="range" id="aerialCm" min="0" max="4" step="1" value="2" class="slider">
-    <div class="ticks"><span>coarse</span><span>as sharp as the photo</span></div>
-    <div class="plain" id="aerialPlain"></div>
-
-    <label for="terrainM" style="margin-top:12px">
-      Ground shape
-      <span class="help" tabindex="0" role="button" aria-label="About ground detail"
-        data-tip="How closely the ground follows the real measured heights. They come from <b>AHN</b>, a laser scan of the entire country taken from an aircraft. Finer picks up dikes, ramps, kerbs and ditches; coarser smooths them away.">?</span>
-      <span class="derived" id="terrainDerived"></span>
-    </label>
-    <input type="range" id="terrainM" min="0" max="4" step="1" value="1" class="slider">
-    <div class="ticks"><span>smooth</span><span>every measurement</span></div>
-    <div class="plain" id="terrainPlain"></div>
+    <div class="kv" id="detailNumbers" style="margin-top:8px"></div>
+    <div class="plain" id="detailPlain"></div>
 
     <div id="qualityNote" class="hint"></div>
   </fieldset>
-
-  <details class="adv">
-    <summary>Terrain and road shape &mdash; quads, faces, and what becomes an edge</summary>
-    <div class="inner">
-      <div class="plain" style="margin: 0 0 10px">
-        These change what the ground is like to <i>edit</i>, not how accurate it
-        is. The checks measure accuracy either way, so all of it is safe to play
-        with.
-      </div>
-
-      <label for="uniform" style="margin-top:0">Even face size
-        <span class="help" tabindex="0" role="button" aria-label="About even face size"
-          data-tip="Caps how big a face may be, whether or not the ground needs the detail. The mesh is adaptive by default, which is right for accuracy and awkward to sculpt: a flat field gets faces tens of metres across right next to a bank packed with tiny ones, so a brush grabs hundreds of vertices in one place and three in another. This removes the big ones. It does not thin the dense parts &mdash; those are carrying real detail &mdash; and it changes nothing about accuracy.">?</span>
-        <span class="derived" id="uniformDerived"></span>
-      </label>
-      <input type="range" id="uniform" min="0" max="4" step="1" value="0" class="slider">
-      <div class="ticks"><span>adaptive</span><span>even everywhere</span></div>
-      <div class="plain" id="uniformPlain"></div>
-
-      <div class="inline" style="margin-top:14px">
-        <input type="checkbox" id="quads">
-        <label for="quads">Make quads where it can</label>
-        <span class="help" tabindex="0" role="button" aria-label="About quads"
-          data-tip="Fuses flat pairs of triangles into quads at the very end. Nothing moves and nothing is added, so the ground is exactly as accurate either way &mdash; but Blender can select, loop and subdivide along quads, and it can do none of that with a triangle fan. Expect roughly 60&ndash;90% quads; the rest are where a breakline or a fold got in the way.">?</span>
-      </div>
-
-      <label for="fold" style="margin-top:12px">Keep folds sharper than
-        <span class="help" tabindex="0" role="button" aria-label="About the fold limit"
-          data-tip="Two triangles meeting at an angle are a ridge or a ditch, and fusing them into one quad would smooth it away. Below this angle a pair counts as flat and may be fused. A Dutch dike face against its crown is around <b>20&deg;</b>, a kerb a few degrees. Lower keeps more of the shape and gives you fewer quads.">?</span>
-        <span class="derived" id="foldDerived"></span>
-      </label>
-      <input type="range" id="fold" min="0" max="4" step="1" value="2" class="slider">
-      <div class="ticks"><span>keep everything</span><span>quads everywhere</span></div>
-      <div class="plain" id="foldPlain"></div>
-
-      <label for="straighten" style="margin-top:12px">Straighten the features
-        <span class="help" tabindex="0" role="button" aria-label="About straightening"
-          data-tip="How far a road or water edge may be moved to make it a straight run. The survey carries vertices centimetres apart along what is visibly a straight kerb, and every one of them becomes a vertex in your mesh. This is the biggest single lever on how busy the ground looks.">?</span>
-        <span class="derived" id="straightenDerived"></span>
-      </label>
-      <input type="range" id="straighten" min="0" max="4" step="1" value="0" class="slider">
-      <div class="ticks"><span>as surveyed</span><span>bold and simple</span></div>
-      <div class="plain" id="straightenPlain"></div>
-
-      <label for="minFeature" style="margin-top:12px">Ignore features shorter than
-        <span class="help" tabindex="0" role="button" aria-label="About the size filter"
-          data-tip="Drops the short runs: traffic islands, kerb stubs, driveway aprons, the corner of a parking bay. Each is a real surveyed line and each becomes an edge loop in the ground, and a few thousand of them is most of what makes a mesh look chaotic without telling you anything about the shape of the land.">?</span>
-        <span class="derived" id="minFeatureDerived"></span>
-      </label>
-      <input type="range" id="minFeature" min="0" max="4" step="1" value="0" class="slider">
-      <div class="ticks"><span>keep every one</span><span>only big features</span></div>
-      <div class="plain" id="minFeaturePlain"></div>
-
-      <label for="contours" style="margin-top:12px">Contour lines
-        <span class="help" tabindex="0" role="button" aria-label="About contours"
-          data-tip="Contours are the only edges that follow the ground itself rather than something drawn on it, so they are what makes a hill read as a hill. They are also the ones that cost the most faces. Flat ground contributes none whatever you set here &mdash; a contour on a field is tracing the scanner's noise, and those are thrown away.">?</span>
-        <span class="derived" id="contourDerived"></span>
-      </label>
-      <input type="range" id="contours" min="0" max="3" step="1" value="2" class="slider">
-      <div class="ticks"><span>off</span><span>every 25 cm</span></div>
-      <div class="plain" id="contourPlain"></div>
-
-      <label style="margin-top:14px">Which features become edges
-        <span class="help" tabindex="0" role="button" aria-label="About which features"
-          data-tip="Each of these is a surveyed outline the ground will fold along, and each one you switch off is that many fewer edges. Roads and water are what most people want; land cover is every patch of grass and paving between them, and buildings put a loop around each footprint so you can select where a wall meets the ground.">?</span>
-      </label>
-      <div class="inline" style="margin-top:6px">
-        <input type="checkbox" id="blRoads" checked>
-        <label for="blRoads">Road and pavement edges</label>
-      </div>
-      <div class="inline">
-        <input type="checkbox" id="blWater" checked>
-        <label for="blWater">Water edges and canal banks</label>
-      </div>
-      <div class="inline">
-        <input type="checkbox" id="blLand" checked>
-        <label for="blLand">Land cover &mdash; grass, paving, bare ground</label>
-      </div>
-      <div class="inline">
-        <input type="checkbox" id="blBuildings" checked>
-        <label for="blBuildings">Building footprints</label>
-      </div>
-
-      <label for="roadDetail" style="margin-top:14px">Road outlines
-        <span class="help" tabindex="0" role="button" aria-label="About road outlines"
-          data-tip="How far a kerb may move when it is straightened. The survey draws a road to the centimetre, so a straight street arrives carrying a vertex every few centimetres and a corner carrying dozens &mdash; and every one of them used to become geometry. A quarter of a metre is still visibly the same road for a fraction of the vertices.">?</span>
-        <span class="derived" id="roadDetailDerived"></span>
-      </label>
-      <input type="range" id="roadDetail" min="0" max="4" step="1" value="2" class="slider">
-      <div class="ticks"><span>as surveyed</span><span>bold</span></div>
-      <div class="plain" id="roadDetailPlain"></div>
-
-      <label for="roadFace" style="margin-top:12px">Road face size
-        <span class="help" tabindex="0" role="button" aria-label="About road face size"
-          data-tip="The size a road face aims for, and what the kerb itself is cut at. Both, because a constrained edge cannot be crossed: leave a 280 m kerb as one segment and every triangle along it has to span the whole street. Smaller gives rounder faces and more of them; it is never coarser than the road is wide, since that only makes wedges the refinement then has to dig out of.">?</span>
-        <span class="derived" id="roadFaceDerived"></span>
-      </label>
-      <input type="range" id="roadFace" min="0" max="4" step="1" value="2" class="slider">
-      <div class="ticks"><span>fine</span><span>coarse</span></div>
-      <div class="plain" id="roadFacePlain"></div>
-
-      <div class="plain" id="shapeNote" style="margin-top:12px"></div>
-    </div>
-  </details>
-
-  <details class="adv">
-    <summary>Fine tuning &mdash; model weight and how buildings look</summary>
-    <div class="inner">
-      <label for="terrainTol">Ground triangles
-        <span class="help" tabindex="0" role="button" aria-label="About the ground triangle budget"
-          data-tip="How much the flat parts get thinned out. The ground is built from triangles, and flat ground barely needs any. This sets how far the model is allowed to sit from the measured height: at <b>10 cm</b> kerbs and dikes survive while a flat field collapses into a few big triangles. <b>Every point</b> keeps them all and makes a very heavy model.">?</span>
-        <span class="derived" id="terrainTolDerived"></span>
-      </label>
-      <input type="range" id="terrainTol" min="0" max="4" step="1" value="2" class="slider">
-      <div class="ticks"><span>every point</span><span>lightest</span></div>
-      <div class="plain" id="terrainTolPlain"></div>
-
-      <label for="facadePx" style="margin-top:12px">Wall detail
-        <span class="help" tabindex="0" role="button" aria-label="About wall texture size"
-          data-tip="How large the generated wall image is. Nobody photographs every facade, so the tool draws windows, doors and brick to fit each building. Larger looks sharper close up and costs memory.">?</span>
-        <span class="derived" id="facadeDerived"></span>
-      </label>
-      <input type="range" id="facadePx" min="0" max="3" step="1" value="1" class="slider">
-      <div class="ticks"><span>small</span><span>large</span></div>
-      <div class="plain" id="facadePlain"></div>
-
-      <div class="row" style="margin-top:14px">
-        <div>
-          <label for="facade">Wall styles
-            <span class="help" tabindex="0" role="button" aria-label="About wall styles"
-              data-tip="The building data carries a construction year for every building. With <b>5 styles</b> a 1900 canal house gets brick and tall windows while a 2015 office gets glass. With <b>1</b> every building gets the same wall.">?</span>
-          </label>
-          <select id="facade">
-            <option value="5" selected>5, by build year</option>
-            <option value="1">1, the same everywhere</option>
-          </select>
-        </div>
-        <div>
-          <label for="looks">Variety within a style
-            <span class="help" tabindex="0" role="button" aria-label="About facade variety"
-              data-tip="Buildings of the same age share a style, and with <b>off</b> they share the exact same wall, so a street of houses built in one go comes out as one house repeated. Each extra look gives that age another wall colour, window frame colour, window count and spacing; a building picks one by its own address, so it keeps the same wall every time you rebuild the area. The number here is roughly how many buildings may end up sharing a wall &mdash; lower buys variety at one extra texture each. Looks are handed out per age group in proportion to how many buildings are in it, so an age with only a handful of buildings never wastes textures.">?</span>
-          </label>
-          <select id="looks">
-            <option value="80" selected>Normal</option>
-            <option value="40">High &mdash; more textures</option>
-            <option value="160">Low &mdash; fewer textures</option>
-            <option value="0">Off &mdash; neighbours identical</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="row" style="margin-top:14px">
-        <div>
-          <label for="clip">Buildings on the edge
-            <span class="help" tabindex="0" role="button" aria-label="About edge buildings"
-              data-tip="What to do with a building the square cuts through. <b>Whole ones only</b> keeps a building when its centre is inside, so nothing is sliced in half. <b>Anything it touches</b> keeps every building that overlaps, and those will hang over the edge.">?</span>
-          </label>
-          <select id="clip">
-            <option value="centroid" selected>Whole ones only</option>
-            <option value="intersect">Anything it touches</option>
-          </select>
-        </div>
-      </div>
-      <div class="hint" id="facadeNote"></div>
-
-      <div class="inline">
-        <input type="checkbox" id="groundFloor" checked>
-        <label for="groundFloor">Separate ground floor</label>
-        <span class="help" tabindex="0" role="button" aria-label="About the ground floor option"
-          data-tip="Gives the street-level storey its own look &mdash; shopfronts, doors and wider glass &mdash; instead of the same window grid running all the way to the pavement.">?</span>
-      </div>
-      <div class="inline">
-        <input type="checkbox" id="normal" checked>
-        <label for="normal">Relief on walls</label>
-        <span class="help" tabindex="0" role="button" aria-label="About the relief option"
-          data-tip="Makes window reveals and brick catch the light as if they had real depth, without adding a single polygon. Costs a little memory and export time. In the trade this is a <b>normal map</b>.">?</span>
-      </div>
-      <div class="inline">
-        <input type="checkbox" id="photoTextures" checked>
-        <label for="photoTextures">Photographed brick and stone</label>
-        <span class="help" tabindex="0" role="button" aria-label="About photographed materials"
-          data-tip="Lays real photographs of brick, plaster and concrete under the drawn windows, so walls have grain rather than flat colour. Free to use and downloaded once, then reused for every later build.">?</span>
-      </div>
-    </div>
-  </details>
 
   <fieldset>
     <legend>
@@ -569,32 +364,11 @@
     </div>
 
     <div class="inline">
-      <input type="checkbox" id="deshadow" checked>
-      <label for="deshadow">Remove the photo's own shadows</label>
-      <span class="help" tabindex="0" role="button" aria-label="About removing shadows"
-        data-tip="The aerial photo was taken on one morning, so hard shadows are painted into it &mdash; over this area about 20 m long, from a sun low in the south-east. Light your scene at any other time of day and those shadows point the wrong way and fight your own. This finds the sun the photo was shot under, works out which ground each building and tree was shading, and lifts it back to daylight. It uses the buildings and trees it already has rather than guessing from dark pixels, so dark roofs, asphalt and water stay dark. Turn it off to keep the photo exactly as flown.">?</span>
-    </div>
-
-    <div class="inline">
-      <input type="checkbox" id="treeShade" checked>
-      <label for="treeShade">Shade the ground under trees</label>
-      <span class="help" tabindex="0" role="button" aria-label="About shading under trees"
-        data-tip="The aerial photo is flown in winter on purpose, with the leaves off, so the ground is visible and can be used as the ground texture. That also means the pavement under a tree is photographed in full sun, and the leafy tree the model puts over it looks like it is hovering. This darkens the photo under each canopy. It is <b>ambient shade</b>, not a sun shadow, so it stays right at any time of day and adds to a real shadow rather than fighting it.">?</span>
-    </div>
-
-    <div class="inline">
       <input type="checkbox" id="collision">
       <label for="collision">Add simplified shapes for physics</label>
       <span class="help" tabindex="0" role="button" aria-label="About collision shapes"
         data-tip="For driving or flying something through the model rather than looking at it. Adds invisible <b>Collision_</b> objects: simple blocks around the trees, and fences thickened so a fast-moving object cannot slip through a 6 cm panel between two physics frames. In Unity, select them, add a Mesh Collider and switch off the Mesh Renderer. Everything else &mdash; the ground, the buildings, the roads &mdash; is already simple enough to collide with directly, and <b>metadata.json</b> lists which object to use for each. Leave this off if you only want a picture; it makes the file bigger.">?</span>
     </div>
-    <div class="inline" id="crownsRow" style="display:none; margin-left:22px">
-      <input type="checkbox" id="collisionCrowns" checked>
-      <label for="collisionCrowns">Tree canopies are solid too</label>
-      <span class="help" tabindex="0" role="button" aria-label="About canopy collision"
-        data-tip="On, a box around each canopy stops anything flying through the leaves &mdash; safe, but it also stops short of the visible foliage near the box corners, by a metre or two on a big tree. Off, only the trunk is solid, at a quarter of the shapes, which suits a simulation that treats leaves as soft.">?</span>
-    </div>
-
     <button class="primary" id="run" style="margin-top:12px">Build model</button>
     <div class="hint" id="estimate" style="text-align:center"></div>
     <button class="danger" id="cancel" style="margin-top:6px; display:none">Cancel</button>
@@ -620,23 +394,29 @@
   <details class="adv">
     <summary>What you get, and how to open it</summary>
     <div class="inner next">
-      <p>A folder <code>output/&lt;name&gt;/</code> holding four files:</p>
+      <p>A folder <code>output/&lt;name&gt;/</code> holding:</p>
       <p>
-        <code>model.fbx</code> &mdash; the model itself: ground, buildings,
-        roads, water, trees.<br>
-        <code>aerial.png</code> &mdash; the photograph that goes on the ground.<br>
-        <code>metadata.json</code> &mdash; where in the world it sits, for
-        lining it up with other data.<br>
+        <code>model.blend</code> &mdash; the model for editing in Blender: every
+        layer its own collection, one object per building, street and tree,
+        roads and ground as clean quads.<br>
+        <code>model.fbx</code> &mdash; the same model for Unity.<br>
+        <code>maptile_tools.py</code> &mdash; Blender tools that keep the
+        ground under the roads after you edit them.<br>
+        <code>aerial.png</code> and the wall images &mdash; the textures.<br>
+        <code>metadata.json</code> &mdash; where in the world it sits.<br>
         <code>ATTRIBUTION.txt</code> &mdash; the credits. Keep it with the model
         if you pass the model on.
       </p>
       <p>
-        <b>Blender:</b> File &rarr; Import &rarr; FBX, and pick
-        <code>model.fbx</code>. It arrives in metres, ready to edit.
+        <b>Blender:</b> open <code>model.blend</code>. The <i>Maptile</i> tab in
+        the sidebar (N) has the tools; if it is missing, allow scripts when
+        Blender asks, or install <code>maptile_tools.py</code> as an add-on.
+        After moving or widening a road, press <i>Fit terrain under roads</i>.
       </p>
       <p>
         <b>Unity:</b> drag the folder into Assets. On the FBX set
-        <i>Scale Factor</i> to 1 and leave <i>Convert Units</i> on.
+        <i>Scale Factor</i> to 1, leave <i>Convert Units</i> on, and tick
+        <i>Bake Axis Conversion</i> so nothing arrives rotated.
       </p>
       <p>
         The centre of the square is the origin, so the model straddles 0,0.
@@ -1070,306 +850,61 @@ $("panel").addEventListener("scroll", () => { if (tipOwner) hideTip(); });
 window.addEventListener("resize", () => { if (tipOwner) hideTip(); });
 
 /* ---------------------------------------------------------------------------
-   Quality.
+   Detail.
 
-   Detail is expressed as ground resolution, not as a pixel count, so a setting
-   means the same thing whatever the area size: 12 cm/px is 12 cm/px over a
-   500 m box and over a 2 km one. Pixel counts are derived from the box.
-
-   Both dials have a ceiling set by the source. The aerial layer is an 8 cm
-   ortho and the AHN DTM is 0.5 m; asking for finer just interpolates, so the
-   readout says so rather than silently costing you time.
+   Expressed as ground resolution, not as a pixel count, so a setting means the
+   same thing whatever the area size: 25 cm/px is 25 cm/px over a 500 m box and
+   over a 2 km one. Pixel and vertex counts are derived from the box.
 --------------------------------------------------------------------------- */
-const AERIAL_NATIVE_CM = 8;      // PDOK ortho ground sample distance
-const TERRAIN_NATIVE_M = 0.5;    // AHN DTM cell size
 const UNITY_MAX_TEXTURE = 16384; // Unity will not import a larger texture at full size
 
-const AERIAL_STEPS  = [50, 25, 12, 8, 6];        // cm per pixel
-const TERRAIN_STEPS = [8, 4, 2, 1, 0.5];         // metres between vertices
-// How far the terrain mesh may stray from the height grid. 0 keeps every grid
-// vertex; anything above drops the ones that sit on ground the neighbours
-// already describe, which over a Dutch bbox is most of them.
-const TOLERANCE_STEPS = [0, 0.05, 0.10, 0.25, 0.50];
-// Fraction of the full grid's triangles that survives, measured over built
-// areas in Utrecht and Rotterdam. Only ever an estimate: what actually
-// survives depends on how much this particular bbox moves.
-const TOLERANCE_YIELD = { 0.05: 0.28, 0.10: 0.17, 0.25: 0.08, 0.50: 0.04 };
-const FACADE_STEPS  = [256, 512, 1024, 2048];    // px per storey tile
-
-/* What each step looks like, for the reader who does not think in centimetres
-   per pixel. Keyed by the value rather than by the slider position, so a step
-   and its sentence cannot drift apart when the scales change. */
-const AERIAL_PLAIN = {
-  50: "Blocks and fields. A road is a line, not a surface.",
-  25: "Cars and pavements are recognisable.",
-  12: "Road markings and street furniture are readable.",
-  8:  "Everything the photograph holds.",
-  6:  "Finer than the photograph, so the extra pixels are invented."
+/* One choice, three settings. Must match DETAIL_PRESETS in src/config.py,
+   which is what the server actually applies; a test keeps them equal. */
+const DETAIL = {
+  draft:    { aerial_cm: 50, grid_m: 4, facade_px: 256 },
+  standard: { aerial_cm: 25, grid_m: 2, facade_px: 512 },
+  high:     { aerial_cm: 12, grid_m: 1, facade_px: 1024 }
 };
-const TERRAIN_PLAIN = {
-  8:   "Large landforms only: an embankment, the slope of a hill.",
-  4:   "The broad lie of the land. Kerbs and ditches disappear.",
-  2:   "Ditches, ramps and embankments come through.",
-  1:   "Kerbs and small steps come through.",
-  0.5: "Every height the scan measured."
-};
-const TOLERANCE_PLAIN = {
-  0:    "Every measured point becomes a corner, flat ground included. Heaviest by far.",
-  0.05: "Never more than 5 cm off the measured ground. Very detailed.",
-  0.10: "Never more than 10 cm off. Kerbs and dikes survive; flat ground becomes a few big triangles.",
-  0.25: "Never more than 25 cm off. Light, though small steps get smoothed over.",
-  0.50: "Never more than 50 cm off. Lightest; only real landforms survive."
-};
-/* ---------------------------------------------------------------------------
-   Terrain shape. None of these change how accurate the ground is -- the checks
-   measure that either way -- they change what it is like to edit.
---------------------------------------------------------------------------- */
-const ROADDETAIL_STEPS = [0.05, 0.15, 0.25, 0.5, 1.0];   // metres
-const ROADDETAIL_PLAIN = {
-  0.05: "Every surveyed vertex kept. A curved kerb becomes hundreds of them.",
-  0.15: "Barely thinned. Survey noise goes.",
-  0.25: "A good default. Still visibly the same road, for a fraction of the vertices.",
-  0.5:  "Bold. Gentle curves become a few straight runs.",
-  1.0:  "Very bold. Only the shape of the street survives."
-};
-const ROADFACE_STEPS = [4, 8, 12, 20, 30];              // metres
-const ROADFACE_PLAIN = {
-  4:  "Small faces, roundest shapes, most of them. Good if the designer will sculpt the road.",
-  8:  "Fine. About one face per lane width.",
-  12: "A good default: few faces, and none of them slivers.",
-  20: "Coarse.",
-  30: "Coarsest. Never actually coarser than the road is wide."
-};
-const UNIFORM_STEPS = [0, 20, 10, 5, 2];            // metres, 0 = adaptive
-const UNIFORM_PLAIN = {
-  0:  "Adaptive: a flat car park gets three faces, a dike gets thousands. Fewest faces, and the least predictable to sculpt.",
-  20: "Nothing bigger than 20 m across. Takes the worst of the unevenness out cheaply.",
-  10: "Nothing bigger than 10 m. A reasonable compromise for brush work.",
-  5:  "Nothing bigger than 5 m. No large faces left anywhere, which is what a brush wants. Costs a lot of faces over a big area.",
-  2:  "Nothing bigger than 2 m. Near enough a uniform sheet — only use this on a small area."
-};
-const FOLD_STEPS = [3, 6, 12, 25, 60];              // degrees
-const FOLD_PLAIN = {
-  3:  "Only genuinely flat pairs are fused. Every ridge and ditch keeps its crease, and you get the fewest quads.",
-  6:  "Careful. Kerbs and small steps stay as triangles.",
-  12: "A good default. Dike faces and canal banks keep their fold; flat ground becomes quads.",
-  25: "Most of the ground becomes quads. Gentle folds get flattened into one face.",
-  60: "Almost everything is fused. Ridges will be smoothed over — use this if you want a clean sheet more than a faithful one."
-};
-const STRAIGHTEN_STEPS = [0.15, 0.5, 1, 2, 5];      // metres
-const STRAIGHTEN_PLAIN = {
-  0.15: "Exactly as surveyed. Every wobble in a kerb is a vertex in your mesh.",
-  0.5:  "Slightly tidied. Survey noise goes, corners stay.",
-  1:    "Clean runs. A curved kerb becomes a few straight lengths.",
-  2:    "Bold. Streets read as straight lines and gentle curves flatten out.",
-  5:    "Very bold. Only the layout survives; a bend under 5 m disappears."
-};
-const MINFEATURE_STEPS = [0, 5, 10, 25, 50];        // metres
-const MINFEATURE_PLAIN = {
-  0:  "Every surveyed run becomes an edge, down to the corner of a parking bay.",
-  5:  "Drops the smallest: kerb stubs and driveway aprons.",
-  10: "Drops traffic islands and single bays. Usually the sweet spot.",
-  25: "Only streets, waterways and larger plots.",
-  50: "Just the big structure of the place."
-};
-const CONTOUR_STEPS = [0, 1, 0.5, 0.25];            // metres of height, 0 = off
-const CONTOUR_PLAIN = {
-  0:    "No contours. Hills are described only by where the ground points fell.",
-  1:    "Coarse. The big landforms read, cheaply.",
-  0.5:  "A good default. Banks and dikes get an edge loop each.",
-  0.25: "Fine. Every slope is heavily banded, and this costs the most faces."
-};
-
-const FACADE_PLAIN = {
-  256:  "Blurry close up, fine from across the water.",
-  512:  "Reads well from across the street.",
-  1024: "Sharp at walking distance.",
-  2048: "Sharp with your nose against the wall. Heaviest."
-};
-
-const PRESETS = {
-  draft:    { aerial: 0, terrain: 0, facade: 0, tol: 3, normal: false },
-  standard: { aerial: 1, terrain: 1, facade: 1, tol: 2, normal: true  },
-  high:     { aerial: 2, terrain: 2, facade: 2, tol: 2, normal: true  },
-  max:      { aerial: 3, terrain: 3, facade: 3, tol: 1, normal: true  }
+const DETAIL_PLAIN = {
+  draft: "Quick to build, to check an area before committing to it. The photo shows blocks and roads; the ground follows the land but not its kerbs.",
+  standard: "Cars and pavements read in the photo; ditches, ramps and embankments come through in the ground, which is a 2 m grid of quads.",
+  high: "Road markings read in the photo and the ground carries kerbs and small steps. Heavy over a full square kilometre; best on a smaller area."
 };
 
 function quality() {
   const side = sel.size;
-  const cm = AERIAL_STEPS[+$("aerialCm").value];
-  const spacing = TERRAIN_STEPS[+$("terrainM").value];
-  const tol = TOLERANCE_STEPS[+$("terrainTol").value];
-
-  // Round the aerial to a multiple of 4 px: the mosaic splits it into tiles and
-  // whole numbers keep every tile boundary on an exact pixel.
-  let sizePx = Math.max(256, Math.round(side / (cm / 100) / 4) * 4);
-  let mesh = Math.max(33, Math.round(side / spacing) + 1);
-  // The adaptive mesh subdivides by halving, so it only fits a 2^k + 1 grid.
-  // Round up to match what the pipeline will do, or the estimate shown here
-  // is not the grid that gets built.
-  if (tol > 0) {
-    let fitted = 33;
-    while (fitted < mesh) fitted = (fitted - 1) * 2 + 1;
-    mesh = fitted;
-  }
-
+  const d = DETAIL[$("detail").value] || DETAIL.standard;
+  // A multiple of 4 px: the mosaic splits the photo into tiles and whole
+  // numbers keep every tile boundary on an exact pixel.
+  const sizePx = Math.max(256, Math.round(side / (d.aerial_cm / 100) / 4) * 4);
+  const perSide = Math.ceil(side / d.grid_m) + 1;
   return {
-    cm, spacing, sizePx, mesh, tol,
-    facadePx: FACADE_STEPS[+$("facadePx").value],
-    aerialOver: cm < AERIAL_NATIVE_CM,
-    terrainOver: spacing < TERRAIN_NATIVE_M,
-    megapixels: (sizePx * sizePx) / 1e6,
-    vertices: mesh * mesh
+    detail: $("detail").value, cm: d.aerial_cm, grid: d.grid_m, sizePx,
+    facadePx: d.facade_px, megapixels: (sizePx * sizePx) / 1e6,
+    vertices: perSide * perSide, perSide
   };
 }
 
 function updateQuality() {
   const q = quality();
-
-  $("aerialDerived").textContent = `${q.cm} cm/px · ${q.sizePx} px · ~${Math.round(q.megapixels * 1.5)} MB`;
-  $("aerialDerived").className = "derived" + (q.aerialOver ? " over" : "");
-
-  $("terrainDerived").textContent =
-    `${q.spacing} m · ${q.mesh}² = ${(q.vertices / 1000).toFixed(0)}k verts`;
-  $("terrainDerived").className = "derived" + (q.terrainOver ? " over" : "");
-
-  $("terrainTolDerived").textContent = q.tol === 0
-    ? `full grid · ${(q.vertices * 2 / 1000).toFixed(0)}k tris`
-    : `within ${q.tol} m · typically ${(q.vertices * 2 * TOLERANCE_YIELD[q.tol] / 1000).toFixed(0)}k tris`;
-
-  $("facadeDerived").textContent =
-    `${q.facadePx} px per storey · ${(q.facadePx / 4).toFixed(0)} px/m`;
-
-  $("aerialPlain").textContent = AERIAL_PLAIN[q.cm] || "";
-  $("terrainPlain").textContent = TERRAIN_PLAIN[q.spacing] || "";
-  $("terrainTolPlain").textContent = TOLERANCE_PLAIN[q.tol] || "";
-  $("facadePlain").textContent = FACADE_PLAIN[q.facadePx] || "";
-
+  $("detailNumbers").innerHTML =
+    `<b>photo</b> ${q.cm} cm/px, ${q.sizePx} px<br>`
+    + `<b>ground</b> every ${q.grid} m, ${(q.vertices / 1000).toFixed(0)}k points<br>`
+    + `<b>walls</b> ${q.facadePx} px a storey`;
+  $("detailPlain").textContent = DETAIL_PLAIN[q.detail] || "";
   const notes = [];
-  if (q.aerialOver)
-    notes.push(`You have asked for more detail than the photograph holds (${AERIAL_NATIVE_CM} cm). The extra pixels are enlarged, not sharper.`);
-  if (q.terrainOver)
-    notes.push(`You have asked for more detail than the height scan measured (${TERRAIN_NATIVE_M} m). The extra points are filled in between real measurements.`);
-  if (q.spacing <= 1 && !q.terrainOver)
-    notes.push("Below about 1 m, most ground points fall inside the building-shaped holes the scan leaves behind, so they are reconstructed rather than measured.");
-  // These two fire at the recommended settings, so they are worded as things
-  // to know rather than things that have gone wrong.
   if (q.sizePx > UNITY_MAX_TEXTURE)
     notes.push(`Using Unity? The photo is bigger than it will import (${UNITY_MAX_TEXTURE} px) and gets shrunk on the way in. A smaller area keeps this detail. Blender takes it as it is.`);
   else if (q.sizePx > 2048)
     notes.push("Using Unity? It shrinks imported textures to 2048 px until you raise Max Size on the texture. Blender takes it as it is.");
-  const shipped = q.tol === 0 ? q.vertices : q.vertices * TOLERANCE_YIELD[q.tol];
-  if (shipped > 1e6)
-    notes.push(`That is around ${(shipped / 1e6).toFixed(1)} million points of ground. It will open, but expect a slow import and a heavy scene.`);
-  if (q.tol === 0)
-    notes.push("Ground triangles are set to keep every point, so a flat field costs as much as a dike. One step along that slider drops the points the neighbours already describe.");
-
+  if (q.vertices > 1.5e6)
+    notes.push(`That is ${(q.vertices / 1e6).toFixed(1)} million points of ground. It will open, but expect a slow import and a heavy scene.`);
   $("qualityNote").innerHTML = notes.map(escapeHtml).join("<br>");
-  $("qualityNote").style.color = (q.aerialOver || q.terrainOver)
-    ? "var(--warn)" : "var(--muted)";
+  $("qualityNote").style.color = "var(--muted)";
 }
 
-function shape() {
-  return {
-    roadDetail: ROADDETAIL_STEPS[+$("roadDetail").value],
-    roadFace: ROADFACE_STEPS[+$("roadFace").value],
-    uniform: UNIFORM_STEPS[+$("uniform").value],
-    quads: $("quads").checked,
-    fold: FOLD_STEPS[+$("fold").value],
-    straighten: STRAIGHTEN_STEPS[+$("straighten").value],
-    minFeature: MINFEATURE_STEPS[+$("minFeature").value],
-    contour: CONTOUR_STEPS[+$("contours").value],
-    breaklines: [
-      ...($("blRoads").checked ? ["roads"] : []),
-      ...($("blWater").checked ? ["water"] : []),
-      ...($("blLand").checked ? ["unpaved", "green"] : []),
-      ...($("blBuildings").checked ? ["buildings"] : [])
-    ]
-  };
-}
-
-function updateShape() {
-  const s = shape();
-  $("roadDetailDerived").textContent = `${s.roadDetail} m`;
-  $("roadDetailPlain").textContent = ROADDETAIL_PLAIN[s.roadDetail] || "";
-  $("roadFaceDerived").textContent = `${s.roadFace} m`;
-  $("roadFacePlain").textContent = ROADFACE_PLAIN[s.roadFace] || "";
-  $("uniformDerived").textContent = s.uniform ? `max ${s.uniform} m` : "adaptive";
-  $("uniformPlain").textContent = UNIFORM_PLAIN[s.uniform] || "";
-  $("foldDerived").textContent = `${s.fold}°`;
-  $("foldPlain").textContent = FOLD_PLAIN[s.fold] || "";
-  $("straightenDerived").textContent = `${s.straighten} m`;
-  $("straightenPlain").textContent = STRAIGHTEN_PLAIN[s.straighten] || "";
-  $("minFeatureDerived").textContent = s.minFeature ? `${s.minFeature} m` : "off";
-  $("minFeaturePlain").textContent = MINFEATURE_PLAIN[s.minFeature] || "";
-  $("contourDerived").textContent = s.contour ? `every ${s.contour} m` : "off";
-  $("contourPlain").textContent = CONTOUR_PLAIN[s.contour] || "";
-
-  // The fold slider only means anything once quads are on.
-  for (const id of ["fold"]) $(id).disabled = !s.quads;
-  $("foldPlain").style.opacity = s.quads ? "1" : "0.45";
-
-  const notes = [];
-  if (!s.breaklines.length)
-    notes.push("Nothing left to fold along: the ground will be a plain surface through the height points, with no edge on any street or bank.");
-  if (s.quads && s.fold >= 60)
-    notes.push("At 60° almost nothing counts as a fold, so real ridges will be fused flat.");
-  if (s.contour === 0 && !s.breaklines.includes("water"))
-    notes.push("With contours off and water edges off, a canal bank has nothing to fold along.");
-  if (s.uniform && s.uniform <= 5)
-    notes.push(`An even ${s.uniform} m face over a square kilometre is on the order of ${Math.round(1e6 / (s.uniform * s.uniform) / 1000)}k faces before anything else is counted. Try it on a small area first.`);
-  if (s.straighten >= 5 && s.minFeature >= 25)
-    notes.push("Bold on both: expect a clean, sparse sheet that no longer follows the survey closely.");
-  $("shapeNote").innerHTML = notes.map(escapeHtml).join("<br>");
-  $("shapeNote").style.color = notes.length ? "var(--warn)" : "var(--muted)";
-}
-
-for (const id of ["roadDetail", "roadFace",
-                  "uniform", "quads", "fold", "straighten", "minFeature", "contours",
-                  "blRoads", "blWater", "blLand", "blBuildings"]) {
-  $(id).addEventListener("input", updateShape);
-  $(id).addEventListener("change", updateShape);
-}
-
-function applyPreset(name) {
-  const preset = PRESETS[name];
-  if (!preset) return;
-  $("aerialCm").value = preset.aerial;
-  $("terrainM").value = preset.terrain;
-  $("terrainTol").value = preset.tol;
-  $("facadePx").value = preset.facade;
-  $("normal").checked = preset.normal;
-  updateQuality();
-}
-
-$("preset").addEventListener("change", () => applyPreset($("preset").value));
-for (const id of ["aerialCm", "terrainM", "terrainTol", "facadePx"]) {
-  $(id).addEventListener("input", () => {
-    $("preset").value = "custom";
-    updateQuality();
-  });
-}
-$("normal").addEventListener("change", () => { $("preset").value = "custom"; });
-
+$("detail").addEventListener("change", updateQuality);
 $("name").addEventListener("input", updateAreaPlain);
-
-function updateFacadeNote() {
-  const styles = +$("facade").value, budget = +$("looks").value;
-  const era = styles > 1
-    ? "Walls follow the era rather than the height: pre-1920 brick, through "
-      + "post-war concrete, to contemporary glass."
-    : "One wall style for every building, whatever its age.";
-  const variety = budget > 0
-    ? ` Within a style, roughly every ${budget} buildings get their own wall `
-      + `colour and window layout, so neighbours of the same age differ. `
-      + `Ages with few buildings use fewer textures.`
-    : " Buildings sharing a style share the exact same wall, so a street "
-      + "built in one go repeats.";
-  $("facadeNote").textContent = era + variety;
-}
-$("facade").addEventListener("change", updateFacadeNote);
-$("looks").addEventListener("change", updateFacadeNote);
-updateFacadeNote();
 
 /* ---------- estimate ---------- */
 function humanTime(seconds) {
@@ -1421,16 +956,11 @@ function refreshEstimate() {
 }
 
 /* Anything that changes the cost changes the estimate. */
-for (const id of ["aerialCm", "terrainM", "terrainTol", "facadePx", "size", "preset"]) {
+for (const id of ["detail", "size"]) {
   $(id).addEventListener("input", refreshEstimate);
   $(id).addEventListener("change", refreshEstimate);
 }
 $("preview").addEventListener("change", refreshEstimate);
-
-/* The canopy choice only means anything once physics shapes are on. */
-$("collision").addEventListener("change", () => {
-  $("crownsRow").style.display = $("collision").checked ? "" : "none";
-});
 
 /* ---------- running ---------- */
 const logEl = $("log");
@@ -1481,38 +1011,14 @@ function setStatus(state, text) {
 }
 
 $("run").onclick = async () => {
-  const q = quality();
-  const sh = shape();
   const payload = {
     name: $("name").value.trim(),
     bbox: bbox(),
-    size_px: q.sizePx,
-    mesh_vertices: q.mesh,
-    simplify_tolerance_m: q.tol,
-    facade_texture_px: q.facadePx,
-    facade_normal_map: $("normal").checked,
-    facade_variants: +$("facade").value,
-    // 0 means off; otherwise it is the buildings-per-wall budget.
-    facade_buildings_per_look: +$("looks").value,
-    facade_ground_floor: $("groundFloor").checked,
-    facade_photo_textures: $("photoTextures").checked,
+    // Everything else follows from these. See DETAIL_PRESETS in src/config.py.
+    detail: $("detail").value,
     sources: selectedSources(),
-    clip_mode: $("clip").value,
     preview: $("preview").checked,
-    collision: $("collision").checked,
-    collision_tree_crowns: $("collisionCrowns").checked,
-    tree_ground_shade: $("treeShade").checked ? 0.35 : 0,
-    deshadow: $("deshadow").checked ? 1.0 : 0,
-    // Terrain shape. See updateShape: none of this changes accuracy.
-    road_simplify_m: sh.roadDetail,
-    road_max_edge_m: sh.roadFace,
-    max_face_m: sh.uniform,
-    quads: sh.quads,
-    quad_max_fold_deg: sh.fold,
-    breakline_simplify_m: sh.straighten,
-    min_feature_length_m: sh.minFeature,
-    contour_interval_m: sh.contour,
-    breaklines: sh.breaklines
+    collision: $("collision").checked
   };
 
   $("banner").innerHTML = "";
@@ -1755,10 +1261,7 @@ $("recheck").onclick = () => { checkServices(); };
 /* ---------- start ---------- */
 fitToSelection();
 updateBboxInfo();
-// The preset dropdown is the authority at load: without this the sliders keep
-// their markup defaults and can disagree with the preset shown next to them.
-applyPreset($("preset").value);
-updateShape();
+updateQuality();
 refreshEstimate();
 checkServices();
 

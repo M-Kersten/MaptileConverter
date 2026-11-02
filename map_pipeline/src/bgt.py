@@ -32,11 +32,10 @@ LOG = logging.getLogger(__name__)
 BGT_BASE = "https://api.pdok.nl/lv/bgt/ogc/v1/collections"
 RD_URI = "http://www.opengis.net/def/crs/EPSG/0/28992"
 
-# Where a run parks the collections it has already read. Two stages want the
-# same outlines -- the terrain mesh needs them as breaklines before anything is
-# draped, and the surfaces stage needs them again as geometry -- and the BGT is
-# slow enough per collection that reading it twice is worth avoiding. Also
-# means a re-run over the same area starts instantly.
+# Where a run parks the collections it has already read. The BGT is slow
+# enough per collection that reading one twice is worth avoiding, and it
+# means a re-run over the same area starts instantly. The NWB road network is
+# cached alongside.
 CACHE_DIRNAME = "_bgt"
 _cache_dir: Path | None = None
 

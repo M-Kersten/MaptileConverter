@@ -850,64 +850,104 @@ def _survey_error(raw, valid, bounds, bbox: BBox, grid, xs, ys) -> dict:
     }
 
 
+# How much more of a correction a vertex under a road takes than one beside it.
+# Measured over Bronbeek: at 1 (no preference) 39 vertices beside a road drop
+# by more than half a metre, at 4 it is 24, and the vertices that make up the
+# difference are under the road surface where nobody sees them.
+HIDDEN_VERTEX_WEIGHT = 4.0
+
+
 def lower_under(
     terrain: TerrainResult,
-    underside: HeightRaster,
+    points: np.ndarray,
     *,
     clearance_m: float,
 ) -> dict:
-    """Push the grid down wherever a road lies over it, and nowhere else.
+    """Push the grid down under the road surface, as little as that takes.
 
-    The road is a separate surface laid on top, so the terrain only has to
-    stay out of its way. Each vertex is held below the lowest point of road
-    anywhere in the squares around it, by `clearance_m`. That is the condition
-    that makes it impossible for the ground to show through: a triangle under
-    a road has all three corners below the lowest road over it, so every point
-    of the triangle is too. Testing only the road height at the vertex itself
-    lets a bump between vertices poke through on any slope.
+    `points` are (x, y, z) samples of the road's underside: wherever there is
+    road, how low it gets. Each one must end up with the terrain as drawn at
+    least `clearance_m` below it.
 
-    Returns how many vertices moved and how far, for the metadata.
+    A point lies in one triangle of the grid, and the terrain there is a
+    weighted mix of that triangle's three corners. The smallest lowering that
+    clears one point moves each corner in proportion to its weight -- the
+    corner the point sits next to by nearly all of it, the far corner hardly
+    at all. Every corner then takes the largest move any point asks of it,
+    which clears every point at once: lowering a corner further can only
+    lower the terrain at every point that uses it.
+
+    Vertices under the road take more of each correction than those beside
+    it; see HIDDEN_VERTEX_WEIGHT.
+
+    The first version held each vertex below the lowest road anywhere in the
+    four squares round it. That is also safe, and over Bronbeek it dragged
+    about 1,800 vertices beside roads down by more than half a metre, most of
+    them on the embankments of the Europaweg: a vertex at the top of a slope
+    was pulled down to the road at its foot two metres away. This drops 24.
     """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     n = terrain.n
-    step_x = terrain.bbox.width / (n - 1)
-    step_y = terrain.bbox.height / (n - 1)
-    values = underside.values
-    rows, cols = values.shape
-
-    # Lowest road under each cell of the road raster, gathered per grid square
-    # first and then per vertex over the squares that share it.
-    low = np.where(np.isfinite(values), values, np.inf)
-    # Cell centres of the raster, mapped to the grid square they fall in.
-    centre_x = terrain.bbox.xmin + (np.arange(cols) + 0.5) * underside.cell_x
-    centre_y = terrain.bbox.ymax - (np.arange(rows) + 0.5) * underside.cell_y
-    square_col = np.clip(((centre_x - terrain.bbox.xmin) / step_x).astype(np.int64), 0, n - 2)
-    square_row = np.clip(((centre_y - terrain.bbox.ymin) / step_y).astype(np.int64), 0, n - 2)
-    per_square = np.full((n - 1, n - 1), np.inf)
-    flat = (square_row[:, None] * (n - 1) + square_col[None, :]).ravel()
-    np.minimum.at(per_square.reshape(-1), flat, low.ravel())
-
-    # A vertex touches up to four squares.
-    padded = np.pad(per_square, 1, constant_values=np.inf)
-    per_vertex = np.minimum.reduce(
-        [padded[:-1, :-1], padded[:-1, 1:], padded[1:, :-1], padded[1:, 1:]]
+    heights = terrain.heights.astype(np.float64)
+    if not len(points):
+        terrain.conformed = {"vertices": 0, "max_m": 0.0, "median_m": 0.0,
+                             "clearance_m": float(clearance_m)}
+        return terrain.conformed
+    xs, ys = terrain.xs, terrain.ys
+    step_x = (xs[-1] - xs[0]) / (n - 1)
+    step_y = (ys[-1] - ys[0]) / (n - 1)
+    fx = np.clip((points[:, 0] - xs[0]) / step_x, 0, n - 1)
+    fy = np.clip((points[:, 1] - ys[0]) / step_y, 0, n - 1)
+    i0 = np.minimum(np.floor(fx).astype(np.int64), n - 2)
+    j0 = np.minimum(np.floor(fy).astype(np.int64), n - 2)
+    tx = fx - i0
+    ty = fy - j0
+    lower = tx >= ty
+    base = j0 * n + i0
+    # The same split `_triangulated_on_grid` reads: south-west to north-east.
+    corners = np.stack(
+        [base, np.where(lower, base + 1, base + n + 1), np.where(lower, base + n + 1, base + n)],
+        axis=1,
     )
-    ceiling = per_vertex - clearance_m
-    before = terrain.heights.astype(np.float64)
-    after = np.minimum(before, ceiling)
-    moved = after < before - 1e-6
-    terrain.heights = after.astype(np.float32)
-    drop = (before - after)[moved]
+    weights = np.stack(
+        [np.where(lower, 1 - tx, 1 - ty),
+         np.where(lower, tx - ty, tx),
+         np.where(lower, ty, ty - tx)],
+        axis=1,
+    )
+    flat = heights.ravel()
+    drawn = (weights * flat[corners]).sum(axis=1)
+    excess = drawn - (points[:, 2] - clearance_m)
+    bad = excess > 0.0
+    drop = np.zeros(flat.shape)
+    if bad.any():
+        # A vertex with road over it is hidden, so it takes more of the
+        # correction than one beside the road that everyone can see. Which
+        # vertices are under a road: the ones some road point is nearest to.
+        nearest = np.rint(fy).astype(np.int64) * n + np.rint(fx).astype(np.int64)
+        hidden = np.bincount(nearest, minlength=n * n) > 0
+        w = weights[bad]
+        share = w * np.where(hidden[corners[bad]], HIDDEN_VERTEX_WEIGHT, 1.0)
+        # Scaled so that moving each corner by its share lowers the terrain at
+        # the point by exactly the excess.
+        need = excess[bad, None] * share / np.maximum((w * share).sum(axis=1), 1e-12)[:, None]
+        np.maximum.at(drop, corners[bad].ravel(), need.ravel())
+    after = flat - drop
+    moved = drop > 1e-6
+    terrain.heights = after.reshape(heights.shape).astype(np.float32)
     terrain.conformed = {
         "vertices": int(moved.sum()),
         "max_m": round(float(drop.max()), 3) if moved.any() else 0.0,
-        "median_m": round(float(np.median(drop)), 3) if moved.any() else 0.0,
+        "median_m": round(float(np.median(drop[moved])), 3) if moved.any() else 0.0,
+        "over_half_metre": int((drop > 0.5).sum()),
         "clearance_m": float(clearance_m),
     }
     LOG.info(
-        "terrain: %d vertices lowered under the roads, median %.2f m, at most %.2f m",
+        "terrain: %d vertices lowered under the roads, median %.2f m, %d by "
+        "more than half a metre",
         terrain.conformed["vertices"],
         terrain.conformed["median_m"],
-        terrain.conformed["max_m"],
+        terrain.conformed["over_half_metre"],
     )
     return terrain.conformed
 

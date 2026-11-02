@@ -393,63 +393,104 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
         )
 
     if len(surfaces.road_tris):
-        from .surfaces import CLASS_NAMES
+        check_roads(report, surfaces, terrain)
 
-        classes = np.unique(surfaces.road_tri_class)
+
+# The share of road faces that may be further from the ground than the height
+# model allows. A quad spanning a quay wall cannot follow both sides of it.
+MAX_ROAD_OFF_GROUND_FRACTION = 0.002
+
+
+def check_roads(report: CheckReport, surfaces, terrain) -> None:
+    """The road network is the shape it claims, on the ground, and on top.
+
+    Three things an editor and an engine rely on: the streets really are
+    ladders of quads, the surface follows the surveyed ground, and the terrain
+    as drawn never shows through it.
+    """
+    from .surfaces import CLASS_FOOTPATH, CLASS_NAMES
+
+    mesh = getattr(surfaces, "road_mesh", None)
+    classes = np.unique(surfaces.road_tri_class)
+    if mesh is not None and len(mesh):
+        stats = mesh.stats
         report.add(
             "road_surface_present",
             True,
-            f"{len(surfaces.road_tris)} triangles across "
+            f"{stats.get('faces', 0)} faces in {len(mesh.object_names)} objects "
+            f"({stats.get('streets', 0)} streets, {stats.get('junctions', 0)} "
+            f"junctions), {stats.get('kerb_faces', 0)} kerb faces, across "
             + ", ".join(CLASS_NAMES.get(int(c), str(c)) for c in classes),
         )
-
-        # The reason this check exists: earcut leaves slivers over 100 m long,
-        # and a flat one that size cut through a canal bank by 1.86 m before
-        # the refinement went in. The corners are exact by construction, so
-        # the centroid is where a flat triangle misses the ground.
-        # Only the roads that should be on the ground. A carriageway on a
-        # bridge deliberately is not, and asserting otherwise failed the moment
-        # bridges started carrying their own roads.
-        at_grade = (
-            surfaces.road_tri_level <= 0
-            if len(surfaces.road_tri_level) == len(surfaces.road_tris)
-            else np.ones(len(surfaces.road_tris), dtype=bool)
+        # Not a hard number: an area of car parks and squares has few streets
+        # to ladder. Over Bronbeek 80% of faces are quads.
+        report.add(
+            "roads_are_mostly_quads",
+            stats.get("quad_share", 0.0) >= 0.5,
+            f"{100 * stats.get('quad_share', 0.0):.0f}% of road faces are quads; "
+            f"the largest face has {stats.get('largest_face_vertices', 0)} corners",
+            severity="warning",
         )
-        centroid = surfaces.road_tris[at_grade].mean(axis=1)
+
+    at_grade = (
+        surfaces.road_tri_level <= 0
+        if len(surfaces.road_tri_level) == len(surfaces.road_tris)
+        else np.ones(len(surfaces.road_tris), dtype=bool)
+    )
+    tris = surfaces.road_tris[at_grade]
+    tri_class = surfaces.road_tri_class[at_grade]
+    lift = float(getattr(surfaces, "road_lift_m", 0.0) or 0.0)
+    kerb = float(mesh.stats.get("kerb_m", 0.0)) if mesh is not None else 0.0
+    if len(tris):
+        centroid = tris.mean(axis=1)
         ground = terrain.sample(centroid[:, 0], centroid[:, 1])
-        # Measured against the drape, with the deliberate lift taken back off.
-        # Comparing lift plus drape against one fixed number only ever worked
-        # while the lift was 6 cm: raise it to clear a coarser terrain mesh and
-        # the check fails for the very thing that was done to satisfy it.
-        lift = float(getattr(surfaces, "road_lift_m", 0.0) or 0.0)
-        error = np.abs(centroid[:, 2] - lift - ground)
-        # Against what the height model can deliver, for the same reason the
-        # terrain mesh is: a road crossing a quay wall spans a step between two
-        # samples, and no flat triangle sits closer than about half of it
-        # however finely the drape is cut. A flat 0.5 m limit failed a
-        # carriageway whose median error was 22 mm for one triangle over a wall.
+        # With the deliberate lift and the kerb taken back off.
+        offset = lift + np.where(tri_class == CLASS_FOOTPATH, kerb, 0.0)
+        error = np.abs(centroid[:, 2] - offset - ground)
+        # Against what the height model can deliver: a face crossing a quay
+        # wall spans a step between two samples, and no flat face sits closer
+        # than about half of it.
         allowance = _ground_allowance(terrain, centroid[:, :2], floor_m=0.5)
         over = int((error > allowance).sum())
         report.add(
             "road_surface_follows_terrain",
-            over <= 0.001 * max(len(error), 1),
+            over <= MAX_ROAD_OFF_GROUND_FRACTION * max(len(error), 1),
             f"{over} of {len(error)} road triangles are further from the ground "
             f"than the height model allows; it follows to {np.median(error):.3f} m "
             f"at the median and never more than {error.max():.2f} m, over a "
-            f"{lift:.3f} m lift that keeps it from fighting the terrain for depth",
+            f"{lift:.3f} m lift and a {kerb:.2f} m kerb",
         )
 
-        elevated = ~at_grade
-        if elevated.any():
-            high = surfaces.road_tris[elevated].reshape(-1, 3)
-            over = high[:, 2] - terrain.sample(high[:, 0], high[:, 1])
-            report.add(
-                "bridge_roads_ride_their_decks",
-                bool((over > 0.0).all()),
-                f"{int(elevated.sum())} road triangles on bridges, running "
-                f"{over.min():.2f} to {over.max():.2f} m above the ground "
-                f"they cross",
-            )
+        # The terrain as drawn, under every corner and centre of every road
+        # triangle. `lower_under` makes this true by construction; this is
+        # the check that it ran, and ran on the grid that was exported.
+        from .elevation import _triangulated_on_grid
+
+        probe = np.vstack([tris.reshape(-1, 3), centroid])
+        drawn = _triangulated_on_grid(
+            np.asarray(terrain.heights, dtype=np.float64), terrain.xs, terrain.ys,
+            probe[:, 0], probe[:, 1],
+        )
+        poking = probe[:, 2] - drawn
+        report.add(
+            "terrain_stays_under_roads",
+            int((poking < 0.0).sum()) <= 0.001 * len(poking),
+            f"{int((poking < 0.0).sum())} of {len(poking)} road points have the "
+            f"terrain above them; the road clears it by "
+            f"{np.median(poking):.3f} m at the median",
+        )
+
+    elevated = ~at_grade
+    if elevated.any():
+        high = surfaces.road_tris[elevated].reshape(-1, 3)
+        over = high[:, 2] - terrain.sample(high[:, 0], high[:, 1])
+        report.add(
+            "bridge_roads_ride_their_decks",
+            bool((over > 0.0).all()),
+            f"{int(elevated.sum())} road triangles on bridges, running "
+            f"{over.min():.2f} to {over.max():.2f} m above the ground "
+            f"they cross",
+        )
 
 
 def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
@@ -848,6 +889,7 @@ def check_export(
     fbx_name: str,
     aerial_name: str,
     metadata_name: str,
+    blend_name: str = "model.blend",
 ) -> None:
     """The promised files exist and the model bounds look right."""
     fbx = out_dir / fbx_name
@@ -865,6 +907,16 @@ def check_export(
             path.is_file(),
             f"{filename} present" if path.is_file() else f"{filename} is missing",
         )
+    # The editable copy. Written after the FBX, so a Blender stage that died
+    # between the two leaves an FBX and no .blend, and this is what says so.
+    blend = out_dir / blend_name
+    report.add(
+        "blend_written",
+        blend.is_file() and blend.stat().st_size > 1024,
+        f"{blend.name} is {blend.stat().st_size / 1e6:.1f} MB"
+        if blend.is_file()
+        else f"{blend} is missing",
+    )
 
     summary_path = work_dir / "blender_summary.json"
     if summary_path.is_file():
@@ -1008,6 +1060,7 @@ __all__ = [
     "check_built_terrain",
     "check_export",
     "check_fbx_reimport",
+    "check_roads",
     "check_terrain",
     "write_report",
 ]

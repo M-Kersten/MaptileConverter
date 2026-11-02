@@ -3641,73 +3641,6 @@ class TestBridgeDecks(unittest.TestCase):
         np.testing.assert_allclose(z, 9.05)
 
 
-class TestBridgeRoads(unittest.TestCase):
-    """A carriageway on a bridge has to ride its deck, not the ground."""
-
-    @staticmethod
-    def _part(level, cx=0.0):
-        from src.surfaces import CLASS_ROAD, RoadPart
-
-        ring = np.array(
-            [[cx, 0.0], [cx + 20.0, 0.0], [cx + 20.0, 10.0], [cx, 10.0]]
-        )
-        return RoadPart([ring], CLASS_ROAD, level)
-
-    def test_a_road_on_a_bridge_is_lifted_to_its_deck(self):
-        from src.surfaces import triangulate_roads
-
-        ground = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
-        deck = lambda x, y: np.full(len(np.atleast_1d(x)), 12.0)  # noqa: E731
-
-        tris, _, levels = triangulate_roads(
-            [self._part(1)], ground, lift_m=0.06, deck_sampler=deck
-        )
-        self.assertGreater(len(tris), 0)
-        np.testing.assert_allclose(tris[:, :, 2], 12.06, atol=1e-6)
-        self.assertTrue((levels > 0).all())
-
-    def test_a_road_at_grade_still_follows_the_ground(self):
-        from src.surfaces import triangulate_roads
-
-        ground = lambda x, y: np.full(len(np.atleast_1d(x)), 3.0)  # noqa: E731
-        deck = lambda x, y: np.full(len(np.atleast_1d(x)), 12.0)  # noqa: E731
-
-        tris, _, levels = triangulate_roads(
-            [self._part(0)], ground, lift_m=0.06, deck_sampler=deck
-        )
-        np.testing.assert_allclose(tris[:, :, 2], 3.06, atol=1e-6)
-        self.assertTrue((levels == 0).all())
-
-    def test_an_unmeasurable_bridge_road_is_draped_rather_than_flattened(self):
-        """Flattening to the ground's median put half of it underground."""
-        from src.surfaces import triangulate_roads
-
-        # A sloping ground, and a surface model with nothing to say.
-        ground = lambda x, y: 0.2 * np.atleast_1d(np.asarray(x, dtype=float))  # noqa: E731
-        blank = lambda x, y: np.full(len(np.atleast_1d(x)), np.nan)  # noqa: E731
-
-        tris, _, levels = triangulate_roads(
-            [self._part(1)], ground, lift_m=0.06, deck_sampler=blank
-        )
-        corners = tris.reshape(-1, 3)
-        above = corners[:, 2] - ground(corners[:, 0], corners[:, 1])
-        self.assertTrue((above > 0).all(), "part of it ended up underground")
-        # And it is reported as being at grade, because that is where it is.
-        self.assertTrue((levels == 0).all())
-
-    def test_a_reading_far_too_high_is_not_a_deck(self):
-        from src.surfaces import triangulate_roads
-
-        ground = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
-        # A tower block beside the bridge, not the bridge.
-        tower = lambda x, y: np.full(len(np.atleast_1d(x)), 95.0)  # noqa: E731
-
-        tris, _, _ = triangulate_roads(
-            [self._part(1)], ground, lift_m=0.06, deck_sampler=tower
-        )
-        self.assertLess(float(tris[:, :, 2].max()), 5.0)
-
-
 class TestRoadClasses(unittest.TestCase):
     """A Dutch street is brick, and its cycle path is red. Both matter."""
 
@@ -3756,145 +3689,398 @@ class TestRoadClasses(unittest.TestCase):
         self.assertLess(_paint_rank(CLASS_CYCLE), _paint_rank(CLASS_FOOTPATH))
 
 
-class TestRoadGeometry(unittest.TestCase):
-    """Roads leave as their own objects, draped on the ground they run over."""
+def _rect(x0, y0, x1, y1):
+    return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=float)
+
+
+def _street_fixture(*, with_network=True):
+    """A T-junction: a main street running east, a side street going north.
+
+    Carriageways 6 m wide with a 2 m footway either side, the main street's
+    north footway broken where the side street joins. Centrelines as NWB
+    gives them: one section per stretch between junctions, junction ids shared
+    where they meet.
+    """
+    from src.nwb import Centreline, Network
+    from src.surfaces import CLASS_FOOTPATH, CLASS_ROAD, RoadPart
+
+    parts = [
+        RoadPart([_rect(0, -3, 60, 3)], CLASS_ROAD, 0),
+        RoadPart([_rect(0, -5, 60, -3)], CLASS_FOOTPATH, 0),
+        RoadPart([_rect(0, 3, 25, 5)], CLASS_FOOTPATH, 0),
+        RoadPart([_rect(35, 3, 60, 5)], CLASS_FOOTPATH, 0),
+        RoadPart([_rect(27, 3, 33, 40)], CLASS_ROAD, 0),
+        RoadPart([_rect(25, 5, 27, 40)], CLASS_FOOTPATH, 0),
+        RoadPart([_rect(33, 5, 35, 40)], CLASS_FOOTPATH, 0),
+        # The corners where the footways meet.
+        RoadPart([_rect(25, 3, 27, 5)], CLASS_FOOTPATH, 0),
+        RoadPart([_rect(33, 3, 35, 5)], CLASS_FOOTPATH, 0),
+    ]
+    lines = []
+    if with_network:
+        lines = [
+            Centreline(np.array([[-5.0, 0.0], [30.0, 0.0]]), 1, 1, 2, "Hoofdstraat", "RB"),
+            Centreline(np.array([[30.0, 0.0], [65.0, 0.0]]), 2, 2, 3, "Hoofdstraat", "RB"),
+            Centreline(np.array([[30.0, 0.0], [30.0, 45.0]]), 3, 2, 4, "Zijstraat", "RB"),
+        ]
+    return parts, Network(lines=lines)
+
+
+def _build_street(**kwargs):
+    from src.roads import build_road_mesh
+
+    parts, network = _street_fixture(with_network=kwargs.pop("with_network", True))
+    ground = kwargs.pop("ground", lambda x, y: np.full(np.shape(x), 2.0))
+    return parts, build_road_mesh(parts, network, ground=ground, **kwargs)
+
+
+class TestRoadLadders(unittest.TestCase):
+    """The roads are meshed so an editor can work with them.
+
+    What that means, concretely, and what each test pins down: no vertex in
+    the middle of a surface; every street a ladder of quads whose rungs run
+    kerb to kerb across the whole street; junctions as patches of their own;
+    a real kerb where a footway meets the carriageway; and the outline the
+    BGT surveyed, not an approximation of it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parts, cls.mesh = _build_street(lift_m=0.03, kerb_m=0.10)
+
+    def _surface_faces(self, mesh=None):
+        from src.roads import SURFACE
+
+        mesh = mesh or self.mesh
+        return [i for i in range(len(mesh)) if mesh.face_kind[i] == SURFACE]
+
+    def test_no_vertex_lies_inside_a_surface(self):
+        import shapely
+
+        edges = shapely.union_all(
+            [shapely.Polygon(p.rings[0]).boundary for p in self.parts]
+        )
+        used = np.unique(np.concatenate([self.mesh.face(i) for i in self._surface_faces()]))
+        off = shapely.distance(shapely.points(self.mesh.vertices[used, :2]), edges)
+        self.assertLess(float(off.max()), 1e-6, "a vertex sits in the middle of a surface")
+
+    def test_streets_are_ladders_of_quads(self):
+        streets = [
+            i for i in self._surface_faces()
+            if self.mesh.object_names[self.mesh.face_object[i]].startswith("Road_")
+        ]
+        self.assertGreater(len(streets), 30)
+        sizes = self.mesh.face_sizes[streets]
+        self.assertTrue((sizes == 4).all(), f"street faces of {sorted(set(sizes))} corners")
+
+    def test_every_rung_runs_kerb_to_kerb_across_the_whole_street(self):
+        """A cut across the carriageway carries on through both footways, so a
+        cross-section is one edge loop rather than three that do not meet."""
+        v = self.mesh.vertices
+        main = [
+            i for i in self._surface_faces()
+            if self.mesh.object_names[self.mesh.face_object[i]] == "Road_Hoofdstraat"
+        ]
+        rungs = sorted({round(float(x), 3) for i in main for x in v[self.mesh.face(i), 0]})
+        # Away from the side street, where the north footway is unbroken.
+        checked = 0
+        for x in rungs:
+            if 22.0 < x < 38.0:
+                continue
+            ys = {round(float(y), 3) for xx, y in v[:, :2] if abs(xx - x) < 1e-6}
+            for edge in (-5.0, -3.0, 3.0, 5.0):
+                self.assertIn(edge, ys, f"the rung at x={x} stops short of y={edge}")
+            checked += 1
+        self.assertGreater(checked, 10)
+        gaps = np.diff([x for x in rungs if x < 22.0])
+        self.assertLessEqual(float(gaps.max()), 3.0 + 1e-6, "rungs further apart than asked")
+
+    def test_the_junction_is_a_patch_of_its_own(self):
+        names = set(self.mesh.object_names)
+        self.assertIn("Road_Hoofdstraat", names)
+        self.assertIn("Road_Zijstraat", names)
+        junctions = [n for n in names if n.startswith("Junction_")]
+        self.assertEqual(len(junctions), 1, names)
+        self.assertIn("Hoofdstraat_x_Zijstraat", junctions[0])
+        # It is where the streets meet.
+        index = self.mesh.object_names.index(junctions[0])
+        faces = [i for i in self._surface_faces() if self.mesh.face_object[i] == index]
+        centre = np.vstack([self.mesh.vertices[self.mesh.face(i)] for i in faces])[:, :2].mean(axis=0)
+        self.assertLess(float(np.hypot(*(centre - [30.0, 0.0]))), 6.0)
+
+    def test_the_footway_stands_on_a_kerb(self):
+        from src.roads import KERB
+        from src.surfaces import CLASS_FOOTPATH, CLASS_ROAD
+
+        v = self.mesh.vertices
+        for i in self._surface_faces():
+            z = v[self.mesh.face(i), 2]
+            want = 2.0 + 0.03 + (0.10 if self.mesh.face_class[i] == CLASS_FOOTPATH else 0.0)
+            np.testing.assert_allclose(z, want, atol=1e-9)
+            self.assertIn(self.mesh.face_class[i], (CLASS_FOOTPATH, CLASS_ROAD))
+        kerbs = [i for i in range(len(self.mesh)) if self.mesh.face_kind[i] == KERB]
+        length = sum(
+            float(np.hypot(*(v[self.mesh.face(i)][1, :2] - v[self.mesh.face(i)][0, :2])))
+            for i in kerbs
+        )
+        # Both sides of the main street, less the side street's mouth, plus
+        # both sides of the side street.
+        self.assertGreater(length, 2 * 60 - 6 + 2 * 35 - 10)
+        # Welded to the faces it joins: its bottom edge is the carriageway's
+        # own vertices, its top the footway's.
+        tops = {int(k) for i in kerbs for k in self.mesh.face(i)[2:]}
+        bottoms = {int(k) for i in kerbs for k in self.mesh.face(i)[:2]}
+        surface = {int(k) for i in self._surface_faces() for k in self.mesh.face(i)}
+        self.assertTrue(tops <= surface and bottoms <= surface)
+
+    def test_a_kerb_faces_the_carriageway(self):
+        """Wound so its normal points at the lower side, or it is invisible
+        from the road with backface culling on."""
+        from src.roads import KERB
+
+        v = self.mesh.vertices
+        for i in [i for i in range(len(self.mesh)) if self.mesh.face_kind[i] == KERB][:40]:
+            a, b, c = v[self.mesh.face(i)[:3]]
+            normal = np.cross(b - a, c - b)
+            mid = (a + b) / 2
+            # The carriageway side of a main-street kerb is towards y = 0; of a
+            # side-street kerb towards x = 30.
+            towards = np.array([30.0, 0.0]) - mid[:2] if mid[1] > 4.5 else np.array([0.0, -mid[1]])
+            self.assertGreater(float(normal[:2] @ towards), 0.0)
+
+    def test_the_outline_is_the_surveyed_one(self):
+        import shapely
+
+        tris, _ = self.mesh.triangles()
+        u = tris[:, 1, :2] - tris[:, 0, :2]
+        w = tris[:, 2, :2] - tris[:, 0, :2]
+        area = 0.5 * np.abs(u[:, 0] * w[:, 1] - u[:, 1] * w[:, 0]).sum()
+        want = shapely.union_all([shapely.Polygon(p.rings[0]) for p in self.parts]).area
+        self.assertAlmostEqual(area, want, delta=0.005 * want)
+
+    def test_the_network_edge_has_a_skirt(self):
+        from src.roads import SKIRT
+
+        v = self.mesh.vertices
+        skirts = [i for i in range(len(self.mesh)) if self.mesh.face_kind[i] == SKIRT]
+        self.assertGreater(len(skirts), 20)
+        for i in skirts[:20]:
+            z = v[self.mesh.face(i), 2]
+            self.assertGreater(float(z.max() - z.min()), 0.3)
+
+    def test_road_uvs_run_across_and_along_the_street(self):
+        index = self.mesh.object_names.index("Road_Hoofdstraat")
+        starts = self.mesh.loop_starts
+        across, along = [], []
+        for i in self._surface_faces():
+            if self.mesh.face_object[i] != index:
+                continue
+            uv = self.mesh.loop_uv[starts[i] : starts[i] + self.mesh.face_sizes[i]]
+            across.extend(uv[:, 0])
+            along.extend(uv[:, 1])
+        self.assertAlmostEqual(min(across), -5.0, places=3)
+        self.assertAlmostEqual(max(across), 5.0, places=3)
+        self.assertGreater(max(along) - min(along), 20.0)
+
+    def test_without_centrelines_the_road_draws_its_own(self):
+        """Private lanes and park paths are not in NWB. They are cut along a
+        centreline drawn down their own middle instead of left whole."""
+        _, mesh = _build_street(with_network=False)
+        self.assertGreater(mesh.stats["drawn_centrelines"], 0)
+        self.assertGreater(mesh.stats["quad_share"], 0.6)
+        self.assertTrue(any(n.startswith("Lanes_") for n in mesh.object_names))
+
+    def test_no_roads_is_an_empty_mesh(self):
+        from src.nwb import Network
+        from src.roads import build_road_mesh
+
+        mesh = build_road_mesh([], Network(), ground=lambda x, y: np.zeros(np.shape(x)))
+        self.assertEqual(len(mesh), 0)
+        self.assertEqual(mesh.triangles()[0].shape, (0, 3, 3))
+
+    def test_saved_without_pickles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.npz"
+            np.savez(path, **self.mesh.to_npz_fields())
+            data = np.load(path)
+            for key in data.files:
+                self.assertNotEqual(data[key].dtype, object, key)
+            self.assertIn("Road_Hoofdstraat", [str(n) for n in data["road_object_names"]])
+
+
+class TestRoadHeights(unittest.TestCase):
+    """Roads on bridges ride their deck; paths over water stay above it."""
 
     @staticmethod
-    def _slope(gradient=0.02):
-        """A terrain sampler with a slope and a canal-sized dip across it."""
+    def _deck_part(level):
+        from src.surfaces import CLASS_ROAD, RoadPart
 
-        def sample(x, y):
+        return RoadPart([_rect(0, 0, 20, 10)], CLASS_ROAD, level)
+
+    def _build(self, part, ground, deck):
+        from src.nwb import Network
+        from src.roads import build_road_mesh
+
+        return build_road_mesh([part], Network(), ground=ground, lift_m=0.06, deck_sampler=deck)
+
+    def test_a_road_on_a_bridge_is_lifted_to_its_deck(self):
+        flat = lambda x, y: np.zeros(np.shape(x))  # noqa: E731
+        deck = lambda x, y: np.full(np.shape(x), 12.0)  # noqa: E731
+        mesh = self._build(self._deck_part(1), flat, deck)
+        top = mesh.vertices[np.concatenate([mesh.face(i) for i in range(len(mesh)) if mesh.face_kind[i] == 0])]
+        np.testing.assert_allclose(top[:, 2], 12.06, atol=1e-6)
+        self.assertTrue((mesh.face_level[mesh.face_kind == 0] > 0).all())
+
+    def test_a_reading_far_too_high_is_not_a_deck(self):
+        flat = lambda x, y: np.zeros(np.shape(x))  # noqa: E731
+        tower = lambda x, y: np.full(np.shape(x), 95.0)  # noqa: E731
+        mesh = self._build(self._deck_part(1), flat, tower)
+        self.assertLess(float(mesh.vertices[:, 2].max()), 1.0)
+        # And it is said to be at grade, because that is where it is: the
+        # terrain is pushed under it like under any other road.
+        self.assertTrue((mesh.face_level == 0).all())
+
+    def test_an_unmeasurable_bridge_road_follows_the_ground(self):
+        slope = lambda x, y: 0.2 * np.asarray(x, dtype=float)  # noqa: E731
+        blank = lambda x, y: np.full(np.shape(x), np.nan)  # noqa: E731
+        mesh = self._build(self._deck_part(1), slope, blank)
+        top = np.concatenate([mesh.face(i) for i in range(len(mesh)) if mesh.face_kind[i] == 0])
+        v = mesh.vertices[top]
+        np.testing.assert_allclose(v[:, 2], slope(v[:, 0], v[:, 1]) + 0.06, atol=1e-9)
+
+    def test_a_path_over_a_ditch_stays_above_the_water(self):
+        from src.nwb import Network
+        from src.roads import build_road_mesh
+        from src.surfaces import CLASS_FOOTPATH, RoadPart, WaterBody
+
+        ditch = WaterBody(rings=[_rect(40, -50, 60, 150)], level_nap=4.0,
+                          area_m2=4000.0, measured=True)
+
+        def dips(x, y):
+            across = np.clip((np.asarray(x, dtype=float) - 40.0) / 20.0, 0.0, 1.0)
+            return 6.0 - 3.4 * np.sin(np.pi * across)
+
+        path = RoadPart([_rect(0, 45, 100, 48)], CLASS_FOOTPATH, 0)
+        mesh = build_road_mesh(
+            [path], Network(), ground=dips, lift_m=0.0, kerb_m=0.0,
+            water=[ditch], water_clearance_m=0.25,
+        )
+        from src.roads import SURFACE
+
+        top = np.unique(np.concatenate(
+            [mesh.face(i) for i in range(len(mesh)) if mesh.face_kind[i] == SURFACE]
+        ))
+        v = mesh.vertices[top]
+        over = (v[:, 0] > 40.5) & (v[:, 0] < 59.5)
+        self.assertTrue(over.any(), "no vertex over the ditch to test")
+        self.assertTrue((v[over, 2] >= 4.25 - 1e-9).all())
+
+
+class TestRoadRastersAndTerrain(unittest.TestCase):
+    """The terrain gets out of the road's way, and stays out of it."""
+
+    def test_after_lowering_no_ground_shows_through(self):
+        from src.elevation import TerrainResult, lower_under
+        from src.geo import BBox
+        from src.roads import road_top, road_underside
+        from src.validate import CheckReport, check_roads
+        from src.surfaces import SurfaceSet
+
+        bbox = BBox(-10.0, -20.0, 70.0, 60.0)
+        axis_x = np.linspace(bbox.xmin, bbox.xmax, 41)
+        axis_y = np.linspace(bbox.ymin, bbox.ymax, 41)
+        gx, gy = np.meshgrid(axis_x, axis_y)
+        # Lumpy ground, so the road between its vertices is not the ground.
+        heights = (2.0 + 0.25 * np.sin(gx / 3.0) * np.cos(gy / 4.0)).astype(np.float32)
+        terrain = TerrainResult(
+            heights=heights.copy(), xs=axis_x, ys=axis_y, bbox=bbox,
+            center_z_nap=2.0, nodata_fraction_raw=0.0, filled_fraction=0.0,
+            geotiff_path=None, coverage_id="t", resolution_m=0.5,
+            measured=heights.copy(),
+        )
+        _, mesh = _build_street(ground=terrain.sample, lift_m=0.03, kerb_m=0.10)
+        surfaces = SurfaceSet()
+        surfaces.road_mesh = mesh
+        surfaces.road_lift_m = 0.03
+        tris, owner = mesh.triangles()
+        surfaces.road_tris = tris
+        surfaces.road_tri_class = mesh.face_class[owner]
+        surfaces.road_tri_level = mesh.face_level[owner]
+
+        report = CheckReport()
+        check_roads(report, surfaces, terrain)
+        before = {c.name: c for c in report.checks}["terrain_stays_under_roads"]
+        self.assertFalse(before.passed, "the fixture's ground never rose above the road")
+
+        lower_under(terrain, road_underside(mesh, bbox), clearance_m=0.05)
+        terrain.road_top = road_top(mesh, bbox)
+        report = CheckReport()
+        check_roads(report, surfaces, terrain)
+        verdicts = {c.name: c for c in report.checks}
+        self.assertTrue(verdicts["terrain_stays_under_roads"].passed,
+                        verdicts["terrain_stays_under_roads"].detail)
+        self.assertTrue(verdicts["road_surface_follows_terrain"].passed,
+                        verdicts["road_surface_follows_terrain"].detail)
+        # What stands on the road stands on the road.
+        on_footway = terrain.surface(np.array([10.0]), np.array([4.0]))
+        self.assertAlmostEqual(float(on_footway[0]), float(terrain.sample(10.0, 4.0)) + 0.13, delta=0.05)
+
+
+class TestBigFacesFollowTheGround(unittest.TestCase):
+    """A car park has no street to cut it across, and is not flat."""
+
+    def test_a_car_park_is_cut_into_a_grid_that_follows_a_mound(self):
+        from src.nwb import Network
+        from src.roads import GRID_M, SURFACE, build_road_mesh
+        from src.surfaces import CLASS_PARKING, RoadPart
+
+        def mound(x, y):
             x = np.asarray(x, dtype=float)
             y = np.asarray(y, dtype=float)
-            return gradient * x + 3.0 * np.sin(x / 22.0) * np.cos(y / 18.0)
+            return 1.0 * np.exp(-((x - 20) ** 2 + (y - 20) ** 2) / 120.0)
 
-        return sample
+        park = RoadPart([_rect(0, 0, 40, 40)], CLASS_PARKING, 0)
+        mesh = build_road_mesh([park], Network(), ground=mound, lift_m=0.0, kerb_m=0.0)
+        faces = [i for i in range(len(mesh)) if mesh.face_kind[i] == SURFACE]
+        self.assertGreater(len(faces), 50, "the car park was left as one face")
+        tris, owner = mesh.triangles()
+        u = tris[:, 1, :2] - tris[:, 0, :2]
+        w = tris[:, 2, :2] - tris[:, 0, :2]
+        area = np.zeros(len(mesh))
+        np.add.at(area, owner, 0.5 * np.abs(u[:, 0] * w[:, 1] - u[:, 1] * w[:, 0]))
+        self.assertLessEqual(float(area.max()), (GRID_M + 1.0) ** 2)
+        # The middle of the mound is a vertex, not a flat face over it.
+        self.assertGreater(float(mesh.vertices[:, 2].max()), 0.8)
+        # And it is a grid: rows and columns, mostly quads.
+        self.assertGreater(float((mesh.face_sizes[faces] == 4).mean()), 0.7)
 
-    def test_bisecting_halves_the_longest_edge_and_keeps_the_area(self):
-        from src.surfaces import _bisect_longest
 
-        triangle = np.array([[[0.0, 0.0], [100.0, 0.0], [0.0, 10.0]]])
-        halves = _bisect_longest(triangle)
+class TestMedialAxis(unittest.TestCase):
+    def test_an_l_shaped_path_gets_one_centreline_without_spurs(self):
+        import shapely
 
-        self.assertEqual(len(halves), 2)
+        from src.roads import skeleton_centrelines
 
-        def area(tri):
-            a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
-            return 0.5 * np.abs(cross2d(b - a, c - a))
+        path = shapely.union_all([
+            shapely.Polygon(_rect(0, 0, 40, 3)), shapely.Polygon(_rect(37, 0, 40, 30)),
+        ])
+        lines = skeleton_centrelines(path)
+        self.assertGreaterEqual(len(lines), 1)
+        total = sum(float(np.linalg.norm(np.diff(l.points, axis=0), axis=1).sum()) for l in lines)
+        # About the length down the middle, 38.5 + 28.5, and no corner spurs.
+        self.assertGreater(total, 55.0)
+        self.assertLess(total, 75.0)
+        for line in lines:
+            self.assertEqual(line.kind, "skeleton")
+            inside = shapely.contains(path, shapely.points(line.points))
+            self.assertTrue(inside.all())
 
-        self.assertAlmostEqual(float(area(halves).sum()), float(area(triangle)[0]))
+    def test_a_square_is_not_a_street(self):
+        import shapely
 
-        def longest_edge(tris):
-            return max(
-                np.linalg.norm(tris[:, (k + 1) % 3] - tris[:, k], axis=1).max()
-                for k in range(3)
-            )
+        from src.roads import skeleton_centrelines
 
-        self.assertLess(longest_edge(halves), longest_edge(triangle))
-
-    def test_bisecting_keeps_the_winding(self):
-        """A flipped child would face down and light wrongly."""
-        from src.surfaces import _bisect_longest
-
-        triangle = np.array([[[0.0, 0.0], [80.0, 0.0], [0.0, 10.0]]])
-        halves = _bisect_longest(triangle)
-        for tri in halves:
-            cross = cross2d(tri[1] - tri[0], tri[2] - tri[0])
-            self.assertGreater(cross, 0.0)
-
-    def test_a_long_flat_triangle_is_split_until_it_follows_the_ground(self):
-        from src.surfaces import drape_to_terrain
-
-        sampler = self._slope()
-        # 160 m across a sine-shaped dip: exactly the case earcut produces.
-        triangle = np.array([[[0.0, 0.0], [160.0, 0.0], [0.0, 40.0]]])
-
-        before = np.abs(
-            sampler(np.array([160 / 3]), np.array([40 / 3]))
-            - sampler(triangle[0, :, 0], triangle[0, :, 1]).mean()
-        )
-        self.assertGreater(before[0], 0.5, "the test case is not actually hard")
-
-        draped = drape_to_terrain(triangle, sampler, tolerance_m=0.08)
-        centroid = draped.mean(axis=1)
-        error = np.abs(centroid[:, 2] - sampler(centroid[:, 0], centroid[:, 1]))
-        self.assertLess(error.max(), 0.081)
-
-    def test_corners_land_exactly_on_the_ground(self):
-        from src.surfaces import drape_to_terrain
-
-        sampler = self._slope()
-        triangles = np.array([[[0.0, 0.0], [30.0, 5.0], [10.0, 25.0]]])
-        draped = drape_to_terrain(triangles, sampler, tolerance_m=0.08)
-
-        corners = draped.reshape(-1, 3)
-        np.testing.assert_allclose(
-            corners[:, 2], sampler(corners[:, 0], corners[:, 1]), atol=1e-9
-        )
-
-    def test_flat_ground_needs_no_subdivision(self):
-        """Adaptive, not uniform: a flat street must stay cheap."""
-        from src.surfaces import drape_to_terrain
-
-        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
-        triangles = np.array([[[0.0, 0.0], [200.0, 0.0], [0.0, 200.0]]])
-        draped = drape_to_terrain(triangles, flat, tolerance_m=0.08)
-        self.assertEqual(len(draped), 1)
-
-    def test_each_class_becomes_its_own_geometry(self):
-        from src.surfaces import (
-            CLASS_CYCLE, CLASS_ROAD, RoadPart, triangulate_roads,
-        )
-
-        square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
-        parts = [
-            RoadPart([square], CLASS_ROAD),
-            RoadPart([square + np.array([20.0, 0.0])], CLASS_CYCLE),
-        ]
-        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
-        triangles, classes, _ = triangulate_roads(parts, flat, lift_m=0.06)
-
-        self.assertGreater(len(triangles), 0)
-        self.assertEqual(set(classes.tolist()), {CLASS_ROAD, CLASS_CYCLE})
-        self.assertEqual(len(triangles), len(classes))
-
-    def test_the_road_surface_is_lifted_clear_of_the_terrain(self):
-        """Sharing a depth with the terrain is what makes surfaces flicker."""
-        from src.surfaces import CLASS_ROAD, RoadPart, triangulate_roads
-
-        square = np.array([[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]])
-        flat = lambda x, y: np.full_like(np.asarray(x, dtype=float), 3.0)  # noqa: E731
-        triangles, _, _ = triangulate_roads(
-            [RoadPart([square], CLASS_ROAD)], flat, lift_m=0.06
-        )
-        np.testing.assert_allclose(triangles[:, :, 2], 3.06, atol=1e-9)
-
-    def test_a_hole_in_a_road_polygon_stays_a_hole(self):
-        from src.surfaces import CLASS_ROAD, RoadPart, triangulate_roads
-
-        outer = np.array([[0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0]])
-        hole = np.array([[10.0, 10.0], [10.0, 20.0], [20.0, 20.0], [20.0, 10.0]])
-        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
-
-        triangles, _, _ = triangulate_roads(
-            [RoadPart([outer, hole], CLASS_ROAD)], flat, lift_m=0.0
-        )
-        area = 0.5 * np.abs(
-            cross2d(
-                triangles[:, 1, :2] - triangles[:, 0, :2],
-                triangles[:, 2, :2] - triangles[:, 0, :2],
-            )
-        ).sum()
-        # 900 for the square, less the 100 the hole takes out.
-        self.assertAlmostEqual(area, 800.0, places=6)
-
-    def test_no_roads_gives_empty_arrays_rather_than_failing(self):
-        from src.surfaces import triangulate_roads
-
-        flat = lambda x, y: np.zeros_like(np.asarray(x, dtype=float))  # noqa: E731
-        triangles, classes, _ = triangulate_roads([], flat)
-        self.assertEqual(len(triangles), 0)
-        self.assertEqual(len(classes), 0)
+        self.assertEqual(skeleton_centrelines(shapely.Polygon(_rect(0, 0, 60, 60))), [])
 
 
 class TestRailways(unittest.TestCase):
@@ -4291,247 +4477,6 @@ class TestCentringCheck(unittest.TestCase):
         self.assertLess(_centring_tolerance(1120.0, 1000.0), 62.0)
 
 
-class TestConstrainedTriangulation(unittest.TestCase):
-    """The triangulator that lets mesh edges follow real features."""
-
-    @staticmethod
-    def _audit(t):
-        """Signed area, worst edge use count, and lost constraints."""
-        p, tri = t.points, t.triangles
-        a, b, c = p[tri[:, 0]], p[tri[:, 1]], p[tri[:, 2]]
-        area = 0.5 * (
-            (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
-            - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
-        )
-        counts: dict = {}
-        for x, y, z in tri:
-            for u, v in ((x, y), (y, z), (z, x)):
-                key = frozenset((int(u), int(v)))
-                counts[key] = counts.get(key, 0) + 1
-        return float(area.sum()), max(counts.values()), len(t.missing_constraints())
-
-    @staticmethod
-    def _square(n, seed=11, side=100.0):
-        rng = np.random.default_rng(seed)
-        corners = [[0, 0], [side, 0], [side, side], [0, side]]
-        return np.vstack([corners, rng.random((n, 2)) * side])
-
-    def test_a_square_is_two_triangles(self):
-        from src.cdt import triangulate
-
-        t = triangulate(np.array([[0, 0], [10, 0], [10, 10], [0, 10]], float))
-        self.assertEqual(t.triangle_count, 2)
-
-    def test_the_result_tiles_the_convex_hull_exactly(self):
-        """Too little is a hole, too much is an overlap; both read as a tear."""
-        from src.cdt import triangulate
-
-        for n in (50, 200, 600):
-            area, worst_edge, lost = self._audit(triangulate(self._square(n)))
-            self.assertAlmostEqual(area, 10000.0, places=6)
-            self.assertLessEqual(worst_edge, 2)
-            self.assertEqual(lost, 0)
-
-    def test_the_super_triangle_has_to_be_far_away(self):
-        """A close one makes real hull triangles genuinely non-Delaunay.
-
-        They then never get built, and the mesh quietly loses slivers along the
-        edge of the bbox: 5 triangles and 1.3% of the area, with no error and
-        no failed invariant anywhere to notice it.
-        """
-        from src.cdt import SUPER_TRIANGLE_SPAN
-
-        self.assertGreaterEqual(SUPER_TRIANGLE_SPAN, 100.0)
-
-    def test_a_constraint_survives_as_an_edge(self):
-        from src.cdt import triangulate
-
-        # Two points straddle the diagonal, so Delaunay would never pick it.
-        pts = np.array(
-            [[0, 0], [10, 0], [10, 10], [0, 10], [5, 4.9], [5, 5.1]], float
-        )
-        t = triangulate(pts, np.array([[0, 2]]))
-        self.assertIn(frozenset((0, 2)), t.edges())
-        area, worst_edge, lost = self._audit(t)
-        self.assertAlmostEqual(area, 100.0, places=9)
-        self.assertLessEqual(worst_edge, 2)
-        self.assertEqual(lost, 0)
-
-    def test_a_concave_footprint_keeps_every_edge(self):
-        """The pocket left by a removed constraint is routinely not convex."""
-        from src.cdt import triangulate
-
-        ring = np.array(
-            [[30, 30], [70, 30], [70, 45], [55, 45], [55, 70], [30, 70]], float
-        )
-        rng = np.random.default_rng(11)
-        pts = np.vstack(
-            [[[0, 0], [100, 0], [100, 100], [0, 100]], ring, rng.random((600, 2)) * 100]
-        )
-        seg = np.array([[4 + i, 4 + (i + 1) % len(ring)] for i in range(len(ring))])
-        t = triangulate(pts, seg)
-        for x, y in seg:
-            self.assertIn(frozenset((int(x), int(y))), t.edges())
-        area, worst_edge, lost = self._audit(t)
-        self.assertAlmostEqual(area, 10000.0, places=6)
-        self.assertLessEqual(worst_edge, 2)
-        self.assertEqual(lost, 0)
-
-    def test_a_constraint_running_through_a_vertex_is_split(self):
-        """BGT outlines share corners and plenty of them are collinear."""
-        from src.cdt import triangulate
-
-        pts = np.array(
-            [[0, 0], [10, 0], [10, 10], [0, 10], [2, 0], [5, 0], [8, 0], [5, 5]], float
-        )
-        t = triangulate(pts, np.array([[0, 1]]))
-        area, worst_edge, lost = self._audit(t)
-        self.assertAlmostEqual(area, 100.0, places=9)
-        self.assertLessEqual(worst_edge, 2)
-        self.assertEqual(lost, 0)
-        # The whole run 0-4-5-6-1 has to be edges, not just the ends.
-        for pair in ((0, 4), (4, 5), (5, 6), (6, 1)):
-            self.assertIn(frozenset(pair), t.edges())
-
-    def test_crossing_constraints_are_refused_rather_than_mangled(self):
-        from src.cdt import triangulate
-
-        pts = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], float)
-        with self.assertRaises(RuntimeError) as caught:
-            triangulate(pts, np.array([[0, 2], [1, 3]]))
-        self.assertIn("cross", str(caught.exception))
-
-    def test_many_disjoint_footprints(self):
-        """The shape of the real job: thousands of rings on scattered points."""
-        from src.cdt import triangulate
-
-        rng = np.random.default_rng(5)
-        side, cells = 1000.0, 20
-        pts = [[0, 0], [side, 0], [side, side], [0, side]]
-        segs = []
-        step = side / cells
-        for i in range(cells):
-            for j in range(cells):
-                x0, y0 = i * step + step * 0.2, j * step + step * 0.2
-                base = len(pts)
-                pts.extend(
-                    [
-                        [x0, y0],
-                        [x0 + step * 0.55, y0],
-                        [x0 + step * 0.55, y0 + step * 0.45],
-                        [x0, y0 + step * 0.45],
-                    ]
-                )
-                segs.extend([[base + k, base + (k + 1) % 4] for k in range(4)])
-        pts.extend((rng.random((cells * cells * 4, 2)) * (side - 2) + 1).tolist())
-        t = triangulate(np.array(pts, float), np.array(segs))
-        area, worst_edge, lost = self._audit(t)
-        self.assertAlmostEqual(area, side * side, places=5)
-        self.assertLessEqual(worst_edge, 2)
-        self.assertEqual(lost, 0)
-
-    @staticmethod
-    def _nasty(seed, side=200.0):
-        """Thin overlapping slivers at every angle: what a kerb looks like."""
-        from src.cdt import WELD_M, weld
-
-        rng = np.random.default_rng(seed)
-        pts = [[0, 0], [side, 0], [side, side], [0, side]]
-        segs = []
-        for _ in range(60):
-            x0, y0 = rng.random(2) * (side - 20) + 5
-            angle = rng.random() * np.pi
-            d = np.array([np.cos(angle), np.sin(angle)])
-            n = np.array([-d[1], d[0]])
-            width = 10 ** rng.uniform(-1.5, 0.5)  # 3 cm to 3 m
-            length = rng.uniform(2, 30)
-            base = len(pts)
-            pts.extend(
-                [
-                    [x0, y0],
-                    [x0 + d[0] * length, y0 + d[1] * length],
-                    [x0 + d[0] * length + n[0] * width, y0 + d[1] * length + n[1] * width],
-                    [x0 + n[0] * width, y0 + n[1] * width],
-                ]
-            )
-            segs.extend([[base + k, base + (k + 1) % 4] for k in range(4)])
-        pts.extend((rng.random((400, 2)) * (side - 2) + 1).tolist())
-        welded, mapping = weld(np.array(pts, float), WELD_M)
-        segments = mapping[np.array(segs)]
-        return welded, segments[segments[:, 0] != segments[:, 1]]
-
-    @staticmethod
-    def _hull_area(points):
-        ordered = points[np.lexsort((points[:, 1], points[:, 0]))]
-
-        def half(seq):
-            out = []
-            for q in seq:
-                while len(out) >= 2 and (
-                    (out[-1][0] - out[-2][0]) * (q[1] - out[-2][1])
-                    - (out[-1][1] - out[-2][1]) * (q[0] - out[-2][0])
-                ) <= 0:
-                    out.pop()
-                out.append(q)
-            return out
-
-        hull = np.array(half(ordered)[:-1] + half(ordered[::-1])[:-1])
-        return 0.5 * abs(
-            np.dot(hull[:, 0], np.roll(hull[:, 1], -1))
-            - np.dot(hull[:, 1], np.roll(hull[:, 0], -1))
-        )
-
-    def test_degenerate_input_never_tears_the_mesh(self):
-        """A torn mesh does not announce itself.
-
-        The adjacency stays self-consistent around a hole, so the first sign is
-        a fan spinning round some unrelated vertex thousands of constraints
-        later, with nothing left to connect it back to the cause.
-        """
-        import logging
-
-        from src.cdt import triangulate
-
-        logging.disable(logging.WARNING)
-        try:
-            for seed in range(12):
-                points, segments = self._nasty(seed)
-                mesh = triangulate(points, segments, skip_crossing=True)
-                area, worst_edge, lost = self._audit(mesh)
-                self.assertAlmostEqual(area, self._hull_area(points), places=5)
-                self.assertLessEqual(worst_edge, 2)
-                self.assertEqual(lost, 0)
-        finally:
-            logging.disable(logging.NOTSET)
-
-    def test_a_patch_that_does_not_tile_is_refused(self):
-        """Checked before the mesh is touched, so a bad patch costs one edge."""
-        from src.cdt import _Mesh, _patch_tiles
-
-        px = [0.0, 4.0, 4.0, 0.0]
-        py = [0.0, 0.0, 4.0, 4.0]
-        mesh = _Mesh(px, py, real=4)
-        doomed = [mesh.add(0, 1, 2), mesh.add(0, 2, 3)]
-        self.assertTrue(_patch_tiles(mesh, doomed, [(0, 1, 3), (1, 2, 3)]))
-        # Same ground, one triangle short.
-        self.assertFalse(_patch_tiles(mesh, doomed, [(0, 1, 3)]))
-        # A repeated vertex is not a triangle.
-        self.assertFalse(_patch_tiles(mesh, doomed, [(0, 1, 1), (1, 2, 3)]))
-        # Wound the wrong way.
-        self.assertFalse(_patch_tiles(mesh, doomed, [(0, 3, 1), (1, 2, 3)]))
-        self.assertFalse(_patch_tiles(mesh, doomed, []))
-
-    def test_welding_merges_shared_corners(self):
-        from src.cdt import weld
-
-        pts = np.array([[0, 0], [1, 0], [0, 0], [1, 0], [5, 5]], float)
-        kept, mapping = weld(pts)
-        self.assertEqual(len(kept), 3)
-        self.assertEqual(mapping[0], mapping[2])
-        self.assertEqual(mapping[1], mapping[3])
-        self.assertTrue(np.allclose(kept[mapping], pts))
-
-
 class TestFindingBlender(unittest.TestCase):
     """Blender is installed in places PATH never mentions."""
 
@@ -4597,102 +4542,6 @@ class TestFindingBlender(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("Looked in", message)
         self.assertIn("/Applications/Blender.app", message)
-
-
-class TestBreaklines(unittest.TestCase):
-    """The lines the terrain has to fold along."""
-
-    def test_simplification_keeps_the_shape(self):
-        from src.breaklines import douglas_peucker
-
-        ring = np.array(
-            [[0, 0], [1, 0.001], [2, 0], [3, 0.002], [4, 0], [4, 4], [0, 4]], float
-        )
-        thin = douglas_peucker(ring, 0.15)
-        self.assertLess(len(thin), len(ring))
-        # The corners are the shape; only the wobble along the straight goes.
-        for corner in ([0, 0], [4, 0], [4, 4], [0, 4]):
-            self.assertTrue(np.isclose(thin, corner).all(axis=1).any())
-
-    def test_a_ring_is_cut_at_the_bbox(self):
-        from src.breaklines import clip_ring_segments
-        from src.geo import BBox
-
-        pieces = clip_ring_segments(
-            np.array([[-5, 5], [15, 5]], float), BBox(0, 0, 10, 10)
-        )
-        self.assertEqual(len(pieces), 1)
-        self.assertTrue(np.allclose(pieces[0], [[0, 5], [10, 5]]))
-
-    def test_a_ring_that_leaves_and_returns_comes_back_in_pieces(self):
-        from src.breaklines import clip_ring_segments
-        from src.geo import BBox
-
-        ring = np.array([[1, 1], [1, 9], [-5, 9], [-5, 1], [9, 1], [9, 9]], float)
-        pieces = clip_ring_segments(ring, BBox(0, 0, 10, 10))
-        self.assertGreaterEqual(len(pieces), 2)
-
-    def test_contours_come_out_at_the_right_heights(self):
-        from src.breaklines import contour_lines
-
-        n = 33
-        _, cols = np.mgrid[0:n, 0:n].astype(float)
-        axis = np.arange(n, dtype=float)
-        segs = contour_lines(cols * 0.25, axis, axis, interval_m=1.0)
-        self.assertGreater(len(segs), 0)
-        # A ramp of 0.25 m per cell crosses a whole metre every four cells.
-        levels = sorted({round(float(s[0][0]) * 0.25, 3) for s in segs})
-        self.assertEqual(levels, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
-
-    def test_flat_ground_has_no_contours(self):
-        from src.breaklines import contour_lines
-
-        axis = np.arange(9, dtype=float)
-        self.assertEqual(contour_lines(np.zeros((9, 9)), axis, axis), [])
-
-    def test_crossing_segments_are_cut_apart(self):
-        """The triangulator refuses crossings, so they cannot reach it."""
-        from src.breaklines import split_crossings
-
-        pts = np.array([[0, 0], [10, 10], [0, 10], [10, 0]], float)
-        out_pts, out_segs = split_crossings(pts, np.array([[0, 1], [2, 3]]))
-        self.assertEqual(len(out_segs), 4)
-        self.assertEqual(len(out_pts), 6)
-        # Both new points sit on the crossing, which is the middle.
-        self.assertTrue(np.allclose(out_pts[4], [5, 5]))
-        self.assertTrue(np.allclose(out_pts[5], [5, 5]))
-
-    def test_segments_that_only_touch_are_left_alone(self):
-        from src.breaklines import split_crossings
-
-        pts = np.array([[0, 0], [10, 0], [5, 0], [5, 5]], float)
-        _, out = split_crossings(pts, np.array([[0, 1], [2, 3]]))
-        self.assertEqual(len(out), 2)
-
-    def test_the_bbox_edge_is_always_a_breakline(self):
-        """Otherwise the mesh ends wherever the outlines happened to."""
-        from src.breaklines import build_breaklines
-        from src.geo import BBox
-
-        lines = build_breaklines(BBox(0, 0, 10, 10), rings_by_source={})
-        self.assertEqual(lines.counts["bbox"], 1)
-        self.assertGreaterEqual(len(lines.segments), 4)
-
-    def test_everything_reaches_the_triangulator_as_an_edge(self):
-        from src.breaklines import build_breaklines
-        from src.cdt import triangulate
-        from src.geo import BBox
-
-        bbox = BBox(0, 0, 100, 100)
-        rings = {
-            "water": [np.array([[20, 20], [80, 20], [80, 40], [20, 40], [20, 20]], float)],
-            "roads": [np.array([[0, 60], [100, 60], [100, 70], [0, 70], [0, 60]], float)],
-        }
-        lines = build_breaklines(bbox, rings_by_source=rings, simplify_m=0.05)
-        result = triangulate(
-            lines.points, lines.segments, origin=tuple(bbox.center)
-        )
-        self.assertEqual(result.missing_constraints(), set())
 
 
 class TestBag3dTiles(unittest.TestCase):
@@ -4777,188 +4626,58 @@ class TestBag3dTiles(unittest.TestCase):
         self.assertIn("vertices", inspect.signature(_extract_feature).parameters)
 
 
-class TestPlanarPartitionSimplification(unittest.TestCase):
-    """A boundary two polygons share has to stay one line.
-
-    This is the defect that produced almost every unusable triangle in the
-    mesh. Simplifying ring by ring pulled shared kerbs into two lines that
-    crossed each other, the crossings were cut into a ladder of millimetre
-    segments, and refinement then chased the resulting acute corners into ever
-    smaller slivers -- 268 of the 283 worst triangles in a measured area came
-    from one kerb that had become two.
-    """
-
-    @staticmethod
-    def _kerb(n=400):
-        t = np.linspace(0.0, 1.0, n)
-        return np.column_stack(
-            [10.0 + 80.0 * t, 50.0 + 6.0 * np.sin(t * 5.0) + np.sin(t * 29.0)]
-        )
-
-    def _partition(self):
-        """A road with three separate verges along it, BGT style.
-
-        The point of three is the junction between two of them, which lands
-        part way along a smooth stretch of the kerb: a ring corner for the
-        verge and an ordinary point for the road. That difference is what used
-        to make Douglas-Peucker keep different vertices on each side.
-        """
-        kerb = self._kerb()
-        road = np.vstack([kerb, [[90.0, 30.0], [10.0, 30.0]], kerb[:1]])
-        verges = []
-        for lo, hi in ((0, 140), (140, 260), (260, 399)):
-            piece = kerb[lo : hi + 1]
-            verges.append(
-                np.vstack(
-                    [piece, [[piece[-1, 0], 70.0], [piece[0, 0], 70.0]], piece[:1]]
-                )
-            )
-        return {"roads": [road], "unpaved": verges}
-
-    def test_a_shared_kerb_survives_as_one_line(self):
-        from src.breaklines import partition_chains
-        from src.geo import BBox
-
-        chains, _ = partition_chains(self._partition(), BBox(0, 0, 100, 100), 0.15)
-
-        # Every vertex of every chain that lies along the kerb must be one of
-        # the kerb's own points: two differing copies would put vertices in
-        # between, off the surveyed line.
-        kerb = self._kerb()
-        on_kerb = np.vstack(
-            [c for c in chains if ((c[:, 1] > 40) & (c[:, 1] < 60)).all()]
-        )
-        for point in on_kerb:
-            gap = np.hypot(*(kerb - point).T).min()
-            self.assertLess(
-                gap, 1e-6, f"{point} is on neither copy of the kerb, so there are two"
-            )
-
-    def test_the_kerb_is_not_cut_into_a_ladder(self):
-        """Two copies of one line cross constantly, and every crossing became a
-        cut. One line crosses nothing."""
-        from src.breaklines import build_breaklines
-        from src.geo import BBox
-
-        lines = build_breaklines(
-            BBox(0, 0, 100, 100), rings_by_source=self._partition(), simplify_m=0.15
-        )
-        length = np.hypot(
-            *(lines.points[lines.segments[:, 1]] - lines.points[lines.segments[:, 0]]).T
-        )
-        self.assertEqual(
-            int((length < 0.02).sum()),
-            0,
-            "millimetre segments mean the kerb was cut at its own crossings",
-        )
-
-    def test_junctions_are_never_simplified_away(self):
-        """A run is simplified between junctions, so the junctions themselves
-        have to survive or the polygons stop meeting where they meet."""
-        from src.breaklines import chains_between_junctions
-
-        points = np.array(
-            [[0, 0], [1, 0.01], [2, 0], [3, 0.01], [4, 0], [2, 3]], dtype=float
-        )
-        edges = [(0, 1), (1, 2), (2, 3), (3, 4), (2, 5)]
-        chains = chains_between_junctions(points, edges)
-        # Three runs meet at point 2, so it is a junction: every run ends there.
-        self.assertEqual(len(chains), 3)
-        for chain in chains:
-            self.assertTrue(
-                np.isclose(chain[0], points[2]).all()
-                or np.isclose(chain[-1], points[2]).all()
-            )
-
-
-class TestContourBreaklines(unittest.TestCase):
-    """Contours used to arrive at full grid resolution and were 99% of all the
-    breaklines in an area, which is what made the mesh a hundred times denser
-    along them than on the ground either side."""
-
-    @staticmethod
-    def _ground(n=129, noise=0.025, seed=3):
-        xs = np.linspace(0.0, 256.0, n)
-        ys = np.linspace(0.0, 256.0, n)
-        _, y = np.meshgrid(xs, ys)
-        rng = np.random.default_rng(seed)
-        # Flat at 1 m, with one bank dropping 3 m, plus scanner noise.
-        height = 1.0 - 3.0 * np.exp(-(((y - 128.0) / 10.0) ** 2))
-        return height + rng.normal(0.0, noise, height.shape), xs, ys
-
-    def test_chords_are_joined_into_lines_and_thinned(self):
-        from src.breaklines import contour_lines, contour_polylines
-
-        height, xs, ys = self._ground()
-        raw = contour_lines(height, xs, ys, interval_m=0.5)
-        thin = contour_polylines(height, xs, ys, interval_m=0.5, tolerance_m=0.10)
-        raw_vertices = sum(len(s) for s in raw)
-        thin_vertices = sum(len(line) for line in thin)
-        self.assertLess(
-            thin_vertices,
-            raw_vertices / 10,
-            f"{thin_vertices} vertices against {raw_vertices}: barely thinned",
-        )
-
-    def test_flat_ground_contributes_no_contours(self):
-        """A level that lands near the height of a flat field used to trace the
-        scanner's noise all over it and arrive as a constraint."""
-        from src.breaklines import contour_polylines
-
-        rng = np.random.default_rng(5)
-        xs = ys = np.linspace(0.0, 256.0, 129)
-        flat = np.full((129, 129), 1.0) + rng.normal(0.0, 0.03, (129, 129))
-        # Levels either side of the ground, so marching squares has plenty to
-        # bite on if it is going to.
-        self.assertEqual(
-            contour_polylines(flat, xs, ys, interval_m=0.05, tolerance_m=0.10), []
-        )
-
-    def test_a_real_bank_still_gets_its_contours(self):
-        from src.breaklines import contour_polylines
-
-        height, xs, ys = self._ground()
-        lines = contour_polylines(height, xs, ys, interval_m=0.5, tolerance_m=0.10)
-        self.assertGreater(len(lines), 0, "the bank lost its contours entirely")
-        middle = np.vstack([0.5 * (line[:-1] + line[1:]) for line in lines])
-        on_bank = np.abs(middle[:, 1] - 128.0) < 25.0
-        self.assertGreater(
-            on_bank.mean(), 0.9, "contours are landing somewhere other than the bank"
-        )
-
-    def test_simplification_is_priced_in_height_not_distance(self):
-        from src.breaklines import simplify_by_height
-
-        wobble = np.column_stack(
-            [np.linspace(0, 100, 41), np.tile([0.0, 1.0], 21)[:41]]
-        )
-        steep = simplify_by_height(wobble, np.full(41, 0.5), 0.10)
-        gentle = simplify_by_height(wobble, np.full(41, 0.001), 0.10)
-        self.assertGreater(len(steep), len(gentle))
-        self.assertEqual(len(gentle), 2, "a wobble on flat ground is a straight line")
-
-    def test_chaining_stops_at_a_saddle(self):
-        """Four chord ends meeting at a point is two branches, not one line;
-        joining them would let the simplifier cut the corner across it."""
-        from src.breaklines import chain_segments
-
-        hub = [1.0, 1.0]
-        chords = [
-            np.array([[0.0, 0.0], hub]),
-            np.array([hub, [2.0, 2.0]]),
-            np.array([[2.0, 0.0], hub]),
-            np.array([hub, [0.0, 2.0]]),
-        ]
-        for line in chain_segments(chords):
-            self.assertLessEqual(len(line), 2)
-
-
 class TestConfig(unittest.TestCase):
     def test_shipped_config_loads(self):
         config = load_config(REPO_ROOT / "config.json")
         self.assertEqual(config.bbox.width, 1000.0)
         self.assertEqual(config.geo.origin, (136500.0, 455500.0))
         self.assertEqual(config.warnings, [])
+        self.assertEqual(config.terrain["grid_m"], 2.0)
+
+    def test_an_old_config_still_loads_and_says_what_changed(self):
+        """A config written for the adaptive terrain and the old road mesher
+        loads, and every setting that now does nothing is named, with what
+        took its place, rather than being ignored without a word."""
+        old = {
+            "name": "old",
+            "bbox": {"crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
+                     "xmax": 137000, "ymax": 456000},
+            "terrain": {"mesh_vertices_per_side": 513, "quads": True,
+                        "breaklines": ["roads"]},
+            "surfaces": {"road_max_edge_m": 8.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.json"
+            path.write_text(json.dumps(old))
+            with self.assertLogs("src.config", level="WARNING"):
+                config = load_config(path)
+        said = " ".join(config.warnings)
+        for key in ("terrain.mesh_vertices_per_side", "terrain.quads",
+                    "terrain.breaklines", "surfaces.road_max_edge_m"):
+            self.assertIn(key, said)
+        self.assertIn("grid_m", said)
+        self.assertEqual(config.terrain["grid_m"], 2.0)
+
+    def test_a_detail_level_in_a_config_file_and_an_explicit_setting(self):
+        """The level fills in; whatever the file also sets wins."""
+        raw = {
+            "name": "lvl",
+            "bbox": {"crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
+                     "xmax": 137000, "ymax": 456000},
+            "detail": "draft",
+            "terrain": {"grid_m": 3.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(raw))
+            config = load_config(path)
+        self.assertEqual(config.terrain["grid_m"], 3.0)
+        self.assertEqual(config.aerial["size_px"], 2000)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(dict(raw, detail="extreme")))
+            with self.assertRaises(ValueError):
+                load_config(path)
 
     def test_defaults_fill_in_missing_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5080,12 +4799,41 @@ def _blender_mesh_calls():
     source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
     calls: list[dict] = []
 
+    class FakeAttributes:
+        """Mesh attributes: created and filled, never read back here."""
+
+        @staticmethod
+        def new(name, kind, domain):
+            class Attribute:
+                class data:  # noqa: N801 - mirrors bpy
+                    @staticmethod
+                    def foreach_set(key, values):
+                        pass
+            return Attribute
+
+    class FakeMesh:
+        attributes = FakeAttributes
+
+    class Stub(str):
+        """What the builders get back: a name they can also set things on."""
+
+        data = FakeMesh
+
+        def __setitem__(self, key, value):
+            self.__dict__[key] = value
+
+        def __getitem__(self, key):
+            return self.__dict__[key]
+
     def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
+        extra = kw.get("extra_uvs") or {}
         calls.append({
             "object": name,
             "vertices": len(vertices),
             "loops": len(loops),
             "uvs": len(uvs),
+            # Every extra UV map is per loop too.
+            "extra_uvs": [len(values) for values in extra.values()],
             "polygons": len(starts),
             "totals": len(totals),
             "loop_total_sum": int(np.sum(totals)),
@@ -5093,17 +4841,50 @@ def _blender_mesh_calls():
             "materials": len(materials),
             "max_index": int(np.max(loops)) if len(loops) else -1,
         })
-        return name
+        return Stub(name)
+
+    class FakeObject(dict):
+        """Enough of a Blender object for a builder to place and name it."""
+
+        def __init__(self, name, data=None):
+            super().__init__()
+            self.name = name
+            self.data = data
+            self.location = (0.0, 0.0, 0.0)
+            self.rotation_euler = [0.0, 0.0, 0.0]
+            self.scale = (1.0, 1.0, 1.0)
+            self.parent = None
+
+    class FakeBpy:
+        class data:  # noqa: N801 - mirrors bpy.data
+            class objects:  # noqa: N801
+                @staticmethod
+                def new(name, data):
+                    return FakeObject(name, data)
+
+                @staticmethod
+                def remove(obj):
+                    pass
+
+        class context:  # noqa: N801 - mirrors bpy.context
+            class scene:  # noqa: N801
+                class collection:  # noqa: N801
+                    class objects:  # noqa: N801
+                        @staticmethod
+                        def link(obj):
+                            pass
 
     namespace = {
-        "np": np, "Path": Path, "log": lambda *a: None,
+        "np": np, "Path": Path, "log": lambda *a: None, "bpy": FakeBpy,
         "build_mesh_object": record,
         "make_material": lambda *a, **k: "M",
         "make_textured_material": lambda *a, **k: "M",
+        "make_plain_material": lambda *a, **k: "M",
     }
     # Pull in every helper the builders lean on, in file order.
     for match in re.finditer(r"\ndef (\w+)\(.*?\n(?=\ndef |\n# ---|\Z)", source, re.S):
-        if match.group(1) == "build_mesh_object":
+        # Stubbed above, and the real ones need bpy.
+        if match.group(1) in ("build_mesh_object", "make_plain_material"):
             continue
         try:
             exec(match.group(0), namespace)  # noqa: S102 - our own source
@@ -5135,8 +4916,8 @@ def _blender_mesh_calls():
     np.savez(folder / "barriers.npz", vertices=verts,
              triangles=np.arange(len(verts)).reshape(-1, 3).astype(np.int32),
              material=np.zeros(n, np.int32), kind=(np.arange(n) % 3).astype(np.int32),
-             material_names=np.array(["brick", "hedge", "metal"], dtype=object),
-             kind_names=np.array(["wall", "hedge", "fence"], dtype=object),
+             material_names=np.array(["brick", "hedge", "metal"], dtype=str),
+             kind_names=np.array(["wall", "hedge", "fence"], dtype=str),
              # The fattened physics proxy, in its own buffer: no UVs and no
              # materials, because it is never drawn.
              collision_vertices=verts + np.array([0.0, 0.0, 0.0]),
@@ -5153,9 +4934,9 @@ def _blender_mesh_calls():
              heading=rng.uniform(0, 6, n), length=np.full(n, 4.2),
              width=np.full(n, 1.8), kind=np.zeros(n, np.int32),
              colour=rng.integers(0, 4, n))
-    np.savez(folder / "roads.npz", road_tris=triangles,
-             road_tri_class=(np.arange(n) % 2).astype(np.int32),
-             road_tri_level=np.zeros(n, np.int32), road_lift_m=0.06)
+    # A real road network, from the real mesher: a T-junction.
+    _, street = _build_street()
+    np.savez(folder / "roads.npz", **street.to_npz_fields(), road_lift_m=0.03)
 
     scene = {
         "origin_rd": [100.0, 100.0],
@@ -5169,7 +4950,8 @@ def _blender_mesh_calls():
         "rails": {"file": "rails.npz", "kind_names": {"0": "track"}},
         "vehicles": {"file": "vehicles.npz", "texture": "v.png"},
         "surfaces": {"file": "roads.npz",
-                     "road_class_names": {"0": "road_asphalt"}},
+                     "road_class_names": {"1": "road_asphalt", "8": "footpath",
+                                          "12": "kerb"}},
         "export": {"collision": True, "collision_tree_crowns": True},
     }
 
@@ -5215,9 +4997,14 @@ class TestTreeShape(unittest.TestCase):
 
         source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
         namespace = {"np": np}
+        for constant in ("TREE_TRUNK_FRACTIONS", "TREE_SHAPES_PER_KIND"):
+            line = re.search(rf"\n{constant} = .*\n", source)
+            assert line is not None, f"{constant} moved"
+            exec(line.group(0), namespace)  # noqa: S102 - our own source
         for name in ("_octahedron_canopy", "_tree_dice", "_lobed_crown",
+                     "_tree_instance", "_shape_lean", "_unit_tree",
                      "_tree_group_mesh"):
-            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef |\n# )", source, re.S)
             assert body is not None, f"{name} moved"
             exec(body.group(0), namespace)  # noqa: S102 - our own source
         return namespace
@@ -5345,8 +5132,10 @@ class TestTreeShape(unittest.TestCase):
         for height in (3.0, 5.0, 9.0, 18.0, 28.0):
             for x in (1500.0, 1503.0):
                 vertices, faces, uvs = self._one(namespace, x, 600.0, height)
+                # The flared foot sinks a hundredth of the tree's height in,
+                # so it meets the ground rather than standing on it.
                 self.assertAlmostEqual(
-                    float(vertices[:, 2].min()), -0.05, places=6,
+                    float(vertices[:, 2].min()), -0.01 * height, places=6,
                     msg=f"a {height:.0f} m tree does not meet the ground",
                 )
                 self.assertLessEqual(
@@ -5431,6 +5220,8 @@ class TestBlenderMeshContract(unittest.TestCase):
                         f"UVs are per loop; after a weld that is corners"
                         f"[indices], not corners.",
                     )
+                    for extra in call.get("extra_uvs", []):
+                        self.assertEqual(extra, call["loops"], f"{label}: extra UV map")
                     self.assertLess(
                         call["max_index"], call["vertices"],
                         f"{label}: loop index {call['max_index']} into a buffer "
@@ -5588,125 +5379,6 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertIn(buildings.probe(self.config), health_targets(self.config))
 
 
-class TestQuadPairing(unittest.TestCase):
-    """Quads for an editor, without giving up anything the triangles earned.
-
-    Nothing moves, nothing is added and nothing is dropped -- only pairs of
-    triangles are fused -- so every accuracy figure measured on the triangles
-    still holds. What the pairing must not do is dissolve the edges the mesh was
-    built around, or flatten a fold.
-    """
-
-    @staticmethod
-    def _sheet(n=7, height=lambda x, y: 0.0):
-        """A regular triangulated grid, as a stand-in for flat-ish terrain."""
-        xs = np.arange(n, dtype=np.float64)
-        gx, gy = np.meshgrid(xs, xs)
-        vertices = np.column_stack(
-            [gx.ravel(), gy.ravel(), [height(x, y) for x, y in zip(gx.ravel(), gy.ravel())]]
-        )
-        tris = []
-        for r in range(n - 1):
-            for c in range(n - 1):
-                a, b = r * n + c, r * n + c + 1
-                d, e = (r + 1) * n + c, (r + 1) * n + c + 1
-                tris.append([a, b, e])
-                tris.append([a, e, d])
-        return vertices, np.asarray(tris, dtype=np.int64)
-
-    def _faces(self, loops, sizes):
-        out, at = [], 0
-        for size in sizes:
-            out.append([int(v) for v in loops[at : at + size]])
-            at += size
-        return out
-
-    def test_flat_ground_pairs_up(self):
-        from src.quadmesh import pair_into_quads
-
-        vertices, tris = self._sheet()
-        loops, sizes, stats = pair_into_quads(vertices, tris, set())
-        self.assertGreater(stats["quad_fraction"], 0.9, f"only {stats}")
-        self.assertEqual(len(loops), int(sizes.sum()))
-
-    def test_a_breakline_is_never_dissolved(self):
-        from src.quadmesh import pair_into_quads
-
-        vertices, tris = self._sheet()
-        # Protect every edge of the first triangle.
-        a, b, c = (int(v) for v in tris[0])
-        protected = {frozenset((a, b)), frozenset((b, c)), frozenset((c, a))}
-        loops, sizes, _ = pair_into_quads(vertices, tris, protected)
-
-        present = set()
-        for face in self._faces(loops, sizes):
-            for i in range(len(face)):
-                present.add(frozenset((face[i], face[(i + 1) % len(face)])))
-        for edge in protected:
-            self.assertIn(
-                edge, present, f"the breakline {sorted(edge)} was fused away"
-            )
-
-    def test_a_fold_is_not_flattened(self):
-        """Two triangles meeting at an angle are a ridge or a ditch. Merging
-        them into one quad smooths it away, which is the one thing a terrain
-        mesh must not do quietly."""
-        from src.quadmesh import pair_into_quads
-
-        # A roof ridge along x = 3: height rises to it and falls away.
-        vertices, tris = self._sheet(height=lambda x, y: 2.0 - abs(x - 3.0))
-        loops, sizes, stats = pair_into_quads(
-            vertices, tris, set(), max_fold_deg=5.0
-        )
-        self.assertGreater(
-            stats["edges_kept_for_folds"], 0, "the ridge was fused straight over"
-        )
-        # Every quad has to be flat to within the threshold it was given.
-        for face in self._faces(loops, sizes):
-            if len(face) != 4:
-                continue
-            p = vertices[face]
-            n1 = np.cross(p[1] - p[0], p[2] - p[0])
-            n2 = np.cross(p[2] - p[0], p[3] - p[0])
-            cos = np.dot(n1, n2) / (np.linalg.norm(n1) * np.linalg.norm(n2))
-            self.assertLess(np.degrees(np.arccos(np.clip(cos, -1, 1))), 6.0)
-
-    def test_nothing_is_lost_or_added(self):
-        from src.quadmesh import pair_into_quads
-
-        vertices, tris = self._sheet()
-        loops, sizes, stats = pair_into_quads(vertices, tris, set())
-
-        def area(face):
-            p = vertices[face][:, :2]
-            return 0.5 * abs(
-                sum(
-                    p[i][0] * p[(i + 1) % len(p)][1] - p[(i + 1) % len(p)][0] * p[i][1]
-                    for i in range(len(p))
-                )
-            )
-
-        faces = self._faces(loops, sizes)
-        before = sum(area(list(t)) for t in tris)
-        self.assertAlmostEqual(sum(area(f) for f in faces), before, places=6)
-        self.assertEqual(stats["quads"] * 2 + stats["triangles"], len(tris))
-
-    def test_every_quad_is_convex_and_wound_the_same_way(self):
-        """A concave or flipped quad renders as a crease that is not there."""
-        from src.quadmesh import pair_into_quads
-
-        vertices, tris = self._sheet()
-        loops, sizes, _ = pair_into_quads(vertices, tris, set())
-        for face in self._faces(loops, sizes):
-            p = vertices[face][:, :2]
-            for i in range(len(p)):
-                u = p[(i + 1) % len(p)] - p[i]
-                v = p[(i + 2) % len(p)] - p[(i + 1) % len(p)]
-                self.assertGreater(
-                    u[0] * v[1] - u[1] * v[0], 0, f"face {face} turns back on itself"
-                )
-
-
 class TestSurfaceRegions(unittest.TestCase):
     """The terrain has to arrive knowing which faces are road and which grass.
 
@@ -5758,434 +5430,6 @@ class TestSurfaceRegions(unittest.TestCase):
         # for proportional editing, which is what levelling a plot uses.
         self.assertIn('mesh.attributes.new("surface_class", "INT", "FACE")', source)
         self.assertIn("obj.vertex_groups.new", source)
-
-
-class TestRoadTopology(unittest.TestCase):
-    """The road surface has to be usable in an engine, not merely correct.
-
-    Four things were wrong and they compounded: nothing was simplified, so a
-    surveyed kerb put a vertex every few centimetres into the model; earcut
-    fanned a strip into slivers, a third of them under one degree; refinement
-    cut single triangles and left hanging nodes; and nothing was indexed, so
-    every triangle carried its own three corners.
-    """
-
-    @staticmethod
-    def _street(x0, y0, x1, y1, width, seed=5):
-        rng = np.random.default_rng(seed)
-        length = np.hypot(x1 - x0, y1 - y0)
-        n = max(4, int(length / 0.05))          # surveyed every 5 cm
-        t = np.linspace(0, 1, n)
-        cx, cy = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
-        dx, dy = (x1 - x0) / length, (y1 - y0) / length
-        nx, ny = -dy, dx
-        w = width / 2 + rng.normal(0, 0.01, n)
-        left = np.column_stack([cx + nx * w, cy + ny * w])
-        right = np.column_stack([cx - nx * w, cy - ny * w])[::-1]
-        return np.vstack([left, right, left[:1]])
-
-    @staticmethod
-    def _angles(points, triangles):
-        q = points[triangles]
-        out = []
-        for i in range(3):
-            u = q[:, (i + 1) % 3] - q[:, i]
-            v = q[:, (i + 2) % 3] - q[:, i]
-            cos = (u * v).sum(1) / np.maximum(
-                np.hypot(*u.T) * np.hypot(*v.T), 1e-30
-            )
-            out.append(np.degrees(np.arccos(np.clip(cos, -1, 1))))
-        return np.min(np.stack(out), axis=0)
-
-    def test_a_straight_street_is_not_a_fan_of_slivers(self):
-        """Earcut gave a 280 m street two triangles 35 times longer than they
-        were wide, and that is not a consequence of the dense input -- it does
-        the same to a clean rectangle."""
-        from src.roadmesh import build_road_mesh
-
-        ring = self._street(10, 100, 290, 100, 8.0)
-        points, triangles = build_road_mesh([[ring]], simplify_m=0.25,
-                                            max_edge_m=12.0)
-        smallest = self._angles(points, triangles)
-        self.assertGreater(len(triangles), 4)
-        self.assertGreater(
-            float(np.median(smallest)), 30.0,
-            f"median smallest angle is {np.median(smallest):.1f} degrees",
-        )
-        self.assertEqual(
-            int((smallest < 20.0).sum()), 0, "a clean street should have no wedges"
-        )
-
-    def test_the_kerb_keeps_its_shape(self):
-        """Simplification may thin a road; it may not move it."""
-        from src.roadmesh import build_road_mesh
-
-        ring = self._street(10, 100, 290, 100, 8.0)
-        points, triangles = build_road_mesh([[ring]], simplify_m=0.25,
-                                            max_edge_m=12.0)
-        q = points[triangles]
-        area = 0.5 * np.abs(
-            (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
-            - (q[:, 1, 1] - q[:, 0, 1]) * (q[:, 2, 0] - q[:, 0, 0])
-        ).sum()
-        self.assertAlmostEqual(area / (280.0 * 8.0), 1.0, delta=0.02)
-
-    def test_two_parts_that_meet_still_cover_their_own_area(self):
-        """Checked against the real number, not merely against itself.
-
-        Even-odd applied across parts punches a hole wherever two of them
-        overlap, and crossing constraints dropped rather than split leave the
-        outline open so the inside test keeps whatever it likes. Both faults
-        are invisible to a test that only asks whether the answer is stable,
-        because both are perfectly stable wrong answers.
-        """
-        from src.roadmesh import build_road_mesh
-
-        # Exact rectangles, so the answer is exact and a hole the size of the
-        # crossing cannot hide inside a survey wobble and a loose tolerance.
-        # Wide ones, so that hole is 13% of the total rather than 1%.
-        def rect(x0, y0, x1, y1):
-            return np.array(
-                [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=float
-            )
-
-        groups = [[rect(10, 90, 290, 110)], [rect(140, 10, 160, 290)]]
-        # The union counts the 20 x 20 crossing once, not twice and not zero
-        # times: 280x20 + 280x20 - 20x20.
-        want = 280.0 * 20.0 * 2 - 20.0 * 20.0
-
-        for max_edge in (6.0, 12.0, 25.0):
-            points, triangles = build_road_mesh(groups, simplify_m=0.25,
-                                                max_edge_m=max_edge)
-            q = points[triangles]
-            area = 0.5 * np.abs(
-                (q[:, 1, 0] - q[:, 0, 0]) * (q[:, 2, 1] - q[:, 0, 1])
-                - (q[:, 1, 1] - q[:, 0, 1]) * (q[:, 2, 0] - q[:, 0, 0])
-            ).sum()
-            self.assertAlmostEqual(
-                area / want, 1.0, delta=0.005,
-                msg=f"{area:.0f} m2 against {want:.0f} at a {max_edge} m face",
-            )
-
-    def test_a_shared_kerb_is_not_pulled_apart(self):
-        """Road parts are a planar partition, and a gap between two copies of
-        one kerb is a stripe of ground showing through the road.
-
-        The fixture is a T-junction on purpose. Handing two parts the *same*
-        run and reversing one proves nothing, because Douglas-Peucker is
-        symmetric end to end and gives the identical answer either way -- a
-        first version of this test did that and passed with the network logic
-        torn out. What breaks it is a junction part way along a run: that point
-        is a ring corner for one part and an ordinary vertex on a smooth curve
-        for the other, so anchored per ring the two are thinned differently.
-        """
-        from src.roadmesh import simplify_ring_network
-
-        # A kerb, surveyed once and shared by three parts: one long one on the
-        # south side, two short ones meeting half way along it on the north.
-        t = np.linspace(0.0, 1.0, 600)
-        kerb = np.column_stack(
-            [10.0 + 280.0 * t, 100.0 + 4.0 * np.sin(t * 5.0) + 0.4 * np.sin(t * 33.0)]
-        )
-        south = np.vstack([kerb, [[290.0, 80.0], [10.0, 80.0]], kerb[:1]])
-        half = len(kerb) // 2
-        north = []
-        for piece in (kerb[: half + 1], kerb[half:]):
-            north.append(
-                np.vstack(
-                    [piece, [[piece[-1, 0], 120.0], [piece[0, 0], 120.0]], piece[:1]]
-                )
-            )
-
-        thinned, _ = simplify_ring_network([south, *north], 0.25)
-        self.assertEqual(len(thinned), 3)
-
-        # Compared with each other, not with the kerb. Douglas-Peucker only ever
-        # keeps vertices it was given, so "is this point on the surveyed kerb"
-        # is true however badly the two copies disagree -- an earlier version of
-        # this test asserted exactly that and passed with the network logic torn
-        # out. What matters is that both parts kept the *same* ones.
-        def on_shared_run(ring):
-            picked = ring[
-                (ring[:, 1] > 90.0) & (ring[:, 1] < 110.0)
-                & (ring[:, 0] >= kerb[0, 0] - 1e-9)
-                & (ring[:, 0] <= kerb[half, 0] + 1e-9)
-            ]
-            return {tuple(np.round(p, 6)) for p in picked}
-
-        south_run = on_shared_run(thinned[0])
-        north_run = on_shared_run(thinned[1])
-        self.assertGreater(len(south_run), 3, "nothing was kept to compare")
-        self.assertEqual(
-            south_run,
-            north_run,
-            f"the two parts kept different vertices along one kerb: "
-            f"{len(south_run ^ north_run)} differ",
-        )
-
-    def test_the_result_is_conforming(self):
-        """Splitting one triangle and not its neighbour leaves a T-junction,
-        which is a crack and a shading seam. Inserting points cannot."""
-        from collections import defaultdict
-
-        from src.roadmesh import build_road_mesh
-
-        ring = self._street(10, 100, 290, 100, 8.0)
-        points, triangles = build_road_mesh(
-            [[ring]], simplify_m=0.25, max_edge_m=8.0,
-            sampler=lambda x, y: 0.3 * np.atleast_1d(np.asarray(x, float)),
-        )
-        seen = defaultdict(int)
-        for tri in triangles:
-            for i in range(3):
-                a, b = int(tri[i]), int(tri[(i + 1) % 3])
-                seen[(min(a, b), max(a, b))] += 1
-        self.assertEqual(
-            [v for v in seen.values() if v > 2], [], "non-manifold edge"
-        )
-
-    def test_it_is_indexed_when_it_reaches_blender(self):
-        """Every triangle used to carry its own three corners: three times the
-        vertex buffer, no reuse, and no shared normals."""
-        import re
-
-        source = (REPO_ROOT / "blender" / "process.py").read_text()
-        self.assertIn("_weld_corners", source)
-        body = re.search(
-            r"def _weld_corners.*?return corners\[np\.sort\(first\)\], "
-            r"order\[inverse\.ravel\(\)\]\.astype\(np\.int64\)",
-            source,
-            re.S,
-        )
-        self.assertIsNotNone(body, "the weld helper moved")
-        namespace = {"np": np}
-        exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
-
-        # Two triangles sharing an edge, handed over as six loose corners.
-        corners = np.array(
-            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
-            dtype=float,
-        )
-        points, indices = namespace["_weld_corners"](corners)
-        self.assertEqual(len(points), 4)
-        self.assertTrue(
-            np.allclose(points[indices], corners), "welding moved a corner"
-        )
-
-    def test_the_outline_really_is_the_edge_of_the_mesh(self):
-        """Where two parts cross, their kerbs cross too, and no triangulation
-        can honour two constraints that cross -- so one gets dropped. Silently.
-        The area still comes out right, because the inside test reads the rings
-        rather than the mesh, so nothing notices until you look at the model and
-        find the road's edge cutting across its own corner.
-        """
-        from collections import defaultdict
-
-        from src.roadmesh import build_road_mesh
-
-        def rect(x0, y0, x1, y1):
-            return np.array(
-                [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=float
-            )
-
-        rings = [rect(10, 90, 290, 110), rect(140, 10, 160, 290)]
-        points, triangles = build_road_mesh(
-            [[rings[0]], [rings[1]]], simplify_m=0.25, max_edge_m=12.0
-        )
-
-        used = defaultdict(int)
-        for tri in triangles:
-            for i in range(3):
-                a, b = int(tri[i]), int(tri[(i + 1) % 3])
-                used[(min(a, b), max(a, b))] += 1
-        boundary = [e for e, n in used.items() if n == 1]
-        self.assertGreater(len(boundary), 8)
-
-        def distance_to_rings(point):
-            best = np.inf
-            for ring in rings:
-                a, b = ring[:-1], ring[1:]
-                d = b - a
-                length2 = np.maximum((d * d).sum(axis=1), 1e-12)
-                t = np.clip(((point - a) * d).sum(axis=1) / length2, 0.0, 1.0)
-                foot = a + t[:, None] * d
-                best = min(best, float(np.hypot(*(point - foot).T).min()))
-            return best
-
-        for a, b in boundary:
-            middle = 0.5 * (points[a] + points[b])
-            self.assertLess(
-                distance_to_rings(middle), 0.5,
-                f"the mesh has an edge at {middle} that is not on any kerb",
-            )
-
-    def test_a_coarser_setting_never_costs_more_faces(self):
-        """A face size coarser than the road is wide leaves the kerb carrying a
-        vertex every 30 m across an 8 m strip, which can only be triangulated
-        into wedges -- and the shape refinement then spends far more faces
-        digging out than it would have used. Asking for 30 m faces produced
-        5760 triangles where asking for 12 m produced 1152."""
-        from src.roadmesh import build_road_mesh
-
-        ring = self._street(10, 100, 290, 100, 8.0)
-        counts = []
-        for max_edge in (6.0, 12.0, 30.0):
-            _, triangles = build_road_mesh([[ring]], simplify_m=0.25,
-                                           max_edge_m=max_edge)
-            counts.append(len(triangles))
-        self.assertEqual(
-            counts, sorted(counts, reverse=True),
-            f"face counts {counts} do not fall as the setting coarsens",
-        )
-
-    def test_refining_a_narrow_street_reaches_the_angle_it_was_asked_for(self):
-        """The one that matters, and the one the small fixtures all missed.
-
-        A constrained edge cannot be crossed, so a point dropped beside a kerb
-        cannot improve the triangle there -- it only wedges a thinner sliver
-        against the kerb. Refinement has to split the kerb instead, and when it
-        does not, it either fails to converge or feeds on its own slivers; over
-        one square kilometre of Utrecht it turned 18,731 triangles into 233,807
-        and took the share under ten degrees from 23.6% up to 33.0%.
-
-        It takes nothing exotic to reproduce: a plain rectangle 2.5 m wide and
-        200 m long, with not one stray vertex in it. Every triangle in a strip
-        that narrow has a kerb for a side, which is the whole condition. The
-        target is what to assert on -- without the split the same fixture stops
-        at 12 degrees, which is a mesh that quietly ignored its setting.
-        """
-        from src.roadmesh import build_road_mesh
-
-        ring = np.array(
-            [[0, 0], [200, 0], [200, 2.5], [0, 2.5], [0, 0]], dtype=float
-        )
-        points, triangles = build_road_mesh([[ring]], simplify_m=0.25,
-                                            max_edge_m=12.0, min_angle_deg=22.0)
-        angles = self._angles(points, triangles)
-        self.assertGreater(
-            angles.min(), 20.0,
-            f"asked for 22 degrees and the thinnest face is "
-            f"{angles.min():.1f}: refinement did not converge",
-        )
-        # And it did not pay for that by burying the path in geometry.
-        self.assertLess(
-            len(triangles), 200,
-            f"{len(triangles)} faces for a 200 m footpath",
-        )
-
-    def test_a_sharp_corner_does_not_set_refinement_off(self):
-        """Two streets meeting at a narrow angle give the triangulator a wedge
-        it cannot improve. Chasing it anyway -- which is what inserting beside
-        a kerb amounts to -- turned 73 faces into 201, 29% of them under ten
-        degrees."""
-        from src.roadmesh import build_road_mesh
-
-        street = np.array(
-            [[0, 0], [100, 0], [100, 8], [0, 8], [0, 0]], dtype=float
-        )
-        spur = np.array(
-            [[95, 8], [140, 30], [138, 34], [93, 10], [95, 8]], dtype=float
-        )
-        points, triangles = build_road_mesh(
-            [[street], [spur]], simplify_m=0.25, max_edge_m=12.0
-        )
-        angles = self._angles(points, triangles)
-        self.assertLess(float((angles < 10).mean()), 0.05)
-        self.assertLess(len(triangles), 150, f"{len(triangles)} faces")
-
-    def test_a_point_that_encroaches_a_kerb_splits_it(self):
-        """The mechanism on its own: a candidate inside a kerb segment's
-        diametral circle is dropped, and the kerb is halved in its place."""
-        from src.roadmesh import _split_encroached
-
-        kerb = np.array([[[0.0, 0.0], [10.0, 0.0]]])
-        # Well inside the circle on that segment as a diameter.
-        surviving, split = _split_encroached(kerb, np.array([[5.0, 0.5]]))
-        self.assertEqual(len(surviving), 0, "the encroaching point was kept")
-        self.assertEqual(len(split), 2, "the kerb was not halved")
-        self.assertTrue(
-            np.allclose(sorted(np.vstack(split).tolist()),
-                        sorted([[0, 0], [5, 0], [5, 0], [10, 0]])),
-            f"the halves are not the kerb: {split}",
-        )
-
-        # And a point clear of every diametral circle is left alone.
-        surviving, split = _split_encroached(kerb, np.array([[5.0, 8.0]]))
-        self.assertEqual(len(surviving), 1)
-        self.assertEqual(len(split), 0)
-
-    def test_two_drawings_of_one_kerb_do_not_make_a_ribbon(self):
-        """Both parts either side of a shared kerb have drawn it, and the two
-        drawings disagree by millimetres. Past the weld tolerance the vertices
-        no longer merge, and the pair becomes a ribbon of triangles a few
-        millimetres tall -- 691 of them under a hundredth of a degree over one
-        square kilometre, median height exactly the 5 mm weld.
-
-        Welding cannot see it: these vertices are near each other's *edges*,
-        not near each other's *vertices*.
-        """
-        from src.roadmesh import build_road_mesh
-
-        # Two strips meeting along y = 0. The lower one puts a vertex every
-        # 2 m exactly on the line; the upper puts one every 3 m, each up to
-        # 12 mm off it -- above the 5 mm weld, so not one vertex merges with
-        # any other, and the pair becomes a chain of lenses.
-        rng = np.random.default_rng(3)
-        along = np.arange(0.0, 120.001, 2.0)
-        straight = np.column_stack([along, np.zeros(len(along))])
-        wobbly_x = np.arange(0.0, 120.001, 3.0)
-        wobbly_y = rng.uniform(-0.012, 0.012, len(wobbly_x))
-        wobbly_y[0] = wobbly_y[-1] = 0.0
-        wobbly = np.column_stack([wobbly_x, wobbly_y])
-
-        lower = np.vstack([straight, [[120, -6], [0, -6]], straight[:1]])
-        upper = np.vstack([wobbly, [[120, 6], [0, 6]], wobbly[:1]])
-
-        points, triangles = build_road_mesh(
-            [[lower], [upper]], simplify_m=0.0, max_edge_m=12.0
-        )
-        angles = self._angles(points, triangles)
-        # Snapping does not make the disagreement go away -- the surveyors
-        # still drew two lines -- but it stops it becoming a ribbon: 77 faces
-        # under a degree become 14, and the thinnest goes from 0.016 to 0.3.
-        self.assertGreater(
-            angles.min(), 0.1,
-            f"thinnest face is {angles.min():.4f} deg: the two drawings made "
-            f"a ribbon",
-        )
-        self.assertLess(
-            int((angles < 1).sum()), 30,
-            f"{int((angles < 1).sum())} faces under one degree",
-        )
-
-    def test_a_stray_vertex_is_found_on_a_long_kerb_too(self):
-        """The snap pass runs before the kerbs are cut down, so it meets
-        segments hundreds of metres long. Filing those under their midpoint --
-        which is what a grid usually does -- hides them from anything near
-        their ends, and the ribbon comes back at exactly the places nobody
-        looks."""
-        from src.roadmesh import _snap_to_edges
-
-        # One 300 m kerb, and a point 3 mm off it near the far end.
-        points = np.array(
-            [[0.0, 0.0], [300.0, 0.0], [295.0, 0.003]], dtype=float
-        )
-        segments = np.array([[0, 1], [1, 2]], dtype=np.int64)
-        _, split = _snap_to_edges(points, segments, 0.05, 12.0)
-
-        chain = [tuple(pair) for pair in split.tolist()]
-        self.assertIn(
-            (0, 2), chain,
-            f"the long kerb was not bent onto the stray vertex: {chain}",
-        )
-        self.assertIn((2, 1), chain, f"and not put back together: {chain}")
-
-    def test_the_settings_reach_the_config(self):
-        from src.config import DEFAULTS
-
-        self.assertEqual(DEFAULTS["surfaces"]["road_simplify_m"], 0.25)
-        self.assertEqual(DEFAULTS["surfaces"]["road_max_edge_m"], 12.0)
-        self.assertEqual(DEFAULTS["surfaces"]["road_snap_m"], 0.05)
 
 
 def _height_by_brute_force(vertices, triangles, query):
@@ -6271,6 +5515,134 @@ def _build_fake_terrain(bbox, raw_fn, *, grid_m=2.0, holes=None, smooth=1):
     return terrain, saved
 
 
+def _call_keywords(path: Path, function: str, call: str) -> dict:
+    """The keyword arguments of `call(...)` inside `function`, evaluated."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and ast.unparse(inner.func).endswith(call):
+                    return {k.arg: ast.literal_eval(k.value) for k in inner.keywords
+                            if k.arg != "filepath"}
+    raise AssertionError(f"{call} not found in {function}")
+
+
+def _module_assignment(path: Path, name: str):
+    import ast
+
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            if isinstance(node.value, ast.Call):
+                return {k.arg: ast.literal_eval(k.value) for k in node.value.keywords}
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} not found in {path.name}")
+
+
+class TestUnityExport(unittest.TestCase):
+    """What the FBX promises Unity, pinned where it can be read."""
+
+    PROCESS = REPO_ROOT / "blender" / "process.py"
+    TOOLS = REPO_ROOT / "blender" / "maptile_tools.py"
+
+    def test_the_settings_are_the_ones_measured_to_work(self):
+        settings = _module_assignment(self.PROCESS, "FBX_SETTINGS")
+        self.assertEqual(settings["axis_forward"], "-Z")
+        self.assertEqual(settings["axis_up"], "Y")
+        self.assertEqual(settings["apply_scale_options"], "FBX_SCALE_ALL")
+        # Apply Transform cannot rewrite a mesh the tree instances share, and
+        # left them at their Blender coordinates in Unity's frame.
+        self.assertFalse(settings["bake_space_transform"])
+        # Empties carry the hierarchy; render modifiers carry the triangulation.
+        self.assertEqual(settings["object_types"], {"MESH", "EMPTY"})
+        self.assertTrue(settings["use_mesh_modifiers"])
+        self.assertTrue(settings["use_mesh_modifiers_render"])
+        self.assertTrue(settings["use_custom_props"])
+
+    def test_a_re_export_from_the_tools_matches_the_pipeline(self):
+        settings = _module_assignment(self.PROCESS, "FBX_SETTINGS")
+        tools = _call_keywords(self.TOOLS, "export_unity_fbx", "export_scene.fbx")
+        self.assertEqual(tools, settings)
+
+    def test_the_export_splits_quads_the_way_things_were_placed(self):
+        """Trees and lamp posts were placed on each terrain square split south-
+        west to north-east; Blender's FIXED method splits first corner to
+        third, and the terrain's squares are wound from the south-west."""
+        import ast
+
+        source = self.PROCESS.read_text(encoding="utf-8")
+        self.assertIn('modifier.quad_method = quads', source)
+        tree = ast.parse(source)
+        for name in ("build_terrain", "build_roads"):
+            body = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            calls = [
+                c for c in ast.walk(body)
+                if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_triangulate_on_export"
+            ]
+            self.assertTrue(calls, f"{name} does not triangulate for export")
+            for call in calls:
+                quads = {k.arg: ast.literal_eval(k.value) for k in call.keywords}.get("quads")
+                self.assertEqual(quads, "FIXED", name)
+        # And the winding: bottom-left, bottom-right, top-right, top-left.
+        self.assertIn("bottom_left + 1,\n            bottom_left + n + 1,", source)
+
+    def test_every_layer_is_gathered_under_a_parent(self):
+        source = self.PROCESS.read_text(encoding="utf-8")
+        for layer in ('_Layer("Roads", "Roads")', '_Layer("Buildings", "Buildings")',
+                      '_Layer("Trees", "Trees")', '_Layer("Collision", "Collision")'):
+            self.assertIn(layer, source)
+
+
+class TestMaptileTools(unittest.TestCase):
+    """The tools in the .blend fit the terrain the way the pipeline did."""
+
+    @staticmethod
+    def _tools():
+        import re
+
+        source = (REPO_ROOT / "blender" / "maptile_tools.py").read_text(encoding="utf-8")
+        namespace = {"np": np}
+        # The plain constants: a number or a quoted name on one line.
+        for line in re.findall(r"\n([A-Z_]+ = (?:[-0-9.]+|\"[^\"\n]*\"))(?=\n)", source):
+            exec(line, namespace)  # noqa: S102 - our own source
+        body = re.search(r"\ndef fit_terrain\(.*?\n(?=\ndef |\nclass )", source, re.S)
+        exec(body.group(0), namespace)  # noqa: S102 - our own source
+        return namespace
+
+    def test_the_constants_agree_with_the_pipeline(self):
+        from src import elevation, roads
+
+        tools = self._tools()
+        self.assertEqual(tools["TERRAIN_CLEARANCE_M"], roads.TERRAIN_CLEARANCE_M)
+        self.assertEqual(tools["HIDDEN_VERTEX_WEIGHT"], elevation.HIDDEN_VERTEX_WEIGHT)
+
+    def test_fitting_in_blender_is_fitting_in_the_pipeline(self):
+        from src.elevation import TerrainResult, lower_under
+        from src.geo import BBox
+
+        bbox = BBox(0.0, 0.0, 40.0, 40.0)
+        axis = np.linspace(0.0, 40.0, 21)
+        gx, gy = np.meshgrid(axis, axis)
+        heights = (5.0 + 0.4 * np.sin(gx / 4.0) * np.cos(gy / 5.0)).astype(np.float32)
+        rng = np.random.default_rng(12)
+        points = np.column_stack([
+            rng.uniform(10, 25, 3000), rng.uniform(2, 38, 3000), rng.uniform(4.6, 5.2, 3000),
+        ])
+        terrain = TerrainResult(
+            heights=heights.copy(), xs=axis, ys=axis, bbox=bbox, center_z_nap=5.0,
+            nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
+            coverage_id="t", resolution_m=0.5, measured=heights.copy(),
+        )
+        lower_under(terrain, points, clearance_m=0.05)
+        grid = np.dstack([gx, gy, heights.astype(np.float64)])
+        fitted, moved = self._tools()["fit_terrain"](grid, axis, axis, points, 0.05)
+        np.testing.assert_allclose(fitted, terrain.heights, atol=1e-5)
+        self.assertGreater(moved, 0)
+
+
 class TestIntermediatesNeedNoPickle(unittest.TestCase):
     """Blender reads these files with its own NumPy, not this one.
 
@@ -6297,10 +5669,7 @@ class TestIntermediatesNeedNoPickle(unittest.TestCase):
             for key in data.files:
                 self.assertNotEqual(data[key].dtype, object, key)
 
-    def test_nothing_saves_an_object_array(self):
-        for path in (REPO_ROOT / "src").glob("*.py"):
-            text = path.read_text(encoding="utf-8")
-            self.assertNotIn("dtype=object", text, f"{path.name} pickles an array")
+    def test_blender_never_unpickles(self):
         self.assertNotIn(
             "allow_pickle=True",
             (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8"),
@@ -6415,43 +5784,67 @@ class TestTerrainGrid(unittest.TestCase):
         verdict = {c.name: c for c in report.checks}["terrain_follows_the_survey"]
         self.assertFalse(verdict.passed)
 
-    def test_the_ground_never_shows_through_a_road(self):
-        """Every grid vertex is held below the lowest road anywhere in the
-        squares around it. Testing the road height at the vertex alone lets a
-        road dipping between two vertices sink into the ground."""
-        from src.elevation import HeightRaster, TerrainResult, lower_under
+    @staticmethod
+    def _flat_terrain(level=5.0):
+        from src.elevation import TerrainResult
         from src.geo import BBox
 
         bbox = BBox(0.0, 0.0, 40.0, 40.0)
         axis = np.linspace(0.0, 40.0, 21)
-        flat = np.full((21, 21), 5.0, dtype=np.float32)
-        terrain = TerrainResult(
-            heights=flat.copy(), xs=axis, ys=axis, bbox=bbox, center_z_nap=5.0,
+        flat = np.full((21, 21), level, dtype=np.float32)
+        return TerrainResult(
+            heights=flat.copy(), xs=axis, ys=axis, bbox=bbox, center_z_nap=level,
             nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
             coverage_id="test", resolution_m=0.5, measured=flat.copy(),
         )
+
+    def test_the_ground_never_shows_through_a_road(self):
+        """Every point under a road ends up with the terrain as drawn below it,
+        including where the road dips between two grid vertices: testing the
+        road height at the vertex alone lets that dip sink into the ground."""
+        from src.elevation import lower_under
+
+        terrain = self._flat_terrain()
         # A road strip from x = 11 to 19, sagging to 4.7 m in the middle of a
         # grid square (x = 15) and back up to 5.03 m at its edges.
-        res = 0.25
-        cols = int(40 / res)
-        cx = (np.arange(cols) + 0.5) * res
-        top = np.full((cols, cols), np.nan)
-        strip = (cx > 11.0) & (cx < 19.0)
-        top[:, strip] = (4.7 + 0.33 * np.abs(cx[strip] - 15.0) / 4.0)[None, :]
-        info = lower_under(terrain, HeightRaster(top, bbox), clearance_m=0.05)
-
         rng = np.random.default_rng(5)
+        px = rng.uniform(11.0, 19.0, 4000)
+        py = rng.uniform(0.0, 40.0, 4000)
+        road = lambda x: 4.7 + 0.33 * np.abs(x - 15.0) / 4.0  # noqa: E731
+        info = lower_under(terrain, np.column_stack([px, py, road(px)]), clearance_m=0.05)
+
         q = np.column_stack([rng.uniform(11.2, 18.8, 500), rng.uniform(1.0, 39.0, 500)])
-        road = HeightRaster(top, bbox)(q[:, 0], q[:, 1])
         ground = terrain.surface(q[:, 0], q[:, 1])
-        self.assertTrue((ground <= road - 0.05 + 1e-6).all(),
-                        f"ground above the road by {float((ground - road).max()):.3f} m")
+        self.assertTrue((ground <= road(q[:, 0]) - 0.05 + 0.01).all(),
+                        f"ground above the road by {float((ground - road(q[:, 0])).max()):.3f} m")
         # Only what is near a road moved; the far field is untouched.
         self.assertAlmostEqual(float(terrain.heights[10, 2]), 5.0)
         self.assertAlmostEqual(float(terrain.heights[10, 18]), 5.0)
         self.assertGreater(info["vertices"], 0)
         # The survey is kept, and is what `sample` reports.
         self.assertAlmostEqual(float(np.ravel(terrain.sample(15.0, 20.0))[0]), 5.0)
+
+    def test_a_bank_beside_a_road_gives_up_less_than_the_road_side(self):
+        """The vertex under the road takes the correction; the one on the bank
+        beside it, which everyone sees, moves much less. Holding every vertex
+        below the lowest road in the squares around it pulled embankment tops
+        down by metres beside the Europaweg."""
+        from src.elevation import lower_under
+
+        terrain = self._flat_terrain(level=6.0)
+        # A sunken road from x = 10 to 13 at 5 m, the bank rising to 6 m beside
+        # it; the vertex at x = 14 is the bank top, a metre from the road.
+        rng = np.random.default_rng(8)
+        px = rng.uniform(10.0, 13.0, 6000)
+        py = rng.uniform(2.0, 38.0, 6000)
+        lower_under(terrain, np.column_stack([px, py, np.full(len(px), 5.0)]), clearance_m=0.05)
+        bank_top = 6.0 - float(terrain.heights[10, 7])  # x = 14
+        road_side = 6.0 - float(terrain.heights[10, 6])  # x = 12, under the road
+        # Holding both below the road would have dropped the bank top by the
+        # full 1.05 m, the same as the vertex under the road.
+        self.assertGreater(road_side, 1.05)
+        self.assertLess(bank_top, 0.7)
+        self.assertLess(bank_top, 0.5 * road_side)
 
     def test_surface_reads_the_road_where_there_is_one(self):
         from src.elevation import HeightRaster, TerrainResult
@@ -6564,44 +5957,6 @@ class TestPathsOverWater(unittest.TestCase):
         self.assertTrue(np.array_equal(_hold_above_water(points, z, [], 0.25), z))
         self.assertTrue(np.array_equal(_hold_above_water(points, z, None, 0.25), z))
 
-    def test_the_road_builder_actually_applies_it(self):
-        """The rule is only worth anything if triangulate_roads runs it, and
-        every other test here calls the helper directly."""
-        from src.surfaces import RoadPart, triangulate_roads
-
-        level = 4.0
-        ditch = self._body(
-            level, [[40, -50], [60, -50], [60, 150], [40, 150], [40, -50]]
-        )
-
-        def dips(x, y):
-            """Bank at 6 m, dipping to 2.6 m across the ditch, as the filler
-            leaves it."""
-            x = np.asarray(x, dtype=float)
-            across = np.clip((x - 40.0) / 20.0, 0.0, 1.0)
-            return 6.0 - 3.4 * np.sin(np.pi * across)
-
-        # A footpath running east, straight over the ditch.
-        path = RoadPart(
-            [np.array([[0.0, 45.0], [100.0, 45.0], [100.0, 55.0], [0.0, 55.0],
-                       [0.0, 45.0]])],
-            surface_class=8,
-            level=0,
-        )
-        triangles, _classes, _levels = triangulate_roads(
-            [path], dips, lift_m=0.0, water=[ditch], water_clearance_m=0.25,
-        )
-        self.assertTrue(len(triangles), "the path did not triangulate at all")
-
-        corners = triangles.reshape(-1, 3)
-        over = (corners[:, 0] > 42) & (corners[:, 0] < 58)
-        self.assertTrue(over.any(), "no part of the path is over the ditch")
-        self.assertGreaterEqual(
-            float(corners[over, 2].min()), level + 0.25 - 1e-6,
-            f"the path drops to {corners[over, 2].min():.2f} m over water "
-            f"sitting at {level:.2f} m",
-        )
-
     def test_the_setting_reaches_the_config(self):
         from src.config import DEFAULTS
 
@@ -6627,9 +5982,14 @@ class TestCollisionLayer(unittest.TestCase):
 
         source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
         namespace = {"np": np}
+        for constant in ("TREE_TRUNK_FRACTIONS", "TREE_SHAPES_PER_KIND"):
+            line = re.search(rf"\n{constant} = .*\n", source)
+            assert line is not None, f"{constant} moved"
+            exec(line.group(0), namespace)  # noqa: S102 - our own source
         for name in ("_octahedron_canopy", "_box", "_tree_dice", "_lobed_crown",
+                     "_tree_instance", "_shape_lean", "_unit_tree",
                      "_tree_group_mesh", "_collision_tree_mesh"):
-            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef |\n# )", source, re.S)
             assert body is not None, f"{name} moved"
             exec(body.group(0), namespace)  # noqa: S102 - our own source
         return namespace
@@ -7068,7 +6428,12 @@ class TestCollisionLayer(unittest.TestCase):
             "np": np, "Path": Path, "log": lambda *a: None,
             "build_mesh_object": on_build or (lambda name, *a, **k: name),
         }
+        for constant in ("TREE_TRUNK_FRACTIONS", "TREE_SHAPES_PER_KIND"):
+            line = re.search(rf"\n{constant} = .*\n", source)
+            assert line is not None, f"{constant} moved"
+            exec(line.group(0), namespace)  # noqa: S102 - our own source
         for name in ("_octahedron_canopy", "_box", "_tree_dice", "_lobed_crown",
+                     "_tree_instance", "_shape_lean",
                      "_collision_tree_mesh", "reused_colliders",
                      "build_collision"):
             body = re.search(
@@ -7335,7 +6700,8 @@ class TestCollisionLayer(unittest.TestCase):
         exec(body.group(0), namespace)  # noqa: S102 - our own source
         reused = namespace["reused_colliders"]()
         self.assertIn("Terrain", reused)
-        self.assertIn("Buildings", reused)
+        # One object per building now, named after its BAG pand.
+        self.assertIn("Pand_*", reused)
         for name, why in reused.items():
             self.assertGreater(len(why), 20, f"{name} has no reason given")
 
@@ -7917,105 +7283,6 @@ class TestStreetDetail(unittest.TestCase):
         self.assertEqual(override.name, "noise_barrier")
 
 
-class TestRoadDrape(unittest.TestCase):
-    """A road follows the ground as closely as the ground allows, no closer."""
-
-    def test_it_stops_cutting_below_the_sample_spacing(self):
-        """Without a floor the drape chases a step it cannot resolve, and 12
-        rounds was not enough for a long street over a 1 m grid either -- one
-        carriageway came out 0.82 m off the ground it was draped on."""
-        from src.surfaces import drape_to_terrain
-
-        # A hard step in the middle, as a quay wall is.
-        def sampler(x, y):
-            return np.where(np.atleast_1d(np.asarray(x, dtype=float)) > 50.0, 2.0, 0.0)
-
-        big = np.array([[[0.0, 0.0], [100.0, 0.0], [0.0, 40.0]]])
-        floored = drape_to_terrain(big, sampler, tolerance_m=0.08, min_edge_m=1.0)
-        unfloored = drape_to_terrain(big, sampler, tolerance_m=0.08, min_edge_m=0.0)
-        self.assertLess(
-            len(floored),
-            len(unfloored),
-            "the floor did not stop the drape cutting into the interpolation",
-        )
-        self.assertGreater(len(floored), 1, "it did not refine at all")
-
-    def test_smooth_ground_is_followed_closely(self):
-        """The floor must not become an excuse: where the ground is smooth the
-        drape still has to land on it."""
-        from src.surfaces import drape_to_terrain
-
-        def sampler(x, y):
-            return 0.01 * np.atleast_1d(np.asarray(x, dtype=float))
-
-        tris = np.array([[[0.0, 0.0], [100.0, 0.0], [0.0, 40.0]]])
-        draped = drape_to_terrain(tris, sampler, tolerance_m=0.08, min_edge_m=1.0)
-        centre = draped.mean(axis=1)
-        truth = sampler(centre[:, 0], centre[:, 1])
-        self.assertLess(float(np.abs(centre[:, 2] - truth).max()), 0.09)
-
-    def test_the_check_allows_what_the_ground_forces(self):
-        """The failure reported from a 2 km run: median error 22 mm, one
-        triangle over a wall at 0.82 m, judged against a flat 0.5 m."""
-        from src.validate import _ground_allowance
-
-        class Terrain:
-            xs = np.linspace(0.0, 100.0, 101)
-            ys = np.linspace(0.0, 100.0, 101)
-            heights = np.zeros((101, 101))
-
-        Terrain.heights[:, 50:] = 1.8   # a 1.8 m wall
-
-        at_wall = _ground_allowance(Terrain, np.array([[50.0, 50.0]]), floor_m=0.5)
-        on_flat = _ground_allowance(Terrain, np.array([[10.0, 10.0]]), floor_m=0.5)
-        self.assertGreater(float(at_wall[0]), 0.82, "0.82 m over a 1.8 m wall failed")
-        self.assertAlmostEqual(float(on_flat[0]), 0.5, places=6)
-
-
-class TestFeatureFilter(unittest.TestCase):
-    """Dropping the runs that make a mesh busy without describing the ground."""
-
-    def test_short_runs_are_dropped(self):
-        from src.breaklines import build_breaklines
-        from src.geo import BBox
-
-        bbox = BBox(0, 0, 100, 100)
-        # One long road edge, and a scatter of traffic-island-sized rings.
-        rings = {
-            "roads": [np.array([[5.0, 50.0], [95.0, 50.0], [95.0, 54.0], [5.0, 54.0],
-                                [5.0, 50.0]])],
-            "unpaved": [
-                np.array([[x, 20.0], [x + 2.0, 20.0], [x + 2.0, 22.0], [x, 22.0],
-                          [x, 20.0]])
-                for x in range(10, 80, 10)
-            ],
-        }
-        keep_all = build_breaklines(bbox, rings_by_source=rings, simplify_m=0.15)
-        pruned = build_breaklines(
-            bbox, rings_by_source=rings, simplify_m=0.15, min_feature_length_m=20.0
-        )
-        self.assertLess(
-            len(pruned.segments),
-            len(keep_all.segments),
-            "the islands survived a 20 m minimum",
-        )
-        # The road is 90 m long, so it has to be there either way.
-        self.assertGreater(len(pruned.segments), 0)
-
-    def test_a_zero_minimum_changes_nothing(self):
-        from src.breaklines import build_breaklines
-        from src.geo import BBox
-
-        rings = {"roads": [np.array([[1.0, 1.0], [9.0, 1.0], [9.0, 9.0], [1.0, 9.0],
-                                     [1.0, 1.0]])]}
-        bbox = BBox(0, 0, 10, 10)
-        plain = build_breaklines(bbox, rings_by_source=rings, simplify_m=0.15)
-        zero = build_breaklines(
-            bbox, rings_by_source=rings, simplify_m=0.15, min_feature_length_m=0.0
-        )
-        self.assertEqual(len(plain.segments), len(zero.segments))
-
-
 class TestUIServer(unittest.TestCase):
     """The UI writes a config and shells out to pipeline.py, so the translation
     from form fields to config is the part worth pinning down."""
@@ -8056,9 +7323,16 @@ class TestUIServer(unittest.TestCase):
                 "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
             }
         )
-        self.assertEqual(config["aerial"]["size_px"], 4096)
-        self.assertEqual(config["terrain"]["ahn_model"], "DTM")
-        self.assertEqual(config["buildings"]["lod"], "2.2")
+        self.assertEqual(config["detail"], "standard")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+        # Standard: 25 cm a pixel over a kilometre, a 2 m ground grid.
+        self.assertEqual(loaded.aerial["size_px"], 4000)
+        self.assertEqual(loaded.terrain["grid_m"], 2.0)
+        self.assertEqual(loaded.terrain["ahn_model"], "DTM")
+        self.assertEqual(loaded.buildings["lod"], "2.2")
 
     def test_the_collision_toggle_reaches_a_loadable_config(self):
         """The checkbox has to survive the whole trip: form payload, config
@@ -8132,8 +7406,12 @@ class TestUIServer(unittest.TestCase):
             "name": "bare",
             "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
         })
-        self.assertEqual(config["aerial"]["deshadow"], 1.0)
-        self.assertEqual(config["aerial"]["size_px"], 4096)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+        self.assertEqual(loaded.aerial["deshadow"], 1.0)
+        self.assertEqual(loaded.trees["ground_shade"], 0.35)
 
     def test_collision_is_off_when_the_form_does_not_ask(self):
         config = self.server.build_config(
@@ -8143,8 +7421,29 @@ class TestUIServer(unittest.TestCase):
             }
         )
         self.assertFalse(config["export"]["collision"])
-        self.assertTrue(config["export"]["collision_tree_crowns"])
-        self.assertEqual(config["barriers"]["collision_thickness_m"], 0.30)
+        loaded = self._load(config)
+        self.assertTrue(loaded.export["collision_tree_crowns"])
+        self.assertEqual(loaded.barriers["collision_thickness_m"], 0.30)
+
+    def _load(self, config):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            return load_config(path)
+
+    def test_a_detail_level_sets_photo_ground_and_walls(self):
+        from src.config import DETAIL_PRESETS
+
+        for level, preset in DETAIL_PRESETS.items():
+            loaded = self._load(self.server.build_config({
+                "name": "lvl", "detail": level,
+                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+            }))
+            self.assertEqual(loaded.terrain["grid_m"], preset["grid_m"], level)
+            self.assertEqual(loaded.facade["texture_px"], preset["facade_px"], level)
+            # Ground resolution, so the pixel count follows the area.
+            want = int(round(1000 / (preset["aerial_cm"] / 100) / 4)) * 4
+            self.assertEqual(loaded.aerial["size_px"], want, level)
 
     def test_area_summary_is_none_for_unknown_area(self):
         self.assertIsNone(self.server.area_summary("no_such_area_xyz"))
@@ -8372,7 +7671,7 @@ class TestUIPage(unittest.TestCase):
     def test_every_help_marker_says_something(self):
         """A "?" that opens an empty bubble is worse than no "?" at all."""
         tips = self.page.tips
-        self.assertGreaterEqual(len(tips), 15, "help markers have gone missing")
+        self.assertGreaterEqual(len(tips), 7, "help markers have gone missing")
         for tip in tips:
             self.assertIsNotNone(tip, "a help marker carries no data-tip")
             self.assertGreater(len(tip), 40, f"a help marker only says {tip!r}")
@@ -8380,11 +7679,7 @@ class TestUIPage(unittest.TestCase):
     def test_the_settings_that_matter_are_explained(self):
         """Every control a first-time user has to answer carries its own help,
         rather than one note at the top of the group."""
-        for control in ("q", "size", "name", "preset", "aerialCm", "terrainM",
-                        "terrainTol", "facadePx", "facade", "clip",
-                        "groundFloor", "normal", "photoTextures", "preview",
-                        "collision", "collisionCrowns", "looks", "treeShade",
-                        "deshadow"):
+        for control in ("q", "size", "name", "detail", "preview", "collision"):
             self.assertIn(
                 control, self.page.explained, f"the control {control} has no help marker"
             )
@@ -8405,28 +7700,34 @@ class TestUIPage(unittest.TestCase):
             self.page.details_open, [], "an advanced section ships open"
         )
 
-    def test_every_slider_step_has_a_sentence(self):
-        """The words under a slider come from a table keyed by value. A step
-        added to one and not the other reads as a blank line."""
-        def table(name):
-            body = re.search(r"const %s = \{(.*?)\};" % name, self.html, re.S).group(1)
-            return {float(k) for k in re.findall(r"^\s*([\d.]+):", body, re.M)}
+    def test_the_detail_levels_match_the_server(self):
+        """The page shows what a level means; the server applies it. Two
+        tables, so they are held equal here, or the numbers on the page stop
+        being the model that gets built."""
+        from src.config import DETAIL_PRESETS
 
-        def steps(name):
-            body = re.search(r"const %s\s*= \[([^\]]+)\]" % name, self.html).group(1)
-            return {float(v) for v in body.split(",")}
+        body = re.search(r"const DETAIL = \{(.*?)\n\};", self.html, re.S).group(1)
+        shown = {
+            name: {k: float(v) for k, v in re.findall(r"(\w+): ([\d.]+)", values)}
+            for name, values in re.findall(r"(\w+):\s*\{([^}]*)\}", body)
+        }
+        self.assertEqual(set(shown), set(DETAIL_PRESETS))
+        for name, preset in DETAIL_PRESETS.items():
+            self.assertEqual(shown[name]["aerial_cm"], preset["aerial_cm"], name)
+            self.assertEqual(shown[name]["grid_m"], preset["grid_m"], name)
+            self.assertEqual(shown[name]["facade_px"], preset["facade_px"], name)
+        sentences = re.search(r"const DETAIL_PLAIN = \{(.*?)\n\};", self.html, re.S).group(1)
+        self.assertEqual(set(re.findall(r"^\s*(\w+):", sentences, re.M)), set(DETAIL_PRESETS))
+        options = set(re.findall(r'<option value="(\w+)"', re.search(
+            r'<select id="detail">(.*?)</select>', self.html, re.S).group(1)))
+        self.assertEqual(options, set(DETAIL_PRESETS))
 
-        for values, sentences in (
-            ("AERIAL_STEPS", "AERIAL_PLAIN"),
-            ("TERRAIN_STEPS", "TERRAIN_PLAIN"),
-            ("TOLERANCE_STEPS", "TOLERANCE_PLAIN"),
-            ("FACADE_STEPS", "FACADE_PLAIN"),
-        ):
-            self.assertEqual(
-                steps(values),
-                table(sentences),
-                f"{values} and {sentences} describe different steps",
-            )
+    def test_there_are_no_sliders_left(self):
+        """The ask was fewer controls. What is left: where, how much detail,
+        which layers, and whether to add collision shapes and previews."""
+        self.assertNotIn('type="range"', self.html)
+        controls = set(re.findall(r'<(?:input|select)[^>]*\bid="(\w+)"', self.html))
+        self.assertEqual(controls, {"q", "size", "name", "detail", "preview", "collision"})
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

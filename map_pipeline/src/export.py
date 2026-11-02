@@ -313,6 +313,7 @@ def write_scene_description(
         "export": {
             "fbx_name": export_cfg["fbx_name"],
             "aerial_name": export_cfg["aerial_name"],
+            "blend_name": export_cfg.get("blend_name", "model.blend"),
             # Physics proxies, off by default: they cost FBX size and most
             # people importing this want a picture. A drone or a vehicle sim
             # wants them, because the thing it needs -- a fence a drone cannot

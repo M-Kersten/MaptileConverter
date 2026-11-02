@@ -171,6 +171,7 @@ def build_mesh_object(
     material_indices: np.ndarray,
     materials: list,
     shade_smooth: bool,
+    extra_uvs: dict | None = None,
 ):
     """Create a mesh through the bulk API.
 
@@ -200,6 +201,14 @@ def build_mesh_object(
 
     uv_layer = mesh.uv_layers.new(name="UVMap")
     uv_layer.data.foreach_set("uv", uvs.astype(np.float32).ravel())
+    for uv_name, values in (extra_uvs or {}).items():
+        extra = mesh.uv_layers.new(name=uv_name)
+        extra.data.foreach_set("uv", np.asarray(values, dtype=np.float32).ravel())
+    # The aerial projection is the one that draws; the others are for whoever
+    # swaps the material.
+    mesh.uv_layers.active = uv_layer
+    if hasattr(uv_layer, "active_render"):
+        uv_layer.active_render = True
 
     for material in materials:
         mesh.materials.append(material)
@@ -222,6 +231,71 @@ def build_mesh_object(
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.scene.collection.objects.link(obj)
     return obj
+
+
+def _triangulate_on_export(obj, quads: str = "FIXED") -> None:
+    """Triangulate for the FBX, and only for the FBX.
+
+    The .blend keeps its quads and n-gons, which is what an editor wants; the
+    modifier is off in the viewport and on for render, and the export applies
+    render modifiers. That decides the split here, where it can be matched,
+    rather than leaving it to Unity's importer: the terrain's squares are cut
+    first corner to third, south-west to north-east, which is the surface the
+    pipeline placed every tree and lamp post on. N-gons -- junctions and the
+    edges of car parks, some of them concave -- are cut by Blender's own
+    polygon fill rather than by whatever an importer does with them.
+    """
+    if not hasattr(obj, "modifiers") or getattr(obj, "type", "MESH") != "MESH":
+        return
+    modifier = obj.modifiers.new("Triangulate for export", "TRIANGULATE")
+    modifier.quad_method = quads
+    modifier.ngon_method = "BEAUTY"
+    modifier.show_viewport = False
+    modifier.show_render = True
+
+
+class _Layer:
+    """Gather what a builder made into a collection, under one parent.
+
+    The collection is how the .blend is organised; the parent empty is how the
+    FBX is, because FBX has no collections and Unity builds its hierarchy from
+    parents. Everything a builder adds without a parent of its own is put
+    under the layer's empty.
+    """
+
+    def __init__(self, collection: str, parent: str | None = None):
+        self.collection = collection
+        self.parent = parent
+
+    def __enter__(self):
+        self.before = {obj.name for obj in bpy.data.objects}
+        return self
+
+    def __exit__(self, *exc_info):
+        if exc_info[0] is not None:
+            return False
+        new = [obj for obj in bpy.data.objects if obj.name not in self.before]
+        if not new:
+            return False
+        scene = bpy.context.scene
+        collection = bpy.data.collections.get(self.collection)
+        if collection is None:
+            collection = bpy.data.collections.new(self.collection)
+            scene.collection.children.link(collection)
+        empty = None
+        if self.parent:
+            empty = bpy.data.objects.get(self.parent)
+            if empty is None:
+                empty = bpy.data.objects.new(self.parent, None)
+                empty.empty_display_size = 5.0
+                collection.objects.link(empty)
+        for obj in new:
+            for owner in list(obj.users_collection):
+                owner.objects.unlink(obj)
+            collection.objects.link(obj)
+            if empty is not None and obj.parent is None:
+                obj.parent = empty
+        return False
 
 
 def planar_uv(points_xy: np.ndarray, aerial_bbox_local: list[float]) -> np.ndarray:
@@ -267,7 +341,7 @@ def _water_bed_grid(scene: dict, work_dir: Path, shape=None) -> np.ndarray | Non
 
 
 def _sink_water_bed(
-    scene: dict, work_dir: Path, heights: np.ndarray, n: int
+    scene: dict, work_dir: Path, heights: np.ndarray, n: int, quiet: bool = False
 ) -> np.ndarray:
     """Push the terrain under each water body below its surface.
 
@@ -283,10 +357,11 @@ def _sink_water_bed(
     water = np.isfinite(bed)
     out = heights.copy()
     out[water] = np.minimum(out[water], bed[water])
-    log(
-        f"terrain: sank {int(water.sum())} cells to water beds between "
-        f"{np.nanmin(bed):.2f} and {np.nanmax(bed):.2f} m NAP"
-    )
+    if not quiet:
+        log(
+            f"terrain: sank {int(water.sum())} cells to water beds between "
+            f"{np.nanmin(bed):.2f} and {np.nanmax(bed):.2f} m NAP"
+        )
     return out
 
 
@@ -334,74 +409,120 @@ def build_water(scene: dict, work_dir: Path, material):
     return obj
 
 
+def make_plain_material(name: str, colour, roughness: float):
+    """An untextured Principled BSDF: a kerb is grey concrete, not photo."""
+    material = bpy.data.materials.new(name=name)
+    material.use_nodes = True
+    bsdf = material.node_tree.nodes.get("Principled BSDF")
+    if bsdf is not None:
+        bsdf.inputs["Base Color"].default_value = (*colour, 1.0)
+        if "Roughness" in bsdf.inputs:
+            bsdf.inputs["Roughness"].default_value = roughness
+    material.diffuse_color = (*colour, 1.0)
+    return material
+
+
 def build_roads(scene: dict, work_dir: Path, make_material):
-    """The road surface as its own objects, one per class.
+    """The road network: one object per street, junction and stretch of paving.
 
-    Separate objects rather than one merged mesh, because that is what makes
-    them separately addressable downstream: each becomes its own GameObject, so
-    a carriageway can go on a drivable layer and a footpath on a walkable one
-    without splitting anything by hand. They are cheap — six at most.
+    Every street is quads cut straight across it from kerb to kerb, so a
+    cross-section is an edge loop and so is every kerb; nothing sits in the
+    middle of a surface. Junctions, and road no centreline reaches, are one
+    face per piece of surface, bounded by its own outline. Footways stand on a
+    kerb, and the edge of the whole network has a short skirt down into the
+    ground. See src/roads.py.
 
-    Each carries its own material, textured with the aerial and projected the
-    same way the terrain is, so the road looks exactly as it did when it was
-    only pixels in the terrain's photograph. The point of the split is that the
-    material is now yours to replace.
+    Each surface class is its own material slot, textured with the aerial and
+    projected the way the terrain is, so the road looks as it did when it was
+    pixels in the photo -- and the material is yours to replace. The second UV
+    map, RoadUV, runs in metres across and along the street, for a tiling
+    asphalt or brick texture and lane markings.
     """
     data = _load_surfaces(scene, work_dir)
-    if data is None or "road_tris" not in data.files:
+    if data is None or "road_vertices" not in data.files:
         return []
-
-    triangles = data["road_tris"]
-    classes = data["road_tri_class"]
-    if len(triangles) == 0:
+    vertices_rd = data["road_vertices"].astype(np.float64)
+    sizes = data["road_face_sizes"].astype(np.int64)
+    if not len(sizes):
         return []
+    loops = data["road_face_loops"].astype(np.int64)
+    face_class = data["road_face_class"].astype(np.int64)
+    face_object = data["road_face_object"].astype(np.int64)
+    loop_uv = data["road_loop_uv"].astype(np.float64)
+    object_names = [str(n) for n in data["road_object_names"]]
+    object_kinds = [str(n) for n in data["road_object_kinds"]]
+    face_kind = data["road_face_kind"] if "road_face_kind" in data.files else None
 
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
     names = scene.get("surfaces", {}).get("road_class_names", {})
+    local = vertices_rd - np.array([origin_x, origin_y, z_offset])
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    face_of_loop = np.repeat(np.arange(len(sizes)), sizes)
 
-    local = triangles.copy()
-    local[:, :, 0] -= origin_x
-    local[:, :, 1] -= origin_y
-    local[:, :, 2] -= z_offset
+    materials: dict[int, object] = {}
+
+    def material_for(code: int):
+        if code not in materials:
+            label = str(names.get(str(code), f"class_{code}"))
+            if label == "kerb":
+                materials[code] = make_plain_material("M_road_kerb", (0.42, 0.42, 0.40), 0.8)
+            else:
+                materials[code] = make_material(f"M_road_{label.replace('road_', '')}")
+        return materials[code]
 
     objects = []
-    for code in sorted(set(int(c) for c in classes)):
-        part = local[classes == code]
-        if not len(part):
+    for index, name in enumerate(object_names):
+        faces = np.flatnonzero(face_object == index)
+        if not len(faces):
             continue
-        # Welded, so the road arrives indexed. Every triangle used to carry its
-        # own three corners, which is three times the vertex buffer with no
-        # reuse at all -- and no shared normals, so an engine cannot smooth the
-        # surface even where it should be smooth.
-        corners, indices = _weld_corners(part.reshape(-1, 3))
-        n_triangles = len(part)
-        label = str(names.get(str(code), f"class_{code}"))
-        # The class names already say "road_asphalt", and Roads_road_asphalt
-        # reads badly in a hierarchy.
-        if label.startswith("road_"):
-            label = label[len("road_") :]
-
-        objects.append(
-            build_mesh_object(
-                f"Roads_{label}",
-                corners,
-                indices,
-                np.arange(0, n_triangles * 3, 3),
-                np.full(n_triangles, 3),
-                # The same top-down projection the terrain uses, so the photo
-                # lines up across the join.
-                planar_uv(corners[indices][:, :2], scene["aerial"]["bbox_local"]),
-                np.zeros(n_triangles),
-                [make_material(f"M_road_{label}")],
-                shade_smooth=False,
-            )
+        wanted = np.isin(face_of_loop, faces)
+        own_loops = loops[wanted]
+        used, remap = np.unique(own_loops, return_inverse=True)
+        points = local[used]
+        # The object's origin sits on the ground under the middle of it, so it
+        # moves, rotates and snaps like the thing it is.
+        origin = np.array(
+            [0.5 * (points[:, 0].min() + points[:, 0].max()),
+             0.5 * (points[:, 1].min() + points[:, 1].max()),
+             points[:, 2].min()]
         )
-        log(
-            f"roads: {label}, {n_triangles} triangles, {len(corners)} vertices "
-            f"({n_triangles * 3 / max(len(corners), 1):.1f}x reuse)"
+        own_sizes = sizes[faces]
+        own_starts = np.concatenate([[0], np.cumsum(own_sizes)[:-1]])
+        codes = face_class[faces]
+        slots = sorted(set(int(c) for c in codes))
+        slot_of = {code: i for i, code in enumerate(slots)}
+        obj = build_mesh_object(
+            name,
+            points - origin,
+            remap,
+            own_starts,
+            own_sizes,
+            # The top-down projection the terrain uses, from where the vertex
+            # is in the model rather than in the object, so the photo lines up
+            # across every join.
+            planar_uv(points[remap][:, :2], scene["aerial"]["bbox_local"]),
+            np.array([slot_of[int(c)] for c in codes]),
+            [material_for(code) for code in slots],
+            shade_smooth=False,
+            extra_uvs={"RoadUV": loop_uv[wanted]},
         )
+        obj.location = tuple(origin)
+        obj["kind"] = object_kinds[index] if index < len(object_kinds) else "street"
+        if face_kind is not None:
+            # 0 surface, 1 kerb, 2 skirt: what the Maptile tools fit the
+            # terrain under, and what they leave out.
+            part = obj.data.attributes.new("road_part", "INT", "FACE")
+            part.data.foreach_set("value", face_kind[faces].astype(np.int32))
+        _triangulate_on_export(obj, quads="FIXED")
+        objects.append(obj)
 
+    quads = int((sizes == 4).sum())
+    log(
+        f"roads: {len(objects)} objects ({sum(1 for o in objects if o['kind'] == 'street')} "
+        f"streets, {sum(1 for o in objects if o['kind'] == 'junction')} junctions), "
+        f"{len(sizes)} faces of which {quads} quads, {len(vertices_rd)} vertices"
+    )
     return objects
 
 
@@ -557,6 +678,16 @@ def build_terrain(scene: dict, work_dir: Path, material) -> object:
     groups = _tag_surface_regions(
         obj, scene, work_dir, vertices, loop_vertex_indices, loop_starts, loop_totals
     )
+    # The ground as surveyed, before anything was pushed down under a road, so
+    # the Maptile tools can put it back. Water beds stay sunk: that is not a
+    # fit to the roads but a fix to the survey.
+    if "measured" in data.files:
+        measured = _sink_water_bed(
+            scene, work_dir, data["measured"].astype(np.float64), n, quiet=True
+        )
+        attribute = obj.data.attributes.new("measured_z", "FLOAT", "POINT")
+        attribute.data.foreach_set("value", (measured - z_offset).ravel().astype(np.float32))
+    _triangulate_on_export(obj, quads="FIXED")
     spacing = float(xs[1] - xs[0]) if len(xs) > 1 else 0.0
     log(
         f"terrain: {n}x{n} vertices at {spacing:.2f} m, {n_quads} quads, "
@@ -598,7 +729,7 @@ def build_buildings(
     aerial_material,
     ground_materials: list | None = None,
 ):
-    """One mesh holding every building, with facade and aerial material slots."""
+    """One object per building, with facade and aerial material slots."""
     data = np.load(work_dir / scene["buildings"]["file"])
     wall_tris = data["wall_tris"]
     roof_tris = data["roof_tris"]
@@ -704,7 +835,6 @@ def build_buildings(
 
     parts = [chunk for chunk in (walls, roofs, grounds) if len(chunk)]
     triangles = np.concatenate(parts, axis=0)
-    corners = triangles.reshape(-1, 3)
 
     uv_chunks = []
     if n_walls:
@@ -750,27 +880,68 @@ def build_buildings(
             ground_style[ground_owner], 0, max(0, len(ground_materials) - 1)
         )
 
-    n_triangles = n_walls + n_roofs + n_grounds
-    loop_vertex_indices = np.arange(n_triangles * 3)
-    loop_starts = np.arange(0, n_triangles * 3, 3)
-    loop_totals = np.full(n_triangles, 3)
-
-    obj = build_mesh_object(
-        "Buildings",
-        corners,
-        loop_vertex_indices,
-        loop_starts,
-        loop_totals,
-        uvs,
-        material_indices,
-        materials,
-        shade_smooth=False,
+    owner = np.concatenate(
+        [chunk for chunk, count in ((wall_owner, n_walls), (roof_owner, n_roofs),
+                                    (ground_owner, n_grounds)) if count]
+    ).astype(np.int64)
+    ids = (
+        [str(i) for i in data["building_ids"]]
+        if "building_ids" in data.files
+        else [f"{i:05d}" for i in range(len(ground_z_nap))]
     )
+    years = data["build_year"] if "build_year" in data.files else None
+    heights = data["height_m"] if "height_m" in data.files else None
+
+    # One object per building, so a building is something you click on, move,
+    # delete or swap, and its own GameObject in Unity. The triangles of each
+    # are pulled out in one sort rather than one search per building.
+    order = np.argsort(owner, kind="stable")
+    bounds = np.searchsorted(owner[order], np.arange(len(ground_z_nap) + 1))
+    corner_uvs = uvs.reshape(-1, 3, 2)
+    objects = []
+    for index in range(len(ground_z_nap)):
+        mine = order[bounds[index] : bounds[index + 1]]
+        if not len(mine):
+            continue
+        tris = triangles[mine]
+        points, loops = _weld_corners(tris.reshape(-1, 3))
+        slots = sorted(set(int(m) for m in material_indices[mine]))
+        slot_of = {m: i for i, m in enumerate(slots)}
+        # The origin on the ground under the middle of the footprint, so the
+        # building stands on its origin: snapping it to the terrain, or
+        # swapping it for a modelled one, then just works.
+        origin = np.array([
+            0.5 * (points[:, 0].min() + points[:, 0].max()),
+            0.5 * (points[:, 1].min() + points[:, 1].max()),
+            float(ground_z_local[index]),
+        ])
+        identifier = ids[index]
+        obj = build_mesh_object(
+            "Pand_" + identifier.rsplit(".", 1)[-1],
+            points - origin,
+            loops,
+            np.arange(0, len(mine) * 3, 3),
+            np.full(len(mine), 3),
+            corner_uvs[mine].reshape(-1, 2),
+            np.array([slot_of[int(m)] for m in material_indices[mine]]),
+            [materials[m] for m in slots],
+            shade_smooth=False,
+        )
+        obj.location = tuple(origin)
+        # Carried into the FBX as user properties, where a Unity asset
+        # postprocessor can read them.
+        obj["bag_id"] = identifier
+        if years is not None:
+            obj["build_year"] = int(years[index])
+        if heights is not None:
+            obj["height_m"] = round(float(heights[index]), 2)
+        objects.append(obj)
+
     log(
-        f"buildings: {len(ground_z_nap)} buildings, {n_walls} wall triangles, "
+        f"buildings: {len(objects)} objects, {n_walls} wall triangles, "
         f"{n_roofs} roof triangles, {n_grounds} ground-storey triangles"
     )
-    return obj
+    return objects
 
 
 # ---------------------------------------------------------------------------
@@ -897,126 +1068,141 @@ def _lobed_crown(shape, faces, lobes, crown_r, crown_h, squash, spin):
     return crown, np.vstack(all_faces)
 
 
-def _tree_group_mesh(members, fields, origin, rng):
-    """Trunks and canopies for one group of trees, as (vertices, faces, uvs).
+# Tree shapes are built once at unit size and shared: every tree is an
+# instance of one, scaled to its own crown and height and turned to its own
+# angle. Two crown types by size, four trunk proportions, four shapes each.
+TREE_TRUNK_FRACTIONS = (0.25, 0.35, 0.45, 0.55)
+TREE_SHAPES_PER_KIND = 4
 
-    A tree used to be a sphere on a prism, which from any distance reads as a
-    lollipop and from close up reads as eight of them in a row. Three things
-    fix that: the crown is pushed out of round by noise taken from the tree's
-    own position, so no two match; a mature tree gets a second lobe, so its
-    outline is not convex; and the trunk tapers, flares and leans a little,
-    because a cylinder meets the ground like a pipe.
 
-    Everything is broadleaf. An earlier version made a third of them conifers,
-    which is a real Dutch verge but not what these models are for -- a wood of
-    spikes reads as a Christmas tree farm, and the reference is the billowy
-    leafy mass you get from photogrammetry.
+def _tree_instance(x: float, y: float, height: float, trunk_h: float) -> dict:
+    """Which shape a tree is drawn with, and how it is turned and squashed.
+
+    From the tree's position, so a tree looks the same whatever else is in the
+    model. The drawn tree and its collision proxy both read this, which is
+    what keeps the proxy round the tree rather than near it.
+    """
+    spin_d, squash_d, _spare, shape_d = _tree_dice(x, y)
+    fraction = trunk_h / max(height, 1e-3)
+    trunk = int(np.argmin([abs(fraction - f) for f in TREE_TRUNK_FRACTIONS]))
+    return {
+        "lobes": 2 if height >= 14.0 else 1,
+        "trunk": trunk,
+        "shape": int(shape_d * TREE_SHAPES_PER_KIND) % TREE_SHAPES_PER_KIND,
+        "spin": spin_d * 2 * np.pi,
+        "squash": 0.78 + 0.34 * squash_d,
+    }
+
+
+def _shape_lean(shape: int) -> float:
+    """The lean of one unit tree shape, in units of its crown radius."""
+    return (_tree_dice(31.0 * shape + 7.0, 17.0 * shape + 3.0)[3] - 0.5) * 0.06
+
+
+def _unit_tree(lobes: int, trunk_fraction: float, shape: int):
+    """One tree at unit size, as (vertices, faces, uvs) with its foot at 0.
+
+    One unit tall and one unit of crown radius, so an instance scaled to
+    (crown radius, crown radius x squash, height) is that tree. The same
+    construction as the per-tree mesh this replaced -- tapered, flared trunk
+    with a slight lean, lobed crown -- with the shape drawn from `shape`
+    instead of from the tree's position.
+    """
+    spin = _tree_dice(31.0 * shape + 7.0, 17.0 * shape + 3.0)[0] * 2 * np.pi
+    trunk_h = trunk_fraction
+    crown_h = max(0.05, 1.0 - trunk_h)
+    trunk_sides = 5
+    angles = np.linspace(0, 2 * np.pi, trunk_sides, endpoint=False)
+    cos_a, sin_a = np.cos(angles + spin), np.sin(angles + spin)
+    trunk_r = 0.12
+    lean = _shape_lean(shape)
+    tops = np.column_stack([
+        lean + trunk_r * 0.55 * cos_a, lean * 0.4 + trunk_r * 0.55 * sin_a,
+        np.full(trunk_sides, trunk_h + 0.15 * crown_h),
+    ])
+    mids = np.column_stack([
+        trunk_r * cos_a, trunk_r * sin_a, np.full(trunk_sides, trunk_h * 0.35),
+    ])
+    feet = np.column_stack([
+        trunk_r * 1.5 * cos_a, trunk_r * 1.5 * sin_a, np.full(trunk_sides, -0.01),
+    ])
+    vertices = [np.vstack([feet, mids, tops])]
+    faces = []
+    for side in range(trunk_sides):
+        nxt = (side + 1) % trunk_sides
+        for lower_ring, upper_ring in ((0, 1), (1, 2)):
+            a = lower_ring * trunk_sides
+            b = upper_ring * trunk_sides
+            faces.append([a + side, a + nxt, b + nxt])
+            faces.append([a + side, b + nxt, b + side])
+    uvs = [np.tile([0.25, 0.5], (len(faces) * 3, 1))]
+    shape_verts, shape_faces = _octahedron_canopy(1)
+    crown, crown_faces = _lobed_crown(shape_verts, shape_faces, lobes, 1.0, crown_h, 1.0, spin)
+    crown = crown + np.array([lean, 0.0, trunk_h + crown_h * 0.5])
+    offset = trunk_sides * 3
+    vertices.append(crown)
+    faces = np.vstack([np.asarray(faces), crown_faces + offset])
+    uvs.append(np.tile([0.75, 0.5], (len(crown_faces) * 3, 1)))
+    return np.vstack(vertices), faces, np.vstack(uvs)
+
+
+def _tree_group_mesh(members, fields, origin, rng=None):
+    """The trees exactly as drawn, flattened into one (vertices, faces, uvs).
+
+    Not used to build the scene -- that instances shared shapes -- but the
+    same transform the instances get, applied here, so anything that has to
+    agree with the drawn trees (the collision proxies, the tests) can measure
+    against what is drawn rather than against a description of it.
     """
     xy, ground, heights, crowns, trunks = fields
     origin_x, origin_y, z_offset = origin
-
-    fine_verts, fine_faces = _octahedron_canopy(1)
-    trunk_sides = 5
-    angles = np.linspace(0, 2 * np.pi, trunk_sides, endpoint=False)
-
-    # UVs address one atlas: bark on the left half, foliage on the right.
-    bark_uv = np.array([0.25, 0.5])
-    leaf_uv = np.array([0.75, 0.5])
-
-    all_verts: list[np.ndarray] = []
-    all_faces: list[np.ndarray] = []
-    all_uvs: list[np.ndarray] = []
+    all_verts, all_faces, all_uvs = [], [], []
     offset = 0
-
     for index in np.flatnonzero(members):
-        base_x = float(xy[index, 0]) - origin_x
-        base_y = float(xy[index, 1]) - origin_y
-        base_z = float(ground[index]) - z_offset
         height = float(heights[index])
         crown_r = float(crowns[index])
-        trunk_h = float(trunks[index])
-
-        spin_d, squash_d, _spare, lean_d = _tree_dice(
-            xy[index, 0], xy[index, 1]
+        params = _tree_instance(xy[index, 0], xy[index, 1], height, float(trunks[index]))
+        vertices, faces, uvs = _unit_tree(
+            params["lobes"], TREE_TRUNK_FRACTIONS[params["trunk"]], params["shape"]
         )
-        spin = spin_d * 2 * np.pi
-        squash = 0.78 + 0.34 * squash_d
-        canopy_base = base_z + trunk_h
-        crown_h = max(0.6, height - trunk_h)
-
-        # Trunk: tapered, and flared at the foot. A cylinder meets the ground
-        # like a pipe; a tree meets it like a tree.
-        trunk_r = max(0.08, crown_r * 0.12)
-        cos_a, sin_a = np.cos(angles + spin), np.sin(angles + spin)
-        # A slight lean, so an avenue is not a row of plumb lines.
-        lean = (lean_d - 0.5) * 0.06 * height
-        tops = np.column_stack([
-            base_x + lean + trunk_r * 0.55 * cos_a,
-            base_y + lean * 0.4 + trunk_r * 0.55 * sin_a,
-            np.full(trunk_sides, canopy_base + crown_r * 0.3),
+        scaled = vertices * np.array([crown_r, crown_r * params["squash"], height])
+        c, s_ = np.cos(params["spin"]), np.sin(params["spin"])
+        turned = np.column_stack([
+            scaled[:, 0] * c - scaled[:, 1] * s_,
+            scaled[:, 0] * s_ + scaled[:, 1] * c,
+            scaled[:, 2],
         ])
-        mids = np.column_stack([
-            base_x + trunk_r * cos_a,
-            base_y + trunk_r * sin_a,
-            np.full(trunk_sides, base_z + min(0.6, trunk_h * 0.35)),
+        turned += np.array([
+            float(xy[index, 0]) - origin_x,
+            float(xy[index, 1]) - origin_y,
+            float(ground[index]) - z_offset,
         ])
-        feet = np.column_stack([
-            base_x + trunk_r * 1.5 * cos_a,
-            base_y + trunk_r * 1.5 * sin_a,
-            np.full(trunk_sides, base_z - 0.05),
-        ])
-        all_verts.append(np.vstack([feet, mids, tops]))
-        for side in range(trunk_sides):
-            nxt = (side + 1) % trunk_sides
-            for lower_ring, upper_ring in ((0, 1), (1, 2)):
-                a = offset + lower_ring * trunk_sides
-                b = offset + upper_ring * trunk_sides
-                all_faces.append(
-                    np.array([[a + side, a + nxt, b + nxt],
-                              [a + side, b + nxt, b + side]])
-                )
-        all_uvs.append(np.tile(bark_uv, (trunk_sides * 4 * 3, 1)))
-        offset += trunk_sides * 3
-
-        # Lobes by size. A sapling is one lump; a mature tree is a cluster,
-        # which is the only way to an outline that is not convex. Three lobes
-        # of the blunt blob come to 36 triangles, about what one subdivided
-        # sphere used to cost.
-        # Two lobes on a big tree, one on the rest. The lobe has to be a
-        # round shape, not a bipyramid: two bipyramids whose centres overlap
-        # still cross rather than merge, because there is almost nothing
-        # between their six ring vertices and their poles, and the result is a
-        # pair of spikes rather than a canopy.
-        lobes = 2 if height >= 14.0 else 1
-        shape, faces = fine_verts, fine_faces
-        crown, crown_faces = _lobed_crown(
-            shape, faces, lobes, crown_r, crown_h, squash, spin
-        )
-        crown = crown + np.array(
-            [base_x + lean, base_y, canopy_base + crown_h * 0.5]
-        )
-        faces = crown_faces
-
-        all_verts.append(crown)
+        all_verts.append(turned)
         all_faces.append(faces + offset)
-        all_uvs.append(np.tile(leaf_uv, (len(faces) * 3, 1)))
-        offset += len(crown)
-
+        all_uvs.append(uvs)
+        offset += len(turned)
+    if not all_verts:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64), np.zeros((0, 2))
     return np.vstack(all_verts), np.vstack(all_faces), np.vstack(all_uvs)
 
 
 def build_trees(scene: dict, work_dir: Path, tree_material):
-    """Trees as trunk prisms with low-poly canopies, in two groups.
+    """Every tree its own object: an instance of one of a few shared shapes.
 
     Solid geometry rather than crossed billboards, so nothing depends on alpha
     settings surviving the FBX trip and being configured again in Unity.
+
+    One object per tree is what makes a tree something you can select, move or
+    delete in Blender, and its own GameObject in Unity. The shapes are shared
+    meshes -- 32 of them -- so ten thousand trees cost ten thousand transforms,
+    not ten thousand meshes: the FBX writes each shape once.
 
     Split into Trees_registered and Trees_detected. The BGT tree register is a
     municipal asset list rather than a survey of vegetation -- over a square
     kilometre of Utrecht centre it holds 1489 trees where the canopy model
     finds 8700 -- so most of what arrives was found rather than surveyed. The
-    detector is good and not perfect, so the found ones stay their own object
-    and a bad patch can be deleted as a group without touching a surveyed tree.
+    detector is good and not perfect, so the found ones stay their own group
+    and a bad patch can be deleted together without touching a surveyed tree.
     """
     tree_file = scene.get("trees", {}).get("file")
     if not tree_file or not (work_dir / tree_file).is_file():
@@ -1027,25 +1213,26 @@ def build_trees(scene: dict, work_dir: Path, tree_material):
     if len(xy) == 0:
         return []
 
-    fields = (xy, data["ground_z_nap"], data["height_m"],
-              data["crown_radius_m"], data["trunk_height_m"])
+    ground = data["ground_z_nap"]
+    heights = data["height_m"]
+    crowns = data["crown_radius_m"]
+    trunks = data["trunk_height_m"]
     detected = (
         data["detected"] if "detected" in data.files
         else np.zeros(len(xy), dtype=bool)
     )
-    origin = (*scene["origin_rd"], float(scene["ground_z_offset_nap"]))
-    rng = np.random.default_rng(4242)
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
 
-    objects = []
-    for label, members in (("Trees_registered", ~detected),
-                           ("Trees_detected", detected)):
-        if not members.any():
-            continue
-        vertices, faces, uvs = _tree_group_mesh(members, fields, origin, rng)
-        n_triangles = len(faces)
-        objects.append(
-            build_mesh_object(
-                label,
+    shapes: dict[tuple, object] = {}
+
+    def shape_for(lobes: int, trunk: int, kind: int):
+        key = (lobes, trunk, kind)
+        if key not in shapes:
+            vertices, faces, uvs = _unit_tree(lobes, TREE_TRUNK_FRACTIONS[trunk], kind)
+            n_triangles = len(faces)
+            holder = build_mesh_object(
+                f"TreeShape_{lobes}{trunk}{kind}",
                 vertices,
                 faces.reshape(-1),
                 np.arange(0, n_triangles * 3, 3),
@@ -1055,8 +1242,41 @@ def build_trees(scene: dict, work_dir: Path, tree_material):
                 [tree_material],
                 shade_smooth=False,
             )
-        )
-        log(f"{label}: {int(members.sum())} trees, {n_triangles} triangles")
+            # Only the mesh is wanted; the object that came with it goes.
+            mesh = holder.data
+            bpy.data.objects.remove(holder)
+            shapes[key] = mesh
+        return shapes[key]
+
+    objects = []
+    for label, prefix, members in (
+        ("Trees_registered", "Tree_", ~detected),
+        ("Trees_detected", "Tree_d", detected),
+    ):
+        if not members.any():
+            continue
+        group = bpy.data.objects.new(label, None)
+        bpy.context.scene.collection.objects.link(group)
+        objects.append(group)
+        for count, index in enumerate(np.flatnonzero(members), start=1):
+            height = float(heights[index])
+            crown_r = float(crowns[index])
+            params = _tree_instance(xy[index, 0], xy[index, 1], height, float(trunks[index]))
+            mesh = shape_for(params["lobes"], params["trunk"], params["shape"])
+            tree = bpy.data.objects.new(f"{prefix}{count:05d}", mesh)
+            tree.location = (
+                float(xy[index, 0]) - origin_x,
+                float(xy[index, 1]) - origin_y,
+                float(ground[index]) - z_offset,
+            )
+            tree.rotation_euler[2] = params["spin"]
+            tree.scale = (crown_r, crown_r * params["squash"], height)
+            tree.parent = group
+            tree["height_m"] = round(height, 2)
+            tree["detected"] = bool(detected[index])
+            bpy.context.scene.collection.objects.link(tree)
+            objects.append(tree)
+        log(f"{label}: {int(members.sum())} trees as instances of {len(shapes)} shapes")
     return objects
 
 
@@ -1705,11 +1925,14 @@ def reused_colliders() -> dict:
     right shape is only a bigger FBX, so these are named instead.
     """
     return {
-        "Terrain": "already the simplified surface; a coarser one would not be "
-                   "the ground the drone is flying over",
-        "Buildings": "walls are a prism per footprint edge and the roof is a "
-                     "few triangles, so there is nothing to take out",
-        "Roads_*": "flat sheets, and a drone that lands wants the real camber",
+        "Terrain": "a regular grid already; a coarser one would not be the "
+                   "ground the drone is flying over",
+        "Pand_*": "walls are a prism per footprint edge and the roof is a "
+                   "few triangles, so there is nothing to take out",
+        "Road_*, Path_*, Junction_*, Lanes_*, Paths_*, Paving": (
+            "the road surface itself, kerbs included: a drone that lands wants "
+            "the real camber and a car wants the real kerb"
+        ),
         "Water": "one flat quad per body",
         "Structures_*": "bridge decks and piers, already low-poly prisms",
     }
@@ -1760,23 +1983,36 @@ def _collision_tree_mesh(members, fields, origin, crowns: bool):
         crown_r = float(crown_radii[index])
         trunk_h = float(trunks[index])
 
-        # The same dice the drawn tree rolls, so the proxy lands on that tree
-        # rather than near it. Matching `_tree_group_mesh` exactly is the whole
-        # job: a proxy built from different numbers is a proxy for nothing.
-        spin_d, squash_d, _spare, lean_d = _tree_dice(xy[index, 0], xy[index, 1])
-        spin = spin_d * 2 * np.pi
-        squash = 0.78 + 0.34 * squash_d
-        lean = (lean_d - 0.5) * 0.06 * height
-        canopy_base = base_z + trunk_h
-        crown_h = max(0.6, height - trunk_h)
+        # The same instance the drawn tree is, so the proxy lands on that tree
+        # rather than near it. Matching it exactly is the whole job: a proxy
+        # built from different numbers is a proxy for nothing.
+        params = _tree_instance(xy[index, 0], xy[index, 1], height, trunk_h)
+        spin = params["spin"]
+        squash = params["squash"]
+        fraction = TREE_TRUNK_FRACTIONS[params["trunk"]]
+        crown_h = max(0.05, 1.0 - fraction) * height
+        canopy_base = base_z + fraction * height
+        # The unit shape's lean, in its own x, scaled by the crown radius and
+        # turned with the tree.
+        lean = _shape_lean(params["shape"]) * crown_r
+        cos_s, sin_s = np.cos(spin), np.sin(spin)
 
         # Trunk. The drawn one has three rings -- flared feet, plain middle,
         # tapered top -- and the feet are the widest, so one prism at the flare
-        # radius covers all three. The top ring is also pushed sideways by the
-        # lean while the feet are not, so the lean goes into the radius instead
-        # of tilting the prism: cheaper than shearing it, and it still contains
-        # every drawn vertex.
-        trunk_r = max(0.08, crown_r * 0.12) * 1.5 + abs(lean)
+        # radius covers all three. Squashed sideways with the crown, so the
+        # radius takes the wider of the two; the lean goes into the radius
+        # instead of tilting the prism.
+        # The top ring is pushed by the lean in the shape's own x, and by
+        # four tenths of it in y, which the squash then scales.
+        # And the drawn trunk is turned by its shape's own angle, not the
+        # tree's, so its corners can fall anywhere round the prism: the prism
+        # is sized to circumscribe the circle they lie in, not to pass through
+        # them. A pentagon's sides sit at cos(36 deg) of its corner radius.
+        trunk_r = (
+            0.12 * 1.5 * crown_r * max(1.0, squash)
+            + abs(lean) * (1.0 + 0.4 * squash)
+            + 0.01
+        ) / np.cos(np.pi / sides)
         cos_a = np.cos(angles + spin)
         sin_a = np.sin(angles + spin)
         rings = [
@@ -1785,7 +2021,7 @@ def _collision_tree_mesh(members, fields, origin, crowns: bool):
                 base_y + trunk_r * sin_a,
                 np.full(sides, z),
             ])
-            for z in (base_z - 0.05, canopy_base + crown_r * 0.3)
+            for z in (base_z - 0.02 * height, canopy_base + 0.15 * crown_h)
         ]
         all_verts.append(np.vstack(rings))
         for side in range(sides):
@@ -1804,10 +2040,12 @@ def _collision_tree_mesh(members, fields, origin, crowns: bool):
         offset += sides * 2
 
         if crowns:
-            # Exactly the box `_lobed_crown` fits its lobes into.
+            # Exactly the box the unit crown is fitted to, scaled and turned
+            # as the instance is.
             box, box_faces = _box(
-                base_x + lean, base_y, canopy_base + crown_h * 0.5,
-                crown_r * 2.0, crown_r * squash * 2.0, crown_h,
+                base_x + lean * cos_s, base_y + lean * sin_s,
+                canopy_base + crown_h * 0.5,
+                crown_r * 2.0, crown_r * squash * 2.0, crown_h, spin=spin,
             )
             all_verts.append(box)
             all_faces.append(box_faces + offset)
@@ -1907,8 +2145,44 @@ def build_collision(scene: dict, work_dir: Path):
 # ---------------------------------------------------------------------------
 
 
+# The FBX settings, in one place. The Maptile tools carry a copy so a
+# re-export from an edited .blend matches; a test keeps the two equal.
+FBX_SETTINGS = dict(
+    use_selection=False,
+    apply_unit_scale=True,
+    # "FBX All": every object arrives in Unity at scale 1.
+    apply_scale_options="FBX_SCALE_ALL",
+    global_scale=1.0,
+    axis_forward="-Z",
+    axis_up="Y",
+    # Not Apply Transform. It would put the axis conversion into the vertices
+    # and leave every object unrotated -- except that it cannot rewrite a mesh
+    # several objects share, and the trees are ten thousand instances of a
+    # dozen meshes: measured, each tree came out at its Blender coordinates
+    # in Unity's frame, 375 m below ground. The conversion stays on the root
+    # objects as a -90 degree X rotation instead, and Unity's own "Bake Axis
+    # Conversion" import option takes it off, instances included.
+    bake_space_transform=False,
+    # Empties carry the hierarchy: Roads, Buildings, Trees and the rest are
+    # parents in Unity as they are in Blender.
+    object_types={"MESH", "EMPTY"},
+    # The triangulation modifiers are render-only, so the export applies them
+    # and the .blend keeps its quads.
+    use_mesh_modifiers=True,
+    use_mesh_modifiers_render=True,
+    # BAG id, build year and height per building; height per tree. Unity can
+    # read them in an AssetPostprocessor.
+    use_custom_props=True,
+    mesh_smooth_type="FACE",
+    use_tspace=True,
+    path_mode="STRIP",
+    embed_textures=False,
+    bake_anim=False,
+)
+
+
 def export_fbx(out_path: Path) -> None:
-    """Write the scene to FBX using the Blender-to-Unity axis convention.
+    """Write the scene to FBX for Unity.
 
     Blender is right-handed Z-up and Unity is left-handed Y-up. Exporting with
     forward -Z and up Y sends east to Unity's X, NAP height to Y and north to Z,
@@ -1919,31 +2193,32 @@ def export_fbx(out_path: Path) -> None:
     next to the FBX, which is where Unity looks for them.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for obj in bpy.context.scene.objects:
-        obj.select_set(True)
-
-    bpy.ops.export_scene.fbx(
-        filepath=str(out_path),
-        use_selection=False,
-        apply_unit_scale=True,
-        apply_scale_options="FBX_SCALE_NONE",
-        global_scale=1.0,
-        axis_forward="-Z",
-        axis_up="Y",
-        # Left off deliberately: every object already carries an identity
-        # transform, and the "apply transform" path is flagged experimental and
-        # is a known source of subtle Unity import differences.
-        bake_space_transform=False,
-        object_types={"MESH"},
-        use_mesh_modifiers=False,
-        mesh_smooth_type="FACE",
-        use_tspace=True,
-        path_mode="STRIP",
-        embed_textures=False,
-        bake_anim=False,
-    )
+    bpy.ops.export_scene.fbx(filepath=str(out_path), **FBX_SETTINGS)
     log(f"exported {out_path}")
+
+
+def save_blend(out_dir: Path, name: str = "model.blend") -> Path:
+    """Save the scene as a .blend for editing, tools included.
+
+    Texture paths are made relative, so the folder can be moved or zipped and
+    the .blend still finds its images beside it. The Maptile tools go in as a
+    text block registered on load (when Blender is allowed to run scripts) and
+    as a file next to the .blend to install as an add-on.
+    """
+    tools = Path(__file__).with_name("maptile_tools.py")
+    if tools.is_file():
+        shutil.copyfile(tools, out_dir / tools.name)
+        text = bpy.data.texts.load(str(out_dir / tools.name))
+        text.name = tools.name
+        text.use_module = True
+    path = out_dir / name
+    # No model.blend1 backup beside it: this is a fresh file every run.
+    bpy.context.preferences.filepaths.save_version = 0
+    bpy.ops.wm.save_as_mainfile(filepath=str(path), compress=True)
+    bpy.ops.file.make_paths_relative()
+    bpy.ops.wm.save_mainfile(compress=True)
+    log(f"saved {path}")
+    return path
 
 
 def copy_textures(
@@ -2044,33 +2319,41 @@ def main() -> int:
         for colour, normal in ground_textures
     ]
 
-    build_terrain(scene, work_dir, aerial_material)
-    # Roads sit just above the terrain, each class its own object, so they can
-    # be given their own material and their own layer downstream.
-    build_roads(
-        scene,
-        work_dir,
-        lambda name: make_textured_material(name, aerial_texture, roughness=0.85),
-    )
-    build_buildings(
-        scene, work_dir, facade_materials, aerial_material, ground_materials
-    )
+    # Each layer its own collection in the .blend and its own parent in the
+    # FBX, so Unity's hierarchy reads Roads > Road_Velperweg rather than a
+    # flat list of two thousand names.
+    with _Layer("Terrain"):
+        build_terrain(scene, work_dir, aerial_material)
+    with _Layer("Roads", "Roads"):
+        # Just above the terrain, one object per street, junction and stretch
+        # of paving, each surface class its own material slot.
+        build_roads(
+            scene,
+            work_dir,
+            lambda name: make_textured_material(name, aerial_texture, roughness=0.85),
+        )
+    with _Layer("Buildings", "Buildings"):
+        build_buildings(
+            scene, work_dir, facade_materials, aerial_material, ground_materials
+        )
 
     if "water" in extra_textures:
         # Water is the one smooth thing in the scene, so it gets a low
         # roughness while everything else stays matte.
-        build_water(
-            scene,
-            work_dir,
-            make_textured_material("M_water", extra_textures["water"], roughness=0.12),
-        )
+        with _Layer("Water"):
+            build_water(
+                scene,
+                work_dir,
+                make_textured_material("M_water", extra_textures["water"], roughness=0.12),
+            )
 
     if "tree" in extra_textures:
-        build_trees(
-            scene,
-            work_dir,
-            make_textured_material("M_tree", extra_textures["tree"], roughness=0.85),
-        )
+        with _Layer("Trees", "Trees"):
+            build_trees(
+                scene,
+                work_dir,
+                make_textured_material("M_tree", extra_textures["tree"], roughness=0.85),
+            )
 
     if "furniture" in extra_textures:
         # One material for both: the atlas covers a brick wall and a wooden
@@ -2078,45 +2361,55 @@ def main() -> int:
         furniture_material = make_textured_material(
             "M_furniture", extra_textures["furniture"], roughness=0.55
         )
-        build_furniture(scene, work_dir, furniture_material)
-        build_barriers(
-            scene,
-            work_dir,
-            furniture_material,
-            make_cutout_material("M_fence", extra_textures["fence"], roughness=0.6)
-            if "fence" in extra_textures
-            else None,
-        )
+        with _Layer("Street furniture"):
+            build_furniture(scene, work_dir, furniture_material)
+        with _Layer("Barriers", "Barriers"):
+            build_barriers(
+                scene,
+                work_dir,
+                furniture_material,
+                make_cutout_material("M_fence", extra_textures["fence"], roughness=0.6)
+                if "fence" in extra_textures
+                else None,
+            )
 
     if "vehicle" in extra_textures:
         # Car paint is the one glossy thing out here.
-        build_vehicles(
-            scene,
-            work_dir,
-            make_textured_material(
-                "M_vehicle", extra_textures["vehicle"], roughness=0.35
-            ),
-        )
+        with _Layer("Vehicles"):
+            build_vehicles(
+                scene,
+                work_dir,
+                make_textured_material(
+                    "M_vehicle", extra_textures["vehicle"], roughness=0.35
+                ),
+            )
 
     if "rail" in extra_textures:
-        build_rails(
-            scene,
-            work_dir,
-            make_textured_material("M_rail", extra_textures["rail"], roughness=0.7),
-        )
+        with _Layer("Rail", "Rails"):
+            build_rails(
+                scene,
+                work_dir,
+                make_textured_material("M_rail", extra_textures["rail"], roughness=0.7),
+            )
 
     if "structure" in extra_textures:
-        build_structures(
-            scene,
-            work_dir,
-            make_textured_material(
-                "M_structure", extra_textures["structure"], roughness=0.8
-            ),
-        )
+        with _Layer("Structures", "Structures"):
+            build_structures(
+                scene,
+                work_dir,
+                make_textured_material(
+                    "M_structure", extra_textures["structure"], roughness=0.8
+                ),
+            )
 
     # After everything visible, because the proxies are built from the same
     # intermediates and the log reads better with them at the end.
-    collision = build_collision(scene, work_dir)
+    with _Layer("Collision", "Collision"):
+        collision = build_collision(scene, work_dir)
+    # Present in the file and in the FBX, but out of the way while editing.
+    layer = bpy.context.view_layer.layer_collection.children.get("Collision")
+    if layer is not None:
+        layer.hide_viewport = True
 
     # Report the scene bounds so a coordinate or scale error shows up in the log
     # rather than only in Unity.
@@ -2133,9 +2426,15 @@ def main() -> int:
     )
 
     export_fbx(out_dir / scene["export"]["fbx_name"])
+    blend = save_blend(out_dir, scene["export"].get("blend_name", "model.blend"))
 
     summary = {
         "fbx": scene["export"]["fbx_name"],
+        "blend": blend.name,
+        "layers": {
+            collection.name: len(collection.all_objects)
+            for collection in bpy.context.scene.collection.children
+        },
         "bounds_local": {
             "x": [min(xs), max(xs)],
             "y": [min(ys), max(ys)],

@@ -47,6 +47,9 @@ CLASS_FOOTPATH = 8
 CLASS_PARKING = 9
 CLASS_TRANSIT = 10
 CLASS_QUAY = 11
+# The vertical face of a kerb, and the skirt along the outer edge of the road
+# network. Never painted into the land-cover raster: it has no area from above.
+CLASS_KERB = 12
 
 CLASS_NAMES = {
     CLASS_NONE: "unclassified",
@@ -61,6 +64,7 @@ CLASS_NAMES = {
     CLASS_PARKING: "parking",
     CLASS_TRANSIT: "transit_lane",
     CLASS_QUAY: "quay",
+    CLASS_KERB: "kerb",
 }
 
 # Tint and grain used to give each surface class some texture of its own on top
@@ -170,10 +174,13 @@ class SurfaceSet:
     # should hug the ground from one riding a bridge deck.
     # The deliberate lift the roads were given, so anything judging the drape
     # can take it back off rather than counting it as error.
-    road_lift_m: float = 0.06
+    road_lift_m: float = 0.03
     road_tri_level: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int32)
     )
+    # The road network as faces: quads across every street, kerbs and all.
+    # `road_tris` is the same surface in triangles, for the checks.
+    road_mesh: object | None = None
     class_grid: np.ndarray | None = None  # (n, n) uint8 on the terrain grid
     # (n, n) float, NaN off water: how far down the bed goes under each body.
     water_bed: np.ndarray | None = None
@@ -293,11 +300,15 @@ def build_surfaces(
     surfaces_cfg: dict,
     terrain,
     deck_sampler=None,
+    network=None,
 ) -> SurfaceSet:
-    """Fetch water and land cover, and classify the terrain grid.
+    """Fetch water and land cover, classify the terrain grid, build the roads.
 
     ``deck_sampler`` gives heights for road parts the BGT marks as being on a
     bridge; without one they are draped on the ground like everything else.
+    ``network`` is the NWB road network the cross-sections are cut along; see
+    `roads`. Without it every road is still built, from centrelines drawn down
+    the middle of the road itself.
     """
     import rasterio
 
@@ -470,59 +481,37 @@ def build_surfaces(
         result.water_bed = np.flipud(bed)
 
     if result.roads:
-        result.road_lift_m = float(surfaces_cfg.get("road_lift_m", 0.06))
-        (
-            result.road_tris,
-            result.road_tri_class,
-            result.road_tri_level,
-        ) = triangulate_roads(
+        from .roads import KERB_M, build_road_mesh
+
+        result.road_lift_m = float(surfaces_cfg.get("road_lift_m", 0.03))
+        mesh = build_road_mesh(
             result.roads,
-            # The grid, and deliberately not the mesh that everything else laid
-            # on the ground uses. A road is not placed at a height, it is
-            # draped: `drape_to_terrain` splits it until a flat triangle is
-            # within tolerance of the ground beneath, and that residual is what
-            # the lift above has to clear.
-            #
-            # Measured over a km of road on a 127k-triangle mesh, draping on the
-            # mesh instead left the terrain poking through by 25.5 cm against
-            # 25.4 cm -- no difference, because the test is the error at the
-            # centroid and the mesh can bulge inside a road triangle whichever
-            # surface was sampled. It cost 4.5 s a square kilometre to learn
-            # that. Worse, the lift is sized from how far the mesh rises above
-            # *the grid*, which is a statistic about the road only while the
-            # road is on the grid.
-            terrain.sample,
+            network,
+            # The surveyed ground, not the terrain as drawn: the terrain is
+            # pushed down under the roads afterwards, to fit them.
+            ground=terrain.sample,
             lift_m=result.road_lift_m,
-            tolerance_m=float(surfaces_cfg.get("road_drape_tolerance_m", 0.08)),
-            simplify_m=float(surfaces_cfg.get("road_simplify_m", 0.25)),
-            max_edge_m=float(surfaces_cfg.get("road_max_edge_m", 12.0)),
-            min_angle_deg=float(surfaces_cfg.get("road_min_angle_deg", 22.0)),
-            snap_m=float(surfaces_cfg.get("road_snap_m", 0.05)),
+            kerb_m=float(surfaces_cfg.get("kerb_m", KERB_M)),
             # Already fetched above, and the only thing that knows where the
             # surface of each body is.
             water=result.water,
-            water_clearance_m=float(
-                surfaces_cfg.get("road_water_clearance_m", 0.25)
-            ),
-            # One cell of the height grid: nothing below that is measured.
-            min_edge_m=(
-                float(abs(terrain.xs[1] - terrain.xs[0]))
-                if getattr(terrain, "xs", None) is not None and len(terrain.xs) > 1
-                else 0.0
-            ),
+            water_clearance_m=float(surfaces_cfg.get("road_water_clearance_m", 0.25)),
             deck_sampler=deck_sampler,
+            uv_origin=bbox.center,
         )
+        result.road_mesh = mesh
+        tris, owner = mesh.triangles()
+        result.road_tris = tris
+        result.road_tri_class = mesh.face_class[owner].astype(np.int32)
+        result.road_tri_level = mesh.face_level[owner].astype(np.int32)
         on_bridges = sum(1 for part in result.roads if part.level > 0)
         if on_bridges:
             result.counts["road_parts_on_bridges"] = on_bridges
         result.counts["road_parts"] = len(result.roads)
-        result.counts["road_triangles"] = int(len(result.road_tris))
-        LOG.info(
-            "road surface: %d parts, %d triangles across %d classes",
-            len(result.roads),
-            len(result.road_tris),
-            len(np.unique(result.road_tri_class)) if len(result.road_tris) else 0,
-        )
+        result.counts["road_faces"] = int(mesh.stats.get("faces", 0))
+        result.counts["road_quad_share"] = float(mesh.stats.get("quad_share", 0.0))
+        result.counts["road_kerb_faces"] = int(mesh.stats.get("kerb_faces", 0))
+        result.counts["road_objects"] = len(mesh.object_names)
 
     # Outside the water block, and guarded: land cover and water are
     # independently switchable, so this ran on a None grid whenever water was
@@ -581,131 +570,6 @@ def triangulate_water(bodies: list[WaterBody]) -> tuple[np.ndarray, np.ndarray]:
     if not triangles:
         return np.zeros((0, 3, 3)), np.zeros(0, dtype=np.int32)
     return np.concatenate(triangles), np.concatenate(owner)
-
-
-def _bisect_longest(triangles: np.ndarray) -> np.ndarray:
-    """Split each triangle across the midpoint of its longest edge.
-
-    Longest-edge bisection rather than a four-way split: it halves the worst
-    dimension, which is the one causing the error, and doubles the count
-    instead of quadrupling it.
-    """
-    lengths = np.stack(
-        [
-            np.linalg.norm(triangles[:, (k + 1) % 3] - triangles[:, k], axis=1)
-            for k in range(3)
-        ],
-        axis=1,
-    )
-    longest = np.argmax(lengths, axis=1)
-    rows = np.arange(len(triangles))
-
-    start = triangles[rows, longest]
-    end = triangles[rows, (longest + 1) % 3]
-    apex = triangles[rows, (longest + 2) % 3]
-    middle = 0.5 * (start + end)
-
-    # Both halves keep the parent's winding.
-    return np.concatenate(
-        [
-            np.stack([start, middle, apex], axis=1),
-            np.stack([middle, end, apex], axis=1),
-        ]
-    )
-
-
-def drape_to_terrain(
-    triangles_xy: np.ndarray,
-    sampler,
-    *,
-    tolerance_m: float = 0.08,
-    # A floor on how small a road triangle is worth cutting: the spacing the
-    # ground was sampled at. Below one cell the surface under it is the
-    # interpolation's opinion rather than a measurement, so splitting further
-    # buys nothing and the loop would only be chasing a step it cannot resolve.
-    min_edge_m: float = 0.0,
-    # Twenty rather than twelve. With a floor to stop at, extra rounds are free
-    # where nothing needs them -- only triangles still over tolerance are cut --
-    # and twelve was not enough for a long street over a 1 m height grid, which
-    # needs about fourteen halvings to get from a 100 m span down to a cell.
-    # That left one carriageway 0.82 m off the ground it was draped on.
-    max_rounds: int = 20,
-) -> np.ndarray:
-    """Give flat triangles a Z that follows the ground under them.
-
-    Sampling only the corners is not enough. Earcut turns a road strip into
-    long slivers — a quarter of the edges over Utrecht are longer than 10 m and
-    the longest is 163 m — and a flat triangle that size cuts through the bank
-    of a canal by nearly two metres.
-
-    So triangles are split until a flat one no longer misses the ground beneath
-    it. The test is the error at the centroid, where a plane through the three
-    corners is exactly their mean, which makes this adaptive rather than
-    uniform: flat streets stay coarse and only the slopes get subdivided.
-
-    Splitting one triangle and not its neighbour leaves a hanging node, and so
-    a crack no wider than the tolerance. That is harmless here and only here,
-    because the terrain sits directly underneath wearing the same photograph:
-    a crack shows the ground, not a hole.
-    """
-    triangles = np.asarray(triangles_xy, dtype=np.float64)
-    if len(triangles) == 0:
-        return np.zeros((0, 3, 3))
-
-    for _ in range(max_rounds):
-        centroid = triangles.mean(axis=1)
-        corner_z = sampler(
-            triangles[:, :, 0].ravel(), triangles[:, :, 1].ravel()
-        ).reshape(-1, 3)
-        error = np.abs(corner_z.mean(axis=1) - sampler(centroid[:, 0], centroid[:, 1]))
-
-        split = error > tolerance_m
-        if min_edge_m > 0:
-            longest = np.max(
-                np.stack(
-                    [
-                        np.hypot(
-                            *(
-                                triangles[:, (i + 1) % 3, :2]
-                                - triangles[:, i, :2]
-                            ).T
-                        )
-                        for i in range(3)
-                    ]
-                ),
-                axis=0,
-            )
-            split &= longest > min_edge_m
-        if not split.any():
-            break
-        triangles = np.concatenate(
-            [triangles[~split], _bisect_longest(triangles[split])]
-        )
-
-    corner_z = sampler(
-        triangles[:, :, 0].ravel(), triangles[:, :, 1].ravel()
-    ).reshape(-1, 3)
-    return np.dstack([triangles, corner_z[:, :, None]])
-
-
-def _flat_triangles(rings: list[np.ndarray]) -> np.ndarray:
-    """Earcut one ring group into flat triangles, or nothing."""
-    import mapbox_earcut
-
-    usable = [np.asarray(r, dtype=np.float64)[:, :2] for r in rings]
-    usable = [r for r in usable if len(r) >= 3]
-    if not usable:
-        return np.zeros((0, 3, 2))
-    flat = np.vstack(usable)
-    ends = np.cumsum([len(r) for r in usable]).astype(np.uint32)
-    try:
-        indices = mapbox_earcut.triangulate_float64(flat, ends)
-    except Exception as exc:  # noqa: BLE001 - one bad outline is not fatal
-        LOG.debug("could not triangulate a road part: %s", exc)
-        return np.zeros((0, 3, 2))
-    if len(indices) < 3:
-        return np.zeros((0, 3, 2))
-    return flat[np.asarray(indices, dtype=np.int64)].reshape(-1, 3, 2)
 
 
 # How far above the ground a bridge carriageway may plausibly be. Past this the
@@ -767,172 +631,6 @@ def _hold_above_water(points, z, water, clearance_m: float):
     return out
 
 
-def triangulate_roads(
-    roads: list[RoadPart],
-    sampler,
-    *,
-    lift_m: float = 0.06,
-    tolerance_m: float = 0.08,
-    min_edge_m: float = 0.0,
-    simplify_m: float = 0.25,
-    max_edge_m: float = 12.0,
-    min_angle_deg: float = 22.0,
-    snap_m: float = 0.05,
-    water: list | None = None,
-    water_clearance_m: float = 0.25,
-    deck_sampler=None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Road polygons into ``(triangles, surface class)``, draped on the ground.
-
-    Triangulated here rather than in the Blender stage, for the same reason the
-    water and the buildings are: that script only gets what Blender bundles.
-    """
-    import mapbox_earcut
-
-    flat_tris: list[np.ndarray] = []
-    classes: list[np.ndarray] = []
-    levels: list[np.ndarray] = []
-
-    for part in roads:
-        rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in part.rings]
-        rings = [r for r in rings if len(r) >= 3]
-        if not rings:
-            continue
-
-        flat = np.vstack(rings)
-        ring_ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
-        try:
-            indices = mapbox_earcut.triangulate_float64(flat, ring_ends)
-        except Exception as exc:  # noqa: BLE001 - one bad outline is not fatal
-            LOG.debug("could not triangulate a road part: %s", exc)
-            continue
-        if len(indices) < 3:
-            continue
-
-        corners = flat[np.asarray(indices, dtype=np.int64)].reshape(-1, 3, 2)
-        flat_tris.append(corners)
-        classes.append(np.full(len(corners), part.surface_class, dtype=np.int32))
-        levels.append(np.full(len(corners), part.level, dtype=np.int32))
-
-    if not flat_tris:
-        empty = np.zeros(0, dtype=np.int32)
-        return np.zeros((0, 3, 3)), empty, empty
-
-    # Refined per class, so the split triangles keep the class they came from.
-    out_tris: list[np.ndarray] = []
-    out_class: list[np.ndarray] = []
-    out_level: list[np.ndarray] = []
-    all_tris = np.concatenate(flat_tris)
-    all_class = np.concatenate(classes)
-    all_level = np.concatenate(levels)
-
-    # A road at grade follows the ground, and is built to follow it rather than
-    # cut up afterwards until it does.
-    #
-    # Every class is triangulated as one surface, not part by part. A street and
-    # the junction it runs into are separate BGT parts carrying the same kerb
-    # between them, and triangulating them separately leaves two meshes abutting
-    # along a seam instead of one continuous road.
-    from .roadmesh import build_road_mesh
-
-    for code in np.unique([part.surface_class for part in roads]):
-        groups = [
-            part.rings for part in roads
-            if part.surface_class == code and part.level <= 0
-        ]
-        if not groups:
-            continue
-        points, tris = build_road_mesh(
-            groups,
-            simplify_m=simplify_m,
-            max_edge_m=max_edge_m,
-            min_angle_deg=min_angle_deg,
-            snap_m=snap_m,
-            sampler=sampler,
-            tolerance_m=tolerance_m,
-        )
-        if not len(tris):
-            continue
-        z = np.asarray(sampler(points[:, 0], points[:, 1]), dtype=np.float64) + lift_m
-        z = _hold_above_water(points, z, water, water_clearance_m)
-        placed = np.column_stack([points, z])[tris]
-        out_tris.append(placed)
-        out_class.append(np.full(len(tris), code, dtype=np.int32))
-        out_level.append(np.zeros(len(tris), dtype=np.int32))
-
-    # A road on a bridge follows its deck. Without this the deck rises to its
-    # real height and leaves its own carriageway lying on the water.
-    #
-    # One height per BGT part, not a surface to chase. The DSM is a raster of
-    # whatever the lidar hit, so over a bridge it also holds railings, gantries
-    # and the buildings beside it; refining against it drove the road mesh from
-    # 35k triangles to 510k and put one carriageway 95 m up. A median over the
-    # part ignores all of that, and a bridge deck is flat enough over the span
-    # of one part that a single height is the right answer anyway.
-    elevated = [part for part in roads if part.level > 0]
-    unmeasured = 0
-    if elevated and deck_sampler is not None:
-        for part in elevated:
-            corners = _flat_triangles(part.rings)
-            if not len(corners):
-                continue
-            points = corners.reshape(-1, 2)
-            ground = np.asarray(sampler(points[:, 0], points[:, 1]))
-            level = _robust_deck_level(points, deck_sampler, ground)
-            if level is None:
-                # Nothing usable overhead. Drape it like any other road rather
-                # than hoist it to whatever the lidar happened to hit —
-                # flattening it to the ground's median instead put half of it
-                # under the ground it was supposed to be crossing.
-                draped = drape_to_terrain(
-                    corners, sampler, tolerance_m=tolerance_m,
-                    min_edge_m=min_edge_m,
-                )
-                if not len(draped):
-                    continue
-                draped[:, :, 2] += lift_m
-                out_tris.append(draped)
-                out_class.append(
-                    np.full(len(draped), part.surface_class, dtype=np.int32)
-                )
-                # Recorded as at grade, because that is where it ended up.
-                out_level.append(np.zeros(len(draped), dtype=np.int32))
-                unmeasured += 1
-                continue
-
-            # The deck level is one flat height for the whole part, which is
-            # right over the span and wrong at the ends: a bridge part carries
-            # its approach ramp too, and where that runs onto rising ground a
-            # flat deck sinks into it. So the road sits on the deck or on the
-            # ground, whichever is higher. That keeps the span flat, lets the
-            # ramp meet grade the way a ramp does, and leaves no vertex under
-            # the terrain it is supposed to be crossing.
-            floor = ground.reshape(len(corners), 3, 1)
-            z = np.maximum(np.full((len(corners), 3, 1), level), floor) + lift_m
-            out_tris.append(np.dstack([corners, z]))
-            out_class.append(
-                np.full(len(corners), part.surface_class, dtype=np.int32)
-            )
-            out_level.append(np.full(len(corners), part.level, dtype=np.int32))
-
-    if unmeasured:
-        LOG.info(
-            "%d of %d road parts on bridges had no usable deck reading and "
-            "were draped on the ground instead",
-            unmeasured,
-            len(elevated),
-        )
-
-    if not out_tris:
-        empty = np.zeros(0, dtype=np.int32)
-        return np.zeros((0, 3, 3)), empty, empty
-    return (
-        np.concatenate(out_tris),
-        np.concatenate(out_class),
-        np.concatenate(out_level),
-    )
-
-
 def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
     """Write water outlines and the class grid for the Blender stage."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -966,11 +664,9 @@ def save_surfaces(surfaces: SurfaceSet, bbox: BBox, work_dir: Path) -> Path:
         water_ring_offsets=np.asarray(ring_offsets, dtype=np.int64),
         water_ring_body=np.asarray(ring_body, dtype=np.int32),
         water_levels=np.asarray(body_levels, dtype=np.float64),
-        # Roads leave as their own geometry so they can carry their own
-        # material and sit on their own layer in Unity.
-        road_tris=surfaces.road_tris,
-        road_tri_class=surfaces.road_tri_class,
-        road_tri_level=surfaces.road_tri_level,
+        # Roads leave as their own geometry, one object per street, so they
+        # can carry their own materials and sit on their own layer in Unity.
+        **(surfaces.road_mesh.to_npz_fields() if surfaces.road_mesh is not None else {}),
         road_lift_m=surfaces.road_lift_m,
         class_grid=(
             surfaces.class_grid
@@ -1170,6 +866,7 @@ __all__ = [
     "CLASS_DETAIL",
     "CLASS_FOOTPATH",
     "CLASS_GREEN",
+    "CLASS_KERB",
     "CLASS_NAMES",
     "CLASS_NONE",
     "CLASS_PARKING",
@@ -1186,9 +883,7 @@ __all__ = [
     "blend_surface_detail",
     "build_surfaces",
     "clip_ring_to_bbox",
-    "drape_to_terrain",
     "road_class",
-    "triangulate_roads",
     "triangulate_water",
     "save_surfaces",
     "write_land_cover",

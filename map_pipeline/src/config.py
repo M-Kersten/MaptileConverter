@@ -226,33 +226,19 @@ DEFAULTS: dict[str, Any] = {
         # one into a bulge. BGT outlines replace the guesswork.
         "water": True,
         "land_cover": True,
-        # Roads as their own geometry, one object per surface class, so they
-        # carry their own material and their own layer in Unity instead of
-        # being pixels in the terrain's texture.
+        # Roads as their own geometry: quads across every street, cut along
+        # the national road network (NWB), one object per street.
         "road_geometry": True,
-        # How far the road surface floats above the terrain, to keep the two
-        # from fighting for the same depth.
-        "road_lift_m": 0.06,
-        # How far a flat road triangle may miss the ground under it before it
-        # gets split. Earcut leaves slivers over 100 m long, and one that size
-        # cuts straight through a canal bank.
-        "road_drape_tolerance_m": 0.08,
-        # How far a simplified kerb may move. BGT surveys to the centimetre, so
-        # a straight street arrives carrying a vertex every few centimetres and
-        # every one of them used to become geometry.
-        "road_simplify_m": 0.25,
-        # The size a road face aims for. Also what the kerb is cut at, because a
-        # constrained edge cannot be crossed: a 280 m kerb left as one segment
-        # forces every triangle along it to span the whole street.
-        "road_max_edge_m": 12.0,
-        # Refinement stops chasing shape here. A road outline has sharp corners
-        # where two streets meet and no triangulation improves those.
-        "road_min_angle_deg": 22.0,
-        # How far a kerb may be bent onto a vertex that all but lies on it.
-        # Two BGT parts sharing a kerb have both drawn it, and where the two
-        # drawings disagree by a few millimetres the pair becomes a ribbon of
-        # near-zero triangles that welding cannot see.
-        "road_snap_m": 0.05,
+        "nwb_url": (
+            "https://api.pdok.nl/rws/nationaal-wegenbestand-wegen/ogc/v1/"
+            "collections/wegvakken/items"
+        ),
+        # How far the road surface floats above the surveyed ground. The
+        # terrain is pushed down under it as well, so this only has to keep
+        # the two apart, not clear the terrain's error.
+        "road_lift_m": 0.03,
+        # Height of the kerb between a footway and the carriageway beside it.
+        "kerb_m": 0.10,
         # How far above a water surface a path crossing it is held. The
         # bare-earth grid has a hole over every body and the filler dips across
         # it -- 1.45 m below its own bank over the Gelderland square -- so a
@@ -374,6 +360,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "export": {
         "fbx_name": "model.fbx",
+        # The same scene for editing: collections per layer, quads and
+        # n-gons kept, the Maptile tools inside.
+        "blend_name": "model.blend",
         "aerial_name": "aerial.png",
         "metadata_name": "metadata.json",
         # Collision_* objects alongside the visible ones, for a simulation
@@ -387,6 +376,76 @@ DEFAULTS: dict[str, Any] = {
         "collision_tree_crowns": True,
     },
 }
+
+
+# One choice in place of a page of sliders. Each level sets how sharp the
+# aerial is (as ground resolution, so it means the same over any area), how
+# closely spaced the terrain grid is, and how large the wall images are. A
+# config file names one with a top-level "detail"; anything it also sets
+# explicitly wins. The UI shows the same table (ui/index.html, DETAIL), and a
+# test keeps the two equal.
+DETAIL_PRESETS: dict[str, dict] = {
+    "draft": {"aerial_cm": 50, "grid_m": 4.0, "facade_px": 256,
+              "buildings_per_look": 160, "normal_map": False},
+    "standard": {"aerial_cm": 25, "grid_m": 2.0, "facade_px": 512,
+                 "buildings_per_look": 80, "normal_map": True},
+    "high": {"aerial_cm": 12, "grid_m": 1.0, "facade_px": 1024,
+             "buildings_per_look": 40, "normal_map": True},
+}
+
+
+# Settings that no longer do anything, and what took their place. A config
+# that still carries one loads, and says so, rather than failing or being
+# silently ignored.
+RETIRED: dict[str, str] = {
+    "terrain.mesh_vertices_per_side": "the terrain is a regular grid; set terrain.grid_m",
+    "terrain.simplify_tolerance_m": "the terrain is a regular grid; set terrain.grid_m",
+    "terrain.breaklines": "the terrain is a regular grid with the roads laid on top",
+    "terrain.breakline_simplify_m": "the terrain is a regular grid with the roads laid on top",
+    "terrain.contour_interval_m": "the terrain is a regular grid with the roads laid on top",
+    "terrain.min_feature_length_m": "the terrain is a regular grid with the roads laid on top",
+    "terrain.max_face_m": "the terrain is a regular grid; set terrain.grid_m",
+    "terrain.quads": "the terrain is quads already",
+    "terrain.quad_max_fold_deg": "the terrain is quads already",
+    "terrain.quad_min_angle_deg": "the terrain is quads already",
+    "surfaces.road_drape_tolerance_m": "roads are cut across along their centrelines",
+    "surfaces.road_simplify_m": "roads are cut across along their centrelines",
+    "surfaces.road_max_edge_m": "roads are cut across along their centrelines",
+    "surfaces.road_min_angle_deg": "roads are cut across along their centrelines",
+    "surfaces.road_snap_m": "roads are cut across along their centrelines",
+}
+
+
+def _retired_keys(raw: dict) -> list[str]:
+    """Warnings for each retired setting a config file still sets."""
+    out = []
+    for path, instead in RETIRED.items():
+        section, key = path.split(".", 1)
+        if isinstance(raw.get(section), dict) and key in raw[section]:
+            out.append(f"{path} no longer does anything: {instead}")
+    return out
+
+
+def detail_settings(detail: str, side_m: float) -> dict:
+    """The config sections a detail level stands for, over an area this wide."""
+    try:
+        preset = DETAIL_PRESETS[str(detail).strip().lower()]
+    except KeyError:
+        raise ValueError(
+            f"detail must be one of {', '.join(DETAIL_PRESETS)}, got {detail!r}"
+        ) from None
+    # A multiple of 4 px: the mosaic splits the photo into tiles and whole
+    # numbers keep every tile boundary on an exact pixel.
+    size_px = max(256, int(round(side_m / (preset["aerial_cm"] / 100.0) / 4.0)) * 4)
+    return {
+        "aerial": {"size_px": size_px},
+        "terrain": {"grid_m": float(preset["grid_m"])},
+        "facade": {
+            "texture_px": int(preset["facade_px"]),
+            "buildings_per_look": int(preset["buildings_per_look"]),
+            "normal_map": bool(preset["normal_map"]),
+        },
+    }
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -473,8 +532,17 @@ def load_config(path: str | Path) -> PipelineConfig:
     if "bbox" not in raw:
         raise ValueError(f"{path} has no 'bbox' section")
 
-    merged = _deep_merge(DEFAULTS, raw)
     bbox = parse_bbox(raw["bbox"])
+    retired = _retired_keys(raw)
+    for warning in retired:
+        LOG.warning("%s", warning)
+    base = DEFAULTS
+    if raw.get("detail") is not None:
+        # The level first, then whatever the file sets explicitly on top.
+        base = _deep_merge(
+            DEFAULTS, detail_settings(raw["detail"], max(bbox.width, bbox.height))
+        )
+    merged = _deep_merge(base, {k: v for k, v in raw.items() if k != "detail"})
     warnings = validate_bbox(bbox)
     for warning in warnings:
         LOG.warning("%s", warning)
@@ -590,8 +658,15 @@ def load_config(path: str | Path) -> PipelineConfig:
         usage=merged["usage"],
         export=merged["export"],
         source_path=path,
-        warnings=warnings,
+        warnings=warnings + retired,
     )
 
 
-__all__ = ["DEFAULTS", "PipelineConfig", "load_config"]
+__all__ = [
+    "DEFAULTS",
+    "DETAIL_PRESETS",
+    "PipelineConfig",
+    "RETIRED",
+    "detail_settings",
+    "load_config",
+]

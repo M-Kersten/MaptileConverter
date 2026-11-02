@@ -11,13 +11,15 @@ numpy>=1.24
 pyproj>=3.5
 mapbox_earcut>=1.0
 pillow>=10.0
+# The road mesher splits the BGT road surfaces along cross-sections, which is
+# polygon overlay: noding, polygonize, coverage cleaning. 2.1 brings coverage
+# simplification; 2.2 adds coverage cleaning, used when present.
+shapely>=2.1
 
 # owslib is deliberately not a dependency. For the AHN WCS it follows the
 # operation URL advertised in the capabilities document, which currently 404s,
 # and it serialises a list-valued coverage id into the query string. The WCS
 # request is a plain GET instead (see src/elevation.py).
-# shapely is not needed either: the only geometry work is triangulation, which
-# mapbox_earcut handles.
 
 # Blender. The pip module runs the whole Blender stage headless without a
 # separate Blender install, and needs CPython 3.11.
