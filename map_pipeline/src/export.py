@@ -82,8 +82,7 @@ def build_metadata(
         "terrain": {
             "coverage": terrain.coverage_id,
             "source_resolution_m": terrain.resolution_m,
-            "mesh_vertices_per_side": terrain.n,
-            "grid_spacing_m": round(bbox.width / (terrain.n - 1), 4),
+            "grid_spacing_m": round(terrain.grid_m, 4),
             **terrain.stats(),
         },
         "aerial": aerial.to_dict(),
@@ -197,20 +196,7 @@ def write_scene_description(
         "ground_z_offset_nap": float(terrain.center_z_nap),
         "bbox_rd": geo.bbox.as_list(),
         "bbox_local": local.as_list(),
-        "terrain": {
-            "file": "terrain_grid.npz",
-            # Present whenever a mesh was built, by either route. Both write
-            # the same file; the file itself says which addressing it uses.
-            # Checking only `mesh` here is what silently shipped the plain
-            # grid for every run that used breaklines, because those set
-            # `constrained` instead and left `mesh` as None.
-            **(
-                {"mesh_file": "terrain_mesh.npz"}
-                if getattr(terrain, "mesh", None) is not None
-                or getattr(terrain, "constrained", None) is not None
-                else {}
-            ),
-        },
+        "terrain": {"file": "terrain_grid.npz"},
         "buildings": {
             "file": "buildings.npz",
             "merge": buildings_cfg["merge"],

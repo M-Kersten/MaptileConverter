@@ -30,7 +30,7 @@ Two families of geometry, and they need different treatment:
   zero-thickness wall shows as a hole from one side in anything with backface
   culling on.
 * **Polygons** extrude: the ring becomes vertical quads and the top gets a cap.
-  The cap is earcut, which fans a thin strip into slivers -- see roadmesh for
+  The cap is earcut, which fans a thin strip into slivers -- see roads for
   how much that matters on a surface. It does not matter here: the top of a
   30 cm wall is not lit, walked on, or ever seen from above, and the sides,
   which are the part you look at, are clean quads by construction.
@@ -102,7 +102,7 @@ def _drape_points(points: np.ndarray, sampler, step_m: float, tolerance_m: float
     because they are the shape of the fence rather than the shape of the
     ground under it.
     """
-    from .roadmesh import _douglas_peucker_keep
+    from .geo import douglas_peucker_keep as _douglas_peucker_keep
 
     dense = densify(points, step_m)
     height = np.asarray(sampler(dense[:, 0], dense[:, 1]), dtype=np.float64)
@@ -736,9 +736,13 @@ def save_barriers(barriers: BarrierSet, path: Path) -> Path:
         material=barriers.material,
         kind=barriers.kind,
         uv=barriers.uv,
-        material_names=np.array(barriers.material_names, dtype=object),
-        kind_names=np.array(barriers.kind_names, dtype=object),
-        see_through=np.array(barriers.see_through, dtype=object),
+        # Fixed-width strings, never object arrays. An object array is
+        # pickled, and a pickle written by NumPy 2 names `numpy._core`, which
+        # the NumPy 1.26 bundled with Blender 4.2 cannot import: the Blender
+        # stage died on the first barrier with every other layer built.
+        material_names=np.array(barriers.material_names, dtype=str),
+        kind_names=np.array(barriers.kind_names, dtype=str),
+        see_through=np.array(barriers.see_through, dtype=str),
         collision_vertices=barriers.collision_vertices,
         collision_triangles=barriers.collision_triangles,
         collision_thickness_m=np.float64(barriers.collision_thickness_m),

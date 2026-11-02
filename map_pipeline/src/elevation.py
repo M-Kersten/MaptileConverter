@@ -23,13 +23,16 @@ import numpy as np
 
 from .geo import BBox, tile_edges, build_grid_coords
 from .http_util import ServiceError, get_with_retry, short_error
-from .terrain_mesh import (
-    TerrainMesh,
-    build_rtin,
-    save_terrain_mesh,
-)
 
 LOG = logging.getLogger(__name__)
+
+# Spacing of the terrain grid when nothing asks for another. Measured against
+# every 0.5 m AHN pixel over Bronbeek, a 2 m grid is within 11 cm for 95% of
+# the ground and off by more than 25 cm on 0.8% of it, at 251k vertices. The
+# adaptive triangulation it replaced held 90k vertices and was off by more than
+# 25 cm on 12% of the same ground, because it was cut from a smoothed 3.9 m
+# grid rather than from the survey.
+DEFAULT_GRID_M = 2.0
 
 # AHN marks empty cells with the largest float32. Anything above this cutoff is
 # nodata rather than a real height.
@@ -51,6 +54,34 @@ COVERAGE_IDS = {"DTM": "dtm_05m", "DSM": "dsm_05m"}
 MAX_COVERAGE_PX = 4000
 
 
+class HeightRaster:
+    """Heights on a regular raster over the bbox, NaN where nothing is.
+
+    What the road surface looks like from above: where a road is, this says
+    how high its top is; everywhere else it says nothing, and whoever asks
+    falls back to the ground.
+    """
+
+    def __init__(self, values: np.ndarray, bbox: BBox):
+        self.values = np.asarray(values, dtype=np.float64)
+        self.bbox = bbox
+        rows, cols = self.values.shape
+        self.cell_x = bbox.width / cols
+        self.cell_y = bbox.height / rows
+
+    def __call__(self, x, y):
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        rows, cols = self.values.shape
+        col = np.floor((x - self.bbox.xmin) / self.cell_x).astype(np.int64)
+        # Raster rows run north-down.
+        row = np.floor((self.bbox.ymax - y) / self.cell_y).astype(np.int64)
+        inside = (col >= 0) & (col < cols) & (row >= 0) & (row < rows)
+        out = np.full(np.broadcast(x, y).shape, np.nan)
+        out[inside] = self.values[row[inside], col[inside]]
+        return out
+
+
 @dataclass
 class TerrainResult:
     """The height grid plus everything needed to place and check it."""
@@ -65,64 +96,47 @@ class TerrainResult:
     geotiff_path: Path | None
     coverage_id: str
     resolution_m: float
-    mesh: "TerrainMesh | None" = None
-    constrained: "ConstrainedMesh | None" = None
-    # Normally left alone: `surface` builds this from `constrained` the first
-    # time it is asked, so there is no wiring step between having a mesh and
-    # draping on it. Set it to override that. See `surface` below.
-    surface_sampler: object | None = None
+    # The grid as surveyed, before anything was pushed down under a road.
+    # `heights` is what the model shows; this is what the ground is.
+    measured: np.ndarray | None = None
+    # The top of the road surface, once the roads are built. See `surface`.
+    road_top: HeightRaster | None = None
+    # Grid vertices lowered under the road surface, and by how much at most.
+    conformed: dict | None = None
+    # How far the grid strays from every surveyed pixel it was built from.
+    survey_error: dict | None = None
 
     @property
     def n(self) -> int:
         return int(self.heights.shape[0])
 
+    @property
+    def grid_m(self) -> float:
+        return float(self.xs[1] - self.xs[0]) if self.n > 1 else 0.0
+
     def sample(self, x, y):
-        """Bilinear height lookup at RD coordinates, clamped to the grid."""
-        return _bilinear_on_grid(self.heights, self.xs, self.ys, x, y)
+        """The surveyed ground at RD coordinates, bilinear, clamped to the grid.
+
+        Not lowered under the roads: this is the ground as measured, which is
+        what a road, a building or a check wants to know about.
+        """
+        grid = self.measured if self.measured is not None else self.heights
+        return _bilinear_on_grid(grid, self.xs, self.ys, x, y)
 
     def surface(self, x, y):
-        """Heights off the ground the model actually shows.
+        """The top of whatever the model shows at RD coordinates.
 
-        Usually the same thing as `sample`, and deliberately not always. When
-        the terrain is a constrained mesh, the grid and the mesh agree exactly
-        along every breakline -- a kerb is an edge of the mesh -- and differ by
-        up to the simplification tolerance everywhere else, because inside a
-        triangle the mesh is a plane where the grid curves. Anything placed on
-        the ground wants the mesh; anything measuring the terrain's own error
-        wants the grid, which is why both are here.
-
-        The sampler is built from the mesh this result already carries rather
-        than handed in beside it, because the two can then never disagree: a
-        terrain with a mesh drapes on it by construction, and there is no
-        separate assignment to forget.
+        On a road that is the road. Everywhere else it is the terrain exactly
+        as it is drawn: each grid square is two flat triangles split corner to
+        corner from south-west to north-east, which is the split Blender and
+        the FBX export make, so a lamp post or a tree trunk stands on the face
+        it will be seen standing on rather than on a curve between them.
         """
-        sampler = self._surface_sampler()
-        if sampler is None:
-            return self.sample(x, y)
-        return sampler(x, y)
-
-    def _surface_sampler(self):
-        """The mesh sampler, built once on demand.
-
-        Indexing a square kilometre's triangles costs a quarter of a second,
-        which is nothing against a pipeline run but is worth not paying in the
-        runs -- the checks, mostly -- that only ever ask for the grid.
-        """
-        if self.surface_sampler is None and self.constrained is not None:
-            if not len(self.constrained.triangles):
-                return None
-            from .terrain_mesh import MeshSampler
-
-            self.surface_sampler = MeshSampler(
-                self.constrained.vertices,
-                self.constrained.triangles,
-                fallback=self.sample,
-            )
-            LOG.info(
-                "draping on the terrain mesh: %d triangles indexed",
-                len(self.constrained.triangles),
-            )
-        return self.surface_sampler
+        ground = _triangulated_on_grid(self.heights, self.xs, self.ys, x, y)
+        if self.road_top is None:
+            return ground
+        top = self.road_top(x, y)
+        return np.where(np.isfinite(top), top, ground)
 
     def stats(self) -> dict:
         h = self.heights
@@ -132,14 +146,30 @@ class TerrainResult:
             "mean_nap": float(h.mean()),
             "center_nap": float(self.center_z_nap),
             "vertices_per_side": self.n,
+            "grid_m": round(self.grid_m, 4),
             "nodata_fraction_raw": float(self.nodata_fraction_raw),
             "filled_fraction": float(self.filled_fraction),
         }
-        if self.mesh is not None:
-            out["mesh"] = self.mesh.stats()
-        if self.constrained is not None:
-            out["mesh"] = self.constrained.stats()
+        if self.survey_error:
+            out["error_against_survey"] = dict(self.survey_error)
+        if self.conformed:
+            out["lowered_under_roads"] = dict(self.conformed)
         return out
+
+    def save(self, work_dir: Path) -> None:
+        """Write the grid the Blender stage builds the terrain from."""
+        np.save(work_dir / "terrain_heights.npy", self.heights.astype(np.float32))
+        np.savez(
+            work_dir / "terrain_grid.npz",
+            heights=self.heights.astype(np.float32),
+            measured=(
+                self.measured if self.measured is not None else self.heights
+            ).astype(np.float32),
+            xs=self.xs,
+            ys=self.ys,
+            bbox=np.asarray(self.bbox.as_list(), dtype=np.float64),
+            center_z_nap=np.float64(self.center_z_nap),
+        )
 
 
 def _coverage_id(ahn_model: str) -> str:
@@ -604,18 +634,73 @@ def _bilinear_on_grid(grid: np.ndarray, xs: np.ndarray, ys: np.ndarray, x, y):
     )
 
 
+def _triangulated_on_grid(grid: np.ndarray, xs: np.ndarray, ys: np.ndarray, x, y):
+    """Height on the grid drawn as triangles, split south-west to north-east.
+
+    A grid square is four heights that are almost never coplanar, so the
+    surface between them depends on which diagonal the renderer splits it
+    along. Bilinear interpolation is neither split; it is a curved patch no
+    engine draws. Blender's fixed quad split and the FBX export both cut from
+    the first corner to the third, which on a square wound south-west,
+    south-east, north-east, north-west is the SW-NE diagonal, so that is the
+    surface reported here.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+
+    n_x, n_y = xs.size, ys.size
+    step_x = (xs[-1] - xs[0]) / (n_x - 1)
+    step_y = (ys[-1] - ys[0]) / (n_y - 1)
+
+    fx = np.clip((x - xs[0]) / step_x, 0, n_x - 1)
+    fy = np.clip((y - ys[0]) / step_y, 0, n_y - 1)
+    # The last row and column belong to the square below and left of them.
+    i0 = np.minimum(np.floor(fx).astype(np.int64), n_x - 2)
+    j0 = np.minimum(np.floor(fy).astype(np.int64), n_y - 2)
+    tx = fx - i0
+    ty = fy - j0
+
+    v00 = grid[j0, i0]
+    v10 = grid[j0, i0 + 1]
+    v01 = grid[j0 + 1, i0]
+    v11 = grid[j0 + 1, i0 + 1]
+
+    lower = tx >= ty  # south-east of the diagonal
+    return np.where(
+        lower,
+        v00 + tx * (v10 - v00) + ty * (v11 - v10),
+        v00 + ty * (v01 - v00) + tx * (v11 - v01),
+    )
+
+
+def grid_size_for(bbox: BBox, grid_m: float) -> int:
+    """Vertices per side for a grid no coarser than `grid_m` over the bbox.
+
+    Sized on the longer side, so a slightly oblong area gets slightly finer
+    spacing across its short side rather than coarser along its long one.
+    """
+    if grid_m <= 0:
+        raise ValueError(f"terrain.grid_m must be positive, got {grid_m}")
+    return max(2, int(np.ceil(max(bbox.width, bbox.height) / grid_m - 1e-9)) + 1)
+
+
 def build_terrain(
     bbox: BBox,
     work_dir: Path,
     *,
     terrain_cfg: dict,
-    breakline_rings: dict | None = None,
 ) -> TerrainResult:
-    """Fetch AHN for `bbox` and turn it into a clean NxN height grid."""
+    """Fetch AHN for `bbox` and turn it into a regular height grid.
+
+    Regular because it is edited. A sculptor, a loop select and a Unity
+    heightmap all expect rows and columns, and every adaptive mesh this
+    pipeline tried instead traded that away for a vertex count nobody had
+    asked to save.
+    """
     import rasterio
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    n = int(terrain_cfg["mesh_vertices_per_side"])
+    n = grid_size_for(bbox, float(terrain_cfg.get("grid_m", DEFAULT_GRID_M)))
     resolution = float(terrain_cfg["resolution_m"])
     ahn_model = str(terrain_cfg["ahn_model"]).upper()
 
@@ -684,78 +769,31 @@ def build_terrain(
         )
 
     xs, ys = build_grid_coords(bbox, n)
+    # Each vertex is the mean of the survey pixels nearest it. Measured at 2 m
+    # over Bronbeek that is within 11 cm of the survey for 95% of the ground,
+    # against 13 cm for reading the single pixel under each vertex.
     grid, hit = _resample_to_grid(raw, valid, bounds, xs, ys)
     filled, filled_cells = _fill_holes(grid)
-    filled = _smooth(filled, int(terrain_cfg["smooth_iterations"]))
+    # Smoothing takes the faceting off the ground the filler invented under
+    # buildings and water, and only there. Smoothing the measured ground as
+    # well doubled the error of a 2 m grid, to 21 cm at the 95th percentile.
+    smoothed = _smooth(filled, int(terrain_cfg.get("smooth_iterations", 1)))
+    filled = np.where(hit, filled, smoothed)
 
     filled_fraction = filled_cells / float(n * n)
     LOG.info(
-        "terrain grid %dx%d, %.1f%% of vertices interpolated from neighbours",
+        "terrain grid %dx%d at %.2f m, %.1f%% of vertices interpolated from "
+        "neighbours",
         n,
         n,
+        float(xs[1] - xs[0]),
         100.0 * filled_fraction,
     )
-
-    # Simplify before anything reads a height off this grid. Roads, rails,
-    # trees and buildings all drape on `sample`, so replacing the grid here --
-    # rather than at the end, next to the mesh that Blender draws -- is what
-    # keeps them sitting on the surface Unity will actually show instead of on
-    # the one that was thrown away.
-    mesh = None
-    constrained = None
-    tolerance = float(terrain_cfg.get("simplify_tolerance_m", 0.0) or 0.0)
-    if breakline_rings:
-        from .terrain_mesh import build_constrained, save_constrained_mesh
-
-        constrained = build_constrained(
-            bbox,
-            filled,
-            xs,
-            ys,
-            rings_by_source=breakline_rings,
-            tolerance_m=max(tolerance, 0.01),
-            simplify_m=float(terrain_cfg.get("breakline_simplify_m", 0.15)),
-            contour_interval_m=float(terrain_cfg.get("contour_interval_m", 0.5)),
-            min_feature_length_m=float(
-                terrain_cfg.get("min_feature_length_m", 0.0)
-            ),
-            max_face_m=float(terrain_cfg.get("max_face_m", 0.0)),
-            quads=bool(terrain_cfg.get("quads", False)),
-            max_fold_deg=float(terrain_cfg.get("quad_max_fold_deg", 12.0)),
-            min_quad_angle_deg=float(terrain_cfg.get("quad_min_angle_deg", 25.0)),
-        )
-        save_constrained_mesh(
-            constrained, work_dir / "terrain_mesh.npz", bbox.center
-        )
-        # The grid is left alone here on purpose. Mesh vertices take their
-        # height from it, so anything else draped on it lands on the same
-        # surface wherever the two share a vertex -- which, along every road
-        # and water edge, is everywhere that matters.
-    elif tolerance > 0.0:
-        mesh = build_rtin(filled, tolerance_m=tolerance)
-        filled = mesh.heights.astype(np.float64)
-        save_terrain_mesh(mesh, work_dir / "terrain_mesh.npz")
 
     heights = filled.astype(np.float32)
     center_z = float(_bilinear_on_grid(filled, xs, ys, *bbox.center))
 
-    np.save(work_dir / "terrain_heights.npy", heights)
-    np.savez(
-        work_dir / "terrain_grid.npz",
-        heights=heights,
-        xs=xs,
-        ys=ys,
-        bbox=np.asarray(bbox.as_list(), dtype=np.float64),
-        center_z_nap=np.float64(center_z),
-    )
-
-    # Everything laid on the ground drapes on the mesh when there is one, so
-    # the model agrees with itself by construction rather than to within a
-    # tolerance. Nothing is wired up for that here: `TerrainResult.surface`
-    # builds the sampler from the mesh below. The grid stays available for the
-    # checks that measure how far the mesh strays from it, which cannot be
-    # done against the mesh itself.
-    return TerrainResult(
+    result = TerrainResult(
         heights=heights,
         xs=xs,
         ys=ys,
@@ -766,12 +804,117 @@ def build_terrain(
         geotiff_path=tif_path,
         coverage_id=_coverage_id(ahn_model),
         resolution_m=resolution,
-        mesh=mesh,
-        constrained=constrained,
+        measured=heights.copy(),
+        survey_error=_survey_error(raw, valid, bounds, bbox, filled, xs, ys),
     )
+    if result.survey_error:
+        LOG.info(
+            "terrain grid within %.3f m of the survey on 95%% of the ground, "
+            "%.3f m on 99%%",
+            result.survey_error["p95_m"],
+            result.survey_error["p99_m"],
+        )
+    result.save(work_dir)
+    return result
+
+
+def _survey_error(raw, valid, bounds, bbox: BBox, grid, xs, ys) -> dict:
+    """How far the grid, as drawn, strays from every surveyed pixel under it.
+
+    Measured against the triangles the model actually shows rather than a
+    bilinear patch no renderer draws, and only over measured pixels inside the
+    bbox: the filled ones are the filler's own guess and agree with it by
+    construction.
+    """
+    rows, cols = raw.shape
+    left, bottom, right, top = bounds
+    px = left + (np.arange(cols) + 0.5) * (right - left) / cols
+    py = top - (np.arange(rows) + 0.5) * (top - bottom) / rows
+    keep_c = (px > bbox.xmin) & (px < bbox.xmax)
+    keep_r = (py > bbox.ymin) & (py < bbox.ymax)
+    if not keep_c.any() or not keep_r.any():
+        return {}
+    window = valid[np.ix_(keep_r, keep_c)]
+    if not window.any():
+        return {}
+    grid_x, grid_y = np.meshgrid(px[keep_c], py[keep_r])
+    truth = raw[np.ix_(keep_r, keep_c)][window]
+    drawn = _triangulated_on_grid(grid, xs, ys, grid_x[window], grid_y[window])
+    error = np.abs(drawn - truth)
+    p50, p95, p99 = np.percentile(error, [50, 95, 99])
+    return {
+        "p50_m": round(float(p50), 3),
+        "p95_m": round(float(p95), 3),
+        "p99_m": round(float(p99), 3),
+        "over_25cm": round(float((error > 0.25).mean()), 4),
+    }
+
+
+def lower_under(
+    terrain: TerrainResult,
+    underside: HeightRaster,
+    *,
+    clearance_m: float,
+) -> dict:
+    """Push the grid down wherever a road lies over it, and nowhere else.
+
+    The road is a separate surface laid on top, so the terrain only has to
+    stay out of its way. Each vertex is held below the lowest point of road
+    anywhere in the squares around it, by `clearance_m`. That is the condition
+    that makes it impossible for the ground to show through: a triangle under
+    a road has all three corners below the lowest road over it, so every point
+    of the triangle is too. Testing only the road height at the vertex itself
+    lets a bump between vertices poke through on any slope.
+
+    Returns how many vertices moved and how far, for the metadata.
+    """
+    n = terrain.n
+    step_x = terrain.bbox.width / (n - 1)
+    step_y = terrain.bbox.height / (n - 1)
+    values = underside.values
+    rows, cols = values.shape
+
+    # Lowest road under each cell of the road raster, gathered per grid square
+    # first and then per vertex over the squares that share it.
+    low = np.where(np.isfinite(values), values, np.inf)
+    # Cell centres of the raster, mapped to the grid square they fall in.
+    centre_x = terrain.bbox.xmin + (np.arange(cols) + 0.5) * underside.cell_x
+    centre_y = terrain.bbox.ymax - (np.arange(rows) + 0.5) * underside.cell_y
+    square_col = np.clip(((centre_x - terrain.bbox.xmin) / step_x).astype(np.int64), 0, n - 2)
+    square_row = np.clip(((centre_y - terrain.bbox.ymin) / step_y).astype(np.int64), 0, n - 2)
+    per_square = np.full((n - 1, n - 1), np.inf)
+    flat = (square_row[:, None] * (n - 1) + square_col[None, :]).ravel()
+    np.minimum.at(per_square.reshape(-1), flat, low.ravel())
+
+    # A vertex touches up to four squares.
+    padded = np.pad(per_square, 1, constant_values=np.inf)
+    per_vertex = np.minimum.reduce(
+        [padded[:-1, :-1], padded[:-1, 1:], padded[1:, :-1], padded[1:, 1:]]
+    )
+    ceiling = per_vertex - clearance_m
+    before = terrain.heights.astype(np.float64)
+    after = np.minimum(before, ceiling)
+    moved = after < before - 1e-6
+    terrain.heights = after.astype(np.float32)
+    drop = (before - after)[moved]
+    terrain.conformed = {
+        "vertices": int(moved.sum()),
+        "max_m": round(float(drop.max()), 3) if moved.any() else 0.0,
+        "median_m": round(float(np.median(drop)), 3) if moved.any() else 0.0,
+        "clearance_m": float(clearance_m),
+    }
+    LOG.info(
+        "terrain: %d vertices lowered under the roads, median %.2f m, at most %.2f m",
+        terrain.conformed["vertices"],
+        terrain.conformed["median_m"],
+        terrain.conformed["max_m"],
+    )
+    return terrain.conformed
 
 
 __all__ = [
+    "DEFAULT_GRID_M",
+    "HeightRaster",
     "MAX_PLAUSIBLE_NAP",
     "MIN_PLAUSIBLE_NAP",
     "NODATA_CUTOFF",
@@ -780,5 +923,7 @@ __all__ = [
     "discover_coverages",
     "ensure_dsm",
     "fetch_dtm_geotiff",
+    "grid_size_for",
+    "lower_under",
     "raster_sampler",
 ]

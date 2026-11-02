@@ -290,33 +290,6 @@ def _sink_water_bed(
     return out
 
 
-def _sink_mesh_water_bed(
-    scene: dict, work_dir: Path, columns: np.ndarray, rows: np.ndarray, z: np.ndarray
-) -> np.ndarray:
-    """The same sinking, applied to the vertices of the simplified mesh.
-
-    The mesh keeps its vertices in grid column and row, so the bed is still a
-    plain lookup. Only vertices inside an outline move, which leaves the
-    triangles that straddle a bank tilted from the quay down to the bed -- the
-    same shape the grid version produced, drawn with fewer vertices.
-    """
-    bed_grid = _water_bed_grid(scene, work_dir)
-    if bed_grid is None:
-        return z
-
-    bed = bed_grid[rows, columns]
-    water = np.isfinite(bed)
-    if not water.any():
-        return z
-    out = z.copy()
-    out[water] = np.minimum(out[water], bed[water])
-    log(
-        f"terrain: sank {int(water.sum())} mesh vertices to water beds between "
-        f"{np.nanmin(bed_grid):.2f} and {np.nanmax(bed_grid):.2f} m NAP"
-    )
-    return out
-
-
 def build_water(scene: dict, work_dir: Path, material):
     """Flat surfaces over the BGT water outlines, one level per body.
 
@@ -442,82 +415,6 @@ def _weld_corners(corners, tolerance=1e-4):
     return corners[np.sort(first)], order[inverse.ravel()].astype(np.int64)
 
 
-def _build_terrain_mesh(
-    scene: dict, work_dir: Path, material, xs, ys, mesh_file: str
-) -> object:
-    """Terrain from the adaptive triangulation instead of the full grid.
-
-    Vertices arrive as grid column, row and height, so they land on exactly the
-    coordinates the grid mesh used -- the simplification decided which of those
-    points to keep, not where they are.
-    """
-    data = np.load(work_dir / mesh_file)
-    vertices = data["vertices"].astype(np.float64)
-    triangles = data["triangles"].astype(np.int64)
-
-    origin_x, origin_y = scene["origin_rd"]
-    z_offset = float(scene["ground_z_offset_nap"])
-    if bool(data.get("grid_indexed", np.array(False))):
-        # The bisection mesh addresses its vertices by grid column and row.
-        columns = vertices[:, 0].astype(np.int64)
-        rows = vertices[:, 1].astype(np.int64)
-        x = xs[columns] - origin_x
-        y = ys[rows] - origin_y
-    else:
-        # The constrained mesh puts its vertices wherever the breaklines run,
-        # already relative to the bbox centre, so only the height needs moving.
-        x = vertices[:, 0]
-        y = vertices[:, 1]
-        columns = np.clip(
-            np.searchsorted(xs - origin_x, x), 0, len(xs) - 1
-        ).astype(np.int64)
-        rows = np.clip(np.searchsorted(ys - origin_y, y), 0, len(ys) - 1).astype(
-            np.int64
-        )
-    z = _sink_mesh_water_bed(scene, work_dir, columns, rows, vertices[:, 2])
-    points = np.column_stack([x, y, z - z_offset])
-
-    # Quad-dominant when the mesh stage paired the triangles up, plain
-    # triangles otherwise. Loops and lengths carry both without a second path.
-    if "face_loops" in data and "face_sizes" in data:
-        loop_vertex_indices = data["face_loops"].astype(np.int64)
-        loop_totals = data["face_sizes"].astype(np.int64)
-        loop_starts = np.concatenate(
-            [[0], np.cumsum(loop_totals)[:-1]]
-        ).astype(np.int64)
-    else:
-        loop_vertex_indices = triangles.ravel()
-        loop_totals = np.full(len(triangles), 3)
-        loop_starts = np.arange(0, len(triangles) * 3, 3)
-    n_faces = len(loop_totals)
-    uvs = planar_uv(points[loop_vertex_indices][:, :2], scene["aerial"]["bbox_local"])
-
-    obj = build_mesh_object(
-        "Terrain",
-        points,
-        loop_vertex_indices,
-        loop_starts,
-        loop_totals,
-        uvs,
-        np.zeros(n_faces),
-        [material],
-        shade_smooth=True,
-    )
-    quads = int((loop_totals == 4).sum())
-    sharp = _mark_breakline_edges(obj, data)
-    groups = _tag_surface_regions(
-        obj, scene, work_dir, points, loop_vertex_indices, loop_starts, loop_totals
-    )
-    full = 2 * (len(xs) - 1) ** 2
-    log(
-        f"terrain: {len(points)} vertices, {n_faces} faces "
-        f"({quads} quads, {n_faces - quads} triangles, "
-        f"{100.0 * n_faces / full:.1f}% of the {len(xs)}x{len(ys)} grid), "
-        f"{sharp} breakline edges marked sharp, {groups} surface regions tagged"
-    )
-    return obj
-
-
 def _tag_surface_regions(
     obj, scene, work_dir, points, loop_vertices, loop_starts, loop_totals
 ) -> int:
@@ -553,9 +450,8 @@ def _tag_surface_regions(
     rows, cols = grid.shape
 
     # One class per face, read at the face centroid.
-    centroids = np.empty((len(loop_totals), 2))
-    for index, (start, total) in enumerate(zip(loop_starts, loop_totals)):
-        centroids[index] = points[loop_vertices[start : start + total]][:, :2].mean(axis=0)
+    corner_xy = points[loop_vertices][:, :2]
+    centroids = np.add.reduceat(corner_xy, loop_starts, axis=0) / loop_totals[:, None]
     col = np.clip(
         ((centroids[:, 0] - xmin) / max(xmax - xmin, 1e-9) * cols).astype(int),
         0, cols - 1,
@@ -572,48 +468,17 @@ def _tag_surface_regions(
 
     # A vertex belongs to every class touching it, which is what you want at a
     # kerb: grabbing the road takes the edge of the pavement with it.
+    loop_class = np.repeat(face_class, loop_totals)
     made = 0
     for value in np.unique(face_class):
         name = names.get(int(value)) or f"class_{int(value)}"
-        picked = np.flatnonzero(face_class == value)
-        members = set()
-        for index in picked:
-            start, total = loop_starts[index], loop_totals[index]
-            members.update(int(v) for v in loop_vertices[start : start + total])
-        if not members:
+        members = np.unique(loop_vertices[loop_class == value])
+        if not len(members):
             continue
         group = obj.vertex_groups.new(name=f"ground_{name}")
-        group.add(sorted(members), 1.0, "REPLACE")
+        group.add(members.tolist(), 1.0, "REPLACE")
         made += 1
     return made
-
-
-def _mark_breakline_edges(obj, data) -> int:
-    """Tag the breaklines so they can be selected as edge loops.
-
-    This is the whole point of having built the mesh around them. Without it
-    Blender is handed a sheet of faces with no record of which edges are the
-    kerb, the canal bank or the foot of a building, and the loop you wanted to
-    grab has to be hunted for one face at a time.
-
-    Marked both sharp and seam: sharp is what Select Sharp Edges and the Edge
-    Split modifier read, and a seam survives into an FBX where sharpness
-    sometimes does not.
-    """
-    if "sharp_edges" not in data:
-        return 0
-    wanted = data["sharp_edges"].astype(np.int64).reshape(-1, 2)
-    if not len(wanted):
-        return 0
-    mesh = obj.data
-    keys = {frozenset((int(a), int(b))) for a, b in wanted}
-    marked = 0
-    for edge in mesh.edges:
-        if frozenset((int(edge.vertices[0]), int(edge.vertices[1]))) in keys:
-            edge.use_edge_sharp = True
-            edge.use_seam = True
-            marked += 1
-    return marked
 
 
 def _terrain_summary() -> dict:
@@ -634,15 +499,15 @@ def _terrain_summary() -> dict:
 
 
 def build_terrain(scene: dict, work_dir: Path, material) -> object:
-    """Grid mesh from the AHN heights, draped with the aerial photo."""
+    """A regular grid of quads from the AHN heights, draped with the aerial.
+
+    Every face is tagged with the surface it lies under, so the ground below a
+    road or a lawn is one click away; see `_tag_surface_regions`.
+    """
     data = np.load(work_dir / scene["terrain"]["file"])
     heights = data["heights"].astype(np.float64)
     xs = data["xs"]
     ys = data["ys"]
-
-    mesh_file = scene["terrain"].get("mesh_file")
-    if mesh_file and (work_dir / mesh_file).is_file():
-        return _build_terrain_mesh(scene, work_dir, material, xs, ys, mesh_file)
 
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
@@ -689,7 +554,14 @@ def build_terrain(scene: dict, work_dir: Path, material) -> object:
         [material],
         shade_smooth=True,
     )
-    log(f"terrain: {n}x{n} vertices, {n_quads} quads")
+    groups = _tag_surface_regions(
+        obj, scene, work_dir, vertices, loop_vertex_indices, loop_starts, loop_totals
+    )
+    spacing = float(xs[1] - xs[0]) if len(xs) > 1 else 0.0
+    log(
+        f"terrain: {n}x{n} vertices at {spacing:.2f} m, {n_quads} quads, "
+        f"{groups} surface regions tagged"
+    )
     return obj
 
 
@@ -1344,7 +1216,7 @@ def build_barriers(scene: dict, work_dir: Path, material, fence_material=None):
     if not barriers_file or not (work_dir / barriers_file).is_file():
         return []
 
-    data = np.load(work_dir / barriers_file, allow_pickle=True)
+    data = np.load(work_dir / barriers_file)
     vertices = data["vertices"]
     triangles = data["triangles"]
     if len(triangles) == 0:
@@ -1991,7 +1863,7 @@ def build_collision(scene: dict, work_dir: Path):
     # 40 cm between steps and never touches it.
     barriers_file = scene.get("barriers", {}).get("file")
     if barriers_file and (work_dir / barriers_file).is_file():
-        data = np.load(work_dir / barriers_file, allow_pickle=True)
+        data = np.load(work_dir / barriers_file)
         if "collision_triangles" in data.files and len(data["collision_triangles"]):
             origin_x, origin_y = scene["origin_rd"]
             z_offset = float(scene["ground_z_offset_nap"])

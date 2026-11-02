@@ -267,6 +267,44 @@ def build_grid_coords(bbox: BBox, n: int):
     return xs, ys
 
 
+def douglas_peucker_keep(points, tolerance: float):
+    """Which vertices of an open run to keep. Endpoints always survive.
+
+    Returns a boolean mask over `points`, an (n, 2) array. Iterative rather
+    than recursive, so a long densified run cannot hit the recursion limit.
+    """
+    import numpy as np
+
+    points = np.asarray(points, dtype=np.float64)
+    n = len(points)
+    keep = np.zeros(n, dtype=bool)
+    if n == 0:
+        return keep
+    keep[0] = keep[-1] = True
+    if n < 3 or tolerance <= 0:
+        keep[:] = True
+        return keep
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        span = points[j] - points[i]
+        length = float(np.hypot(span[0], span[1]))
+        rel = points[i + 1 : j] - points[i]
+        if length < 1e-12:
+            far = np.hypot(rel[:, 0], rel[:, 1])
+        else:
+            far = np.abs(rel[:, 0] * span[1] - rel[:, 1] * span[0]) / length
+        k = int(np.argmax(far))
+        if far[k] > tolerance:
+            k += i + 1
+            keep[k] = True
+            stack.append((i, k))
+            stack.append((k, j))
+    return keep
+
+
 def format_warnings(warnings: Iterable[str], prefix: str = "  - ") -> str:
     return "\n".join(f"{prefix}{w}" for w in warnings)
 
@@ -279,6 +317,7 @@ __all__ = [
     "RD_NAP_CRS",
     "WGS84_CRS",
     "build_grid_coords",
+    "douglas_peucker_keep",
     "parse_bbox",
     "rd_bbox_to_wgs84",
     "validate_bbox",

@@ -4953,189 +4953,6 @@ class TestContourBreaklines(unittest.TestCase):
             self.assertLessEqual(len(line), 2)
 
 
-class TestTerrainMesh(unittest.TestCase):
-    """The adaptive terrain mesh must still be the ground, and still be a mesh."""
-
-    @staticmethod
-    def _grid(n=129):
-        return np.mgrid[0:n, 0:n].astype(np.float64)  # rows, cols
-
-    @staticmethod
-    def _edge_use(mesh):
-        t = mesh.triangles
-        edges = np.sort(
-            np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]]), axis=1
-        )
-        _, counts = np.unique(edges, axis=0, return_counts=True)
-        return counts
-
-    @staticmethod
-    def _covered_area(mesh):
-        corners = mesh.vertices[mesh.triangles][:, :, :2]
-        a = corners[:, 1] - corners[:, 0]
-        b = corners[:, 2] - corners[:, 0]
-        return 0.5 * float((a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]).sum())
-
-    def test_a_plane_costs_two_triangles(self):
-        """The whole point: flat ground should not be paid for twice."""
-        from src.terrain_mesh import build_rtin
-
-        rows, cols = self._grid()
-        mesh = build_rtin(0.01 * cols + 0.02 * rows + 3.0, tolerance_m=1e-9)
-        self.assertEqual(mesh.triangle_count, 2)
-        self.assertEqual(mesh.vertex_count, 4)
-        self.assertLess(mesh.max_error_m, 1e-9)
-
-    def test_zero_tolerance_keeps_every_grid_vertex(self):
-        """Nothing may be dropped silently when nothing was asked to be."""
-        from src.terrain_mesh import build_rtin
-
-        n = 65
-        rng = np.random.default_rng(7)
-        mesh = build_rtin(rng.normal(0.0, 1.0, (n, n)), tolerance_m=0.0)
-        self.assertEqual(mesh.vertex_count, n * n)
-        self.assertEqual(mesh.triangle_count, 2 * (n - 1) ** 2)
-        self.assertEqual(mesh.max_error_m, 0.0)
-
-    def test_detail_lands_on_the_step_and_nowhere_else(self):
-        from src.terrain_mesh import build_rtin
-
-        n = 129
-        rows, cols = self._grid(n)
-        mesh = build_rtin(np.where(cols > 64, 5.0, 0.0), tolerance_m=0.05)
-        self.assertLess(mesh.triangle_count, 0.05 * 2 * (n - 1) ** 2)
-        # Every vertex kept should be near the step, not out on the flat.
-        distance = np.abs(mesh.vertices[:, 0] - 64.5)
-        self.assertGreater(float((distance < 3.0).mean()), 0.5)
-
-    def test_the_mesh_is_watertight(self):
-        """A T-junction reads as a tear in Unity, not as a wrong height."""
-        from src.terrain_mesh import build_rtin
-
-        n = 129
-        rows, cols = self._grid(n)
-        height = np.sin(cols / 9.0) * np.cos(rows / 13.0) * 2.0
-        mesh = build_rtin(height, tolerance_m=0.1)
-        counts = self._edge_use(mesh)
-        # Interior edges are shared by exactly two triangles, boundary by one.
-        self.assertEqual(set(np.unique(counts).tolist()), {1, 2})
-        self.assertEqual(int((counts == 1).sum()) % 2, 0)
-
-    def test_the_mesh_tiles_the_bbox_exactly(self):
-        """Covering too little is a hole; too much is an overlap."""
-        from src.terrain_mesh import build_rtin
-
-        n = 129
-        rows, cols = self._grid(n)
-        mesh = build_rtin(np.sin(cols / 7.0) + np.cos(rows / 11.0), tolerance_m=0.2)
-        self.assertAlmostEqual(self._covered_area(mesh), (n - 1) ** 2, places=6)
-
-    def test_every_triangle_faces_up(self):
-        from src.terrain_mesh import build_rtin
-
-        n = 65
-        rows, cols = self._grid(n)
-        mesh = build_rtin(np.sin(cols / 5.0) * 3.0, tolerance_m=0.15)
-        corners = mesh.vertices[mesh.triangles][:, :, :2]
-        a = corners[:, 1] - corners[:, 0]
-        b = corners[:, 2] - corners[:, 0]
-        self.assertTrue((a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0] > 0).all())
-
-    def test_the_returned_grid_is_the_mesh(self):
-        """Everything downstream drapes on this grid, so it has to agree."""
-        from src.terrain_mesh import build_rtin
-
-        n = 65
-        rows, cols = self._grid(n)
-        mesh = build_rtin(np.sin(cols / 6.0) * 2.0 + rows * 0.01, tolerance_m=0.2)
-        kept = mesh.vertices[:, [1, 0]].astype(int)  # row, column
-        self.assertTrue(
-            np.allclose(mesh.heights[kept[:, 0], kept[:, 1]], mesh.vertices[:, 2])
-        )
-        # Grid points that were dropped must sit on the plane of the triangle
-        # that swallowed them, which is what makes the grid a stand-in for the
-        # mesh rather than an approximation of it.
-        self.assertLessEqual(mesh.max_error_m, 0.2 * 3.0)
-
-    def test_a_grid_that_cannot_be_bisected_is_refused(self):
-        """Rounding it silently would move the bbox."""
-        from src.terrain_mesh import build_rtin
-
-        with self.assertRaises(ValueError) as caught:
-            build_rtin(np.zeros((100, 100)), tolerance_m=0.1)
-        self.assertIn("2**k + 1", str(caught.exception))
-
-    def test_grid_sizes_round_up_to_something_bisectable(self):
-        from src.terrain_mesh import is_grid_size, next_grid_size
-
-        self.assertTrue(all(is_grid_size(n) for n in (3, 5, 9, 129, 257, 513)))
-        self.assertFalse(any(is_grid_size(n) for n in (2, 4, 100, 256, 500)))
-        self.assertEqual(next_grid_size(257), 257)
-        self.assertEqual(next_grid_size(258), 513)
-        self.assertEqual(next_grid_size(200), 257)
-
-    def test_config_snaps_the_grid_when_simplification_is_on(self):
-        from src.config import load_config
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "bbox": {
-                            "xmin": 136000,
-                            "ymin": 455000,
-                            "xmax": 137000,
-                            "ymax": 456000,
-                        },
-                        "terrain": {
-                            "mesh_vertices_per_side": 400,
-                            "simplify_tolerance_m": 0.1,
-                        },
-                    }
-                )
-            )
-            config = load_config(path)
-            self.assertEqual(config.terrain["mesh_vertices_per_side"], 513)
-
-    def test_turning_simplification_off_leaves_the_grid_alone(self):
-        from src.config import load_config
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "bbox": {
-                            "xmin": 136000,
-                            "ymin": 455000,
-                            "xmax": 137000,
-                            "ymax": 456000,
-                        },
-                        "terrain": {
-                            "mesh_vertices_per_side": 400,
-                            "simplify_tolerance_m": 0,
-                        },
-                    }
-                )
-            )
-            config = load_config(path)
-            self.assertEqual(config.terrain["mesh_vertices_per_side"], 400)
-
-    def test_real_terrain_loses_far_more_triangles_than_height(self):
-        """The trade this whole thing exists to make."""
-        from src.terrain_mesh import build_rtin
-
-        n = 257
-        rows, cols = self._grid(n)
-        # A polder with a dike across it: flat almost everywhere, one ridge.
-        height = 0.4 * np.exp(-(((cols - 150.0) / 6.0) ** 2)) * 8.0
-        height += 0.02 * rows
-        mesh = build_rtin(height, tolerance_m=0.1)
-        self.assertLess(mesh.triangle_count, 0.1 * 2 * (n - 1) ** 2)
-        self.assertLess(mesh.mean_error_m, 0.02)
-
-
 class TestConfig(unittest.TestCase):
     def test_shipped_config_loads(self):
         config = load_config(REPO_ROOT / "config.json")
@@ -5771,282 +5588,6 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertIn(buildings.probe(self.config), health_targets(self.config))
 
 
-class TestConstrainedRefinement(unittest.TestCase):
-    """The mesh has to reach its tolerance and be made of usable triangles.
-
-    Neither was true. The old loop probed four points huddled round each
-    triangle's centre, inserted the centroid of whatever failed, and so split
-    a bad triangle into three of the same shape -- it added 132 points, then
-    35, then 33, then 38, and stopped no closer than it started, three times
-    outside its tolerance, with a tenth of the mesh under five degrees.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        from src.geo import BBox
-
-        n, side = 129, 256.0
-        cls.bbox = BBox(0.0, 0.0, side, side)
-        cls.xs = np.linspace(0.0, side, n)
-        cls.ys = np.linspace(0.0, side, n)
-        _, y = np.meshgrid(cls.xs, cls.ys)
-        rng = np.random.default_rng(17)
-        # Dutch: flat, with a canal through it, and centimetres of scan noise.
-        cls.heights = (
-            1.0
-            - 3.0 * np.exp(-(((y - 150.0) / 9.0) ** 2))
-            + rng.normal(0.0, 0.025, (n, n))
-        )
-        edge = np.array(
-            [[20.0, 60.0], [230.0, 60.0], [230.0, 96.0], [20.0, 96.0], [20.0, 60.0]]
-        )
-        cls.rings = {"unpaved": [edge]}
-        cls.mesh = cls._build(0.10)
-
-    @classmethod
-    def _build(cls, tolerance):
-        from src.terrain_mesh import build_constrained
-
-        return build_constrained(
-            cls.bbox,
-            cls.heights,
-            cls.xs,
-            cls.ys,
-            rings_by_source=cls.rings,
-            tolerance_m=tolerance,
-            contour_interval_m=0.5,
-        )
-
-    def test_it_gets_as_close_to_the_ground_as_the_ground_allows(self):
-        self.assertEqual(
-            self.mesh.triangles_over_allowance,
-            0,
-            f"worst gap {self.mesh.max_error_m:.3f} m against a "
-            f"{self.mesh.tolerance_m:.2f} m tolerance, of which "
-            f"{self.mesh.reachable_tolerance_m:.3f} m is the model's own steps",
-        )
-
-    def test_it_converges_rather_than_running_out_of_rounds(self):
-        self.assertTrue(
-            self.mesh.converged,
-            f"still working after {self.mesh.refined_rounds} rounds",
-        )
-
-    def test_the_error_is_measured_across_a_triangle_not_at_its_centre(self):
-        """A wedge laid across a bank passes through the true surface near the
-        middle and is metres out at both ends, so the centre is the one place
-        that flatters it."""
-        import inspect
-
-        from src.terrain_mesh import _sampled_error
-
-        self.assertNotIn("centre", inspect.getsource(_sampled_error).split('"""')[2])
-
-    def test_no_triangle_is_a_sliver(self):
-        from src.validate import _triangle_quality
-
-        quality = _triangle_quality(self.mesh)
-        self.assertEqual(
-            quality["under_one_degree"],
-            0,
-            f"worst angle is {quality['worst_angle_deg']:.3f} degrees",
-        )
-        self.assertLess(quality["under_ten_degrees"], 0.05 * quality["count"])
-
-    def test_breaklines_are_split_until_the_ground_meets_them(self):
-        """A constraint is a straight line and the ground under it is not. The
-        segment has to be cut until it is, or the mesh has a crease running
-        through ground that does not crease there."""
-        # Judged against what the height model can deliver, for the same reason
-        # the check is: the ground here has scan noise in it, and a chord
-        # between two samples cannot be closer to the ground than the step
-        # between them allows.
-        self.assertEqual(
-            self.mesh.breaklines_over_allowance,
-            0,
-            f"worst sag {self.mesh.max_edge_sag_m:.3f} m",
-        )
-        # Which means the outline it started from is no longer four segments.
-        self.assertGreater(self.mesh.breakline_edges, 8)
-
-    def test_a_tighter_tolerance_buys_a_closer_mesh(self):
-        coarse = self._build(0.40)
-        self.assertLess(self.mesh.max_error_m, coarse.max_error_m)
-        self.assertGreater(self.mesh.triangle_count, coarse.triangle_count)
-
-    def test_a_step_in_the_grid_does_not_send_refinement_into_a_spiral(self):
-        """The failure this class exists to prevent a repeat of.
-
-        Real AHN steps 60 cm between neighbouring samples at a quay wall. No
-        triangle that is not aligned to the sample grid gets nearer than about
-        half of that, so a 0.10 m tolerance is unreachable there -- and asking
-        for it anyway meant refinement kept inserting points into triangles it
-        had no way to improve. On a real Utrecht kilometre that ran to 701,978
-        triangles and still missed the tolerance by a factor of five.
-        """
-        from src.terrain_mesh import build_constrained, height_allowance
-
-        heights = self.heights.copy()
-        wall = (self.ys > 96.0) & (self.ys < 100.0)
-        heights[wall, :] += 0.6
-
-        allowance = height_allowance(heights, 0.10)
-        self.assertGreater(
-            allowance.max(), 0.25, "a 60 cm step has to raise the allowance"
-        )
-
-        mesh = build_constrained(
-            self.bbox,
-            heights,
-            self.xs,
-            self.ys,
-            rings_by_source=self.rings,
-            tolerance_m=0.10,
-            contour_interval_m=0.5,
-        )
-        # It has to stop, and it has to stop having done what it could.
-        self.assertLess(
-            mesh.triangle_count,
-            8 * self.mesh.triangle_count,
-            f"{mesh.triangle_count} triangles: refinement ran away on a step",
-        )
-        self.assertLessEqual(
-            mesh.triangles_over_allowance,
-            0.001 * mesh.triangle_count,
-            f"worst gap {mesh.max_error_m:.3f} m",
-        )
-
-    def test_the_allowance_is_the_tolerance_on_smooth_ground(self):
-        """It must not become a licence. Where the grid does not step, the
-        allowance is exactly what was asked for."""
-        from src.terrain_mesh import height_allowance
-
-        smooth = np.add.outer(np.linspace(0.0, 1.0, 40), np.linspace(0.0, 1.0, 40))
-        self.assertAlmostEqual(float(height_allowance(smooth, 0.10).max()), 0.10)
-
-    def test_a_wedge_in_the_input_is_reported_as_the_input_s(self):
-        from src.terrain_mesh import build_constrained
-
-        apex = [30.0, 40.0]
-        rings = dict(self.rings)
-        rings["green"] = [
-            np.array([apex, [220.0, 39.0], [220.0, 44.0], apex]),
-            np.array([apex, [220.0, 45.0], [220.0, 56.0], apex]),
-        ]
-        mesh = build_constrained(
-            self.bbox,
-            self.heights,
-            self.xs,
-            self.ys,
-            rings_by_source=rings,
-            tolerance_m=0.10,
-            contour_interval_m=0.5,
-        )
-        self.assertGreater(
-            mesh.slivers_from_input + mesh.slivers_of_our_own,
-            0,
-            "a one-degree wedge in the input made no sliver at all?",
-        )
-        self.assertGreaterEqual(
-            mesh.slivers_from_input,
-            mesh.slivers_of_our_own,
-            "the wedge is the input's, so most slivers should be attributed to it",
-        )
-
-    def test_the_lift_reads_how_far_the_mesh_stands_above_the_grid(self):
-        """Roads are draped on the grid and lifted to clear the mesh, and that
-        lift used to come from the mesh's worst error in either direction. Two
-        things wrong with it: a mesh dipping *below* the grid buries nothing, and
-        the worst single triangle in four square kilometres is not a statistic to
-        apply to every road in the model -- it pinned the lift to its 0.2 m cap
-        and left every carriageway floating 22 cm."""
-        self.assertLessEqual(
-            self.mesh.rise_above_grid_m,
-            self.mesh.max_error_m + 1e-9,
-            "rising above the grid cannot exceed the total error",
-        )
-        self.assertGreaterEqual(self.mesh.rise_above_grid_m, 0.0)
-
-    def test_the_allowance_covers_the_whole_triangle(self):
-        """A triangle's error is limited by the roughest ground it covers, not by
-        the ground at the point where its own error happens to peak. Reading it
-        at that point flagged 2515 triangles on a real 2 km area for a step that
-        was inside them."""
-        from src.terrain_mesh import _allowance_over, _sample, height_allowance
-
-        allowance = height_allowance(self.heights, 0.10)
-        over_all = _allowance_over(
-            self.mesh.vertices, self.mesh.triangles, allowance, self.xs, self.ys
-        )
-        at_corner = _sample(
-            allowance, self.xs, self.ys, self.mesh.vertices[self.mesh.triangles[:, 0], :2]
-        )
-        self.assertTrue(
-            (over_all >= at_corner - 1e-12).all(),
-            "the allowance across a triangle cannot be less than at a point in it",
-        )
-
-    def test_a_circumcentre_is_not_a_centroid(self):
-        """The centroid sits among the corners it came from; the circumcentre
-        is a full circumradius from every one of them. That difference is the
-        whole reason the loop now converges."""
-        from src.terrain_mesh import _circumcentres
-
-        points = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 3.0, 0.0]])
-        centre, radius = _circumcentres(points, np.array([[0, 1, 2]]))
-        self.assertTrue(np.allclose(centre[0], [2.0, 1.5]))
-        self.assertAlmostEqual(float(radius[0]), 2.5)
-
-
-class TestBuiltAsPlanned(unittest.TestCase):
-    """The check that reads the model rather than the plan.
-
-    It exists because a run once shipped the plain grid while every terrain
-    check passed, all of them reading the in-memory object and none the file.
-    It then failed a perfect model, because it was written when a terrain was
-    always triangles and it asserted that no quad existed.
-    """
-
-    def _run(self, built, intended_triangles):
-        import json
-        import tempfile
-
-        from src.validate import CheckReport, check_built_terrain
-
-        class Mesh:
-            triangle_count = intended_triangles
-
-        class Terrain:
-            constrained = Mesh()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            work = Path(tmp)
-            (work / "blender_summary.json").write_text(json.dumps({"terrain": built}))
-            report = CheckReport()
-            check_built_terrain(report, work, Terrain())
-        return {c.name: c for c in report.checks}
-
-    def test_the_numbers_from_the_two_kilometre_run(self):
-        """A quad is two triangles fused, so this model was exactly right."""
-        checks = self._run(
-            {"triangles": 540424, "quads": 1031304}, 2603032
-        )
-        self.assertEqual(540424 + 2 * 1031304, 2603032)
-        self.assertTrue(
-            checks["terrain_built_as_planned"].passed,
-            checks["terrain_built_as_planned"].detail,
-        )
-
-    def test_plain_triangles_still_count(self):
-        checks = self._run({"triangles": 1000, "quads": 0}, 1000)
-        self.assertTrue(checks["terrain_built_as_planned"].passed)
-
-    def test_a_model_that_is_not_the_mesh_still_fails(self):
-        """What the check was written for: the run that shipped the grid."""
-        checks = self._run({"triangles": 0, "quads": 65536}, 2603032)
-        self.assertFalse(checks["terrain_built_as_planned"].passed)
-
-
 class TestQuadPairing(unittest.TestCase):
     """Quads for an editor, without giving up anything the triangles earned.
 
@@ -6166,98 +5707,6 @@ class TestQuadPairing(unittest.TestCase):
                 )
 
 
-class TestEvenFaceSize(unittest.TestCase):
-    """Sculpting wants even faces; accuracy wants adaptive ones.
-
-    The mesh is adaptive by default and that is right -- a flat car park does
-    not need vertices. It also means the face size varies about a
-    thousandfold, which is exactly what makes it unpleasant to brush: one
-    stroke grabs five hundred vertices in one place and three in another.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        from src.geo import BBox
-
-        n, side = 129, 256.0
-        cls.bbox = BBox(0.0, 0.0, side, side)
-        cls.xs = np.linspace(0.0, side, n)
-        cls.ys = np.linspace(0.0, side, n)
-        _, y = np.meshgrid(cls.xs, cls.ys)
-        rng = np.random.default_rng(23)
-        cls.heights = (
-            1.0
-            - 2.5 * np.exp(-(((y - 150.0) / 9.0) ** 2))
-            + rng.normal(0.0, 0.025, (n, n))
-        )
-        cls.rings = {
-            "unpaved": [
-                np.array([[20.0, 60.0], [230.0, 60.0], [230.0, 96.0], [20.0, 96.0],
-                          [20.0, 60.0]])
-            ]
-        }
-
-    def _build(self, cap):
-        from src.terrain_mesh import build_constrained
-
-        return build_constrained(
-            self.bbox, self.heights, self.xs, self.ys,
-            rings_by_source=self.rings, tolerance_m=0.10,
-            contour_interval_m=0.5, max_face_m=cap,
-        )
-
-    def test_the_cap_is_actually_held(self):
-        from src.terrain_mesh import _longest_edge
-
-        mesh = self._build(10.0)
-        longest = _longest_edge(mesh.vertices, mesh.triangles).max()
-        # A little over is fine -- a triangle 10 m on a side has a longer
-        # hypotenuse -- but nothing like the 60 m spans an adaptive mesh has.
-        self.assertLess(
-            longest, 15.0, f"a {longest:.1f} m face survived a 10 m cap"
-        )
-
-    def test_it_takes_the_big_faces_out(self):
-        """What the cap promises, stated exactly.
-
-        It lowers the top end; it does not raise the bottom. Refinement still
-        packs small faces along a breakline whatever the cap is, so the ratio of
-        largest to smallest barely moves on an area with few features -- and an
-        earlier version of this test asserted that ratio and was simply wrong
-        about what the setting does. The brush problem is a huge face next to a
-        small one, and it is the huge one this removes.
-        """
-        def top_end(mesh):
-            p = mesh.vertices[mesh.triangles][:, :, :2]
-            area = 0.5 * np.abs(cross2d(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]))
-            return float(np.percentile(area, 99))
-
-        adaptive = top_end(self._build(0.0))
-        even = top_end(self._build(10.0))
-        self.assertLess(
-            even, adaptive / 2.0,
-            f"the largest faces went from {adaptive:.0f} to {even:.0f} m2",
-        )
-
-    def test_it_does_not_cost_accuracy(self):
-        """Adding faces cannot make the ground less accurate, and a cap that
-        starves its own budget silently does exactly that: at half the points it
-        needed, a 5 m cap left 62 m faces standing and the error five times what
-        it had been."""
-        capped = self._build(5.0)
-        self.assertEqual(
-            capped.triangles_over_allowance,
-            0,
-            f"worst gap {capped.max_error_m:.3f} m under a 5 m cap",
-        )
-
-    def test_off_by_default(self):
-        from src.config import DEFAULTS
-
-        self.assertEqual(DEFAULTS["terrain"]["max_face_m"], 0.0)
-        self.assertFalse(DEFAULTS["terrain"]["quads"])
-
-
 class TestSurfaceRegions(unittest.TestCase):
     """The terrain has to arrive knowing which faces are road and which grass.
 
@@ -6289,17 +5738,26 @@ class TestSurfaceRegions(unittest.TestCase):
         for name in CLASS_NAMES.values():
             self.assertRegex(name, r"^[a-z][a-z0-9_]*$", f"{name!r} is not a safe name")
 
-    def test_blender_tags_regions_and_marks_breaklines(self):
-        """Both halves have to be wired, or the model looks right and is still
-        unworkable."""
+    def test_the_grid_terrain_is_tagged(self):
+        """Wired into the terrain Blender actually builds, or the model looks
+        right and is still unworkable."""
+        import ast
+
         source = (REPO_ROOT / "blender" / "process.py").read_text()
-        self.assertIn("_tag_surface_regions", source)
-        self.assertIn("_mark_breakline_edges", source)
+        tree = ast.parse(source)
+        build = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "build_terrain"
+        )
+        called = {
+            node.func.id for node in ast.walk(build)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("_tag_surface_regions", called)
         # A face attribute for exactness, vertex groups for one-click select and
         # for proportional editing, which is what levelling a plot uses.
         self.assertIn('mesh.attributes.new("surface_class", "INT", "FACE")', source)
         self.assertIn("obj.vertex_groups.new", source)
-        self.assertIn("use_edge_sharp", source)
 
 
 class TestRoadTopology(unittest.TestCase):
@@ -6756,302 +6214,295 @@ def _height_by_brute_force(vertices, triangles, query):
     return out
 
 
-class TestMeshDrape(unittest.TestCase):
-    """What a thing is laid on has to be what the model draws.
+def _fake_ahn(bbox, raw_fn, *, res=0.5, margin=8.0, holes=None):
+    """A stand-in for the AHN GeoTIFF: `raw_fn(x, y)` on a 0.5 m raster.
 
-    The terrain is a constrained mesh. Along a breakline it and the height grid
-    agree to the millimetre -- a kerb is an edge of the mesh, so the mesh passes
-    through the grid's own value there -- but inside a triangle the mesh is a
-    plane where the grid curves. Everything not on a breakline lands in the
-    middle of one: every refinement vertex a road picked up, every fence post,
-    every tree. At walking height nobody notices ten centimetres. Hovering a
-    drone over a kerb, it is the difference between resting on the ground and
-    hanging above it.
+    `holes` is a function of (x, y) that is True where the survey has no
+    return, which is how a building footprint arrives.
+    """
+    edge = bbox.buffered(margin)
+    nx = int(round((edge.xmax - edge.xmin) / res))
+    ny = int(round((edge.ymax - edge.ymin) / res))
+    rx = edge.xmin + (np.arange(nx) + 0.5) * res
+    ry = edge.ymax - (np.arange(ny) + 0.5) * res
+    gx, gy = np.meshgrid(rx, ry)
+    raw = np.asarray(raw_fn(gx, gy), dtype=np.float64)
+    if holes is not None:
+        raw = np.where(holes(gx, gy), np.float32(3.4028234663852886e38), raw)
+
+    class FakeDataset:
+        def __init__(self):
+            self.bounds = type(
+                "B", (), {"left": edge.xmin, "bottom": edge.ymin,
+                          "right": edge.xmax, "top": edge.ymax},
+            )()
+            self.crs = None
+            self.res = (res, res)
+
+        def read(self, _band):
+            return raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    return FakeDataset
+
+
+def _build_fake_terrain(bbox, raw_fn, *, grid_m=2.0, holes=None, smooth=1):
+    import unittest.mock as mock
+
+    from src import elevation
+
+    cfg = {
+        "grid_m": grid_m, "resolution_m": 0.5, "ahn_model": "DTM",
+        "wcs_url": "https://example.invalid/wcs", "timeout_s": 1.0,
+        "max_retries": 1, "max_nodata_fraction": 0.9,
+        "smooth_iterations": smooth,
+    }
+    dataset = _fake_ahn(bbox, raw_fn, holes=holes)
+    with tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(elevation, "fetch_dtm_geotiff"), \
+            mock.patch("rasterio.open", return_value=dataset()):
+        terrain = elevation.build_terrain(bbox, Path(tmp), terrain_cfg=cfg)
+        saved = dict(np.load(Path(tmp) / "terrain_grid.npz"))
+    return terrain, saved
+
+
+class TestIntermediatesNeedNoPickle(unittest.TestCase):
+    """Blender reads these files with its own NumPy, not this one.
+
+    Blender 4.2 bundles NumPy 1.26. An object array is pickled, and a pickle
+    written by NumPy 2 refers to `numpy._core`, which 1.26 cannot import: the
+    Blender stage died on the first barrier with everything else built.
     """
 
-    @staticmethod
-    def _mesh(fn, n=18, span=100.0):
-        """A coarse triangulation of `fn`, so it differs from a fine grid."""
-        from src.cdt import triangulate
+    def test_barrier_names_load_without_pickle(self):
+        from src.barriers import BarrierSet, save_barriers
 
-        grid = np.linspace(0.0, span, n)
-        xx, yy = np.meshgrid(grid, grid)
-        points = np.column_stack([xx.ravel(), yy.ravel()])
-        result = triangulate(
-            points, np.zeros((0, 2), dtype=np.int64),
-            origin=(span / 2, span / 2), skip_crossing=True,
+        barriers = BarrierSet(
+            vertices=np.zeros((3, 3)), uv=np.zeros((3, 2)),
+            triangles=np.array([[0, 1, 2]], dtype=np.int32),
+            material=np.zeros(1, np.int32), kind=np.zeros(1, np.int32),
+            material_names=["brick", "paint"], kind_names=["muur", "hek"],
+            see_through=["hek"],
         )
-        world = result.world_points()
-        vertices = np.column_stack([world, fn(world[:, 0], world[:, 1])])
-        return vertices, result.triangles
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_barriers(barriers, Path(tmp) / "barriers.npz")
+            data = np.load(path)  # allow_pickle defaults to False
+            self.assertEqual([str(n) for n in data["kind_names"]], ["muur", "hek"])
+            self.assertEqual([str(n) for n in data["see_through"]], ["hek"])
+            for key in data.files:
+                self.assertNotEqual(data[key].dtype, object, key)
 
-    def test_it_lands_on_the_mesh_plane_not_near_it(self):
-        from src.terrain_mesh import MeshSampler
-
-        plane = lambda x, y: 2.0 * x - 3.0 * y + 5.0
-        vertices, triangles = self._mesh(plane)
-        sampler = MeshSampler(vertices, triangles)
-
-        rng = np.random.default_rng(4)
-        q = rng.uniform(5.0, 95.0, (400, 2))
-        got = sampler(q[:, 0], q[:, 1])
-        self.assertTrue(np.isfinite(got).all(), "points inside the mesh were lost")
-        self.assertLess(
-            float(np.abs(got - plane(q[:, 0], q[:, 1])).max()), 1e-9,
-            "a plane is the one surface a triangulation reproduces exactly",
-        )
-
-    def test_it_differs_from_the_grid_where_the_mesh_does(self):
-        """The whole point. On a curved surface a coarse mesh is not the grid,
-        and a thing laid on the grid hangs above or sinks into what is drawn."""
-        from src.elevation import _bilinear_on_grid
-        from src.terrain_mesh import MeshSampler
-
-        bumpy = lambda x, y: 3.0 * np.sin(np.asarray(x) / 9.0) * np.cos(
-            np.asarray(y) / 11.0
-        )
-        vertices, triangles = self._mesh(bumpy)
-        sampler = MeshSampler(vertices, triangles)
-
-        fine = np.linspace(0.0, 100.0, 201)
-        grid = bumpy(*np.meshgrid(fine, fine))
-
-        rng = np.random.default_rng(9)
-        q = rng.uniform(5.0, 95.0, (500, 2))
-        on_mesh = sampler(q[:, 0], q[:, 1])
-        on_grid = _bilinear_on_grid(grid, fine, fine, q[:, 0], q[:, 1])
-
-        self.assertGreater(
-            float(np.abs(on_mesh - on_grid).max()), 0.05,
-            "the fixture's mesh is too fine to differ from its grid",
-        )
-
-    def test_outside_the_mesh_falls_back(self):
-        """A bbox corner can fall outside the triangulated hull, and a tree
-        there has to stand somewhere rather than at NaN."""
-        from src.terrain_mesh import MeshSampler
-
-        vertices, triangles = self._mesh(lambda x, y: np.zeros(len(np.atleast_1d(x))))
-        sampler = MeshSampler(
-            vertices, triangles,
-            fallback=lambda x, y: np.full(len(np.atleast_1d(x)), -7.0),
-        )
-        self.assertAlmostEqual(float(sampler(500.0, 500.0)[0]), -7.0)
-        self.assertAlmostEqual(float(sampler(50.0, 50.0)[0]), 0.0)
-
-    def test_it_locates_the_triangle_a_point_is_actually_in(self):
-        """A cell holds every triangle whose bounding box touches it, most of
-        which the point is outside. Taking the nearest candidate rather than
-        the containing one is a mistake a plane cannot show -- every triangle
-        of a plane agrees -- so the fixture has to be a surface that folds."""
-        from src.terrain_mesh import MeshSampler
-
-        folded = lambda x, y: (
-            np.abs(np.asarray(x) % 23.0 - 11.5) * 1.7
-            - np.abs(np.asarray(y) % 17.0 - 8.5) * 1.3
-        )
-        vertices, triangles = self._mesh(folded, n=14)
-        sampler = MeshSampler(vertices, triangles)
-
-        rng = np.random.default_rng(17)
-        q = rng.uniform(2.0, 98.0, (300, 2))
-        got = sampler(q[:, 0], q[:, 1])
-
-        # Brute force: the containing triangle, found by testing all of them.
-        want = _height_by_brute_force(vertices, triangles, q)
-        self.assertTrue(np.isfinite(want).all(), "the fixture lost points")
-        worst = float(np.abs(got - want).max())
-        self.assertLess(
-            worst, 1e-9,
-            f"the sampler picked the wrong triangle; off by {worst:.3f} m",
-        )
-
-    def test_a_terrain_with_a_mesh_drapes_on_it_without_being_told_to(self):
-        """The grid and the mesh are two different surfaces, and a terrain that
-        carries a mesh has to hand out the mesh's heights -- with no assignment
-        in between for a caller to forget."""
-        from src.elevation import TerrainResult
-        from src.geo import BBox
-        from src.terrain_mesh import ConstrainedMesh
-
-        bumpy = lambda x, y: 3.0 * np.sin(np.asarray(x) / 9.0) * np.cos(
-            np.asarray(y) / 11.0
-        )
-        vertices, triangles = self._mesh(bumpy)
-        fine = np.linspace(0.0, 100.0, 201)
-
-        terrain = TerrainResult(
-            heights=bumpy(*np.meshgrid(fine, fine)).astype(np.float32),
-            xs=fine, ys=fine, bbox=BBox(0.0, 0.0, 100.0, 100.0),
-            center_z_nap=0.0, nodata_fraction_raw=0.0, filled_fraction=0.0,
-            geotiff_path=None, coverage_id="test", resolution_m=0.5,
-            constrained=ConstrainedMesh(
-                vertices=vertices, triangles=triangles, breakline_edges=0,
-                height_points=len(vertices), tolerance_m=0.1, max_error_m=0.1,
-                counts={},
-            ),
-        )
-
-        rng = np.random.default_rng(23)
-        q = rng.uniform(5.0, 95.0, (400, 2))
-        on_mesh = terrain.surface(q[:, 0], q[:, 1])
-        on_grid = terrain.sample(q[:, 0], q[:, 1])
-
-        want = _height_by_brute_force(vertices, triangles, q)
-        self.assertLess(
-            float(np.abs(on_mesh - want).max()), 1e-6,
-            "surface() did not read off the mesh the terrain carries",
-        )
-        self.assertGreater(
-            float(np.abs(on_mesh - on_grid).max()), 0.05,
-            "the fixture's two surfaces are too alike to tell apart",
-        )
-
-    def test_a_terrain_without_a_mesh_still_answers(self):
-        """Not every run has breaklines, and the grid is the surface then."""
-        from src.elevation import TerrainResult
-        from src.geo import BBox
-
-        fine = np.linspace(0.0, 100.0, 51)
-        heights = np.full((51, 51), 4.0, dtype=np.float32)
-        terrain = TerrainResult(
-            heights=heights, xs=fine, ys=fine,
-            bbox=BBox(0.0, 0.0, 100.0, 100.0), center_z_nap=4.0,
-            nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
-            coverage_id="test", resolution_m=0.5,
-        )
-        self.assertAlmostEqual(float(np.ravel(terrain.surface(50.0, 50.0))[0]), 4.0)
-
-    def test_a_real_run_comes_back_carrying_its_mesh(self):
-        """`build_terrain` is the only thing that ever constructs a terrain, so
-        a mesh it builds and then drops is a mesh nothing drapes on -- and the
-        grid it falls back to looks perfectly reasonable, which is what makes
-        that worth a test rather than a glance. Only the two IO boundaries are
-        stubbed; the grid, the hole filling and the triangulation are real."""
-        import tempfile
-        import unittest.mock as mock
-
-        from src import elevation
-        from src.geo import BBox
-
-        bbox = BBox(0.0, 0.0, 200.0, 200.0)
-        # A raster with a dike across it, so the mesh has something to fold on
-        # and is not just a plane the grid happens to reproduce.
-        res = 0.5
-        edge = bbox.buffered(8.0)
-        nx = int(round((edge.xmax - edge.xmin) / res))
-        ny = int(round((edge.ymax - edge.ymin) / res))
-        rx = edge.xmin + (np.arange(nx) + 0.5) * res
-        ry = edge.ymax - (np.arange(ny) + 0.5) * res
-        gx, gy = np.meshgrid(rx, ry)
-        raw = 2.0 + 1.5 * np.exp(-((gx - 100.0) ** 2) / 200.0) + 0.004 * gy
-
-        class FakeDataset:
-            def __init__(self):
-                self.bounds = type(
-                    "B", (), {"left": edge.xmin, "bottom": edge.ymin,
-                              "right": edge.xmax, "top": edge.ymax},
-                )()
-                self.crs = None
-                self.res = (res, res)
-
-            def read(self, _band):
-                return raw
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return False
-
-        cfg = {
-            "mesh_vertices_per_side": 65, "resolution_m": res,
-            "ahn_model": "DTM", "wcs_url": "https://example.invalid/wcs",
-            "timeout_s": 1.0, "max_retries": 1, "max_nodata_fraction": 0.5,
-            "smooth_iterations": 0, "simplify_tolerance_m": 0.1,
-        }
-        ring = np.array(
-            [[60.0, 20.0], [140.0, 20.0], [140.0, 180.0], [60.0, 180.0],
-             [60.0, 20.0]]
-        )
-
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(elevation, "fetch_dtm_geotiff"), \
-                mock.patch("rasterio.open", return_value=FakeDataset()):
-            terrain = elevation.build_terrain(
-                bbox, Path(tmp), terrain_cfg=cfg,
-                breakline_rings={"road": [ring]},
-            )
-
-        self.assertIsNotNone(
-            terrain.constrained,
-            "build_terrain triangulated the ground and threw the mesh away",
-        )
-        rng = np.random.default_rng(31)
-        q = rng.uniform(10.0, 190.0, (300, 2))
-        on_mesh = terrain.surface(q[:, 0], q[:, 1])
-        on_grid = terrain.sample(q[:, 0], q[:, 1])
-        self.assertTrue(np.isfinite(on_mesh).all())
-        want = _height_by_brute_force(
-            terrain.constrained.vertices, terrain.constrained.triangles, q
-        )
-        inside = np.isfinite(want)
-        self.assertGreater(inside.sum(), 200, "the fixture's hull lost points")
-        self.assertLess(
-            float(np.abs(on_mesh[inside] - want[inside]).max()), 1e-6,
-            "a terrain from a real run does not drape on its own mesh",
-        )
-        self.assertGreater(
-            float(np.abs(on_mesh - on_grid).max()), 0.01,
-            "this bbox's mesh and grid are too alike to tell apart",
-        )
-
-    def test_the_grid_stays_reachable_for_the_checks(self):
-        """The checks measure how far the mesh strays from the ground it was
-        simplified from. Against the mesh itself that error is zero by
-        construction, so they have to keep asking the grid."""
-        text = (REPO_ROOT / "src" / "validate.py").read_text(encoding="utf-8")
+    def test_nothing_saves_an_object_array(self):
+        for path in (REPO_ROOT / "src").glob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("dtype=object", text, f"{path.name} pickles an array")
         self.assertNotIn(
-            "terrain.surface", text,
-            "a check that drapes on the mesh is a check that cannot fail",
+            "allow_pickle=True",
+            (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8"),
         )
 
-    def test_everything_placed_on_the_ground_uses_it(self):
-        """A sampler nothing calls is a sampler that fixes nothing.
 
-        Everything here puts an object at a height: a tree, a post, a fence
-        rail, a sleeper. There is no tolerance loop and no lift to absorb the
-        difference, so whichever surface was sampled is the error, and placing
-        on the grid leaves 2.8% of them out by over 5 cm (max 9.6 cm measured
-        on a km of lumpy ground).
-        """
+class TestTerrainGrid(unittest.TestCase):
+    """The terrain is a regular grid of quads, because it is edited.
+
+    What is checked here is what an editor and an engine rely on: the spacing
+    asked for is the spacing delivered, the surveyed ground is not smoothed
+    away, the surface reported to everything placed on it is the surface the
+    model draws, and the ground stays out from under the roads.
+    """
+
+    def test_the_spacing_asked_for_is_the_spacing_delivered(self):
+        from src.elevation import grid_size_for
+        from src.geo import BBox
+
+        self.assertEqual(grid_size_for(BBox(0, 0, 1000, 1000), 2.0), 501)
+        self.assertEqual(grid_size_for(BBox(0, 0, 1000, 1000), 4.0), 251)
+        # Never coarser than asked: 999 m at 2 m is 500 squares, not 499.
+        self.assertEqual(grid_size_for(BBox(0, 0, 999, 999), 2.0), 501)
+        # An oblong area is sized on its long side.
+        self.assertEqual(grid_size_for(BBox(0, 0, 1000, 800), 2.0), 501)
+        with self.assertRaises(ValueError):
+            grid_size_for(BBox(0, 0, 1000, 1000), 0.0)
+
+    def test_the_surface_is_the_triangles_the_model_draws(self):
+        """Each square split south-west to north-east, which is the split
+        Blender's fixed quad method and the FBX export make. A bilinear patch
+        is no renderer's surface, and the other diagonal is the other one."""
+        from src.elevation import _bilinear_on_grid, _triangulated_on_grid
+
+        xs = np.array([0.0, 2.0])
+        ys = np.array([0.0, 2.0])
+        # A saddle: only the north-east corner is raised.
+        grid = np.array([[0.0, 0.0], [0.0, 1.0]])
+        # South-east of the diagonal, a quarter of the way up.
+        x, y = 1.0, 0.5
+        self.assertAlmostEqual(float(_triangulated_on_grid(grid, xs, ys, x, y)), 0.25)
+        self.assertAlmostEqual(float(_bilinear_on_grid(grid, xs, ys, x, y)), 0.125)
+        # North-west of it, by symmetry.
+        self.assertAlmostEqual(float(_triangulated_on_grid(grid, xs, ys, 0.5, 1.0)), 0.25)
+
+        # And against an explicit triangulation of a bumpy grid, point by point.
+        n = 9
+        axis = np.linspace(0.0, 16.0, n)
+        gx, gy = np.meshgrid(axis, axis)
+        bumpy = np.sin(gx / 3.0) * np.cos(gy / 4.0) * 2.0
+        vertices = np.column_stack([gx.ravel(), gy.ravel(), bumpy.ravel()])
+        triangles = []
+        for row in range(n - 1):
+            for col in range(n - 1):
+                bl = row * n + col
+                br, tl = bl + 1, bl + n
+                tr = tl + 1
+                triangles += [[bl, br, tr], [bl, tr, tl]]
+        rng = np.random.default_rng(3)
+        q = rng.uniform(0.1, 15.9, (300, 2))
+        want = _height_by_brute_force(vertices, np.asarray(triangles), q)
+        got = _triangulated_on_grid(bumpy, axis, axis, q[:, 0], q[:, 1])
+        self.assertLess(float(np.abs(got - want).max()), 1e-9)
+
+    def test_the_last_row_and_column_are_reachable(self):
+        from src.elevation import _triangulated_on_grid
+
+        axis = np.array([0.0, 1.0, 2.0])
+        grid = np.arange(9.0).reshape(3, 3)
+        self.assertAlmostEqual(float(_triangulated_on_grid(grid, axis, axis, 2.0, 2.0)), 8.0)
+        self.assertAlmostEqual(float(_triangulated_on_grid(grid, axis, axis, 2.0, 0.0)), 2.0)
+
+    def test_measured_ground_is_not_smoothed(self):
+        """Smoothing the survey doubled a 2 m grid's error. Only the ground the
+        filler invents under a building is smoothed."""
+        from src.geo import BBox
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        # A quay wall: one metre down at x = 50. Smoothing would round it off.
+        quay = lambda x, y: np.where(x < 50.0, 3.0, 2.0)
+        hole = lambda x, y: (x > 70.0) & (x < 80.0) & (y > 70.0) & (y < 80.0)
+        terrain, _ = _build_fake_terrain(bbox, quay, holes=hole, smooth=3)
+        col_dry = int(np.searchsorted(terrain.xs, 46.0))
+        col_wet = int(np.searchsorted(terrain.xs, 54.0))
+        row = int(np.searchsorted(terrain.ys, 20.0))
+        self.assertAlmostEqual(float(terrain.heights[row, col_dry]), 3.0, places=5)
+        self.assertAlmostEqual(float(terrain.heights[row, col_wet]), 2.0, places=5)
+        # The hole was filled and is finite.
+        self.assertTrue(np.isfinite(terrain.heights).all())
+
+    def test_a_built_terrain_reports_its_own_accuracy(self):
+        from src.geo import BBox
+
+        bbox = BBox(0.0, 0.0, 120.0, 120.0)
+        gentle = lambda x, y: 4.0 + 0.01 * x + 0.3 * np.sin(y / 15.0)
+        terrain, saved = _build_fake_terrain(bbox, gentle)
+        self.assertAlmostEqual(terrain.grid_m, 2.0)
+        self.assertEqual(terrain.n, 61)
+        self.assertLess(terrain.survey_error["p95_m"], 0.01)
+        # Saved for Blender, with the surveyed copy alongside.
+        self.assertEqual(saved["heights"].shape, (61, 61))
+        self.assertIn("measured", saved)
+
+        # A ground the grid cannot follow says so.
+        rough = lambda x, y: 4.0 + 0.6 * np.sin(x * 2.1) * np.cos(y * 1.7)
+        coarse, _ = _build_fake_terrain(bbox, rough, grid_m=4.0)
+        self.assertGreater(coarse.survey_error["over_25cm"], 0.05)
+        from src.validate import CheckReport, check_terrain
+
+        report = CheckReport()
+        check_terrain(report, coarse, bbox)
+        verdict = {c.name: c for c in report.checks}["terrain_follows_the_survey"]
+        self.assertFalse(verdict.passed)
+
+    def test_the_ground_never_shows_through_a_road(self):
+        """Every grid vertex is held below the lowest road anywhere in the
+        squares around it. Testing the road height at the vertex alone lets a
+        road dipping between two vertices sink into the ground."""
+        from src.elevation import HeightRaster, TerrainResult, lower_under
+        from src.geo import BBox
+
+        bbox = BBox(0.0, 0.0, 40.0, 40.0)
+        axis = np.linspace(0.0, 40.0, 21)
+        flat = np.full((21, 21), 5.0, dtype=np.float32)
+        terrain = TerrainResult(
+            heights=flat.copy(), xs=axis, ys=axis, bbox=bbox, center_z_nap=5.0,
+            nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
+            coverage_id="test", resolution_m=0.5, measured=flat.copy(),
+        )
+        # A road strip from x = 11 to 19, sagging to 4.7 m in the middle of a
+        # grid square (x = 15) and back up to 5.03 m at its edges.
+        res = 0.25
+        cols = int(40 / res)
+        cx = (np.arange(cols) + 0.5) * res
+        top = np.full((cols, cols), np.nan)
+        strip = (cx > 11.0) & (cx < 19.0)
+        top[:, strip] = (4.7 + 0.33 * np.abs(cx[strip] - 15.0) / 4.0)[None, :]
+        info = lower_under(terrain, HeightRaster(top, bbox), clearance_m=0.05)
+
+        rng = np.random.default_rng(5)
+        q = np.column_stack([rng.uniform(11.2, 18.8, 500), rng.uniform(1.0, 39.0, 500)])
+        road = HeightRaster(top, bbox)(q[:, 0], q[:, 1])
+        ground = terrain.surface(q[:, 0], q[:, 1])
+        self.assertTrue((ground <= road - 0.05 + 1e-6).all(),
+                        f"ground above the road by {float((ground - road).max()):.3f} m")
+        # Only what is near a road moved; the far field is untouched.
+        self.assertAlmostEqual(float(terrain.heights[10, 2]), 5.0)
+        self.assertAlmostEqual(float(terrain.heights[10, 18]), 5.0)
+        self.assertGreater(info["vertices"], 0)
+        # The survey is kept, and is what `sample` reports.
+        self.assertAlmostEqual(float(np.ravel(terrain.sample(15.0, 20.0))[0]), 5.0)
+
+    def test_surface_reads_the_road_where_there_is_one(self):
+        from src.elevation import HeightRaster, TerrainResult
+        from src.geo import BBox
+
+        bbox = BBox(0.0, 0.0, 10.0, 10.0)
+        axis = np.linspace(0.0, 10.0, 6)
+        terrain = TerrainResult(
+            heights=np.full((6, 6), 1.0, dtype=np.float32), xs=axis, ys=axis,
+            bbox=bbox, center_z_nap=1.0, nodata_fraction_raw=0.0,
+            filled_fraction=0.0, geotiff_path=None, coverage_id="t",
+            resolution_m=0.5,
+        )
+        top = np.full((20, 20), np.nan)
+        top[:, :10] = 1.2  # the western half is road, rows run north-down
+        terrain.road_top = HeightRaster(top, bbox)
+        got = terrain.surface(np.array([2.0, 8.0]), np.array([5.0, 5.0]))
+        self.assertAlmostEqual(float(got[0]), 1.2)
+        self.assertAlmostEqual(float(got[1]), 1.0)
+
+    def test_everything_placed_on_the_ground_uses_the_drawn_surface(self):
+        """A tree, a post, a fence rail, a sleeper, a parked car: placed at a
+        height, with no lift to absorb a difference, so it has to be the
+        height the model draws -- the road top where there is one."""
         for module, count in (
             ("barriers", 3), ("furniture", 1), ("rails", 1), ("trees", 2),
         ):
             text = (REPO_ROOT / "src" / f"{module}.py").read_text(encoding="utf-8")
             self.assertGreaterEqual(
                 text.count("terrain.surface"), count,
-                f"src/{module}.py places objects on the grid, not on the mesh",
+                f"src/{module}.py places objects on the survey, not on the model",
             )
 
-    def test_roads_stay_on_the_grid_they_are_lifted_off(self):
-        """The one deliberate exception, and it needs saying so nobody tidies
-        it into line with the rest.
+    def test_the_built_terrain_is_checked_against_the_grid(self):
+        from src.validate import CheckReport, check_built_terrain
 
-        A road is draped, not placed: it is split until a flat triangle is
-        within tolerance of the ground, and the lift clears what is left.
-        Measured, draping on the mesh moved the terrain's poke-through from
-        25.4 cm to 25.5 cm -- nothing -- because the split tests the centroid
-        and the mesh bulges inside a triangle either way. And the lift is sized
-        from how far the mesh rises above the *grid*, which only describes the
-        road while the road is on the grid.
-        """
-        text = (REPO_ROOT / "src" / "surfaces.py").read_text(encoding="utf-8")
-        self.assertIn("terrain.sample", text)
-        self.assertNotIn(
-            "terrain.surface", text,
-            "roads drape on the grid on purpose; see the comment there",
-        )
+        class Grid:
+            n = 5
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            for faces, quads, verts, ok in (
+                (16, 16, 25, True), (20, 16, 25, False), (16, 16, 24, False),
+            ):
+                (work / "blender_summary.json").write_text(json.dumps(
+                    {"terrain": {"faces": faces, "quads": quads, "vertices": verts}}
+                ))
+                report = CheckReport()
+                check_built_terrain(report, work, Grid())
+                verdict = {c.name: c for c in report.checks}["terrain_built_as_planned"]
+                self.assertEqual(verdict.passed, ok, (faces, quads, verts))
 
 
 class TestPathsOverWater(unittest.TestCase):
@@ -8565,115 +8016,6 @@ class TestFeatureFilter(unittest.TestCase):
         self.assertEqual(len(plain.segments), len(zero.segments))
 
 
-class TestTerrainMeshChecks(unittest.TestCase):
-    """The checks that let all of this ship without a word.
-
-    `terrain_mesh_follows_the_ground` allowed eight times the tolerance, or a
-    whole metre, and only warned; nothing looked at the shape of a triangle at
-    all.
-    """
-
-    @staticmethod
-    def _mesh(**over):
-        from src.terrain_mesh import ConstrainedMesh
-
-        # Two healthy triangles tiling the bbox, and where asked the same area
-        # cut into a wedge and its neighbour instead.
-        vertices = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [10.0, 0.0, 0.0],
-                [10.0, 8.0, 0.0],
-                [0.0, 8.0, 0.0],
-                [10.0, 0.001, 0.0],
-            ],
-            dtype=float,
-        )
-        triangles = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
-        if over.pop("sliver", False):
-            triangles = np.array(
-                [[0, 1, 4], [0, 4, 2], [0, 2, 3]], dtype=np.int32
-            )
-        fields = dict(
-            vertices=vertices,
-            triangles=triangles,
-            breakline_edges=3,
-            height_points=3,
-            tolerance_m=0.10,
-            max_error_m=0.05,
-            counts={"roads": 1},
-        )
-        fields.update(over)
-        return ConstrainedMesh(**fields)
-
-    def _run(self, mesh):
-        from src.geo import BBox
-        from src.validate import CheckReport, check_constrained_mesh
-
-        report = CheckReport()
-        check_constrained_mesh(report, mesh, BBox(0, 0, 10, 8))
-        return {c.name: c for c in report.checks}
-
-    def test_a_mesh_further_off_than_the_ground_allows_fails(self):
-        checks = self._run(
-            self._mesh(max_error_m=0.285, triangles_over_allowance=1)
-        )
-        found = checks["terrain_mesh_follows_the_ground"]
-        self.assertFalse(found.passed, "a triangle beyond the allowance passed")
-        self.assertEqual(found.severity, "error", "it must fail, not warn")
-
-    def test_a_step_in_the_height_model_is_not_the_mesh_s_fault(self):
-        """The distinction the check turns on. AHN has quay walls and filled
-        building holes in it: 60 cm between neighbouring samples. No triangle
-        that is not aligned to the sample grid gets nearer than about 30 cm of
-        such a pair, so failing the mesh for it is failing it for the data's
-        resolution -- and chasing it is what ran a real Utrecht kilometre to
-        701,978 triangles."""
-        checks = self._run(
-            self._mesh(
-                max_error_m=0.285,
-                triangles_over_allowance=0,
-                reachable_tolerance_m=0.30,
-            )
-        )
-        found = checks["terrain_mesh_follows_the_ground"]
-        self.assertTrue(found.passed, "penalised for a step in the source data")
-        self.assertIn("steps by up to", found.detail, "the reason must be stated")
-
-    def test_the_old_slack_would_have_let_a_real_fault_through(self):
-        """Kept as a statement of what changed: eight times the tolerance, and
-        only a warning."""
-        self.assertLess(0.285, 8.0 * 0.10)
-
-    def test_slivers_are_caught(self):
-        checks = self._run(self._mesh(sliver=True, slivers_of_our_own=1))
-        self.assertFalse(
-            checks["terrain_triangles_are_not_slivers"].passed,
-            "a triangle 1 mm thick and 10 m long passed the quality check",
-        )
-
-    def test_a_wedge_the_input_already_had_is_not_the_mesh_s_fault(self):
-        """Two surveyed outlines meeting at half a degree put a half-degree
-        triangle in the mesh, and there is nowhere to put a point that improves
-        it. Counting those against the mesh hides the ones that are its own."""
-        checks = self._run(
-            self._mesh(sliver=True, slivers_of_our_own=0, slivers_from_input=1)
-        )
-        found = checks["terrain_triangles_are_not_slivers"]
-        self.assertTrue(found.passed, "penalised for a wedge in the source data")
-        self.assertIn("input already had", found.detail)
-
-    def test_a_clean_mesh_passes_everything(self):
-        for check in self._run(self._mesh()).values():
-            self.assertTrue(check.passed, f"{check.name}: {check.detail}")
-
-    def test_a_breakline_the_ground_has_left_behind_is_reported(self):
-        checks = self._run(
-            self._mesh(max_edge_sag_m=0.9, breaklines_over_allowance=2)
-        )
-        self.assertFalse(checks["breaklines_lie_on_the_ground"].passed)
-
-
 class TestUIServer(unittest.TestCase):
     """The UI writes a config and shells out to pipeline.py, so the translation
     from form fields to config is the part worth pinning down."""
@@ -8689,7 +8031,7 @@ class TestUIServer(unittest.TestCase):
             "name": "somewhere",
             "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
             "size_px": 2048,
-            "mesh_vertices": 129,
+            "terrain_grid_m": 4.0,
             "facade_variants": 4,
             "clip_mode": "intersect",
         }
@@ -8703,7 +8045,7 @@ class TestUIServer(unittest.TestCase):
         self.assertEqual(loaded.name, "somewhere")
         self.assertEqual(loaded.bbox.width, 1000.0)
         self.assertEqual(loaded.aerial["size_px"], 2048)
-        self.assertEqual(loaded.terrain["mesh_vertices_per_side"], 129)
+        self.assertEqual(loaded.terrain["grid_m"], 4.0)
         self.assertEqual(loaded.facade["variants"], 4)
         self.assertEqual(loaded.buildings["clip_mode"], "intersect")
 
@@ -8813,7 +8155,7 @@ class TestUIServer(unittest.TestCase):
                 "name": "q",
                 "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
                 "size_px": 12288,
-                "mesh_vertices": 1025,
+                "terrain_grid_m": 1.0,
                 "facade_texture_px": 2048,
                 "facade_normal_map": False,
             }
@@ -8824,41 +8166,9 @@ class TestUIServer(unittest.TestCase):
             loaded = load_config(path)
 
         self.assertEqual(loaded.aerial["size_px"], 12288)
-        self.assertEqual(loaded.terrain["mesh_vertices_per_side"], 1025)
+        self.assertEqual(loaded.terrain["grid_m"], 1.0)
         self.assertEqual(loaded.facade["texture_px"], 2048)
         self.assertFalse(loaded.facade["normal_map"])
-
-    def test_the_terrain_mesh_slider_reaches_the_config(self):
-        config = self.server.build_config(
-            {
-                "name": "q",
-                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
-                "mesh_vertices": 513,
-                "simplify_tolerance_m": 0.25,
-            }
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "c.json"
-            path.write_text(json.dumps(config))
-            loaded = load_config(path)
-        self.assertEqual(loaded.terrain["simplify_tolerance_m"], 0.25)
-
-    def test_the_slider_can_turn_simplification_off(self):
-        """Zero has to survive the round trip, or the control does nothing."""
-        config = self.server.build_config(
-            {
-                "name": "q",
-                "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
-                "mesh_vertices": 500,
-                "simplify_tolerance_m": 0,
-            }
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "c.json"
-            path.write_text(json.dumps(config))
-            loaded = load_config(path)
-        self.assertEqual(loaded.terrain["simplify_tolerance_m"], 0.0)
-        self.assertEqual(loaded.terrain["mesh_vertices_per_side"], 500)
 
     def test_estimate_grows_with_area_pixels_and_features(self):
         estimate = self.server.estimate_seconds
@@ -8951,7 +8261,7 @@ class TestUIServer(unittest.TestCase):
                 "name": "q",
                 "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
                 "size_px": 16384,     # finer than the 8 cm ortho
-                "mesh_vertices": 4097,  # finer than the 0.5 m DTM
+                "terrain_grid_m": 0.25,  # finer than the 0.5 m DTM
             }
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -8963,6 +8273,7 @@ class TestUIServer(unittest.TestCase):
         messages = " ".join(captured.output)
         self.assertIn("finer than the 8 cm source", messages)
         self.assertIn("finer than the 0.50 m AHN source", messages)
+        self.assertEqual(loaded.terrain["grid_m"], 0.25)
         self.assertEqual(loaded.aerial["size_px"], 16384)
 
 

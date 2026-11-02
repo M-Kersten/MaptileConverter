@@ -139,169 +139,58 @@ def check_terrain(report: CheckReport, terrain, bbox: BBox) -> None:
         f"grid spans {grid_span_x:.3f} m against a {bbox.width:.3f} m bbox",
     )
 
-    check_terrain_mesh(report, getattr(terrain, "mesh", None), bbox)
-    check_constrained_mesh(report, getattr(terrain, "constrained", None), bbox)
-
-
-def check_constrained_mesh(report: CheckReport, mesh, bbox: BBox) -> None:
-    """The terrain folds along real features, and still tiles the area."""
-    if mesh is None:
-        return
-
-    corners = mesh.vertices[mesh.triangles][:, :, :2]
-    a = corners[:, 1] - corners[:, 0]
-    b = corners[:, 2] - corners[:, 0]
-    twice_area = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
-    covered = 0.5 * float(twice_area.sum())
-    want = bbox.width * bbox.height
-    report.add(
-        "terrain_mesh_tiles_the_bbox",
-        abs(covered - want) < 1e-6 * want,
-        f"triangles cover {covered:.1f} m2 of a {want:.0f} m2 bbox",
-    )
-    report.add(
-        "terrain_mesh_wound_up",
-        bool((twice_area > 0).all()),
-        f"{int((twice_area <= 0).sum())} triangles face down or are degenerate",
-    )
-
-    # The whole point: an edge where the ground has one. Without this the mesh
-    # is just a Delaunay triangulation of some points and nothing folds.
-    report.add(
-        "terrain_folds_along_features",
-        mesh.breakline_edges > 0,
-        f"{mesh.breakline_edges} breakline edges from "
-        f"{', '.join(f'{k} {v}' for k, v in mesh.counts.items() if v)}",
-    )
-    # This used to allow eight times the tolerance, or a whole metre, and only
-    # warn, which let a mesh three times outside its tolerance ship in silence.
-    # It now asks for the tolerance -- but counted against what the height model
-    # can actually deliver, not against the number in the config.
-    #
-    # A tolerance is a promise about a surface, and AHN is a grid with steps in
-    # it: a quay wall, the lip of a filled building hole. Where two neighbouring
-    # samples differ by 60 cm, no triangle that is not aligned to the sample grid
-    # gets closer than about 30 cm of the pair, however finely it is cut. Judging
-    # the mesh against 0.10 m there is judging it for the data's resolution, and
-    # it does harm: refinement chased it to 701,978 triangles on a real Utrecht
-    # kilometre and still missed by a factor of five.
-    over = getattr(mesh, "triangles_over_allowance", None)
-    if over is None:
+    # How much of the survey the grid gave up. A regular grid cannot follow a
+    # quay wall that falls between two of its rows, so this is a statement
+    # about the spacing chosen rather than a defect, and it warns: the share of
+    # ground more than 25 cm off was 0.8% at 2 m over Bronbeek and 3.3% at 4 m.
+    survey = getattr(terrain, "survey_error", None)
+    if survey:
         report.add(
-            "terrain_mesh_follows_the_ground",
-            mesh.max_error_m <= CONSTRAINED_ERROR_SLACK * mesh.tolerance_m,
-            f"worst gap between the mesh and the height grid is "
-            f"{mesh.max_error_m:.3f} m against a {mesh.tolerance_m:.2f} m tolerance",
-        )
-    else:
-        reachable = getattr(mesh, "reachable_tolerance_m", mesh.tolerance_m)
-        total = len(mesh.triangles)
-        detail = (
-            f"{over} of {total} triangles are further from the ground than the "
-            f"height model allows; worst gap {mesh.max_error_m:.3f} m, tolerance "
-            f"{mesh.tolerance_m:.2f} m"
-        )
-        if reachable > mesh.tolerance_m * 1.01:
-            detail += (
-                f" (the model steps by up to {2 * reachable:.2f} m between "
-                f"samples, so {reachable:.2f} m is the most it can promise "
-                f"where it steps)"
-            )
-        report.add(
-            "terrain_mesh_follows_the_ground",
-            over <= MAX_OVER_ALLOWANCE_FRACTION * max(total, 1),
-            detail,
+            "terrain_follows_the_survey",
+            survey["over_25cm"] <= 0.05,
+            f"within {survey['p95_m']:.2f} m of the 0.5 m survey on 95% of the "
+            f"ground and {survey['p99_m']:.2f} m on 99%; "
+            f"{100 * survey['over_25cm']:.2f}% is more than 25 cm off at "
+            f"{terrain.grid_m:.2f} m spacing",
+            severity="warning",
         )
 
-    quality = _triangle_quality(mesh)
-    # A mesh can be perfectly accurate and still be unusable. Nothing measured
-    # the shape of these triangles before, which is exactly how a terrain made
-    # largely of wedges passed every check it had.
-    #
-    # Counted as ours or the input's, because the difference is real: two
-    # surveyed outlines that meet at half a degree put a half-degree triangle in
-    # the mesh and there is nowhere to put a point that improves it.
-    ours = getattr(mesh, "slivers_of_our_own", quality["under_one_degree"])
-    from_input = getattr(mesh, "slivers_from_input", 0)
-    detail = (
-        f"{ours} of {quality['count']} triangles have an angle under 1 degree "
-        f"that is not explained by a sharp corner in the source outlines; "
-        f"worst is {quality['worst_angle_deg']:.2f} deg, median smallest "
-        f"{quality['median_angle_deg']:.1f} deg"
-    )
-    if from_input:
-        detail += f" ({from_input} more sit in wedges the input already had)"
-    report.add(
-        "terrain_triangles_are_not_slivers",
-        ours <= MAX_SLIVER_FRACTION * quality["count"],
-        detail,
-    )
-    report.add(
-        "terrain_triangles_are_well_shaped",
-        quality["under_ten_degrees"] <= MAX_THIN_FRACTION * quality["count"],
-        f"{100 * quality['under_ten_degrees'] / max(quality['count'], 1):.1f}% "
-        f"of triangles have an angle under 10 degrees",
-        severity="warning",
-    )
-    # A breakline the ground has left behind is a crease in the wrong place,
-    # and it is invisible to the error check above because that measures inside
-    # triangles, not along their constrained edges.
-    sagging = getattr(mesh, "breaklines_over_allowance", None)
-    report.add(
-        "breaklines_lie_on_the_ground",
-        (
-            sagging <= MAX_OVER_ALLOWANCE_FRACTION * max(mesh.breakline_edges, 1)
-            if sagging is not None
-            else quality["worst_edge_sag_m"]
-            <= CONSTRAINED_ERROR_SLACK * mesh.tolerance_m
-        ),
-        (
-            f"{sagging} of {mesh.breakline_edges} breaklines have ground under "
-            f"them further away than the height model allows; worst "
-            f"{quality['worst_edge_sag_m']:.3f} m"
-            if sagging is not None
-            else f"the ground under the breaklines strays up to "
-            f"{quality['worst_edge_sag_m']:.3f} m from them"
-        ),
-        severity="warning",
-    )
 
+def _step_allowance(heights: np.ndarray, floor_m: float) -> np.ndarray:
+    """How close anything flat can get to the grid, per vertex.
 
-# Refinement drives the worst height error down to the tolerance itself, so
-# there is no slack to allow here beyond the arithmetic.
-CONSTRAINED_ERROR_SLACK = 1.05
-
-# A few triangles will always be beyond help: where two surveyed outlines meet
-# at a sharp angle there is nowhere to put a point that improves them. This is
-# the share allowed to be beyond what the height model can deliver -- one in a
-# thousand, which on a 1 km area is a handful.
-MAX_OVER_ALLOWANCE_FRACTION = 0.001
-
-# Some slivers are unavoidable where two surveyed outlines meet at a sharp
-# angle: no triangulation can put a good triangle in a wedge the input already
-# had. A handful is the input's fault; a percent is ours.
-MAX_SLIVER_FRACTION = 0.001
-MAX_THIN_FRACTION = 0.05
+    Where two neighbouring height samples differ by a step -- a quay wall, the
+    lip of a filled building hole -- a flat face spanning the pair can only sit
+    about half the step away from it. So the allowance is the floor, or half
+    the largest step to a neighbour, whichever is larger.
+    """
+    heights = np.asarray(heights, dtype=np.float64)
+    step = np.zeros_like(heights)
+    for axis in (0, 1):
+        difference = np.abs(np.diff(heights, axis=axis))
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (0, 1)
+        np.maximum(step, np.pad(difference, pad, mode="edge"), out=step)
+        pad[axis] = (1, 0)
+        np.maximum(step, np.pad(difference, pad, mode="edge"), out=step)
+    return np.maximum(floor_m, 0.5 * step)
 
 
 def _ground_allowance(terrain, points, *, floor_m: float) -> np.ndarray:
     """How close anything draped on the grid can get to it, at these points.
 
-    The same idea the terrain mesh is judged by, and deliberately the same
-    function behind it: where two neighbouring height samples differ by a step,
-    nothing flat spanning the pair sits closer than about half of it. Judging a
-    road against a flat number instead means a single triangle crossing a quay
+    Judging a road against a flat number means a single face crossing a quay
     wall fails a drape whose median error is 22 mm.
     """
-    heights = getattr(terrain, "heights", None)
+    heights = getattr(terrain, "measured", None)
+    if heights is None:
+        heights = getattr(terrain, "heights", None)
     xs = getattr(terrain, "xs", None)
     ys = getattr(terrain, "ys", None)
     if heights is None or xs is None or ys is None or len(xs) < 2:
         return np.full(len(points), floor_m)
 
-    from .terrain_mesh import height_allowance
-
-    allowance = height_allowance(np.asarray(heights, dtype=np.float64), floor_m)
+    allowance = _step_allowance(heights, floor_m)
     cols = np.clip(
         np.round((points[:, 0] - xs[0]) / (xs[1] - xs[0])).astype(int), 0, len(xs) - 1
     )
@@ -309,78 +198,6 @@ def _ground_allowance(terrain, points, *, floor_m: float) -> np.ndarray:
         np.round((points[:, 1] - ys[0]) / (ys[1] - ys[0])).astype(int), 0, len(ys) - 1
     )
     return allowance[rows, cols]
-
-
-def _triangle_quality(mesh) -> dict:
-    """Smallest angle per triangle, and how far the ground sags under an edge."""
-    import numpy as np
-
-    corner = mesh.vertices[mesh.triangles][:, :, :2]
-    angles = []
-    for i in range(3):
-        u = corner[:, (i + 1) % 3] - corner[:, i]
-        v = corner[:, (i + 2) % 3] - corner[:, i]
-        cos = (u * v).sum(axis=1) / np.maximum(
-            np.hypot(*u.T) * np.hypot(*v.T), 1e-30
-        )
-        angles.append(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
-    smallest = np.min(np.stack(angles), axis=0)
-    return {
-        "count": int(len(smallest)),
-        "worst_angle_deg": float(smallest.min()) if len(smallest) else 0.0,
-        "median_angle_deg": float(np.median(smallest)) if len(smallest) else 0.0,
-        "under_one_degree": int((smallest < 1.0).sum()),
-        "under_ten_degrees": int((smallest < 10.0).sum()),
-        "worst_edge_sag_m": float(getattr(mesh, "max_edge_sag_m", 0.0)),
-    }
-
-
-# The nested error bound is measured at hypotenuse midpoints, and a vertex can
-# sit on a hypotenuse whose ends were themselves moved, so the height a mesh
-# gives up is bounded by the tolerance only to within a small factor. Measured
-# at about 1.7x across real areas; this is the ceiling before it counts as a
-# defect rather than the expected slack.
-MESH_ERROR_SLACK = 3.0
-
-
-def check_terrain_mesh(report: CheckReport, mesh, bbox: BBox) -> None:
-    """The simplified terrain still describes the ground, and still tiles it."""
-    if mesh is None:
-        return
-
-    report.add(
-        "terrain_mesh_within_tolerance",
-        mesh.max_error_m <= mesh.tolerance_m * MESH_ERROR_SLACK,
-        f"worst height given up is {mesh.max_error_m:.3f} m against a "
-        f"{mesh.tolerance_m:.2f} m tolerance "
-        f"(mean {mesh.mean_error_m:.4f} m)",
-    )
-
-    # Nothing else catches a hole or a double-covered patch, and either one
-    # reads as a tear in Unity rather than as a wrong height.
-    corners = mesh.vertices[mesh.triangles][:, :, :2]
-    edge_a = corners[:, 1] - corners[:, 0]
-    edge_b = corners[:, 2] - corners[:, 0]
-    twice_area = edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]
-    cells = (mesh.grid_vertices - 1) ** 2
-    covered = 0.5 * float(twice_area.sum())
-    report.add(
-        "terrain_mesh_tiles_the_bbox",
-        abs(covered - cells) < 1e-6 * cells,
-        f"triangles cover {covered:.0f} grid cells against {cells}",
-    )
-    report.add(
-        "terrain_mesh_wound_up",
-        bool((twice_area > 0).all()),
-        f"{int((twice_area <= 0).sum())} triangles face down or are degenerate",
-    )
-    report.add(
-        "terrain_mesh_saves_vertices",
-        mesh.triangle_count < 2 * cells,
-        f"{mesh.triangle_count} triangles against {2 * cells} for the full "
-        f"grid ({100.0 * mesh.triangle_count / (2 * cells):.1f}%)",
-        severity="warning",
-    )
 
 
 def check_buildings(report: CheckReport, buildings, *, max_height_m: float) -> None:
@@ -565,23 +382,6 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
             f"bed runs {np.nanmin(bed):.2f} to {np.nanmax(bed):.2f} m NAP "
             f"under {int(water.sum())} cells",
         )
-
-        # The bed is pushed down at mesh vertices, so a canal spanned by one
-        # big triangle would keep the mound the DTM invented over it. The
-        # mound is metres tall and the simplifier keeps what moves, so this
-        # should never bite -- but nothing else would notice if it did.
-        mesh = getattr(terrain, "mesh", None)
-        if mesh is not None:
-            columns = mesh.vertices[:, 0].astype(int)
-            rows = mesh.vertices[:, 1].astype(int)
-            inside = int(np.isfinite(bed[rows, columns]).sum())
-            expected = water.mean() * len(mesh.vertices) * 0.2
-            report.add(
-                "water_reaches_the_terrain_mesh",
-                inside >= max(len(surfaces.water), int(expected)),
-                f"{inside} of {len(mesh.vertices)} terrain mesh vertices sit "
-                f"inside a water outline, which is what the bed sinking moves",
-            )
 
     if surfaces.class_grid is not None:
         classified = float((surfaces.class_grid > 0).mean())
@@ -1007,12 +807,12 @@ def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
 
 
 def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
-    """The terrain in the model is the one the pipeline meant to build.
+    """The terrain in the model is the grid the pipeline meant to build.
 
-    Every other terrain check reads the mesh held in memory, which says nothing
-    about what the Blender stage drew. When scene.json lost its mesh_file the
-    model shipped the plain grid and all of them still passed, because they
-    were never looking at the model.
+    Every other terrain check reads the grid held in memory, which says nothing
+    about what the Blender stage drew. A run that once shipped a different
+    terrain from the one it had built passed all of them for exactly that
+    reason, so this one reads Blender's own count back.
     """
     summary_path = work_dir / "blender_summary.json"
     if not summary_path.is_file():
@@ -1026,34 +826,16 @@ def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
     if not built:
         return
 
-    intended = getattr(terrain, "constrained", None) or getattr(terrain, "mesh", None)
-    if intended is None:
-        report.add(
-            "terrain_built_as_planned",
-            built.get("quads", 0) > 0,
-            f"no mesh was asked for, and the model has {built.get('quads', 0)} "
-            f"grid quads",
-        )
-        return
-
-    # Counted in triangles, because a quad in this mesh is two of them fused
-    # and the fusing is the last thing that happens. Asserting that no quad
-    # exists was right while every terrain was triangles and became wrong the
-    # moment pairing shipped: a perfect 2 km model reported 540424 triangles
-    # and 1031304 quads against 2603032 built, and 540424 + 2 x 1031304 is
-    # exactly 2603032.
-    #
-    # This still catches what the check was written for -- the run that shipped
-    # the plain grid instead of the mesh it had built -- because a grid's face
-    # count does not agree with the mesh's triangle count either.
-    triangles = int(built.get("triangles", 0))
+    n = int(terrain.n)
+    want_quads = (n - 1) ** 2
     quads = int(built.get("quads", 0))
+    others = int(built.get("faces", 0)) - quads
     report.add(
         "terrain_built_as_planned",
-        triangles + 2 * quads == int(intended.triangle_count),
-        f"the model contains {triangles} terrain triangles and {quads} quads, "
-        f"which is {triangles + 2 * quads} triangles' worth against the "
-        f"{intended.triangle_count} that were built for it",
+        quads == want_quads and others == 0 and int(built.get("vertices", 0)) == n * n,
+        f"the model's terrain has {built.get('vertices', 0)} vertices, {quads} "
+        f"quads and {others} other faces, against a {n} x {n} grid of "
+        f"{want_quads} quads",
     )
 
 
@@ -1227,7 +1009,5 @@ __all__ = [
     "check_export",
     "check_fbx_reimport",
     "check_terrain",
-    "check_constrained_mesh",
-    "check_terrain_mesh",
     "write_report",
 ]

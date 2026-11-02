@@ -15,7 +15,6 @@ from typing import Any
 
 from .facade import MAX_LOOKS_PER_ERA
 from .geo import BBox, GeoContext, parse_bbox, validate_bbox
-from .terrain_mesh import is_grid_size, next_grid_size
 
 LOG = logging.getLogger(__name__)
 
@@ -50,56 +49,21 @@ DEFAULTS: dict[str, Any] = {
     "terrain": {
         "ahn_model": "DTM",
         "resolution_m": 0.5,
-        "mesh_vertices_per_side": 257,
+        # Spacing of the terrain grid, in metres. A regular grid of quads,
+        # because it is edited: sculpting, loop selection and subdivision all
+        # expect rows and columns. Measured against the 0.5 m survey over
+        # Bronbeek: 2 m is within 11 cm on 95% of the ground at 251k vertices;
+        # 4 m within 22 cm at 63k; 1 m within 6 cm at 1M.
+        "grid_m": 2.0,
         "wcs_url": "https://service.pdok.nl/rws/ahn/wcs/v1_0",
         "timeout_s": 300,
         "max_retries": 4,
         # DTM strips buildings out, so dense city centres come back mostly
         # nodata. Filling is a normal part of the job, not an error path.
         "max_nodata_fraction": 0.95,
+        # Passes of smoothing over the ground the filler invented under
+        # buildings and water. Measured ground is never smoothed.
         "smooth_iterations": 1,
-        # How far the terrain mesh may stray from the height grid, in metres.
-        # Above zero the regular grid is replaced by a triangulation that keeps
-        # its vertices where the ground moves and drops them where it does not,
-        # which is most of a Dutch bbox. 0.10 m is roughly AHN's own vertical
-        # accuracy (5 cm systematic plus 5 cm stochastic), so at the default
-        # the mesh gives up nothing the source could resolve in the first
-        # place. Set to 0 for the old full grid.
-        "simplify_tolerance_m": 0.10,
-        # Fold the terrain along real features instead of along grid diagonals,
-        # so a canal bank or a kerb is an edge loop you can select in Blender
-        # rather than a staircase of triangles that happens to be dense there.
-        # Empty turns it off and leaves the bisection mesh.
-        "breaklines": ["water", "roads", "unpaved", "green", "buildings"],
-        # How far a simplified outline may stray from the surveyed one. The BGT
-        # carries vertices centimetres apart along a visibly straight kerb.
-        "breakline_simplify_m": 0.15,
-        # Contour spacing. 0 leaves contours out; they are the only breaklines
-        # that follow the ground rather than something drawn on it, and also
-        # the ones that cost the most triangles.
-        "contour_interval_m": 0.5,
-        # Runs shorter than this are dropped. A planar partition is full of
-        # traffic islands, kerb stubs and driveway aprons; each is a real
-        # surveyed line and each becomes an edge loop, and a thousand of them
-        # makes a mesh look busy without saying anything about the ground.
-        "min_feature_length_m": 0.0,
-        # Fuse flat pairs of triangles into quads at the very end. Nothing
-        # moves and nothing is added, so every accuracy figure still holds; it
-        # is purely about handing an editor something it can loop and subdivide.
-        # A cap on how big a terrain face may be, in metres, whether or not the
-        # ground needs the detail. 0 leaves the mesh purely adaptive, which is
-        # right for accuracy and wrong for sculpting: the density varies about a
-        # hundredfold, so one brush stroke grabs five hundred vertices in one
-        # place and three in another.
-        "max_face_m": 0.0,
-        "quads": False,
-        # A fold sharper than this stays two triangles, so a ridge or a ditch
-        # is not flattened into one quad. Roughly: a Dutch dike face against
-        # its crown is about 20 degrees.
-        "quad_max_fold_deg": 12.0,
-        # A quad with a corner tighter than this is worse than the triangles it
-        # replaces, so it is left alone.
-        "quad_min_angle_deg": 25.0,
     },
     "buildings": {
         "lod": "2.2",
@@ -541,44 +505,19 @@ def load_config(path: str | Path) -> PipelineConfig:
         )
     merged["buildings"]["lod"] = lod
 
-    n = int(merged["terrain"]["mesh_vertices_per_side"])
-    if n < 2:
-        raise ValueError(
-            f"terrain.mesh_vertices_per_side must be at least 2, got {n}"
-        )
-
-    tolerance = float(merged["terrain"].get("simplify_tolerance_m", 0.0) or 0.0)
-    if tolerance < 0:
-        raise ValueError(
-            f"terrain.simplify_tolerance_m cannot be negative, got {tolerance}"
-        )
-    merged["terrain"]["simplify_tolerance_m"] = tolerance
-    if tolerance > 0 and not is_grid_size(n):
-        # The bisection hierarchy needs every hypotenuse midpoint to land on a
-        # grid point, which only holds for 2**k + 1. Rounding up rather than
-        # down because the extra rows are source detail for the simplifier to
-        # choose from, and it discards whatever it does not need anyway.
-        snapped = next_grid_size(n)
-        LOG.info(
-            "terrain.mesh_vertices_per_side %d -> %d, the next size the "
-            "adaptive mesh can subdivide",
-            n,
-            snapped,
-        )
-        n = snapped
-    merged["terrain"]["mesh_vertices_per_side"] = n
+    grid_m = float(merged["terrain"].get("grid_m", 2.0))
+    if not grid_m > 0:
+        raise ValueError(f"terrain.grid_m must be positive, got {grid_m}")
+    merged["terrain"]["grid_m"] = grid_m
 
     # Both dials have a ceiling set by the source data. Past it you are
     # interpolating, not resolving, so the run just costs more.
-    native_terrain = int(round(bbox.width / float(merged["terrain"]["resolution_m"]))) + 1
-    if n > native_terrain:
+    if grid_m < float(merged["terrain"]["resolution_m"]):
         LOG.warning(
-            "terrain.mesh_vertices_per_side is %d, finer than the %.2f m AHN "
-            "source supports over this bbox (native is about %d); the extra "
-            "vertices are interpolated",
-            n,
+            "terrain.grid_m is %.2f m, finer than the %.2f m AHN source; the "
+            "extra vertices are interpolated",
+            grid_m,
             float(merged["terrain"]["resolution_m"]),
-            native_terrain,
         )
 
     size_px = int(merged["aerial"]["size_px"])

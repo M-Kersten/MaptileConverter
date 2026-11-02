@@ -29,7 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.bgt import use_cache as bgt_cache  # noqa: E402
-from src.breaklines import fetch_outline_rings  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402
 from src.elevation import build_terrain, ensure_dsm, raster_sampler  # noqa: E402
@@ -171,7 +170,7 @@ def write_timings(
             "area_km2": round(config.bbox.width * config.bbox.height / 1e6, 5),
             "aerial_size_px": int(config.aerial["size_px"]),
             "aerial_megapixels": round(int(config.aerial["size_px"]) ** 2 / 1e6, 3),
-            "mesh_vertices_per_side": int(config.terrain["mesh_vertices_per_side"]),
+            "terrain_grid_m": float(config.terrain["grid_m"]),
             "trees": bool(config.trees["enabled"]),
             "surfaces": bool(config.surfaces["water"] or config.surfaces["land_cover"]),
             "furniture": bool(config.furniture["enabled"]),
@@ -491,46 +490,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         return step
 
     with Stage("terrain (AHN DTM)", next_step(), total):
-        # Cache BGT responses under this run. The terrain mesh reads outlines
-        # here to fold along, and the surfaces stage reads the same collections
-        # again a few steps later; without the cache that is paid for twice.
+        # Cache BGT responses under this run, so a re-run over the same area
+        # starts without waiting on the slowest service it uses.
         bgt_cache(work_dir)
-        breakline_rings = None
-        wanted_lines = list(config.terrain.get("breaklines") or [])
-        if wanted_lines:
-            breakline_rings = fetch_outline_rings(
-                config.bbox,
-                sources=wanted_lines,
-                page_limit=int(config.surfaces["page_limit"]),
-                timeout=float(config.surfaces["timeout_s"]),
-                max_retries=int(config.surfaces["max_retries"]),
-                max_pages=int(config.surfaces["max_pages"]),
-            )
-        terrain = build_terrain(
-            config.bbox,
-            work_dir,
-            terrain_cfg=config.terrain,
-            breakline_rings=breakline_rings,
-        )
-        if terrain.constrained is not None:
-            # Roads float just above the ground so the two do not fight for
-            # depth. The mesh can stray from the grid the roads are draped on,
-            # so the lift has to clear that or the terrain pokes through.
-            #
-            # From how far the mesh *rises above* the grid, not from its worst
-            # error in either direction. A mesh dipping below the grid is hidden
-            # by whatever is laid on top and needs no clearance at all, and the
-            # worst single triangle is the wrong statistic for a number applied
-            # to every road in the model: over four square kilometres it pinned
-            # itself to the 0.2 m cap and lifted every carriageway 22 cm.
-            clearance = round(min(terrain.constrained.rise_above_grid_m, 0.2) + 0.02, 3)
-            if clearance > float(config.surfaces["road_lift_m"]):
-                LOG.info(
-                    "raising surfaces.road_lift_m to %.3f m to clear the "
-                    "terrain mesh",
-                    clearance,
-                )
-                config.surfaces["road_lift_m"] = clearance
+        terrain = build_terrain(config.bbox, work_dir, terrain_cfg=config.terrain)
 
     with Stage("aerial imagery (PDOK)", next_step(), total):
         aerial = build_aerial(config.bbox, work_dir, aerial_cfg=config.aerial)
