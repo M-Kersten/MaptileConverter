@@ -62,8 +62,17 @@ install Blender separately. Every run after that opens the page in seconds.
 **It needs CPython 3.11, and only 3.11.** Blender publishes its Python library
 for that version alone. On anything else pip installs the other dependencies
 happily and the run then fails minutes later at the Blender stage, with nothing
-that points at the version, so the launchers check first and send you to the
-download page instead.
+that points at the version, so the launchers check first.
+
+**On Windows the launcher installs it for you.** When it finds no Python 3.11 it
+asks, and on *Y* downloads the official 3.11.9 installer from python.org (25 MB),
+checks it against the SHA-256 pinned in the `.bat`, and installs it for your
+Windows user only: no administrator rights, nothing added to PATH, any other
+Python left alone. It lands in `%LOCALAPPDATA%\Programs\Python\Python311`,
+where the launcher looks for it next time. On *N*, or if anything fails, it
+opens the download page instead. 3.11.9 is the last 3.11 release python.org
+built Windows installers for. The macOS and Linux launchers still point you at
+`brew install python@3.11` or your package manager, which need your password.
 
 On macOS the first double-click is blocked by Gatekeeper because the file came
 from the internet: right-click it, choose **Open**, and confirm once.

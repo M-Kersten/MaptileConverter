@@ -4882,6 +4882,28 @@ class TestDependencies(unittest.TestCase):
         self.assertIn("shapely is not installed", done.stderr)
         self.assertIn("-m pip install -r", done.stderr)
 
+    def test_the_windows_launcher_can_install_python_itself(self):
+        """Python 3.11 is the step colleagues get stuck on, so the launcher
+        offers to install it: per user, PATH untouched, and only a file whose
+        hash matches the one python.org published."""
+        raw = (REPO_ROOT / "Start Map Pipeline.bat").read_bytes()
+        # cmd.exe reads a batch file in blocks and can miss a label in an
+        # LF-only file, so every line ends CRLF.
+        self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))
+        text = raw.decode("ascii")
+        labels = set(re.findall(r"(?im)^:([A-Za-z_]+)\s*$", text))
+        targets = set(re.findall(r"(?i)\b(?:goto|call)\s+:([A-Za-z_]+)", text)) - {"eof"}
+        self.assertEqual(targets - labels, set(), "a goto or call with no label")
+        self.assertIn("choice /c YN", text)
+        for flag in ("InstallAllUsers=0", "PrependPath=0", "Include_launcher=0"):
+            self.assertIn(flag, text)
+        digest = re.search(r'set "PY_SHA256=([0-9a-f]{64})"', text)
+        self.assertIsNotNone(digest, "the installer is not pinned to a hash")
+        self.assertIn("Get-FileHash", text)
+        # The hash check sits between the download and the install.
+        self.assertLess(text.index("Get-FileHash"), text.index("start \"\" /wait \"%PY_SETUP%\""))
+        self.assertIn(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe", text)
+
     def test_the_launchers_reinstall_when_requirements_change(self):
         """They used to install once and stamp it done, so an update that
         added shapely never reached a team member's existing environment."""
