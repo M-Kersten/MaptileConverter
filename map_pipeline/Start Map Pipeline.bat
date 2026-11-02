@@ -42,14 +42,18 @@ if not exist "%VENV%" (
   %PY% -m venv "%VENV%" || goto :failed
 )
 
-if not exist "%STAMP%" (
+rem The stamp is a copy of the requirements.txt last installed. When an update
+rem adds a package the two differ and pip runs again; it only fetches what is
+rem new, so after the first time this takes seconds.
+fc /b requirements.txt "%STAMP%" >nul 2>&1
+if errorlevel 1 (
   echo.
-  echo Installing dependencies. This is about a gigabyte and takes a while.
-  echo You only pay for this once.
+  echo Installing dependencies. The first time this is about a gigabyte and
+  echo takes a while; after an update it only fetches what is new.
   echo.
   "%VENV%\Scripts\python.exe" -m pip install --upgrade pip || goto :failed
   "%VENV%\Scripts\python.exe" -m pip install -r requirements.txt || goto :failed
-  echo installed > "%STAMP%"
+  copy /y requirements.txt "%STAMP%" >nul
 )
 
 echo.

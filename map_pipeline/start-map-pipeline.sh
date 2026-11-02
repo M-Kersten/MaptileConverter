@@ -45,14 +45,17 @@ if [ ! -d "$VENV" ]; then
   "$PY" -m venv "$VENV" || { read -r -p "Setup failed. Press return."; exit 1; }
 fi
 
-if [ ! -f "$STAMP" ]; then
+# The stamp is a copy of the requirements.txt last installed. When an update
+# adds a package the two differ and pip runs again; it only fetches what is
+# new, so after the first time this takes seconds.
+if ! cmp -s requirements.txt "$STAMP"; then
   echo
-  echo "Installing dependencies. This is about a gigabyte and takes a while."
-  echo "You only pay for this once."
+  echo "Installing dependencies. The first time this is about a gigabyte and"
+  echo "takes a while; after an update it only fetches what is new."
   echo
   "$VENV/bin/python" -m pip install --upgrade pip || { read -r -p "Setup failed. Press return."; exit 1; }
   "$VENV/bin/python" -m pip install -r requirements.txt || { read -r -p "Setup failed. Press return."; exit 1; }
-  echo installed > "$STAMP"
+  cp requirements.txt "$STAMP"
 fi
 
 echo

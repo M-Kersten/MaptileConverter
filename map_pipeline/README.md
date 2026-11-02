@@ -50,6 +50,11 @@ It creates a private Python environment beside itself, installs what is
 missing, starts the UI and opens the browser. Nothing is typed and nothing is
 installed system-wide; deleting the `.venv` folder undoes it completely.
 
+It keeps a copy of the `requirements.txt` it last installed, and runs pip again
+whenever the two differ, so an update that adds a package installs it on the
+next start. A pipeline run checks the same list before it does anything else,
+and stops with the exact command to fix it if a package is missing.
+
 **The first run downloads about a gigabyte and takes several minutes.** 848 MB
 of that is Blender, which ships as a Python library here so nobody has to
 install Blender separately. Every run after that opens the page in seconds.

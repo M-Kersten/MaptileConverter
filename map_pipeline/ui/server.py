@@ -852,15 +852,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def check_environment() -> list[str]:
     """Report anything that would make a run fail, before the user tries."""
+    from src.dependencies import install_command, missing_dependencies
+
+    missing = missing_dependencies()
+    if missing:
+        # pipeline.py imports these, so the Blender search below cannot run.
+        return [*missing, f"install them with: {install_command()}"]
     notes = []
-    try:
-        import rasterio  # noqa: F401
-    except ImportError:
-        notes.append("rasterio is not installed: pip install -r requirements.txt")
-    try:
-        import mapbox_earcut  # noqa: F401
-    except ImportError:
-        notes.append("mapbox_earcut is not installed: pip install -r requirements.txt")
 
     # Not shutil.which: on macOS Blender is an .app bundle, so its executable
     # is never on PATH however it was installed.

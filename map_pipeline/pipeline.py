@@ -28,6 +28,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
+if __name__ == "__main__":
+    # Before the imports below, which need these packages: a missing one is
+    # then a clear message in the first second rather than a traceback from
+    # whichever stage first reaches for it.
+    from src.dependencies import report_missing
+
+    if report_missing():
+        raise SystemExit(2)
+
 from src.bgt import use_cache as bgt_cache  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402

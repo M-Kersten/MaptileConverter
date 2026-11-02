@@ -4824,6 +4824,78 @@ class TestBag3dTiles(unittest.TestCase):
         self.assertIn("vertices", inspect.signature(_extract_feature).parameters)
 
 
+class TestDependencies(unittest.TestCase):
+    """A package added to requirements.txt reaches environments set up before it."""
+
+    def test_the_checked_packages_are_the_required_ones(self):
+        import re
+
+        from src.dependencies import REQUIRED
+
+        listed = {}
+        for line in (REPO_ROOT / "requirements.txt").read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if not line or ";" in line:  # bpy carries a marker and is optional
+                continue
+            name, minimum = re.match(r"([A-Za-z0-9_.-]+)\s*>=\s*([0-9.]+)", line).groups()
+            listed[name.lower()] = minimum
+        checked = {package.lower(): minimum for _, package, minimum in REQUIRED}
+        self.assertEqual(checked, listed)
+
+    def test_a_missing_or_old_package_is_named(self):
+        import importlib.metadata
+        import importlib.util
+        from unittest import mock
+
+        from src import dependencies
+
+        self.assertEqual(dependencies.missing_dependencies(), [])
+        real_find, real_version = importlib.util.find_spec, importlib.metadata.version
+        with mock.patch.object(
+            importlib.util, "find_spec",
+            lambda name, *a: None if name == "shapely" else real_find(name, *a),
+        ), mock.patch.object(
+            importlib.metadata, "version",
+            lambda name: "1.23.5" if name == "numpy" else real_version(name),
+        ):
+            problems = dependencies.missing_dependencies()
+        self.assertEqual(problems, [
+            "numpy 1.23.5 is too old; 1.24 or newer is needed",
+            "shapely is not installed",
+        ])
+
+    def test_the_pipeline_stops_at_once_and_says_how_to_fix_it(self):
+        import subprocess
+
+        hide = (
+            "import importlib.util as u, runpy, sys\n"
+            "real = u.find_spec\n"
+            "u.find_spec = lambda n, *a: None if n == 'shapely' else real(n, *a)\n"
+            "sys.argv = ['pipeline.py', '--config', 'config.json']\n"
+            "runpy.run_path('pipeline.py', run_name='__main__')\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", hide], cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("shapely is not installed", done.stderr)
+        self.assertIn("-m pip install -r", done.stderr)
+
+    def test_the_launchers_reinstall_when_requirements_change(self):
+        """They used to install once and stamp it done, so an update that
+        added shapely never reached a team member's existing environment."""
+        for launcher, compare in (
+            ("Start Map Pipeline.bat", 'fc /b requirements.txt "%STAMP%"'),
+            ("start-map-pipeline.sh", 'cmp -s requirements.txt "$STAMP"'),
+            ("Start Map Pipeline.command", 'cmp -s requirements.txt "$STAMP"'),
+        ):
+            text = (REPO_ROOT / launcher).read_text()
+            self.assertIn(compare, text, launcher)
+            self.assertIn("requirements.txt", text.split(compare, 1)[1].split("pip install -r", 1)[1])
+            self.assertNotIn("echo installed", text, launcher)
+
+
 class TestConfig(unittest.TestCase):
     def test_shipped_config_loads(self):
         config = load_config(REPO_ROOT / "config.json")
