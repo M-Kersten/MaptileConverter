@@ -3908,6 +3908,200 @@ class TestRoadLadders(unittest.TestCase):
             self.assertIn("Road_Hoofdstraat", [str(n) for n in data["road_object_names"]])
 
 
+def _ladder(parts, lines):
+    from src.nwb import Network
+    from src.roads import build_road_mesh
+
+    return build_road_mesh(
+        parts, Network(lines=lines),
+        ground=lambda x, y: np.full(np.shape(x), 2.0), lift_m=0.03, kerb_m=0.10,
+    )
+
+
+def _off_the_kerbs(mesh, parts):
+    """How far the furthest surface vertex is from every surveyed edge."""
+    import shapely
+
+    from src.roads import SURFACE
+
+    edges = shapely.union_all(
+        [shapely.Polygon(p.rings[0], p.rings[1:]).boundary for p in parts]
+    )
+    used = np.unique(np.concatenate(
+        [mesh.face(i) for i in range(len(mesh)) if mesh.face_kind[i] == SURFACE]
+    ))
+    return float(shapely.distance(shapely.points(mesh.vertices[used, :2]), edges).max())
+
+
+def _street_faces(mesh, prefix="Road_"):
+    from src.roads import SURFACE
+
+    return [
+        i for i in range(len(mesh))
+        if mesh.face_kind[i] == SURFACE
+        and mesh.object_names[mesh.face_object[i]].startswith(prefix)
+    ]
+
+
+class TestRoadLadderCases(unittest.TestCase):
+    """The shapes a real street throws at the cutter, one at a time."""
+
+    @staticmethod
+    def _line(points, ident, a, b, name):
+        from src.nwb import Centreline
+
+        return Centreline(np.asarray(points, dtype=float), ident, a, b, name, "RB")
+
+    def test_a_street_does_not_cut_across_its_neighbour(self):
+        """Two streets side by side, footways touching. Each street's rungs
+        stop at its own edge; otherwise both sets land on both streets and
+        every face is cut twice."""
+        from src.surfaces import CLASS_FOOTPATH, CLASS_ROAD, RoadPart
+
+        parts = [
+            RoadPart([_rect(0, -3, 60, 3)], CLASS_ROAD, 0),
+            RoadPart([_rect(0, -5, 60, -3)], CLASS_FOOTPATH, 0),
+            RoadPart([_rect(0, 3, 60, 5)], CLASS_FOOTPATH, 0),
+            # The second street is a metre shorter at each end, so its
+            # kerb corners -- and the stations at them -- fall elsewhere.
+            # Sixty centimetres of verge between the footways keeps every
+            # corner nearer its own street's centreline than the other's.
+            RoadPart([_rect(1, 5.6, 59, 8)], CLASS_FOOTPATH, 0),
+            RoadPart([_rect(1, 8, 59, 14)], CLASS_ROAD, 0),
+            RoadPart([_rect(1, 14, 59, 16)], CLASS_FOOTPATH, 0),
+        ]
+        mesh = _ladder(parts, [
+            self._line([[-5, 0], [65, 0]], 1, 1, 2, "Zuid"),
+            self._line([[-5, 11], [65, 11]], 2, 3, 4, "Noord"),
+        ])
+        v = mesh.vertices
+        far = {round(float(x), 3) for x, y in v[:, :2] if abs(y - 16.0) < 1e-6}
+        near = {round(float(x), 3) for x, y in v[:, :2] if abs(y + 5.0) < 1e-6}
+        # Each outer kerb carries its own street's rungs and no more: about
+        # one every 3 m, not the two streets' sets interleaved.
+        self.assertLessEqual(len(far), 60 / 3.0 + 4)
+        self.assertLessEqual(len(near), 60 / 3.0 + 4)
+        self.assertNotEqual(far, near)
+
+    def test_a_footway_beyond_a_verge_is_cut_with_the_street(self):
+        from src.surfaces import CLASS_FOOTPATH, CLASS_ROAD, RoadPart
+
+        parts = [
+            RoadPart([_rect(0, -3, 60, 3)], CLASS_ROAD, 0),
+            # Two metres of grass, then the footway.
+            RoadPart([_rect(0, 5, 60, 7)], CLASS_FOOTPATH, 0),
+        ]
+        mesh = _ladder(parts, [self._line([[-5, 0], [65, 0]], 1, 1, 2, "Laan")])
+        footway = [
+            i for i in _street_faces(mesh)
+            if mesh.face_class[i] == CLASS_FOOTPATH
+        ]
+        self.assertGreater(len(footway), 15, "the footway past the verge was left whole")
+        self.assertTrue((mesh.face_sizes[footway] == 4).all())
+
+    def test_a_slightly_wavy_kerb_still_gives_quads(self):
+        """The survey wobbles: a kerb vertex every metre and a half, eight
+        centimetres off the line. Kept, every one turns a quad into a
+        pentagon; straightened, the kerb moves by less than ten centimetres."""
+        from src.surfaces import CLASS_ROAD, RoadPart
+
+        xs = np.arange(0.0, 60.01, 1.5)
+        wobble = 3.0 + 0.08 * (np.arange(len(xs)) % 2)
+        ring = np.vstack([[[0.0, -3.0], [60.0, -3.0]], np.column_stack([xs, wobble])[::-1],
+                          [[0.0, -3.0]]])
+        parts = [RoadPart([ring], CLASS_ROAD, 0)]
+        mesh = _ladder(parts, [self._line([[-5, 0], [65, 0]], 1, 1, 2, "Kade")])
+        faces = _street_faces(mesh)
+        self.assertGreater(len(faces), 15)
+        self.assertGreater(float((mesh.face_sizes[faces] == 4).mean()), 0.9)
+        self.assertLess(_off_the_kerbs(mesh, parts), 0.25 + 1e-6)
+
+    def test_a_parking_bay_corner_gets_a_rung(self):
+        """A kerb corner is a vertex that cannot be straightened away, so a
+        rung has to pass through it or the face beside it is a pentagon."""
+        from src.surfaces import CLASS_FOOTPATH, CLASS_PARKING, CLASS_ROAD, RoadPart
+
+        parts = [
+            RoadPart([_rect(0, -3, 60, 3)], CLASS_ROAD, 0),
+            # A bay cut into the footway, from x = 20.5 to 31.3.
+            RoadPart([_rect(20.5, 3, 31.3, 5)], CLASS_PARKING, 0),
+            RoadPart([np.array([[0, 3], [20.5, 3], [20.5, 5], [31.3, 5], [31.3, 3],
+                                [60, 3], [60, 7], [0, 7], [0, 3]], dtype=float)],
+                     CLASS_FOOTPATH, 0),
+        ]
+        mesh = _ladder(parts, [self._line([[-5, 0], [65, 0]], 1, 1, 2, "Singel")])
+        faces = _street_faces(mesh)
+        # Where the bay's back kerb meets a rung the footway face beside it
+        # has that point on its straight side: a T, which no cut can avoid.
+        # Every face still has four corners.
+        corners = []
+        for i in faces:
+            ring = mesh.vertices[mesh.face(i)][:, :2]
+            before = ring - np.roll(ring, 1, axis=0)
+            after = np.roll(ring, -1, axis=0) - ring
+            cross = before[:, 0] * after[:, 1] - before[:, 1] * after[:, 0]
+            scale = np.hypot(*before.T) * np.hypot(*after.T)
+            corners.append(int((np.abs(cross) > 0.02 * scale).sum()))
+        self.assertEqual(set(corners), {4}, f"faces of {sorted(set(corners))} corners")
+        rungs = {round(float(x), 3) for x, y in mesh.vertices[:, :2] if abs(y + 3.0) < 1e-6}
+        self.assertIn(20.5, rungs)
+        self.assertIn(31.3, rungs)
+
+    def test_rungs_round_a_bend_never_cross(self):
+        """On the inside of a sharp bend the cross-sections converge, and two
+        that cross put a vertex in the middle of the carriageway."""
+        import shapely
+
+        from src.surfaces import CLASS_ROAD, RoadPart
+
+        bend = shapely.union_all([
+            shapely.Polygon(_rect(0, -3, 33, 3)), shapely.Polygon(_rect(27, -3, 33, 40)),
+        ])
+        ring = np.asarray(bend.exterior.coords)
+        parts = [RoadPart([ring], CLASS_ROAD, 0)]
+        mesh = _ladder(parts, [self._line([[-5, 0], [30, 0], [30, 45]], 1, 1, 2, "Bocht")])
+        self.assertLess(_off_the_kerbs(mesh, parts), 1e-6, "a vertex inside the carriageway")
+
+    def test_rungs_of_a_narrow_fork_never_cross(self):
+        """Where a road forks at a narrow angle the two branches share one
+        carriageway for a while, and each branch's rungs run across both.
+        Kept together, they cross in the middle of the road."""
+        import shapely
+
+        from src.surfaces import CLASS_ROAD, RoadPart
+
+        a = np.radians(15.0)
+        stem, left, right = [[-30, 0], [0, 0]], [[0, 0], [50 * np.cos(a), 50 * np.sin(a)]], \
+            [[0, 0], [50 * np.cos(a), -50 * np.sin(a)]]
+        road = shapely.union_all([
+            shapely.LineString(c).buffer(3.0, cap_style="flat") for c in (stem, left, right)
+        ]).intersection(shapely.box(-25, -40, 45, 40))
+        parts = [RoadPart([np.asarray(road.exterior.coords)], CLASS_ROAD, 0)]
+        mesh = _ladder(parts, [
+            self._line([[-35, 0], [0, 0]], 1, 9, 1, "Stam"),
+            self._line([[0, 0], [60 * np.cos(a), 60 * np.sin(a)]], 2, 1, 7, "Links"),
+            self._line([[0, 0], [60 * np.cos(a), -60 * np.sin(a)]], 3, 1, 8, "Rechts"),
+        ])
+        self.assertLess(_off_the_kerbs(mesh, parts), 1e-6, "a vertex inside the carriageway")
+
+    def test_a_lamp_post_under_a_bridge_stands_on_the_quay(self):
+        from src.geo import BBox
+        from src.nwb import Network
+        from src.roads import build_road_mesh, road_top
+        from src.surfaces import CLASS_ROAD, RoadPart
+
+        mesh = build_road_mesh(
+            [RoadPart([_rect(0, 0, 20, 10)], CLASS_ROAD, 1),
+             RoadPart([_rect(0, 20, 20, 30)], CLASS_ROAD, 0)],
+            Network(), ground=lambda x, y: np.zeros(np.shape(x)),
+            deck_sampler=lambda x, y: np.full(np.shape(x), 8.0),
+        )
+        top = road_top(mesh, BBox(-5, -5, 25, 35))
+        under, beside = top(np.array([10.0, 10.0]), np.array([5.0, 25.0]))
+        self.assertTrue(np.isnan(under), "the deck counted as the ground under it")
+        self.assertAlmostEqual(float(beside), 0.03, places=3)
+
+
 class TestRoadHeights(unittest.TestCase):
     """Roads on bridges ride their deck; paths over water stay above it."""
 
@@ -4065,7 +4259,11 @@ class TestMedialAxis(unittest.TestCase):
             shapely.Polygon(_rect(0, 0, 40, 3)), shapely.Polygon(_rect(37, 0, 40, 30)),
         ])
         lines = skeleton_centrelines(path)
-        self.assertGreaterEqual(len(lines), 1)
+        # One line, end to end: the corners throw no spurs of their own.
+        self.assertEqual(len(lines), 1, f"{len(lines)} pieces, so spurs survived")
+        ends = sorted(tuple(np.round(p, 0)) for p in (lines[0].points[0], lines[0].points[-1]))
+        self.assertLess(abs(ends[0][1] - 1.5), 1.6)
+        self.assertGreater(ends[1][1], 25.0)
         total = sum(float(np.linalg.norm(np.diff(l.points, axis=0), axis=1).sum()) for l in lines)
         # About the length down the middle, 38.5 + 28.5, and no corner spurs.
         self.assertGreater(total, 55.0)

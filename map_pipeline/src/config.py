@@ -94,7 +94,6 @@ DEFAULTS: dict[str, Any] = {
         # Buildings are pushed this far below the terrain under their footprint
         # so no gap opens up where AHN and the 3DBAG ground level disagree.
         "ground_skirt_m": 0.5,
-        "merge": "single",
         # "centroid" assigns each building to the area containing its centre,
         # which keeps the model bounded without cutting geometry open.
         # "intersect" keeps every building the API returns.
@@ -413,6 +412,7 @@ RETIRED: dict[str, str] = {
     "surfaces.road_max_edge_m": "roads are cut across along their centrelines",
     "surfaces.road_min_angle_deg": "roads are cut across along their centrelines",
     "surfaces.road_snap_m": "roads are cut across along their centrelines",
+    "buildings.merge": "every building is its own object, under the Buildings parent",
 }
 
 
@@ -625,13 +625,6 @@ def load_config(path: str | Path) -> PipelineConfig:
         )
         looks = MAX_LOOKS_PER_ERA
     merged["facade"]["looks_per_era"] = looks
-
-    merge_mode = str(merged["buildings"]["merge"]).strip().lower()
-    if merge_mode not in ("single", "per_building"):
-        raise ValueError(
-            f"buildings.merge must be 'single' or 'per_building', got {merge_mode!r}"
-        )
-    merged["buildings"]["merge"] = merge_mode
 
     clip_mode = str(merged["buildings"]["clip_mode"]).strip().lower()
     if clip_mode not in ("centroid", "intersect"):

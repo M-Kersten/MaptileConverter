@@ -1,13 +1,16 @@
 # Offline 3D map pipeline (3DBAG + AHN + PDOK aerial → Unity)
 
-Takes a bounding box in the Netherlands and bakes a textured 3D model you import
-into Unity yourself. Everything runs locally and the result needs no network at
-runtime.
+Takes a bounding box in the Netherlands and bakes a textured 3D model you edit
+in Blender and import into Unity. Everything runs locally and the result needs
+no network at runtime.
 
 ```
 output/<area_name>/
-├── model.fbx        terrain, roads, rails, bridges, tunnels, water, buildings,
-│                    trees, furniture, cars, boats
+├── model.blend      the model for editing: one collection per layer, one object
+│                    per building, street, junction and tree
+├── model.fbx        the same model for Unity: terrain, roads, rails, bridges,
+│                    tunnels, water, buildings, trees, furniture, cars, boats
+├── maptile_tools.py Blender add-on: fit the ground under edited roads, re-export
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
@@ -80,15 +83,16 @@ for a place or click the map, press **Build model**, and watch the log. When it
 finishes you get the check results, the preview renders and download links.
 
 The page is written for someone who has never opened a GIS or a 3D package.
-Every setting carries a **?** that says what it does in words rather than in
-units, each slider prints a plain sentence under it — *"kerbs and small steps
-come through"* rather than *"1 m"* — and everything a first-time user should
-not have to decide is folded into a collapsed **Fine tuning** section: the
-ground triangle budget, the wall texture size, and how buildings on the edge of
-the square are treated. A closing **What you get, and how to open it** section
-names the four output files and gives the import steps for Blender and Unity.
-The technical readouts have not gone anywhere; they sit beside the plain ones,
-so the same page serves both readers.
+**Detail is one choice, not a panel of sliders**: Draft, Standard or High (see
+[Resolution and quality](#resolution-and-quality)). Under it the page prints
+what that means in words — *"cars and pavements read in the photo"* — and the
+numbers it stands for: photo resolution, ground grid spacing, wall texture
+size. There used to be a dozen sliders here — ground triangle budget, feature
+straightening, contour spacing, road face size and more — and every one of them
+was a way to make the model worse that a newcomer had to learn to leave alone.
+They are gone; a config file that still sets one loads and says what replaced
+it. A closing **What you get, and how to open it** section names the output
+files and gives the steps for Blender and Unity.
 
 Step 3 lists every dataset a model can be built from, each with a checkbox and
 a live status light, so you pick what goes in and see what is answering right
@@ -116,8 +120,8 @@ itself from those, so it converges on the machine it is running on rather than
 the one it was calibrated on. Failed and partial runs are left out of that.
 
 Rough costs for a 1 km² area, previews included: Draft about 3 minutes,
-Standard about 7, High about 10, Maximum about 15. Previews alone are over half
-of that, so turning them off roughly halves the wait.
+Standard about 5, High about 10. Previews are a large share of that, so turning
+them off cuts the wait noticeably.
 
 The map works directly in RD New, so the square you position *is* the bbox that
 gets built — no reprojection anywhere in the page. It is plain HTML with no
@@ -195,12 +199,20 @@ dimensional `np.cross` is on that list today.
   "name": "demo_area",
   "bbox": { "crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
             "xmax": 137000, "ymax": 456000 },
-  "aerial":    { "layer": "Luchtfoto Actueel Ortho 8cm RGB", "size_px": 4096 },
-  "terrain":   { "ahn_model": "DTM", "resolution_m": 0.5,
-                 "mesh_vertices_per_side": 257 },
-  "buildings": { "lod": "2.2" }
+  "detail": "standard",
+  "export": { "collision": true }
 }
 ```
+
+`detail` is `draft`, `standard` or `high` and fills in the photo resolution,
+the ground grid and the wall textures (table below). Anything set explicitly in
+the file wins over it, so `"detail": "high", "terrain": {"grid_m": 2.0}` is High
+with a 2 m ground.
+
+Settings that no longer exist — the terrain triangulation and road mesher knobs
+in particular — still load: the run logs one line per retired key saying what
+replaced it, and otherwise ignores them. `RETIRED` in `src/config.py` is the
+list.
 
 A `"crs": "EPSG:4326"` bbox is accepted too, with longitude in `xmin`/`xmax` and
 latitude in `ymin`/`ymax`. It is converted to RD New once, in `geo.py`, and
@@ -209,44 +221,42 @@ roughly 1 km per side, and warns rather than fails when it is not.
 
 ## Resolution and quality
 
-The UI has a preset plus three sliders. Detail is set as ground resolution
-rather than pixel count, so a setting means the same thing whatever the area
-size, and the pixel counts are derived from the box.
+One choice, three levels. Detail is set as ground resolution rather than pixel
+count, so a level means the same thing whatever the area size, and the pixel
+counts are derived from the box.
 
-| Preset | Aerial | Terrain | Facade | Normal map | 1 km² run |
+| Detail | Aerial | Ground grid | Facade | Normal map | Buildings per wall look |
 | --- | --- | --- | --- | --- | --- |
-| Draft | 50 cm/px | 8 m | 256 px | off | ~1 min |
-| Standard | 25 cm/px | 4 m | 512 px | on | ~2.5 min |
-| High | 12 cm/px | 2 m | 1024 px | on | ~5 min |
-| Maximum | 8 cm/px | 1 m | 2048 px | on | ~8 min |
+| Draft | 50 cm/px | 4 m | 256 px | off | 160 |
+| Standard | 25 cm/px | 2 m | 512 px | on | 80 |
+| High | 12 cm/px | 1 m | 1024 px | on | 40 |
 
 **Both dials hit a source-data ceiling**, and going past it costs time without
 adding information. The aerial layer is an 8 cm ortho, so a 1 km area is fully
-resolved at about 12500 px. The AHN DTM is 0.5 m, so the same area is fully
-resolved at about 2001 vertices per side. The pipeline warns instead of
+resolved at about 12500 px. The AHN DTM is 0.5 m. The pipeline warns instead of
 refusing; the UI shows the derived numbers and flags when a setting has gone
 past what the data holds.
-
-Three things are worth knowing before you reach for the top of the sliders.
 
 **The aerial jump from 25 to 12 cm/px is large; from 12 cm to native 8 cm it is
 small.** At 25 cm/px cars are blobs. At 12 cm/px you can see individual cars,
 kerb lines and bare branches. Native 8 cm adds little over that for double the
-file (92 MB against 174 MB for 1 km²). 12 cm/px is the sweet spot.
+file (92 MB against 174 MB for 1 km²).
 
-**Terrain has a sweet spot, not a "more is better" curve.** The DTM has a hole
-wherever a building stands — 49% of source pixels over Utrecht centre. At 4 m
-spacing each output vertex averages many real measurements and 33% end up
-interpolated. At native 0.5 m spacing that rises to 86%: you get sixteen times
-the vertices, and most of them carry reconstructed ground rather than measured
-ground. Around 1-2 m is where the extra vertices still buy real detail.
+**The ground grid is a trade between faithful and editable.** How far the
+drawn ground strays from every surveyed AHN pixel under it, measured over the
+Bronbeek square kilometre:
 
-**Grid spacing and mesh detail are separate dials.** Spacing decides how finely
-the ground is *measured*; `terrain.simplify_tolerance_m` decides how many
-vertices are *spent* describing what was measured. Finer spacing with the
-default tolerance costs far less than the vertex count suggests, because the
-extra rows are only kept where the ground actually moves — see
-[Terrain mesh](#terrain-mesh).
+| Grid | Vertices | Median | 95% | 99% | Pixels off by > 25 cm |
+| --- | --- | --- | --- | --- | --- |
+| 4 m | 63k | 2.9 cm | 22 cm | 44 cm | 4.1% |
+| **2 m** | **251k** | **1.7 cm** | **11 cm** | **23 cm** | **0.8%** |
+| 1 m | 1.0M | 1.1 cm | 5.8 cm | 12 cm | 0.2% |
+
+AHN's own vertical accuracy is about 5 cm systematic plus 5 cm stochastic, so
+at 2 m the grid gives up little the survey could resolve, and it is the spacing
+a person can still sculpt and select by hand. 1 m is for a smaller area or
+close-up work. The run reports these figures for its own area as
+`terrain.survey_error` in `validation.json`.
 
 **Unity has its own limits.** Textures over 16384 px cannot be imported at full
 size, which a 2 km area at native resolution would exceed. Imported textures
@@ -299,9 +309,10 @@ Other knobs worth knowing:
 | `trees.crown_search_m` | `3.0` | Radius the canopy height is taken as a maximum over. |
 | `trees.ground_shade` | `0.35` | How far the aerial is darkened under each canopy. The photo is flown leaf-off, so without this the ground under a tree is lit as if the tree were not there. Ambient occlusion, not a sun shadow. `0` leaves the photo alone. |
 | `surfaces.water` | `true` | Replace the interpolated canal bulge with real water surfaces. |
-| `surfaces.road_geometry` | `true` | Build roads as their own objects, one per class, instead of only as raster class. |
-| `surfaces.road_lift_m` | `0.06` | How far the road surface floats above the terrain, so the two do not fight for depth. |
-| `surfaces.road_drape_tolerance_m` | `0.08` | How far a flat road triangle may miss the ground before it is split. |
+| `surfaces.road_geometry` | `true` | Build roads as their own surface, one object per street, instead of only as raster class. See [Roads](#roads). |
+| `surfaces.road_lift_m` | `0.03` | How far the carriageway sits above the surveyed ground. The terrain is then fitted under it, so this is a height, not a depth-fighting margin. |
+| `surfaces.kerb_m` | `0.10` | How far footways stand above the carriageway, with a vertical kerb face between. `0` lays everything flat. |
+| `surfaces.nwb_url` | PDOK NWB | Where the national road centrelines come from. Without them the roads draw their own centrelines and nothing else changes. |
 | `surfaces.land_cover` | `true` | Classify the ground and export the class map. |
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
@@ -329,12 +340,7 @@ Other knobs worth knowing:
 | `buildings.sources` | `["api", "tiles"]` | Which of 3DBAG's two services to try, in order. `["tiles"]` skips the flaky API entirely. See [When 3DBAG is down](#when-3dbag-is-down). |
 | `buildings.tiles_version` | `v20250903` | Which dated 3DBAG release the static tiles come from. Bumped by hand; releases are listed at 3dbag.nl/en/download. |
 | `buildings.probe_timeout_s` | `8.0` | How long to knock on the API before giving up and using the tiles. |
-| `buildings.merge` | `single` | One merged buildings mesh. `per_building` gives one object each. |
-| `terrain.mesh_vertices_per_side` | `257` | 257 → 66k terrain vertices before simplification. Rounded up to 2^k + 1 when simplification is on. |
-| `terrain.breaklines` | roads, water, land cover, buildings | Which outlines the terrain folds along. Empty falls back to the bisection mesh. |
-| `terrain.breakline_simplify_m` | `0.15` | How far a simplified outline may stray from the surveyed one. Applied to the whole outline network at once, not ring by ring, so a boundary two polygons share stays one line. |
-| `terrain.contour_interval_m` | `0.5` | Contour spacing. Contours are then thinned against `simplify_tolerance_m`, so flat ground contributes none. `0` leaves them out entirely. |
-| `terrain.simplify_tolerance_m` | `0.10` | How far the terrain mesh may stray from the height grid. Drops the vertices sitting on ground their neighbours already describe, which over a Dutch bbox is most of them. `0` keeps the full grid. |
+| `terrain.grid_m` | `2.0` | Ground grid spacing; set by `detail`. See [Terrain](#terrain). |
 | `aerial.deshadow` | `1.0` | How much of the flown sun to take back out of the photo, 0 to 1. See [The flown sun](#the-flown-sun-and-taking-it-back-out). `0` leaves it as flown. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
 
@@ -342,7 +348,7 @@ Other knobs worth knowing:
 
 ```
 src/geo.py         bbox parsing, WGS84 to RD, origin offset
-src/elevation.py   AHN WCS -> GeoTIFF -> height grid
+src/elevation.py   AHN WCS -> GeoTIFF -> regular height grid, fitted under roads
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
 src/facade.py      generated facade, tree, water and furniture textures
@@ -351,7 +357,9 @@ src/textures.py    photographed CC0 wall surfaces, fetched once and cached
 src/sources.py     the registry of datasets a model can be built from
 src/bgt.py         shared BGT client: paging, version filter, rasterising
 src/trees.py       BGT tree points, heights from AHN DSM minus DTM
-src/surfaces.py    BGT water bodies and land cover
+src/surfaces.py    BGT water bodies, land cover and road surfaces
+src/nwb.py         NWB-Wegen road centrelines, names and junctions
+src/roads.py       road ladders: stations, cross-sections, kerbs, objects
 src/furniture.py   BGT lampposts, bollards, signs and benches
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
@@ -359,7 +367,8 @@ src/structures.py  bridge decks and piers, and tunnels below ground
 src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
-blender/process.py builds the scene, assigns materials, exports FBX
+blender/process.py builds the scene, assigns materials, saves .blend, exports FBX
+blender/maptile_tools.py  the Blender add-on shipped beside the model
 blender/preview.py renders preview images of an exported FBX
 ui/server.py       local web UI, standard library only
 ui/index.html      the page: RD map picker, settings, live log, results
@@ -411,6 +420,83 @@ nap  = local_y + ground_z_offset_nap
 without any fitting. Both get the same `ground_z_offset_nap` subtracted. Much of
 the Netherlands sits below NAP, so negative heights are normal and are never
 clamped away.
+
+## Opening it in Blender
+
+Open `model.blend`. It is the same scene the FBX was exported from, saved with
+relative texture paths, so the output folder can be moved or zipped whole.
+
+**Every layer is a collection, and the big ones a parent too.** Collections are
+how Blender organises a file; FBX has none, and Unity builds its hierarchy from
+parent objects, so a layer of many objects is both — a collection in the
+outliner and an empty that everything in it hangs from:
+
+| Collection / parent | What is in it |
+| --- | --- |
+| `Terrain` | one object, the ground grid |
+| `Roads` | one object per street, junction and paving area (see [Roads](#roads)) |
+| `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
+| `Water` | water surfaces and beds |
+| `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
+| `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named |
+| `Collision` | the physics proxies, hidden; see [Collision shapes](#collision-shapes) |
+
+**Trees are instances.** Ten thousand trees share twelve meshes: three kinds,
+four shapes each. A tree is an object with its own position, height, crown size
+and spin, pointing at one of those meshes. Edit one shared mesh and every tree
+of that shape changes; move or scale a tree and only it does.
+
+**Quads stay quads in Blender.** The ground and the roads carry a *Triangulate*
+modifier set to apply on render and export only, splitting every quad the same
+way the pipeline measured heights on. In the viewport you edit the quads.
+
+### The Maptile tools
+
+`maptile_tools.py` is saved into the file as a script that registers on load,
+and beside it as an add-on. If the **Maptile** tab is missing from the sidebar
+(N), Blender did not run the script: allow it when Blender asks (or *File →
+Preferences → Save & Load → Auto Run Python Scripts*), or install the `.py` as an
+add-on. Four buttons:
+
+* **Fit terrain under roads.** After moving, widening or raising a road, the
+  ground under it is wrong. This redoes the pipeline's fit: the same points, the
+  same 5 cm clearance, the same preference for lowering vertices hidden under
+  the road. It starts from the survey heights stored on the terrain, so running
+  it twice gives the same ground, and moving a road back gives the ground back.
+  Kerb and skirt faces are left out.
+* **Reset terrain to survey.** Puts every terrain vertex back on its measured
+  height (`measured_z`), roads ignored.
+* **Drop selected onto ground.** Moves each selected object vertically onto the
+  road or terrain under it — for a lamppost after a road moved, or anything you
+  added.
+* **Export FBX for Unity.** The pipeline's own export settings, so a re-export
+  after editing lands in Unity exactly like the original did.
+
+## Importing into Unity
+
+Copy the whole output folder into `Assets/` — the FBX finds its textures by
+name beside it. Then select `model.fbx`, and in the Inspector:
+
+1. **Model → Scale Factor: 1, Convert Units: on.** The model is in metres.
+2. **Model → Bake Axis Conversion: on.** Without it the root object arrives
+   with a −90° X rotation, which is harmless until a script reads positions or
+   something is parented to the model. With it every transform is clean:
+   X east, Y up, Z north.
+3. **Model → Generate Lightmap UVs: only if you will bake lighting.** It
+   overwrites the second UV channel, which on the roads is `RoadUV`, the
+   along-and-across mapping for road textures. If you need both, duplicate the
+   road objects for lightmapping.
+4. **Model → Index Format: Auto.** The ground has more than 65k vertices and
+   needs 32-bit indices; Auto handles it.
+5. **`aerial.png` → Max Size: 8192** (or 16384). Unity caps imported textures at
+   2048 by default, and the whole aerial is shrunk to that otherwise.
+6. **Tree materials → Enable GPU Instancing.** Ten thousand trees share twelve
+   meshes; instancing draws each shape in one batch. Marking the `Buildings` and
+   `Roads` hierarchies *Static* lets Unity batch those too.
+
+Custom properties (`kind` on roads, `bag_id` and `build_year` on buildings)
+arrive as FBX user properties, which an `AssetPostprocessor` reads in
+`OnPostprocessGameObjectWithUserProperties`.
 
 ## When 3DBAG is down
 
@@ -467,344 +553,88 @@ cache makes repeat runs faster than the API anyway:
 "buildings": { "sources": ["tiles"] }
 ```
 
-## Terrain mesh
+## Terrain
 
-The terrain folds along the features the ground actually has: a canal bank, a
-kerb, a building footprint and a contour are all real edge loops you can select
-and drag in Blender, not a patch of triangles that happens to be dense there.
+The ground is a **regular grid of quads**, 2 m apart at Standard detail, from
+the 0.5 m AHN DTM. Not a triangulation that spends vertices where the ground
+moves, and not a mesh that folds along every kerb: rows and columns.
 
-**Why the grid could not do this.** A grid puts its edges on grid lines and the
-bisection mesh below puts them on grid diagonals. A bank runs along neither. No
-amount of extra detail fixes that -- it only makes a finer staircase.
+**Why a grid.** This model is edited. Loop select, grid fill, the sculpt
+brushes, proportional editing and every heightmap tool expect rows and columns,
+and all of them stop working on a triangulation. The pipeline used to build a
+constrained Delaunay mesh folded along 10,000 BGT outlines and contours, with
+Ruppert refinement and a quad pass on top. It was accurate and nobody could
+edit it: a plot could not be flattened without hunting triangles, and a road
+could not be moved because the ground had its old outline cut into it. The
+roads now sit on top as their own surface (see [Roads](#roads)) and the ground
+underneath is only ground.
 
-**Breaklines.** `src/breaklines.py` collects the lines the mesh has to fold
-along and `src/cdt.py` triangulates so that every one of them survives as an
-edge. Four sources: BGT roads, land cover and water; building footprints;
-contours off the DTM; and the bbox edge.
+**How the grid is made.** AHN is fetched at 0.5 m with a few cells of margin,
+block-averaged onto the grid — every output vertex is the mean of the surveyed
+pixels around it, not one pixel picked by interpolation — and the holes where
+buildings, water and dense vegetation stood are filled inward from their edges.
+Only the filled cells are smoothed; surveyed ground is left as surveyed. A
+`grid_m` that does not divide the area is rounded so the spacing is never
+coarser than asked.
 
-**The BGT is a planar partition, and simplification has to keep it one.** A road
-and the pavement beside it are two polygons carrying the *same* boundary, vertex
-for vertex. Simplifying them one ring at a time does not preserve that:
-Douglas-Peucker is anchored on the ends of whatever it is given, and where three
-polygons meet part way along a kerb, that junction is a ring corner for one of
-them and an ordinary point on a smooth curve for another. The anchors differ,
-the two copies of the kerb keep different vertices, and one line becomes two
-that cross each other repeatedly.
+**The quads are split one way, on purpose.** A quad of four heights is not flat,
+so the renderer draws it as two triangles, and which diagonal it picks moves the
+ground by up to half the height difference across the cell. Blender's export
+triangulation is told to cut every quad south-west to north-east (*Triangulate*
+modifier, quad method *Fixed*, applied on export only), and every height the
+pipeline places something at — a tree, a lamppost, a car — is read off that
+same pair of triangles. Bilinear interpolation, which is what "the height
+between grid points" usually means, is a surface nothing draws; on lumpy ground
+it put posts a few centimetres in the air or under it.
 
-Everything downstream inherits it. The crossings get cut into a ladder of
-millimetre segments, the ladder meets at angles no triangulation can make a
-decent triangle out of, and refinement chases those corners into ever smaller
-slivers. Measured: **268 of the 283 worst triangles in a test area came from one
-kerb that had been turned into two.** So `partition_chains` welds the outlines
-into a single network first and simplifies the runs *between* junctions. Each
-shared kerb then exists once and is thinned once.
-
-**Contours are joined before they are thinned.** Marching squares emits one
-chord per grid cell, and emitting those raw made contours **99.8% of every
-breakline in an area** — a vertex every 1.5 m on a 2 m grid, along ground that
-mostly needed none. That put the mesh a hundred times denser along a contour
-than on the field beside it, and a triangulation asked to bridge a density step
-like that can only do it with long thin wedges, whatever triangulator you use.
-
-`contour_polylines` chains the chords back into lines and then thins them
-against the **height** they cost rather than the distance: a contour is a line of
-constant height, so moving it sideways by `d` where the ground slopes at `g`
-misplaces the height by `d * g`. That prices every vertex in the units the
-tolerance is written in, and does the right thing at both ends by itself — a
-canal bank keeps its detail, and a contour out on a flat field, where the only
-slope is the scanner's own noise, is allowed to wander a hundred metres and so
-collapses and drops out. Roughly half of the raw contours over a Dutch area were
-tracing that noise; 37% of them were out on flat ground with no feature to fold
-along at all.
-
-**Nothing may cross.** No triangulation can honour two constraints that cross,
-so every segment is cut at every intersection first. Contours cross roads and
-water constantly. Splitting has to be repeated, because welding afterwards is
-what merges the two copies of a shared intersection and also drags a cut that
-landed a millimetre from an endpoint back onto it, undoing the split.
-
-**Then it refines, and this is where the mesh is actually made.** The bisection
-mesh below chooses which grid points are worth keeping, but **its tolerance is a
-property of its own triangles, not of its points**: it keeps a vertex because of
-the right triangles *it* would have drawn, and Delaunay draws different ones.
-Measured, the same points re-triangulated were three times outside the tolerance
-they were chosen for, and with the breaklines added, fourteen times.
-
-So the point set is earned back with Delaunay refinement, after Ruppert:
-
-* **Split a constraint segment** when a vertex encroaches on it — sits inside
-  its diametral circle — or when the ground under its chord has sagged more than
-  the tolerance away from it. Without this a simplified breakline stays a single
-  forced edge with the mesh draped off it; a 339 m one showed up in a mesh whose
-  median edge was 2 m.
-* **Insert the circumcentre** of any triangle that is further than the tolerance
-  from the ground. The circumcentre, not the centroid: the centroid sits among
-  the corners it came from, so inserting it splits a bad triangle into three of
-  the same shape. The loop that did that added 132 points, then 35, then 33,
-  then 38, and stopped no closer than it started.
-* When a circumcentre falls **outside the area**, split the constrained edge
-  blocking it instead. This is the boundary case, and without it the mesh never
-  improves where a canal runs off the edge of the bbox — which is exactly where
-  it was worst.
-
-Ground points are also kept **clear of breaklines** by one grid step. A grid
-node crowding a line carries no height that was ever measured, and the line's
-own vertices are metres apart, so the triangle between them can only be a wedge.
-Forcing the bisection mesh *finer* near lines is the intuitive version of this
-idea and it is simply wrong — it cost 50% more triangles for the same shape,
-because refinement grades the mesh properly by itself and a lattice pushed up
-against an arbitrary polyline can only make wedges.
-
-**A tolerance is a promise about a surface, and AHN is a grid with steps in it.**
-A quay wall, the lip of a filled building hole, the scar where a tree was taken
-out: 60 cm between neighbouring samples is ordinary. Where two samples differ by
-a step, no triangle that is not aligned to the sample grid gets closer than about
-half of it, however finely it is cut — a flat face cannot follow a kink that
-falls between cells, and a Delaunay mesh over scattered points cannot promise an
-edge exactly on a cell boundary.
-
-So refinement and the checks share one notion of *how close the mesh can be
-asked to get*: the tolerance, or half the local step, whichever is larger
-(`height_allowance`). This is not a relaxation, it is the difference between a
-target and a wish. Asking for the wish did real damage — refinement could never
-satisfy it, so it kept inserting points into triangles it had no way to improve,
-and on a real Utrecht kilometre that ran to **701,978 triangles while still
-missing the tolerance by a factor of five**. Refinement also now stops at any
-triangle already smaller than one grid cell, because everything inside a cell is
-the interpolation's opinion rather than a measurement.
-
-The allowance is read across a **whole triangle**, not at the point where its
-own error happens to peak: a triangle's ability to follow the ground is limited
-by the roughest ground it covers, and reading it at one point flagged 2515
-triangles on a 2 km area for a step that was inside them.
-
-Two more things are reported honestly rather than blamed on the mesh:
-
-* **Where a point should go.** A triangle off the ground now takes the *grid
-  node* nearest the worst of it, not a circumcentre. A circumcentre is almost
-  never a grid node, and a one-cell feature is only reproduced by a vertex
-  standing on it. Circumcentres are still what fixes *shape*.
-* **Whose sliver it is.** Two surveyed outlines meeting at half a degree put a
-  half-degree triangle in the mesh, and there is nowhere to put a point that
-  improves it. A sliver with every corner on a constraint is filling a gap the
-  input already had; one with a corner refinement placed itself is ours. Only
-  the second count fails a check.
-
-Measured over one synthetic Dutch area, before and after all of the above:
-
-| | before | after |
-| --- | --- | --- |
-| Triangles | 25,267 | **12,884** |
-| Smallest angle anywhere | 0.0025° | **1.22°** |
-| Triangles under 1° | 628 | **0** |
-| Triangles under 5° | 9.9% | **0.5%** |
-| Triangles under 10° | 17.6% | **1.9%** |
-| Median smallest angle | 29.7° | **40.4°** |
-| Worst height error (0.10 m asked) | 0.459 m | **0.100 m** |
-| Worst sag under a breakline | never measured | **0.100 m** |
-
-### Quads, and controlling how busy the ground is
-
-Everything above makes the ground *correct*. It does not make it pleasant to
-edit, and those are different problems. A triangulation is what the geometry
-wants; quads are what Blender wants, because selecting, looping and subdividing
-all work along quads and none of them work on a triangle fan.
-
-So `src/quadmesh.py` runs last and only decides which pairs of triangles to
-fuse. Nothing moves, nothing is added, nothing is dropped — so every accuracy
-figure measured on the triangles still holds afterwards, and the triangles stay
-the source of truth that the checks read. Two edges are never dissolved:
-
-* **A breakline.** Fusing across one would delete the edge the mesh exists to
-  have. This is the difference from an automatic quad remesher: those align
-  edges to the *curvature* of the surface they are handed, and a kerb is not a
-  curvature feature — it is a line from another dataset that happens to lie on
-  this surface. Often it has no dihedral angle at all, because both sides take
-  their height from the same grid cell. Told which edges those are, the pairing
-  keeps every one.
-* **A fold.** Two triangles meeting at an angle are a ridge or a ditch, and
-  fusing them would smooth it away. `quad_max_fold_deg` is where that line sits.
-
-Greedy matching on the dual graph, best-shaped quads first. Optimal matching is
-a blossom algorithm and buys nothing visible; greedy reaches 60–90% quads.
-
-The breakline edges are also **marked sharp and as UV seams on export**, so in
-Blender *Select Sharp Edges* hands you the kerb, the canal bank or a building
-footprint as a loop instead of leaving you to hunt for it face by face.
-
-Five settings control how busy the ground is, all of them in the UI under
-**Terrain shape**, and none of them affect accuracy:
-
-| Setting | Config key | What it does |
-| --- | --- | --- |
-| Make quads | `terrain.quads` | Fuse flat triangle pairs. |
-| Keep folds sharper than | `terrain.quad_max_fold_deg` | 3° keeps every crease; 60° fuses almost everything. |
-| Straighten the features | `terrain.breakline_simplify_m` | 0.15 m is as surveyed; 5 m leaves only the layout. The biggest single lever on visual busyness. |
-| Ignore features shorter than | `terrain.min_feature_length_m` | Drops traffic islands, kerb stubs, driveway aprons. A planar partition has thousands, and each one is an edge loop. |
-| Contour lines | `terrain.contour_interval_m` | The only edges that follow the ground itself. Also the costliest. Flat ground contributes none regardless. |
-| Which features become edges | `terrain.breaklines` | Roads, water, land cover, buildings — independently. |
-| Even face size | `terrain.max_face_m` | Caps how big a face may be regardless of whether the ground needs it. |
-
-### What the terrain arrives knowing
-
-Two things ship with the mesh that make it editable rather than merely correct,
-and both are information the pipeline already had and used to throw away.
-
-**Every face is labelled with what it is.** The surface class of every square
-metre is worked out for `landcover.png`; it is now also sampled per terrain face
-into an integer attribute `surface_class`, and turned into vertex groups —
-`ground_road_asphalt`, `ground_water`, `ground_green`, one per class present. So
-"flatten the ground for this building" is select-group-then-flatten rather than a
-lasso and a prayer. The vertex groups matter more than the attribute in practice,
-because they also drive proportional editing, which is what levelling a plot
-actually uses.
-
-**Every breakline is marked sharp and as a UV seam.** *Select Sharp Edges* hands
-you the kerb, the canal bank or a footprint as a loop. A footprint is a closed
-ring, so selecting it and then *Select → Inner Region* gives you the plot.
-
-**A note on field-aligned quadrangulation**, since it is the obvious next thing
-to reach for and it is the wrong tool here. A field-aligned quad mesh is regular
-only *between* its singularities, and loop select, grid select and proportional
-editing all terminate at one. The field must align to the constraints, a
-cross-field carries one direction pair per point, and every junction where two
-streets meet at anything but 90 degrees forces a singularity. A real 1 km area
-carries around 10,400 BGT and building features, so on the order of 7,000
-junctions — against roughly 40,000 quads at a 5 m target. That is a singularity
-every handful of faces: not a regular sheet, and harder to work with than this.
-It looks clean in published examples because those are smooth organic surfaces
-or open countryside, where the field has almost nothing to satisfy.
-
-**Roads still float above it.** They are separate objects with their own
-materials, and they share the terrain's edges rather than being part of it, so
-the 6 cm lift is raised just enough to clear how far the mesh *rises above* the
-grid the roads were draped on — a one-sided 99.9th percentile, not the worst
-error in either direction. Both halves of that matter: a mesh dipping below the
-grid buries nothing and needs no clearance, and the worst single triangle is not
-a statistic to apply to every road in a model. Taking the maximum pinned the
-lift to its 0.2 m cap over 4 km² and left every carriageway floating 22 cm.
-
-**And draping them on the mesh does not fix it.** That was the obvious next
-move — put the roads on the surface that is actually drawn, and the lift goes
-back to 6 cm — so it was built and measured, and it does not work. Over a
-kilometre of road on a 127k-triangle mesh the terrain poked up through the
-carriageway by 25.5 cm draped on the mesh, against 25.4 cm draped on the grid.
-No difference, and 4.5 s a square kilometre to find out.
-
-The reason is in `drape_to_terrain`: a road triangle is split while the error
-*at its centroid* is over tolerance, and a mesh can bulge in the middle of a
-road triangle whose centroid sits exactly on it. Which surface was sampled
-never enters into it. The residual is the drape tolerance, not the grid, and
-the lift is the only thing that clears it.
-
-There is a second reason to leave roads on the grid, and it is the stronger
-one: the lift is sized from how far the mesh rises above *the grid*. That
-number describes the road's clearance only while the road is on the grid.
-Draping on the mesh would leave the lift sized by a statistic about something
-else. So `src/surfaces.py` passes `terrain.sample` on purpose, with the
-measurement written next to it and a test holding it there.
-
-### Two surfaces, and which one a thing lands on
-
-With breaklines on, the terrain carries a height grid *and* a constrained mesh,
-and they are not the same surface. Along every breakline they agree to the
-millimetre — a kerb is an edge of the mesh, so the mesh passes through the
-grid's own value there. Inside a triangle the mesh is a plane where the grid
-curves. `TerrainResult` therefore offers both:
+**Two surfaces, kept apart.** `TerrainResult` carries both:
 
 | | Reads | Used by |
 |---|---|---|
-| `terrain.sample` | the height grid | road and water drape, and every check |
-| `terrain.surface` | the mesh, where there is one | trees, street furniture, barriers, rails |
+| `terrain.sample` | the surveyed grid, before anything was moved | road heights, buildings, bridges, and every check |
+| `terrain.surface` | what the model draws: the grid's triangles, or the road surface where there is road | trees, furniture, barriers, rails, cars |
 
-The split is not stylistic. It follows from whether a thing is **placed** or
-**draped**:
+The split follows whether a thing is **measured against the ground** or
+**placed on what you see**. A road takes its height from the survey, because
+that is where the street is; a lamppost on the footway stands on the footway,
+kerb included, because that is what it visibly stands on. The checks read the
+survey, because a check against the drawn surface measures the model against
+itself.
 
-* **Placed** — a tree, a lamppost, a bollard, a fence post, a sleeper. One
-  point, one height, no tolerance loop and no lift to absorb a mistake, so
-  whichever surface was sampled *is* the error. Measured over 40,000 points on
-  a kilometre of lumpy ground, placing on the grid instead of the mesh is out
-  by a median of 0.9 cm and a maximum of 9.6 cm, with 2.8% out by more than
-  5 cm. Those are the posts that hang in the air or sink to the knee.
-* **Draped** — a road, a water surface. Split until flat triangles follow the
-  ground within tolerance, then lifted clear of it. The tolerance dominates,
-  and the measurement above says the mesh buys nothing. The grid it is lifted
-  off is the grid it is draped on.
+### The ground gets out of the road's way
 
-The checks in `src/validate.py` keep the grid for a different reason: they
-measure how far the mesh strays from the ground it was simplified from. Against
-the mesh itself that error is zero by construction, so a check that drapes on
-the mesh is a check that cannot fail. A test asserts the string never appears
-there.
+The road surface follows the survey; the ground grid can only bend at its own
+vertices. Between them a 2 m quad bulges up through a carriageway on any
+cambered street, and a 0.10 m kerb leaves the ground showing through the
+footway. So after the roads are built, the terrain is **fitted under them**:
+every road vertex, edge midpoint and cell under the road is a point the ground
+must stay at least 5 cm below, and the grid vertices around each offending
+point are lowered just enough to clear it.
 
-`TerrainResult.surface` builds the sampler from the mesh the result already
-carries, on first use, rather than taking one handed in beside it. That is
-deliberate: there is then no assignment between having a mesh and draping on
-it, so the two cannot drift apart. Point location is a uniform grid of triangle
-bounding boxes, sized to the median triangle — about 7 triangles a cell on a
-real km², 0.07 s to index 25k triangles and 0.6 s for 40,000 queries. No
-quadtree, and no scipy.
+Two details decide whether this looks right:
 
-## Adaptive terrain mesh (no breaklines)
+* **Lower the vertices you cannot see.** A point under a road lies in a
+  triangle with three corners, and the drop needed can be shared between them
+  in any proportion. Grid vertices under the road surface are hidden; the ones
+  beside it are the verge, the bank, the field. The correction is weighted four
+  to one towards hidden vertices, so the road sinks into the ground rather than
+  the ground around the road sinking. On Bronbeek the fit moves 49,308
+  vertices, three quarters of them hidden under a road. Of the ones you can
+  see, the median drop is 2 cm and 38 drop by more than half a metre — against
+  about 1,800 before this weighting and the car-park grid below.
+* **The survey is kept.** The lowered grid is what is drawn; the measured grid
+  is kept beside it (`terrain_grid.npz`, and the `measured_z` attribute on the
+  Blender terrain), so the fit can be redone after someone moves a road, or
+  undone. That is what the [Maptile tools](#opening-it-in-blender) do.
 
-A regular grid charges the same price everywhere, which over a Dutch bbox is a
-bad trade: a car park that three vertices would describe perfectly costs exactly
-as much as the canal bank next to it. `terrain.simplify_tolerance_m` replaces
-the grid with a triangulation that keeps vertices only where the ground moves.
+Big flat surfaces need help too: a car park or a square has no street to cut it
+across and would otherwise be one face tens of metres wide, flat between its
+corners while the ground under it is not. Any road face over 150 m² is cut into
+a 4 m grid of its own, so it follows the ground in rows and columns instead of
+forcing the terrain metres down to get under it.
 
-**How it decides.** Two triangles cover the bbox. Each is cut at the midpoint of
-its hypotenuse — always another grid point — and a cut only happens where the
-ground under that triangle strays further from it than the tolerance allows.
-The error driving the decision is *nested*: a triangle's error is the worst of
-its own midpoint and everything beneath it. Without that a triangle passes its
-own midpoint test while hiding a dike between two of its corners.
-
-**Why this shape and not a greedy TIN.** Two properties matter more than raw
-vertex efficiency:
-
-- **No cracks.** The error is stored per *vertex*, not per triangle, and taken
-  as the maximum over both triangles sharing a hypotenuse. Neighbours therefore
-  always agree about whether to cut it, so the mesh is watertight by
-  construction — no T-junctions to seam over, no skirts to hide them.
-- **No slivers.** Every triangle is a right isoceles triangle on a grid
-  diagonal, so they all have the same three angles. Greedy point insertion gets
-  fewer triangles for the same error and hands you long thin wedges for it,
-  which normals and lightmaps do not enjoy.
-
-Measured over 600 m of central Utrecht, against the 131,072 triangles of the
-full 257² grid:
-
-| Tolerance | Triangles | Share of the grid | Worst height given up |
-| --- | --- | --- | --- |
-| 0.02 m | 54,750 | 41.8% | 0.03 m |
-| 0.05 m | 30,700 | 23.4% | 0.08 m |
-| **0.10 m** (default) | **18,584** | **14.2%** | **0.17 m** |
-| 0.25 m | 8,922 | 6.8% | 0.44 m |
-| 0.50 m | 4,467 | 3.4% | 0.87 m |
-
-The default is 0.10 m because that is roughly AHN's own vertical accuracy — 5 cm
-systematic plus 5 cm stochastic — so it gives up nothing the source could
-resolve in the first place. Set it to `0` for the old full grid.
-
-**The worst error runs to about 1.7× the tolerance, not 1.0×.** A vertex can sit
-on a hypotenuse whose own ends were moved, so the deviations compose. The bound
-is a budget, not a guarantee; `terrain_mesh_within_tolerance` allows 3× before
-calling it a defect.
-
-**Simplification happens before anything drapes on the ground.** Roads, rails,
-trees, buildings and water levels all read heights through the same sampler, and
-that sampler is switched to the simplified surface inside `build_terrain`. Doing
-it later — next to the mesh Blender actually draws — would leave every one of
-them sitting on a surface that was thrown away, and roads only float 6 cm.
-
-**The grid does not go away.** It is still written, still classified for land
-cover, and still carries the water bed. Mesh vertices are addressed by grid
-column and row, which is what lets the bed be read straight off a vertex.
-
-**The grid side has to be 2^k + 1.** Halving is the only way the hierarchy
-subdivides, so every hypotenuse midpoint has to land on a grid point. Sizes that
-do not fit are rounded *up* — the extra rows are source detail for the
-simplifier to choose from, and it discards whatever it does not need.
+The checks `terrain_stays_under_roads` and `road_surface_follows_terrain` hold
+both ends of this: no ground through any road, and no road far off the survey.
 
 ## Ground surfaces
 
@@ -841,19 +671,108 @@ two forms:
   where the photo has none. `surfaces.detail_strength` controls it; 0 turns it
   off.
 
-**Roads are their own layer.** `surfaces.road_geometry` builds the road surface
-as geometry rather than leaving it as pixels in the terrain's photograph — one
-object per class, so the FBX arrives with `Roads_asphalt`, `Roads_brick`,
-`Roads_cycle_path`, `Roads_footpath`, `Roads_parking` and `Roads_transit_lane`
-as separate GameObjects, each carrying its own material. That is what makes them
-separately addressable: a carriageway can go on a drivable layer and a footpath
-on a walkable one without splitting anything by hand.
+## Roads
 
-Nothing about the look changes by default. Each road material is the aerial
-photo under the same top-down projection the terrain uses, so the surface is
-pixel-identical to what it replaced — including road markings and crossings,
-which a tiling texture would lose. The point of the split is that the material
-is now yours to replace.
+The roads are built to be edited: **a ladder of quads down every street**, a
+rung across the whole street every three metres or so, kerb to kerb, with no
+vertex anywhere in the middle of a carriageway. Every street is its own object,
+named after it.
+
+```
+Roads (empty)
+├── Road_Velperweg                a street, all its sections between junctions
+├── Junction_<street names>_<id>  where they meet, named after them
+├── Path_<name>                   a named footpath or cycle path
+├── Bridge_<name>                 the part of a street on a bridge deck
+├── Lanes_004, Paths_017          estate roads and park paths the national
+│                                 road network does not have
+└── Paving                        squares and car parks belonging to no street
+```
+
+### Where the rungs come from
+
+A rung is a cross-section of the street: a line square to its centreline, from
+one outer kerb to the other. So the first thing needed is the centreline, and
+the BGT only has outlines.
+
+**The national road network has them.** NWB-Wegen (Rijkswaterstaat, via PDOK,
+CC0) carries a centreline for every public road in the country, split into
+sections at every junction, with the street name and the id of the junction at
+each end. Its geometry is derived from the BGT, so it lies on the BGT roads.
+That gives each street a spine, a name, and its junctions.
+
+**Then the stations.** Along each centreline the cutter places a station at
+every kerb corner the street owns — a parking bay, a driveway apron, the start
+of a bus stop — and fills between them at three metres. A station at a corner
+matters: a corner is a vertex no straightening can remove, and without a rung
+through it the face beside it is a pentagon.
+
+**Each rung stops where the street does.** The cross-section is clipped to the
+road surface, and walks outward from the centreline across carriageway, cycle
+path and footway — across a verge of up to 6 m too, so the footway beyond the
+grass is cut with the street — until it reaches road that belongs to a
+*different* street, which is judged by which centreline is nearer. Without that,
+two parallel streets with touching footways cut each other's footways twice.
+
+**At a junction the streets stand back.** Each street's stations stop short of a
+junction by the reach of the streets crossing it there, so no rung runs into the
+corner footways, and what is left between the streets is the junction: its own
+object, named after the streets that meet in it.
+
+**No two rungs may cross.** Where they would — a fork at a narrow angle, where
+both branches share one carriageway for a while — the one nearer a junction is
+dropped. A rung that has run round a sharp bend and up the next leg of the same
+street is dropped too: it is no longer square to anything.
+
+**Where there is no centreline, the road draws its own.** NWB has public roads
+only. A private estate's lanes, the paths through a park and a hospital's
+service roads have no centreline, and before this they came out as single faces
+with hundreds of corners. Whatever road the national centrelines leave without a
+rung is skeletonised: the medial axis of the leftover surface, pruned of the
+spurs every corner grows, smoothed, and then cut exactly like a street. On
+Bronbeek 173 national sections and 418 drawn centrelines give 6,671 rungs.
+
+### What a street is made of
+
+The rungs and the BGT outlines together cut the surface into faces. The
+outlines are surveyed to the centimetre and wobble by a few centimetres between
+rungs, and every wobble kept is one more corner on a face, so each kerb run is
+straightened between the rungs it meets — within 10 cm, and once per kerb, so
+the two surfaces sharing it stay welded. A face over 150 m² with no street to cut
+it (a car park, a square) is cut into a 4 m grid. On Bronbeek:
+
+| | |
+| --- | --- |
+| Surface faces | 17,652 |
+| Quads | 78% of faces |
+| Surface vertices off a surveyed kerb or outline | 0 |
+| Kerb faces (the vertical step at a footway) | 4,831 |
+| Street objects / junction objects | 94 / 92 |
+
+The rest are faces with five or more corners, mostly at junctions and where a
+kerb meets a rung at a T, which no cut can avoid.
+
+**Kerbs are real.** Footways stand `surfaces.kerb_m` (10 cm) above the
+carriageway, with a vertical kerb face between them in its own material,
+`M_road_kerb`. The open edge of the network — where a road runs off the area, or
+a path ends in grass — gets a 35 cm skirt down into the ground so nothing shows
+daylight at a grazing angle.
+
+**Heights come from the survey**, per vertex: the AHN grid under it plus
+`surfaces.road_lift_m` (3 cm), footways plus the kerb. Then the terrain is
+fitted under the roads (see [Terrain](#the-ground-gets-out-of-the-roads-way)),
+rather than the roads being floated above the terrain to clear it.
+
+**Two UV maps.** `UVMap` is the aerial photo under the same top-down
+projection the terrain uses, so the surface looks exactly like the photo,
+markings and crossings included. `RoadUV` runs in metres: on a street, U across
+it from the centreline and V along it, so a tiling asphalt or brick texture, or
+a lane marking, follows the curve; on a junction or paving, plain metres east
+and north.
+
+Every road object carries a `kind` custom property (`street`, `junction`,
+`paving`) that survives into Unity, and every face carries `road_part`
+(0 surface, 1 kerb, 2 skirt) as an attribute.
 
 **A path crossing water does not dive into it.** Lidar does not reflect off
 water, so the bare-earth grid has a hole over every body and the gap filler
@@ -864,99 +783,6 @@ road over a body is now held at that body's own level plus
 `surfaces.road_water_clearance_m`, per body rather than shared, because levels
 across one area run to metres. Held, not pinned: a real bridge rides higher and
 is left alone.
-
-**The road surface floats 6 cm above the terrain**, so the two do not fight for
-the same depth. That is safe here and only here: the terrain sits directly
-underneath wearing the same photograph, so any gap shows the ground rather than
-a hole.
-
-### Road topology
-
-The roads were correct and unusable. Correct in that they covered the right
-ground; unusable in that no engine wants that mesh. Four things were wrong and
-they compounded:
-
-- **Nothing was simplified.** BGT surveys a kerb to the centimetre, so a
-  straight street arrived carrying a vertex every few centimetres.
-- **Earcut fans a strip into slivers**, and that is not a consequence of the
-  dense input — hand it a clean 280 m rectangle and it still returns two
-  triangles 35 times longer than they are wide.
-- **Refinement cut single triangles**, leaving T-junctions: a crack and a
-  shading seam in any engine that welds normals.
-- **Nothing was indexed.** Every triangle carried its own three corners.
-
-The replacement (`src/roadmesh.py`) simplifies the rings as a *network*, so a
-kerb two road parts share is thinned once and they stay welded; triangulates
-with the same constrained Delaunay code the terrain uses, so the outline
-survives as edges; refines by inserting points rather than cutting triangles,
-so the result stays conforming; and comes out indexed. Over one square
-kilometre of Utrecht centre, 1,864 road parts at grade:
-
-| | earcut | now |
-|---|---|---|
-| triangles | 70,803 | 82,239 |
-| vertex buffer | 212,409 | 66,458 |
-| smallest angle, median | 1.5° | 35.4° |
-| faces under 10° | 82.2% | 1.2% |
-| thinnest face | 0.000° | 0.117° |
-| non-manifold edges | — | 0 |
-| surface area | 311,746 m² | 311,727 m² |
-
-It is not fewer triangles, and it was never going to be: a footpath 2.7 m wide
-cannot be covered in 12 m faces whatever you do. It is a third of the vertices
-and a mesh whose faces are shaped like faces.
-
-**Two things about the refinement are worth knowing before touching it**,
-because both were got wrong first and the pair of them made the mesh worse than
-no refinement at all. Nothing stopped a candidate point being inserted right
-beside a kerb — and since the triangulator may not flip across a constraint,
-such a point cannot improve the triangle there, it only wedges a thinner sliver
-against the kerb. Meanwhile a circumcentre landing outside the road was replaced
-by the triangle's centroid, which for a triangle lying along a kerb is a hair
-off that kerb: it manufactured exactly the points the first fault could not cope
-with. Each round laid new slivers for the next round to chase.
-
-| footpath network, 18,731 triangles unrefined | after | median | under 10° |
-|---|---|---|---|
-| both faults | 233,807 | 22.6° | 33.0% |
-| no encroachment split only | 43,849 | 26.6° | 21.1% |
-| centroid fallback only | 53,105 | 35.1° | 0.9% |
-| neither | 51,240 | 35.1° | 1.2% |
-
-The fix that matters is Ruppert's rule: a candidate inside a kerb segment's
-diametral circle is dropped and the kerb halved in its place. That is also what
-made the pass that used to chop every kerb to the face size redundant, and
-removing it saved 1,499 triangles and nine seconds.
-
-**Two BGT parts that share a kerb have both drawn it**, and the two drawings
-rarely agree to the millimetre. Where they disagree by more than the 5 mm weld
-the vertices do not merge and the pair becomes a ribbon of triangles a few
-millimetres tall — 691 of them under a hundredth of a degree over one square
-kilometre, with a median height of exactly the weld tolerance. Welding cannot
-fix it, because those vertices are near each other's *edges*, not near each
-other's *vertices*. `road_snap_m` bends a kerb by up to 5 cm to meet a vertex
-that all but lies on it, which removes four fifths of them. Not more than 5 cm:
-at 10 cm a bent kerb starts crossing its neighbour.
-
-What is left is 82 faces under a degree out of 82,239, and they are the survey's
-own — two streets meeting at a very acute angle is a wedge no triangulation
-improves.
-
-**The surface is draped, not flat.** Sampling the ground only at the corners of
-a long face left one cutting through a canal bank by 1.86 m. A face whose middle
-misses the ground by more than the tolerance is refined like any other, at the
-same time and by the same mechanism, so the drape costs no separate pass and
-leaves no hanging nodes. The worst error over the demo area is the 8 cm
-tolerance. A check asserts it.
-
-Two settings are on the **Terrain and road shape** panel: *Road outlines* is how
-far a simplified kerb may move (`road_simplify_m`, 25 cm), and *Road face size*
-is the size a face aims for (`road_max_edge_m`, 12 m). `road_min_angle_deg`
-(22°) and `road_snap_m` (5 cm) are config-only.
-
-Tunnels (`relatieve_hoogteligging` below zero) are left out — a tunnel drawn on
-the surface is simply wrong. Bridges are kept, because the DTM under a canal is
-interpolated up to bank level, which is about where a low Dutch bridge sits.
 
 **Roads are not one class.** The BGT knows what every road surface is for and
 what it is made of, and a Dutch street is unrecognisable without both: the
@@ -969,6 +795,11 @@ lane, each with its own tint and grain. Over Utrecht centre brick carriageway
 junctions and kerbs, so they are painted in an explicit order — broad surfaces
 first, the things cut out of them last — rather than in whatever order the API
 returned them.
+
+Tunnels (`relatieve_hoogteligging` below zero) are left out of the road surface
+— a tunnel drawn on the surface is simply wrong — and get their own geometry
+(see [Bridges and tunnels](#bridges-and-tunnels)). Roads on a bridge ride its
+deck.
 
 ## Street detail
 
@@ -1379,10 +1210,12 @@ nothing and cost a great deal — footpath is 305 of the 871 road parts over tha
 square, and in a park every winding path through the lawns is one.
 `trees.detect_off_surfaces` names the classes.
 
-**Detected trees arrive as their own object.** The model gets `Trees_registered`
-and `Trees_detected`, sharing one material. The detector is good rather than
-perfect — scaffolding, roof plant and the odd parked lorry will get through — and
-a bad patch has to be deletable as a group rather than hunted tree by tree. Turn
+**Detected trees arrive under their own parent.** The model gets
+`Trees_registered` and `Trees_detected`, each holding one object per tree
+(`Tree_00001`, `Tree_d00001`), sharing one material. The detector is good rather
+than perfect — scaffolding, roof plant and the odd parked lorry will get through
+— and a bad patch has to be deletable as a group, or a tree at a time, rather
+than cut out of a merged mesh. Turn
 it off with `trees.detect`, and the thresholds are all under `trees.detect_*`.
 
 **Point clouds would not fix this.** They would improve crown *shape* and let the
@@ -1599,7 +1432,7 @@ copy of a mesh that is already minimal:
 ```json
 "collision": {
   "objects": {"Collision_Trees": 365204, "Collision_Barriers": 5120},
-  "reuses_its_own_mesh": {"Terrain": "...", "Buildings": "...", "Roads_*": "..."},
+  "reuses_its_own_mesh": {"Terrain": "...", "Pand_*": "...", "Road_*, Path_*, ...": "..."},
   "note": "Add a Mesh Collider to each Collision_* object and untick ..."
 }
 ```
@@ -1693,9 +1526,10 @@ The centroid rule is the usual tiling convention: each building belongs to
 exactly one tile, and geometry is never cut open. Set
 `buildings.clip_mode: "intersect"` for full coverage with an unbounded overhang.
 
-**Buildings are one merged mesh by default.** A 1 km² of Utrecht is ~2500
-buildings; one mesh with two material slots is two draw calls in Unity instead of
-thousands of objects. `buildings.merge: "per_building"` gives one object each.
+**Every building is its own object.** One merged mesh was cheaper to draw and
+impossible to edit: deleting a building, or moving one aside for a scenario,
+meant cutting it out of a mesh holding a thousand others. Unity's static
+batching recovers the draw calls for buildings that do not move.
 
 **Wall bases are pushed below the terrain.** Because the DTM's building-shaped
 holes are filled by interpolation, the reconstructed ground can sit slightly
@@ -1712,8 +1546,15 @@ building actually reaches the terrain, aerial size, content and georeference, th
 output files, model span and centring, and a re-import of the exported FBX to
 re-measure it.
 
-A run over the shipped Utrecht bbox passes 27 of 27 in about 140 s: 2557
-buildings, 232k triangles, a 26 MB FBX.
+A run over the Bronbeek square kilometre in Arnhem, collision shapes on, passes
+60 of 60 in about 4 minutes: a 501 × 501 ground grid, 188 road objects of
+17,652 faces, 1,250 buildings, 10,743 trees, 1,007 parked cars, a 64 MB FBX and
+a 27 MB `.blend`. The Blender stage is under half a minute of that.
+
+The road and terrain checks are the ones to read after a change to either:
+`roads_are_mostly_quads`, `road_surface_follows_terrain` (no road far off the
+survey), `terrain_stays_under_roads` (no ground through a road) and
+`terrain_follows_the_survey`.
 
 ## Attribution
 
@@ -1728,6 +1569,8 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
   Grootschalige Topografie) via PDOK (CC BY 4.0)
 - **Building function** — BAG (Basisregistratie Adressen en Gebouwen) via PDOK
   (CC BY 4.0)
+- **Road centrelines and street names** — NWB-Wegen (Nationaal Wegenbestand),
+  Rijkswaterstaat, via PDOK (CC0)
 - **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution
   is required for these; they are credited because it is the decent thing, and
   listed here so you know nothing in the model carries an obligation you did not

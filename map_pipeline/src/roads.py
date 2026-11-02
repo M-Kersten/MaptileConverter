@@ -326,9 +326,12 @@ def _frame(line, t: float) -> tuple[np.ndarray, np.ndarray]:
 def _cut_pieces(stations, polygons, poly_tree, lines, line_tree, reach):
     """Where each station's cross-section runs through road, in pieces.
 
-    Returns, per station, a sorted list of ``(s0, s1, owner, own_margin)``
-    where `s` is signed distance from the centreline and each piece lies in
-    one surface polygon.
+    Returns, per station, a sorted list of ``(s0, s1, owner, own_margin,
+    wandered)`` where `s` is signed distance from the centreline and each
+    piece lies in one surface polygon. A piece has `wandered` when one of its
+    ends is far nearer the station's own centreline than its distance along
+    the cross-section: the cut has run round a bend and up another stretch of
+    the same street, where it is no longer square to anything.
     """
     import shapely
 
@@ -341,6 +344,7 @@ def _cut_pieces(stations, polygons, poly_tree, lines, line_tree, reach):
     pieces = shapely.intersection(segments[pairs[0]], polygons[pairs[1]])
 
     rows: list[tuple[int, float, float, np.ndarray]] = []
+    ends: list[np.ndarray] = []
     for k, piece in enumerate(pieces):
         station = int(pairs[0][k])
         _, _, p, n = stations[station]
@@ -350,6 +354,7 @@ def _cut_pieces(stations, polygons, poly_tree, lines, line_tree, reach):
             coords = np.asarray(part.coords)[:, :2]
             s = (coords - p) @ n
             rows.append((station, float(s.min()), float(s.max()), coords.mean(axis=0)))
+            ends.append(coords[[int(np.argmin(s)), int(np.argmax(s))]])
 
     per_station: list[list] = [[] for _ in stations]
     if not rows:
@@ -361,9 +366,17 @@ def _cut_pieces(stations, polygons, poly_tree, lines, line_tree, reach):
     own_lines = np.array([lines[stations[r[0]][0]] for r in rows], dtype=object)
     own_distance = shapely.distance(mids, own_lines)
     other_distance = shapely.distance(mids, lines[owner_of])
+    # Round an ordinary bend a point on the cross-section is at least half
+    # as far from the centreline as along the cut (cos 60 degrees for a turn
+    # of 120); a cut that has run up the street's next leg is much nearer.
+    end_points = shapely.points(np.array(ends))
+    end_distance = shapely.distance(end_points, own_lines[:, None])
+    offsets = np.abs(np.array([[r[1], r[2]] for r in rows]))
+    wandered = (end_distance < 0.5 * offsets - 0.5).any(axis=1)
     for k, (station, s0, s1, _) in enumerate(rows):
         per_station[station].append(
-            (s0, s1, int(owner_of[k]), float(own_distance[k] - other_distance[k]))
+            (s0, s1, int(owner_of[k]), float(own_distance[k] - other_distance[k]),
+             bool(wandered[k]))
         )
     for entry in per_station:
         entry.sort()
@@ -390,7 +403,7 @@ def _run_through_centre(
         return []
     centre = None
     best = approach
-    for i, (s0, s1, _, _) in enumerate(pieces):
+    for i, (s0, s1, *_) in enumerate(pieces):
         d = 0.0 if s0 <= 0.0 <= s1 else min(abs(s0), abs(s1))
         if d <= best:
             best, centre = d, i
@@ -398,8 +411,8 @@ def _run_through_centre(
         return []
 
     def mine(piece) -> bool:
-        _, _, owner, margin = piece
-        return owner == line_index or margin <= 0.5
+        _, _, owner, margin, wandered = piece
+        return not wandered and (owner == line_index or margin <= 0.5)
 
     if not mine(pieces[centre]):
         return []
@@ -412,7 +425,7 @@ def _run_through_centre(
         and mine(pieces[hi + 1])
     ):
         hi += 1
-    crossings = sorted({round(v, 4) for s0, s1, _, _ in pieces[lo : hi + 1] for v in (s0, s1)})
+    crossings = sorted({round(v, 4) for s0, s1, *_ in pieces[lo : hi + 1] for v in (s0, s1)})
     # Two crossings closer than this are one kerb seen twice.
     merged: list[float] = []
     for value in crossings:

@@ -38,6 +38,10 @@ ATTRIBUTION = {
         "Building function from the BAG (Basisregistratie Adressen en "
         "Gebouwen) via PDOK, CC BY 4.0."
     ),
+    "roads": (
+        "Road centrelines and street names from the NWB (Nationaal Wegenbestand) "
+        "by Rijkswaterstaat, via PDOK (CC0)."
+    ),
     "textures": (
         "Wall surfaces under the generated facades from Poly Haven (CC0, no "
         "attribution required). https://polyhaven.com"
@@ -197,10 +201,7 @@ def write_scene_description(
         "bbox_rd": geo.bbox.as_list(),
         "bbox_local": local.as_list(),
         "terrain": {"file": "terrain_grid.npz"},
-        "buildings": {
-            "file": "buildings.npz",
-            "merge": buildings_cfg["merge"],
-        },
+        "buildings": {"file": "buildings.npz"},
         "aerial": {
             "file": aerial.path.name,
             "bbox_rd": aerial.bbox.as_list(),
@@ -348,6 +349,7 @@ def write_attribution(out_dir: Path) -> Path:
         f"Aerial:    {ATTRIBUTION['aerial']}",
         f"BGT:       {ATTRIBUTION['bgt']}",
         f"BAG:       {ATTRIBUTION['bag']}",
+        f"NWB:       {ATTRIBUTION['roads']}",
         f"Textures:  {ATTRIBUTION['textures']}",
         "",
         "Keep this notice with the model when you redistribute it.",
