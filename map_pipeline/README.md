@@ -133,8 +133,8 @@ what it actually cost to `work/<area>/timings.json`, and the estimate rescales
 itself from those, so it converges on the machine it is running on rather than
 the one it was calibrated on. Failed and partial runs are left out of that.
 
-Rough costs for a 1 km² area, previews included: Draft about 3 minutes,
-Standard about 5, High about 10. Previews are a large share of that, so turning
+Rough costs for a 1 km² area, previews included: Draft about 4 minutes,
+Standard about 6, High about 11. Previews are a large share of that, so turning
 them off cuts the wait noticeably.
 
 The map works directly in RD New, so the square you position *is* the bbox that
@@ -355,6 +355,7 @@ Other knobs worth knowing:
 | `buildings.tiles_version` | `v20250903` | Which dated 3DBAG release the static tiles come from. Bumped by hand; releases are listed at 3dbag.nl/en/download. |
 | `buildings.probe_timeout_s` | `8.0` | How long to knock on the API before giving up and using the tiles. |
 | `terrain.grid_m` | `2.0` | Ground grid spacing; set by `detail`. See [Terrain](#terrain). |
+| `terrain.feature_edges` | `["water", "roads", "buildings"]` | Which outlines the terrain's edges follow, each with a row of quads alongside. `[]` gives the plain grid. |
 | `aerial.deshadow` | `1.0` | How much of the flown sun to take back out of the photo, 0 to 1. See [The flown sun](#the-flown-sun-and-taking-it-back-out). `0` leaves it as flown. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
 
@@ -362,7 +363,8 @@ Other knobs worth knowing:
 
 ```
 src/geo.py         bbox parsing, WGS84 to RD, origin offset
-src/elevation.py   AHN WCS -> GeoTIFF -> regular height grid, fitted under roads
+src/elevation.py   AHN WCS -> GeoTIFF -> regular height grid; the fit under roads
+src/terrain_mesh.py the terrain mesh: outlines as edges, rows, grid, fill
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
 src/facade.py      generated facade, tree, water and furniture textures
@@ -447,7 +449,7 @@ outliner and an empty that everything in it hangs from:
 
 | Collection / parent | What is in it |
 | --- | --- |
-| `Terrain` | one object, the ground grid |
+| `Terrain` | one object, the ground; its edges follow the outlines (see [Terrain](#terrain)) |
 | `Roads` | one object per street, junction and paving area (see [Roads](#roads)) |
 | `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
 | `Water` | water surfaces and beds |
@@ -464,6 +466,26 @@ of that shape changes; move or scale a tree and only it does.
 modifier set to apply on render and export only, splitting every quad the same
 way the pipeline measured heights on. In the viewport you edit the quads.
 
+**The terrain's outlines are one click away.** Every outline is a vertex group
+on the `Terrain` object, so *Object Data Properties → Vertex Groups → Select*
+picks a whole waterline or every road edge at once:
+
+| Vertex group | What it selects |
+| --- | --- |
+| `outline_waterline` | the edge of the water: bank above, bed below |
+| `outline_road` | where the ground meets the road surface |
+| `outline_building` | the footprint of every building |
+| `outline_row` | the inner edge of the row along an outline: the next loop in |
+| `outline_bed` | the bottom of the bank inside the water, and a ditch's centre line |
+
+The outlines are also marked as seams, so they show in edit mode, and carried
+as attributes for anything scripted: `outline` on each edge (1 waterline, 2 road
+edge, 4 building, 8 row, 16 bed, added together where they meet),
+`ground_kind` on each face (0 land, 1 road, 2 water, 3 building) and
+`ground_part` (0 grid, 1 row, 2 fill). To work on one outline, select its
+group, then *Select Linked* or *Select Loops* from there; with proportional
+editing on, moving a waterline takes the bank with it.
+
 ### The Maptile tools
 
 `maptile_tools.py` is saved into the file as a script that registers on load,
@@ -473,11 +495,13 @@ Preferences → Save & Load → Auto Run Python Scripts*), or install the `.py` 
 add-on. Four buttons:
 
 * **Fit terrain under roads.** After moving, widening or raising a road, the
-  ground under it is wrong. This redoes the pipeline's fit: the same points, the
-  same 5 cm clearance, the same preference for lowering vertices hidden under
-  the road. It starts from the survey heights stored on the terrain, so running
-  it twice gives the same ground, and moving a road back gives the ground back.
-  Kerb and skirt faces are left out.
+  ground under it is wrong. This redoes the pipeline's fit: the same points,
+  the same 5 cm clearance, the same preference for lowering vertices hidden
+  under the road. It only ever lowers, from the heights the terrain has now,
+  so a sculpt survives it and running it twice changes nothing the second
+  time; to get the ground back from under a road you moved away, Reset first
+  and Fit after. It works on the terrain whatever its faces, including any you
+  have remeshed yourself. Kerb and skirt faces are left out.
 * **Reset terrain to survey.** Puts every terrain vertex back on its measured
   height (`measured_z`), roads ignored.
 * **Drop selected onto ground.** Moves each selected object vertically onto the
@@ -569,19 +593,92 @@ cache makes repeat runs faster than the API anyway:
 
 ## Terrain
 
-The ground is a **regular grid of quads**, 2 m apart at Standard detail, from
-the 0.5 m AHN DTM. Not a triangulation that spends vertices where the ground
-moves, and not a mesh that folds along every kerb: rows and columns.
+**The ground's edges follow what is on it.** The waterline, the edge of every
+road and the outline of every building are edges of the terrain mesh, each with
+a row of quads running alongside it. Further from any outline the ground is the
+regular grid of 2 m quads it was before: same squares, same places, same
+surveyed heights.
 
-**Why a grid.** This model is edited. Loop select, grid fill, the sculpt
-brushes, proportional editing and every heightmap tool expect rows and columns,
-and all of them stop working on a triangulation. The pipeline used to build a
-constrained Delaunay mesh folded along 10,000 BGT outlines and contours, with
-Ruppert refinement and a quad pass on top. It was accurate and nobody could
-edit it: a plot could not be flattened without hunting triangles, and a road
-could not be moved because the ground had its old outline cut into it. The
-roads now sit on top as their own surface (see [Roads](#roads)) and the ground
-underneath is only ground.
+Why: a plain grid ignores the outlines. A waterline falls wherever it falls
+inside a square, so the bank of a pond came out as a staircase of squares and
+there was nothing to select. Editing terrain in Blender works from the outlines
+inward: select the waterline, move or scale it, and proportional editing takes
+the bank with it; the row beside it is the next loop in. That needs the
+outlines to be edges and the faces laid out along them.
+
+How it is built (`src/terrain_mesh.py`):
+
+* **Regions.** At-grade road surfaces, water and building footprints cut the
+  area into regions of one kind each; where they overlap, road wins over
+  water, and water over building. Corners of different outlines closer than
+  40 cm become one corner, and an edge two regions share has the same
+  vertices on both sides, so the sheet has no cracks.
+* **Rows.** Every region you can see — land and water — gets a row of quads
+  along its outline, one grid spacing wide, with a rung from every station on
+  the outline: every corner, and no more than 3.2 m apart between them.
+* **Ladders.** A region too narrow for a row on each side — a front garden, a
+  verge, a ditch — gets rungs straight across instead, and the point each one
+  lands on is added to the outline on both sides of it. Under water the rungs
+  are split at their middle and the middles joined: a ditch has a bed line
+  down its centre.
+* **Grid.** Inside the rows, the regular grid carries on.
+* **Fill.** Between the rows and the grid's staircase edge a strip is
+  triangulated, and the triangles are paired back into quads wherever the quad
+  comes out well shaped. Each rung is carried on to the grid node in front of
+  it first, which cuts the strip into small cells.
+* **Hidden ground.** Under roads and buildings nobody sees the ground, so it
+  gets no rows: its outline is an edge loop and the inside is grid and fill.
+
+Heights come from the survey, as before. The waterline is never below the
+water's own level, and everything under water lies at least `water_depth_m`
+below that level, so the inside row of a pond is its bank, from the waterline
+down to the bed. (Water beds used to be sunk square by square in Blender,
+which left a stepped wall at the edge of every pond.)
+
+Over the Bronbeek square kilometre:
+
+| | |
+| --- | --- |
+| Faces | 263,601, 84% quads |
+| Grid squares / row faces / fill faces | 149,179 / 39,635 / 74,787 |
+| Quads among the row faces / fill faces | 81% / 54% |
+| Edges along a waterline / road edge / building outline | 4,422 / 24,382 / 13,563 |
+| Edges along the inner side of a row / a bed | 22,168 / 2,153 |
+| Cracks, edges shared by three faces, faces upside down | 0 / 0 / 0 |
+| Faces with an angle under 10° | 1,502 (0.6%) |
+| Within the survey, 95% / 99% of the ground | 12 cm / 26 cm (the plain grid: 11 cm / 23 cm) |
+| Time | 55 s |
+
+The cracks line is a check every run makes (`terrain_is_one_closed_sheet`):
+the faces have to cover the bbox exactly once.
+
+The mesh gives up a little accuracy to the plain grid, and it gives it up
+along the outlines: a row sits exactly on a bank, a kerb or the foot of a wall,
+where any surface of flat faces is furthest from the survey. Two things keep
+that small. The vertices off the grid read the 0.5 m survey directly rather
+than the grid between its nodes. And the waterline keeps its surveyed height,
+raised to the water level only where the survey dips below it; pinned to the
+water level, it pulled every bank top down with it and left half the ground
+beside the water more than 25 cm off.
+
+**Choosing what it follows.** `terrain.feature_edges` names the outlines:
+`["water", "roads", "buildings"]` by default, `["water"]` for only the
+waterlines, `[]` for the plain grid. If the outlines ever defeat the geometry,
+the run carries on with the plain grid and says so in a warning rather than
+failing at the terrain.
+
+**Every quad is split one way, on purpose.** A quad of four heights is not
+flat, so the renderer draws it as two triangles, and which diagonal it picks
+moves the ground by up to half the height difference across it. Blender's export
+triangulation is told to cut every quad from its first corner to its third
+(*Triangulate* modifier, quad method *Fixed*, applied on export only), and the
+pipeline writes each quad so that is the diagonal it wants: south-west to
+north-east on a grid square, and elsewhere the diagonal whose middle lies
+nearer the surveyed ground. Every height the pipeline places something at — a
+tree, a lamppost, a car — is read off those same triangles. Bilinear
+interpolation, which is what "the height between grid points" usually means, is
+a surface nothing draws; on lumpy ground it put posts a few centimetres in the
+air or under it.
 
 **How the grid is made.** AHN is fetched at 0.5 m with a few cells of margin,
 block-averaged onto the grid — every output vertex is the mean of the surveyed
@@ -589,24 +686,14 @@ pixels around it, not one pixel picked by interpolation — and the holes where
 buildings, water and dense vegetation stood are filled inward from their edges.
 Only the filled cells are smoothed; surveyed ground is left as surveyed. A
 `grid_m` that does not divide the area is rounded so the spacing is never
-coarser than asked.
-
-**The quads are split one way, on purpose.** A quad of four heights is not flat,
-so the renderer draws it as two triangles, and which diagonal it picks moves the
-ground by up to half the height difference across the cell. Blender's export
-triangulation is told to cut every quad south-west to north-east (*Triangulate*
-modifier, quad method *Fixed*, applied on export only), and every height the
-pipeline places something at — a tree, a lamppost, a car — is read off that
-same pair of triangles. Bilinear interpolation, which is what "the height
-between grid points" usually means, is a surface nothing draws; on lumpy ground
-it put posts a few centimetres in the air or under it.
+coarser than asked. The mesh's other vertices take their height from that grid.
 
 **Two surfaces, kept apart.** `TerrainResult` carries both:
 
 | | Reads | Used by |
 |---|---|---|
 | `terrain.sample` | the surveyed grid, before anything was moved | road heights, buildings, bridges, and every check |
-| `terrain.surface` | what the model draws: the grid's triangles, or the road surface where there is road | trees, furniture, barriers, rails, cars |
+| `terrain.surface` | what the model draws: the terrain mesh's triangles, or the road surface where there is road | trees, furniture, barriers, rails, cars |
 
 The split follows whether a thing is **measured against the ground** or
 **placed on what you see**. A road takes its height from the survey, because
@@ -617,13 +704,15 @@ itself.
 
 ### The ground gets out of the road's way
 
-The road surface follows the survey; the ground grid can only bend at its own
+The road surface follows the survey; the ground can only bend at its own
 vertices. Between them a 2 m quad bulges up through a carriageway on any
 cambered street, and a 0.10 m kerb leaves the ground showing through the
-footway. So after the roads are built, the terrain is **fitted under them**:
+footway. So once the terrain mesh is built, it is **fitted under the roads**:
 every road vertex, edge midpoint and cell under the road is a point the ground
-must stay at least 5 cm below, and the grid vertices around each offending
-point are lowered just enough to clear it.
+must stay at least 5 cm below, and the vertices around each offending point
+are lowered just enough to clear it. Because the road edge is now an edge of
+the terrain too, the ground beside a road no longer shares a face with the
+ground under it, and the verge stays where it was surveyed.
 
 Two details decide whether this looks right:
 
@@ -632,14 +721,17 @@ Two details decide whether this looks right:
   in any proportion. Grid vertices under the road surface are hidden; the ones
   beside it are the verge, the bank, the field. The correction is weighted four
   to one towards hidden vertices, so the road sinks into the ground rather than
-  the ground around the road sinking. On Bronbeek the fit moves 49,308
-  vertices, three quarters of them hidden under a road. Of the ones you can
-  see, the median drop is 2 cm and 38 drop by more than half a metre — against
-  about 1,800 before this weighting and the car-park grid below.
-* **The survey is kept.** The lowered grid is what is drawn; the measured grid
-  is kept beside it (`terrain_grid.npz`, and the `measured_z` attribute on the
-  Blender terrain), so the fit can be redone after someone moves a road, or
-  undone. That is what the [Maptile tools](#opening-it-in-blender) do.
+  the ground around the road sinking. On Bronbeek the fit moves 48,452
+  vertices, by 3 cm at the median. 210 drop by more than half a metre, and the
+  60 of those in sight are all on the road edge itself, where the ground meets
+  a road lying lower than the survey beside it. Beyond the road edge not one
+  does; on the plain grid, 38 verge and bank vertices did, and about 1,800
+  before this weighting and the car-park grid below.
+* **The survey is kept.** The lowered mesh is what is drawn; the surveyed
+  heights are kept beside it (`terrain_mesh.npz`, and the `measured_z`
+  attribute on the Blender terrain), so the fit can be undone and redone after
+  someone moves a road. That is what the
+  [Maptile tools](#opening-it-in-blender) do.
 
 Big flat surfaces need help too: a car park or a square has no street to cut it
 across and would otherwise be one face tens of metres wide, flat between its
@@ -1561,14 +1653,16 @@ output files, model span and centring, and a re-import of the exported FBX to
 re-measure it.
 
 A run over the Bronbeek square kilometre in Arnhem, collision shapes on, passes
-60 of 60 in about 4 minutes: a 501 × 501 ground grid, 188 road objects of
-17,652 faces, 1,250 buildings, 10,743 trees, 1,007 parked cars, a 64 MB FBX and
-a 27 MB `.blend`. The Blender stage is under half a minute of that.
+62 of 62 in just over 5 minutes: a terrain of 263,601 faces following 42,367
+outline edges, 188 road objects of 17,652 faces, 1,250 buildings, 10,743
+trees, 1,007 parked cars, a 64 MB FBX and a 29 MB `.blend`. The Blender stage
+is under half a minute of that.
 
 The road and terrain checks are the ones to read after a change to either:
 `roads_are_mostly_quads`, `road_surface_follows_terrain` (no road far off the
-survey), `terrain_stays_under_roads` (no ground through a road) and
-`terrain_follows_the_survey`.
+survey), `terrain_stays_under_roads` (no ground through a road),
+`terrain_follows_the_survey`, `terrain_is_one_closed_sheet` (no cracks, no
+overlaps, nothing upside down) and `terrain_follows_the_outlines`.
 
 ## Attribution
 

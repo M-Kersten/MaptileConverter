@@ -200,7 +200,10 @@ def write_scene_description(
         "ground_z_offset_nap": float(terrain.center_z_nap),
         "bbox_rd": geo.bbox.as_list(),
         "bbox_local": local.as_list(),
-        "terrain": {"file": "terrain_grid.npz"},
+        "terrain": {
+            "file": "terrain_mesh.npz" if getattr(terrain, "mesh", None) is not None
+            else "terrain_grid.npz",
+        },
         "buildings": {"file": "buildings.npz"},
         "aerial": {
             "file": aerial.path.name,

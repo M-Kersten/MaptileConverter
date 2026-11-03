@@ -105,6 +105,10 @@ class TerrainResult:
     conformed: dict | None = None
     # How far the grid strays from every surveyed pixel it was built from.
     survey_error: dict | None = None
+    # The terrain as the model draws it: a mesh whose edges follow the
+    # outlines on the ground (see terrain_mesh.py). Until it is built, the
+    # grid is what is drawn.
+    mesh: object | None = None
 
     @property
     def n(self) -> int:
@@ -123,16 +127,28 @@ class TerrainResult:
         grid = self.measured if self.measured is not None else self.heights
         return _bilinear_on_grid(grid, self.xs, self.ys, x, y)
 
+    def ground(self, x, y):
+        """The terrain exactly as it is drawn, at RD coordinates.
+
+        Flat triangles, split the way Blender and the FBX export split them:
+        the mesh's own triangles once it is built, before that each grid
+        square split corner to corner from south-west to north-east.
+        """
+        if self.mesh is not None:
+            shape = np.broadcast(np.asarray(x), np.asarray(y)).shape
+            x = np.broadcast_to(np.asarray(x, dtype=np.float64), shape)
+            y = np.broadcast_to(np.asarray(y, dtype=np.float64), shape)
+            return self.mesh.heights_at(x.ravel(), y.ravel()).reshape(shape)
+        return _triangulated_on_grid(self.heights, self.xs, self.ys, x, y)
+
     def surface(self, x, y):
         """The top of whatever the model shows at RD coordinates.
 
         On a road that is the road. Everywhere else it is the terrain exactly
-        as it is drawn: each grid square is two flat triangles split corner to
-        corner from south-west to north-east, which is the split Blender and
-        the FBX export make, so a lamp post or a tree trunk stands on the face
-        it will be seen standing on rather than on a curve between them.
+        as it is drawn (`ground`), so a lamp post or a tree trunk stands on the
+        face it will be seen standing on rather than on a curve between them.
         """
-        ground = _triangulated_on_grid(self.heights, self.xs, self.ys, x, y)
+        ground = self.ground(x, y)
         if self.road_top is None:
             return ground
         top = self.road_top(x, y)
@@ -154,6 +170,8 @@ class TerrainResult:
             out["error_against_survey"] = dict(self.survey_error)
         if self.conformed:
             out["lowered_under_roads"] = dict(self.conformed)
+        if self.mesh is not None:
+            out["mesh"] = dict(self.mesh.stats)
         return out
 
     def save(self, work_dir: Path) -> None:
@@ -170,6 +188,8 @@ class TerrainResult:
             bbox=np.asarray(self.bbox.as_list(), dtype=np.float64),
             center_z_nap=np.float64(self.center_z_nap),
         )
+        if self.mesh is not None:
+            np.savez(work_dir / "terrain_mesh.npz", **self.mesh.to_npz_fields())
 
 
 def _coverage_id(ahn_model: str) -> str:
@@ -887,6 +907,8 @@ def lower_under(
     was pulled down to the road at its foot two metres away. This drops 24.
     """
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if terrain.mesh is not None:
+        return _lower_mesh_under(terrain, points, clearance_m=clearance_m)
     n = terrain.n
     heights = terrain.heights.astype(np.float64)
     if not len(points):
@@ -952,6 +974,109 @@ def lower_under(
     return terrain.conformed
 
 
+def _lower_mesh_under(terrain: TerrainResult, points: np.ndarray, *, clearance_m: float) -> dict:
+    """`lower_under` on the terrain mesh: the same correction, its triangles.
+
+    Hidden here means under the road all round: a vertex whose every face is
+    ground under a road. The terrain's own outline along the road edge is
+    not hidden -- it is where the verge starts -- so it gives way least.
+    """
+    from .terrain_mesh import ROAD
+
+    mesh = terrain.mesh
+    z = mesh.vertices[:, 2].astype(np.float64)
+    drop = np.zeros(len(z))
+    # A vertex is in sight if any face round it is not under a road.
+    face_of_loop = np.repeat(np.arange(len(mesh.face_sizes)), mesh.face_sizes)
+    visible = np.zeros(len(z), dtype=bool)
+    visible[mesh.face_loops[mesh.face_kind[face_of_loop] != ROAD]] = True
+    if len(points):
+        tri, weights = mesh.locator().locate(points[:, 0], points[:, 1])
+        found = tri >= 0
+        triangles, _ = mesh.triangles()
+        corners = triangles[tri[found]]
+        w = weights[found]
+        excess = (w * z[corners]).sum(axis=1) - (points[found, 2] - clearance_m)
+        bad = excess > 0.0
+        if bad.any():
+            wb = w[bad]
+            share = wb * np.where(visible[corners[bad]], 1.0, HIDDEN_VERTEX_WEIGHT)
+            need = excess[bad, None] * share / np.maximum((wb * share).sum(axis=1), 1e-12)[:, None]
+            np.maximum.at(drop, corners[bad].ravel(), need.ravel())
+    mesh.vertices[:, 2] = z - drop
+    moved = drop > 1e-6
+    terrain.conformed = {
+        "vertices": int(moved.sum()),
+        "max_m": round(float(drop.max()), 3) if moved.any() else 0.0,
+        "median_m": round(float(np.median(drop[moved])), 3) if moved.any() else 0.0,
+        "over_half_metre": int((drop > 0.5).sum()),
+        # The ones you can see: not under a road on every side.
+        "visible_over_half_metre": int(((drop > 0.5) & visible).sum()),
+        "clearance_m": float(clearance_m),
+    }
+    LOG.info(
+        "terrain: %d vertices lowered under the roads, median %.2f m; %d by "
+        "more than half a metre, %d of them in sight",
+        terrain.conformed["vertices"],
+        terrain.conformed["median_m"],
+        terrain.conformed["over_half_metre"],
+        terrain.conformed["visible_over_half_metre"],
+    )
+    return terrain.conformed
+
+
+def mesh_survey_error(terrain: TerrainResult, *, step: int = 2) -> dict:
+    """How far the terrain mesh, as surveyed, strays from the survey under it.
+
+    The same measure as for the grid (`_survey_error`), against every `step`th
+    measured pixel each way, and leaving out the water: under it the bed is
+    put there on purpose, below anything the scanner saw.
+    """
+    import rasterio
+
+    from .terrain_mesh import WATER
+
+    mesh = terrain.mesh
+    if mesh is None or terrain.geotiff_path is None or not Path(terrain.geotiff_path).is_file():
+        return {}
+    with rasterio.open(terrain.geotiff_path) as dataset:
+        raw = dataset.read(1).astype(np.float64)
+        left, bottom, right, top = dataset.bounds
+    valid = (
+        np.isfinite(raw) & (raw < NODATA_CUTOFF)
+        & (raw > MIN_PLAUSIBLE_NAP) & (raw < MAX_PLAUSIBLE_NAP)
+    )
+    rows, cols = raw.shape
+    px = left + (np.arange(cols) + 0.5) * (right - left) / cols
+    py = top - (np.arange(rows) + 0.5) * (top - bottom) / rows
+    bbox = terrain.bbox
+    keep_c = np.flatnonzero((px > bbox.xmin) & (px < bbox.xmax))[::step]
+    keep_r = np.flatnonzero((py > bbox.ymin) & (py < bbox.ymax))[::step]
+    if not len(keep_c) or not len(keep_r):
+        return {}
+    window = valid[np.ix_(keep_r, keep_c)]
+    gx, gy = np.meshgrid(px[keep_c], py[keep_r])
+    x, y = gx[window], gy[window]
+    truth = raw[np.ix_(keep_r, keep_c)][window]
+    tri, w = mesh.locator().locate(x, y)
+    triangles, owner = mesh.triangles()
+    found = tri >= 0
+    dry = found.copy()
+    dry[found] = mesh.face_kind[owner[tri[found]]] != WATER
+    corners = triangles[tri[dry]]
+    drawn = (w[dry] * mesh.measured_z[corners]).sum(axis=1)
+    error = np.abs(drawn - truth[dry])
+    if not len(error):
+        return {}
+    p50, p95, p99 = np.percentile(error, [50, 95, 99])
+    return {
+        "p50_m": round(float(p50), 3),
+        "p95_m": round(float(p95), 3),
+        "p99_m": round(float(p99), 3),
+        "over_25cm": round(float((error > 0.25).mean()), 4),
+    }
+
+
 __all__ = [
     "DEFAULT_GRID_M",
     "HeightRaster",
@@ -965,5 +1090,6 @@ __all__ = [
     "fetch_dtm_geotiff",
     "grid_size_for",
     "lower_under",
+    "mesh_survey_error",
     "raster_sampler",
 ]

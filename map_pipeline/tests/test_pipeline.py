@@ -5900,8 +5900,10 @@ class TestMaptileTools(unittest.TestCase):
         # The plain constants: a number or a quoted name on one line.
         for line in re.findall(r"\n([A-Z_]+ = (?:[-0-9.]+|\"[^\"\n]*\"))(?=\n)", source):
             exec(line, namespace)  # noqa: S102 - our own source
-        body = re.search(r"\ndef fit_terrain\(.*?\n(?=\ndef |\nclass )", source, re.S)
-        exec(body.group(0), namespace)  # noqa: S102 - our own source
+        for pattern in (r"\nclass TriangleLocator:.*?\n(?=\ndef |\nclass )",
+                        r"\ndef fit_terrain\(.*?\n(?=\ndef |\nclass )"):
+            body = re.search(pattern, source, re.S)
+            exec(body.group(0), namespace)  # noqa: S102 - our own source
         return namespace
 
     def test_the_constants_agree_with_the_pipeline(self):
@@ -5912,27 +5914,699 @@ class TestMaptileTools(unittest.TestCase):
         self.assertEqual(tools["HIDDEN_VERTEX_WEIGHT"], elevation.HIDDEN_VERTEX_WEIGHT)
 
     def test_fitting_in_blender_is_fitting_in_the_pipeline(self):
-        from src.elevation import TerrainResult, lower_under
-        from src.geo import BBox
+        """On the terrain mesh, outlines and all: same point location, same
+        correction, the same vertices kept back for being in sight."""
+        import copy
 
-        bbox = BBox(0.0, 0.0, 40.0, 40.0)
-        axis = np.linspace(0.0, 40.0, 21)
-        gx, gy = np.meshgrid(axis, axis)
-        heights = (5.0 + 0.4 * np.sin(gx / 4.0) * np.cos(gy / 5.0)).astype(np.float32)
-        rng = np.random.default_rng(12)
-        points = np.column_stack([
-            rng.uniform(10, 25, 3000), rng.uniform(2, 38, 3000), rng.uniform(4.6, 5.2, 3000),
-        ])
-        terrain = TerrainResult(
-            heights=heights.copy(), xs=axis, ys=axis, bbox=bbox, center_z_nap=5.0,
-            nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
-            coverage_id="t", resolution_m=0.5, measured=heights.copy(),
-        )
+        from src.elevation import lower_under
+        from src.roads import road_underside
+        from src.terrain_mesh import ROAD, build_terrain_mesh
+
+        terrain, roads, water, buildings = _outline_terrain()
+        terrain.mesh = build_terrain_mesh(terrain, roads=roads, water=water, buildings=buildings)
+        mesh = copy.deepcopy(terrain.mesh)
+        points = road_underside(roads, terrain.bbox)
         lower_under(terrain, points, clearance_m=0.05)
-        grid = np.dstack([gx, gy, heights.astype(np.float64)])
-        fitted, moved = self._tools()["fit_terrain"](grid, axis, axis, points, 0.05)
-        np.testing.assert_allclose(fitted, terrain.heights, atol=1e-5)
+
+        # The triangles as the tool reads them from Blender: each face fanned
+        # from its first corner, which for a quad is the export's own split.
+        sizes = mesh.face_sizes.astype(np.int64)
+        fans = sizes - 2
+        face = np.repeat(np.arange(len(sizes)), fans)
+        step = np.arange(int(fans.sum())) - np.repeat(np.cumsum(fans) - fans, fans) + 1
+        first = mesh.loop_starts[face]
+        loops = mesh.face_loops
+        triangles = np.column_stack([loops[first], loops[first + step], loops[first + step + 1]])
+        visible = np.zeros(len(mesh.vertices), dtype=bool)
+        face_of_loop = np.repeat(np.arange(len(sizes)), sizes)
+        visible[loops[mesh.face_kind[face_of_loop] != ROAD]] = True
+
+        fitted, moved = self._tools()["fit_terrain"](
+            mesh.vertices, triangles, visible, points, 0.05, mesh.grid_m
+        )
+        np.testing.assert_allclose(fitted, terrain.mesh.vertices[:, 2], atol=1e-6)
         self.assertGreater(moved, 0)
+
+    def test_the_tools_find_points_as_the_pipeline_does(self):
+        from src.terrain_mesh import TriangleLocator
+
+        terrain, roads, water, buildings = _outline_terrain()
+        from src.terrain_mesh import build_terrain_mesh
+
+        mesh = build_terrain_mesh(terrain, roads=roads, water=water, buildings=buildings)
+        triangles, _ = mesh.triangles()
+        xy = mesh.vertices[:, :2]
+        bounds = (*xy.min(axis=0), *xy.max(axis=0))
+        rng = np.random.default_rng(8)
+        x = rng.uniform(bounds[0] - 5, bounds[2] + 5, 4000)
+        y = rng.uniform(bounds[1] - 5, bounds[3] + 5, 4000)
+        ours = TriangleLocator(xy, triangles, cell=2.0, bounds=bounds).locate(x, y)
+        theirs = self._tools()["TriangleLocator"](xy, triangles, cell=2.0, bounds=bounds).locate(x, y)
+        np.testing.assert_array_equal(ours[0], theirs[0])
+        np.testing.assert_allclose(ours[1], theirs[1])
+
+
+class TestBarrierHeightCheck(unittest.TestCase):
+    """Walls stand on the ground; awnings and canopies hang over it."""
+
+    @staticmethod
+    def _barriers(kind_name, top):
+        from src.barriers import BarrierSet
+
+        vertices = np.array([[0, 0, 0], [4, 0, 0], [4, 0, top], [0, 0, top]], dtype=float)
+        if kind_name == "awning":
+            vertices[:, 2] += top - 0.1  # a plate up in the air
+        return BarrierSet(
+            vertices=vertices, uv=np.zeros((4, 2)),
+            triangles=np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32),
+            material=np.zeros(2, np.int32), kind=np.zeros(2, np.int32),
+            material_names=["brick"], kind_names=[kind_name], see_through=[],
+        )
+
+    def _verdict(self, barriers):
+        from src.validate import CheckReport, check_barriers
+
+        report = CheckReport()
+        check_barriers(report, barriers, lambda x, y: np.zeros(np.shape(x)))
+        return {c.name: c for c in report.checks}["barriers_are_a_believable_height"]
+
+    def test_a_nine_metre_wall_is_a_mistake(self):
+        self.assertFalse(self._verdict(self._barriers("wall", 9.0)).passed)
+
+    def test_an_awning_eight_metres_up_is_not(self):
+        self.assertTrue(self._verdict(self._barriers("awning", 8.5)).passed)
+
+
+def _outline_terrain():
+    """A small area with everything the terrain mesh follows.
+
+    Lumpy ground 2 m above NAP, the T-junction street from `_street_fixture`,
+    a house beside it, a pond at 1 m NAP, and a ditch 4 m wide: too narrow
+    for a row on each bank, so it is laddered with a bed line down it.
+    """
+    import types
+
+    from src.elevation import TerrainResult
+    from src.geo import BBox
+    from src.surfaces import WaterBody
+
+    bbox = BBox(-20.0, -30.0, 100.0, 90.0)
+    axis_x = np.linspace(bbox.xmin, bbox.xmax, 61)
+    axis_y = np.linspace(bbox.ymin, bbox.ymax, 61)
+    gx, gy = np.meshgrid(axis_x, axis_y)
+    heights = (2.0 + 0.3 * np.sin(gx / 7.0) * np.cos(gy / 9.0)).astype(np.float32)
+    terrain = TerrainResult(
+        heights=heights.copy(), xs=axis_x, ys=axis_y, bbox=bbox, center_z_nap=2.0,
+        nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
+        coverage_id="t", resolution_m=0.5, measured=heights.copy(),
+    )
+    _, roads = _build_street(ground=terrain.sample)
+    angle = np.linspace(0.0, 2.0 * np.pi, 41)[:-1]
+    pond = np.column_stack([70.0 + 14.0 * np.cos(angle), 60.0 + 9.0 * np.sin(angle)])
+    pond = np.vstack([pond, pond[:1]])
+    ditch = _rect(-10.0, -20.0, 80.0, -16.0)
+    water = [
+        WaterBody(rings=[pond], level_nap=1.0, area_m2=0.0, measured=True),
+        WaterBody(rings=[ditch], level_nap=1.2, area_m2=0.0, measured=True),
+    ]
+    house = np.array([[5.0, 10.0], [15.0, 10.0], [15.0, 20.0], [5.0, 20.0]])
+    roof = np.array([
+        [[*house[0], 8.0], [*house[1], 8.0], [*house[2], 8.0]],
+        [[*house[0], 8.0], [*house[2], 8.0], [*house[3], 8.0]],
+    ])
+    buildings = types.SimpleNamespace(buildings=[types.SimpleNamespace(roof_tris=roof)])
+    return terrain, roads, water, buildings
+
+
+class TestTerrainMesh(unittest.TestCase):
+    """The terrain's edges follow what is on the ground.
+
+    What the person editing it gets: the waterline, the road edge and each
+    building outline as edges, a row of quads along each, the plain grid
+    further in -- and one closed sheet, with every height where it belongs.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from src.terrain_mesh import build_terrain_mesh
+
+        cls.terrain, cls.roads, cls.water, cls.buildings = _outline_terrain()
+        cls.mesh = build_terrain_mesh(
+            cls.terrain, roads=cls.roads, water=cls.water, buildings=cls.buildings,
+            water_depth_m=1.2,
+        )
+
+    def _edges(self, mesh=None):
+        mesh = mesh or self.mesh
+        sizes = mesh.face_sizes.astype(np.int64)
+        starts = mesh.loop_starts
+        following = np.arange(len(mesh.face_loops)) + 1
+        following[starts + sizes - 1] = starts
+        pairs = np.sort(np.column_stack([mesh.face_loops, mesh.face_loops[following]]), axis=1)
+        return np.unique(pairs, axis=0, return_counts=True)
+
+    def test_it_is_one_closed_sheet(self):
+        from src.validate import CheckReport, check_terrain_mesh
+
+        self.assertNotIn("fallback", self.mesh.stats)
+        edges, counts = self._edges()
+        self.assertFalse((counts > 2).any(), "an edge with three faces")
+        xy = self.mesh.vertices[:, :2]
+        open_edges = edges[counts == 1]
+        bbox = self.terrain.bbox
+
+        def on_bbox(p):
+            return (np.isclose(p[:, 0], bbox.xmin) | np.isclose(p[:, 0], bbox.xmax)
+                    | np.isclose(p[:, 1], bbox.ymin) | np.isclose(p[:, 1], bbox.ymax))
+
+        self.assertTrue((on_bbox(xy[open_edges[:, 0]]) & on_bbox(xy[open_edges[:, 1]])).all(),
+                        "a crack inside the area")
+        triangles, _ = self.mesh.triangles()
+        t = xy[triangles]
+        area = 0.5 * ((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
+                      - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1]))
+        self.assertTrue((area > 0).all(), "a face upside down")
+        self.assertAlmostEqual(float(area.sum()), bbox.width * bbox.height, places=3)
+        report = CheckReport()
+        check_terrain_mesh(report, types_namespace(mesh=self.mesh))
+        verdicts = {c.name: c for c in report.checks}
+        self.assertTrue(verdicts["terrain_is_one_closed_sheet"].passed,
+                        verdicts["terrain_is_one_closed_sheet"].detail)
+
+    def test_the_check_finds_a_hole(self):
+        from src.terrain_mesh import TerrainMesh
+        from src.validate import CheckReport, check_terrain_mesh
+
+        mesh = self.mesh
+        keep = np.ones(len(mesh), dtype=bool)
+        keep[len(mesh) // 2] = False
+        holed = TerrainMesh(
+            vertices=mesh.vertices, measured_z=mesh.measured_z,
+            face_sizes=mesh.face_sizes[keep],
+            face_loops=mesh.face_loops[np.repeat(keep, mesh.face_sizes)],
+            face_kind=mesh.face_kind[keep], face_part=mesh.face_part[keep],
+            vertex_on=mesh.vertex_on, edges=mesh.edges, edge_on=mesh.edge_on,
+            grid_m=mesh.grid_m, stats=dict(mesh.stats),
+        )
+        report = CheckReport()
+        check_terrain_mesh(report, types_namespace(mesh=holed))
+        self.assertFalse({c.name: c for c in report.checks}["terrain_is_one_closed_sheet"].passed)
+
+    def test_the_check_finds_a_corner_cut_off(self):
+        """Both ends of the cut lie on the bbox -- on two different sides."""
+        from src.terrain_mesh import TerrainMesh, grid_mesh
+        from src.validate import CheckReport, check_terrain_mesh
+
+        plain = grid_mesh(self.terrain)
+        report = CheckReport()
+        check_terrain_mesh(report, types_namespace(mesh=plain))
+        self.assertTrue({c.name: c for c in report.checks}["terrain_is_one_closed_sheet"].passed)
+        # The corner square (0, 1, n + 1, n) loses the triangle at the corner.
+        n = len(self.terrain.xs)
+        cut = TerrainMesh(
+            vertices=plain.vertices, measured_z=plain.measured_z,
+            face_sizes=np.concatenate([[3], plain.face_sizes[1:]]).astype(np.int32),
+            face_loops=np.concatenate([[1, n + 1, n], plain.face_loops[4:]]),
+            face_kind=plain.face_kind, face_part=plain.face_part,
+            vertex_on=plain.vertex_on, edges=plain.edges, edge_on=plain.edge_on,
+            grid_m=plain.grid_m, stats=dict(plain.stats),
+        )
+        report = CheckReport()
+        check_terrain_mesh(report, types_namespace(mesh=cut))
+        verdict = {c.name: c for c in report.checks}["terrain_is_one_closed_sheet"]
+        self.assertFalse(verdict.passed)
+        self.assertTrue(verdict.detail.startswith("1 crack edges"), verdict.detail)
+        self.assertIn("covering 14,398.00 of 14,400.00 m2", verdict.detail)
+
+    def test_the_waterline_is_an_edge_on_the_bank_never_under_water(self):
+        """The bank top stays where it was surveyed; the waterline is only
+        raised to the water level where the survey dips below it."""
+        import copy
+
+        from src.terrain_mesh import WATER, WATERLINE, build_terrain_mesh
+
+        mesh = self.mesh
+        line = np.flatnonzero(mesh.vertex_on & WATERLINE)
+        self.assertGreater(len(line), 20)
+        xy = mesh.vertices[line, :2]
+        on_pond = np.hypot((xy[:, 0] - 70.0) / 14.0, (xy[:, 1] - 60.0) / 9.0) < 1.2
+        surveyed = self.terrain.sample(xy[on_pond, 0], xy[on_pond, 1])
+        np.testing.assert_allclose(mesh.measured_z[line[on_pond]], surveyed, atol=1e-6)
+        # The same pond with the water standing above its banks: the
+        # waterline comes up to the water, not the water down to the bank.
+        flooded = copy.deepcopy(self.water)
+        flooded[0].level_nap = 3.0
+        high = build_terrain_mesh(self.terrain, roads=self.roads, water=flooded,
+                                  buildings=self.buildings)
+        edge = np.flatnonzero(high.vertex_on & WATERLINE)
+        near = np.hypot((high.vertices[edge, 0] - 70.0) / 14.0,
+                        (high.vertices[edge, 1] - 60.0) / 9.0) < 1.2
+        np.testing.assert_allclose(high.measured_z[edge[near]], 3.0, atol=1e-9)
+        # Everything strictly under water lies on or below the bed.
+        face_of_loop = np.repeat(np.arange(len(mesh)), mesh.face_sizes)
+        dry = np.zeros(len(mesh.vertices), dtype=bool)
+        dry[mesh.face_loops[mesh.face_kind[face_of_loop] != WATER]] = True
+        wet = np.zeros(len(mesh.vertices), dtype=bool)
+        wet[mesh.face_loops[mesh.face_kind[face_of_loop] == WATER]] = True
+        under = wet & ~dry
+        self.assertTrue(under.any())
+        pond = under & (np.hypot((mesh.vertices[:, 0] - 70.0) / 14.0,
+                                 (mesh.vertices[:, 1] - 60.0) / 9.0) < 1.0)
+        self.assertTrue((mesh.vertices[pond, 2] <= 1.0 - 1.2 + 1e-9).all())
+
+    def test_a_row_of_quads_runs_along_each_outline(self):
+        import shapely
+
+        from src.terrain_mesh import (
+            BUILDING_EDGE, LAND, ROAD_EDGE, ROW, ROW_EDGE, WATERLINE,
+        )
+
+        mesh = self.mesh
+        for bit in (WATERLINE, ROAD_EDGE, BUILDING_EDGE, ROW_EDGE):
+            self.assertTrue((mesh.edge_on & bit).any(), f"no edges tagged {bit}")
+        row = (mesh.face_part == ROW) & (mesh.face_kind == LAND)
+        self.assertGreater(float((mesh.face_sizes[row] == 4).mean()), 0.75)
+        # The inner edge of the row is a row's width in from the outline.
+        outline = shapely.MultiLineString([
+            mesh.vertices[e, :2] for e, bits in zip(mesh.edges, mesh.edge_on)
+            if bits & (WATERLINE | ROAD_EDGE | BUILDING_EDGE)
+        ])
+        inner = np.unique(mesh.edges[(mesh.edge_on & ROW_EDGE) > 0])
+        distance = shapely.distance(shapely.points(mesh.vertices[inner, :2]), outline)
+        self.assertAlmostEqual(float(np.median(distance)), mesh.grid_m, delta=0.35)
+
+    def test_a_narrow_ditch_is_a_ladder_with_a_bed_line(self):
+        from src.terrain_mesh import BED, WATER
+
+        mesh = self.mesh
+        bed = np.unique(mesh.edges[(mesh.edge_on & BED) > 0])
+        in_ditch = bed[(mesh.vertices[bed, 1] > -19.5) & (mesh.vertices[bed, 1] < -16.5)]
+        self.assertGreater(len(in_ditch), 10, "no bed line down the ditch")
+        np.testing.assert_allclose(mesh.vertices[in_ditch, 1], -18.0, atol=0.3)
+        self.assertTrue((mesh.vertices[in_ditch, 2] <= 1.2 - 1.2 + 1e-9).all())
+        cells = np.add.reduceat(mesh.vertices[mesh.face_loops, :2], mesh.loop_starts) / \
+            mesh.face_sizes[:, None]
+        ditch = (mesh.face_kind == WATER) & (cells[:, 1] < -16.0) & (cells[:, 1] > -20.0) \
+            & (cells[:, 0] > 0.0) & (cells[:, 0] < 70.0)
+        self.assertGreater(float((mesh.face_sizes[ditch] == 4).mean()), 0.9)
+        from src.terrain_mesh import CORE
+
+        self.assertFalse((ditch & (mesh.face_part == CORE)).any(),
+                         "a lone grid square in a ditch too narrow for rows")
+
+    def test_open_ground_is_still_the_grid(self):
+        from src.terrain_mesh import CORE, WATER
+
+        mesh = self.mesh
+        # Under the pond the grid carries on, on the bed rather than the survey.
+        core = np.flatnonzero((mesh.face_part == CORE) & (mesh.face_kind != WATER))
+        self.assertGreater(len(core), 1000)
+        corners = mesh.vertices[mesh.face_loops[mesh.loop_starts[core][:, None] + np.arange(4)]]
+        step = self.terrain.grid_m
+        np.testing.assert_allclose(corners[:, 1, 0] - corners[:, 0, 0], step, atol=1e-6)
+        np.testing.assert_allclose(corners[:, 3, 1] - corners[:, 0, 1], step, atol=1e-6)
+        # Its heights are the surveyed grid's own.
+        node = corners[:, 0]
+        i = np.rint((node[:, 0] - self.terrain.xs[0]) / step).astype(int)
+        j = np.rint((node[:, 1] - self.terrain.ys[0]) / step).astype(int)
+        np.testing.assert_allclose(mesh.measured_z[mesh.face_loops[mesh.loop_starts[core]]],
+                                   self.terrain.measured[j, i], atol=1e-5)
+
+    def test_with_nothing_to_follow_it_is_the_plain_grid(self):
+        from src.terrain_mesh import build_terrain_mesh
+
+        mesh = build_terrain_mesh(self.terrain, roads=self.roads, water=self.water,
+                                  buildings=self.buildings, sources=[])
+        n = len(self.terrain.xs)
+        self.assertEqual(len(mesh), (n - 1) ** 2)
+        self.assertTrue((mesh.face_sizes == 4).all())
+        self.assertEqual(len(mesh.edges), 0)
+
+    def test_outlines_that_cannot_be_meshed_leave_the_plain_grid(self):
+        from unittest import mock
+
+        from src import terrain_mesh
+
+        with mock.patch.object(terrain_mesh, "_feature_mesh", side_effect=RuntimeError("bad")):
+            mesh = terrain_mesh.build_terrain_mesh(
+                self.terrain, roads=self.roads, water=self.water, buildings=self.buildings,
+            )
+        self.assertEqual(len(mesh), (len(self.terrain.xs) - 1) ** 2)
+        self.assertIn("bad", mesh.stats["fallback"])
+
+    def test_points_are_found_in_their_triangle(self):
+        mesh = self.mesh
+        triangles, _ = mesh.triangles()
+        rng = np.random.default_rng(3)
+        bbox = self.terrain.bbox
+        x = rng.uniform(bbox.xmin, bbox.xmax, 5000)
+        y = rng.uniform(bbox.ymin, bbox.ymax, 5000)
+        tri, w = mesh.locator().locate(x, y)
+        self.assertTrue((tri >= 0).all())
+        corners = mesh.vertices[triangles[tri], :2]
+        back = (w[:, :, None] * corners).sum(axis=1)
+        np.testing.assert_allclose(back, np.column_stack([x, y]), atol=1e-6)
+        self.assertTrue((w > -1e-6).all())
+        # At a vertex the drawn height is that vertex's.
+        some = np.arange(0, len(mesh.vertices), 97)
+        np.testing.assert_allclose(
+            mesh.heights_at(mesh.vertices[some, 0], mesh.vertices[some, 1]),
+            mesh.vertices[some, 2], atol=1e-6,
+        )
+
+    def test_the_ground_drawn_is_the_mesh_and_the_fit_clears_the_road(self):
+        import copy
+
+        from src.elevation import lower_under
+        from src.roads import road_top, road_underside
+
+        terrain = copy.deepcopy(self.terrain)
+        terrain.mesh = copy.deepcopy(self.mesh)
+        points = road_underside(self.roads, terrain.bbox)
+        lower_under(terrain, points, clearance_m=0.05)
+        ground = terrain.ground(points[:, 0], points[:, 1])
+        self.assertTrue((ground <= points[:, 2] - 0.05 + 1e-6).all())
+        self.assertIn("visible_over_half_metre", terrain.conformed)
+        terrain.road_top = road_top(self.roads, terrain.bbox)
+        np.testing.assert_allclose(
+            terrain.surface(np.array([45.0]), np.array([0.0])),
+            terrain.road_top(np.array([45.0]), np.array([0.0])),
+        )
+        # The survey is untouched by the fit.
+        np.testing.assert_allclose(terrain.mesh.measured_z, self.mesh.measured_z)
+
+    def test_blender_builds_it_with_its_outlines_selectable(self):
+        import re
+
+        from src.terrain_mesh import BUILDING_EDGE, WATERLINE
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        built = {}
+
+        class Attribute:
+            def __init__(self, name):
+                self.name, self.values = name, None
+                outer = self
+
+                class data:  # noqa: N801 - mirrors bpy
+                    @staticmethod
+                    def foreach_set(key, values):
+                        outer.values = np.asarray(values)
+                self.data = data
+
+        class Edges:
+            def __init__(self, pairs):
+                self.pairs = pairs
+                self.seams = None
+
+            def __len__(self):
+                return len(self.pairs)
+
+            def foreach_get(self, key, out):
+                out[:] = self.pairs.ravel()
+
+            def foreach_set(self, key, values):
+                self.seams = np.asarray(values)
+
+        class Group:
+            def __init__(self, name):
+                self.name, self.members = name, []
+
+            def add(self, members, weight, mode):
+                self.members = list(members)
+
+        class Groups(list):
+            def new(self, name):
+                group = Group(name)
+                self.append(group)
+                return group
+
+        def build_mesh_object(name, vertices, loops, starts, totals, *rest, **kw):
+            following = np.arange(len(loops)) + 1
+            following[starts + totals - 1] = starts
+            pairs = np.unique(np.sort(np.column_stack([loops, loops[following]]), axis=1), axis=0)
+
+            class Mesh:
+                pass
+
+            mesh = Mesh()
+            mesh.vertices = [None] * len(vertices)
+            mesh.polygons = [None] * len(starts)
+            mesh.edges = Edges(pairs[::-1].copy())  # Blender's own order
+            created = {}
+
+            class Attributes:
+                @staticmethod
+                def new(attr_name, kind, domain):
+                    created[attr_name] = Attribute(attr_name)
+                    return created[attr_name]
+
+            mesh.attributes = Attributes
+            obj = type("Object", (), {})()
+            obj.name, obj.data, obj.vertex_groups = name, mesh, Groups()
+            built.update(obj=obj, attributes=created, vertices=len(vertices),
+                         polygons=len(starts))
+            return obj
+
+        namespace = {"np": np, "Path": Path, "log": lambda *a: None,
+                     "build_mesh_object": build_mesh_object,
+                     "_triangulate_on_export": lambda *a, **k: None,
+                     "_tag_surface_regions": lambda *a, **k: 0}
+        for constant in ("OUTLINE_GROUPS", "OUTLINE_SEAMS"):
+            line = re.search(rf"\n{constant} = .*?\n(?=\n)", source, re.S)
+            exec(line.group(0), namespace)  # noqa: S102 - our own source
+        for name in ("planar_uv", "_mark_outlines", "_build_terrain_mesh", "build_terrain"):
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef |\n# ---|\n[A-Z_]+ = )", source, re.S)
+            exec(body.group(0), namespace)  # noqa: S102 - our own source
+        with tempfile.TemporaryDirectory() as tmp:
+            np.savez(Path(tmp) / "terrain_mesh.npz", **self.mesh.to_npz_fields())
+            scene = {"terrain": {"file": "terrain_mesh.npz"}, "origin_rd": [40.0, 30.0],
+                     "ground_z_offset_nap": 2.0,
+                     "aerial": {"bbox_local": [-60.0, -60.0, 60.0, 60.0]}}
+            namespace["build_terrain"](scene, Path(tmp), "M")
+        self.assertEqual(built["vertices"], len(self.mesh.vertices))
+        self.assertEqual(built["polygons"], len(self.mesh))
+        outline = built["attributes"]["outline"].values
+        self.assertEqual(int((outline > 0).sum()), len(self.mesh.edges))
+        seams = built["obj"].data.edges.seams
+        self.assertEqual(int(seams.sum()), int(((self.mesh.edge_on & 7) > 0).sum()))
+        groups = {g.name: g.members for g in built["obj"].vertex_groups}
+        np.testing.assert_array_equal(
+            sorted(groups["outline_waterline"]),
+            np.flatnonzero(self.mesh.vertex_on & WATERLINE),
+        )
+        np.testing.assert_array_equal(
+            sorted(groups["outline_building"]),
+            np.flatnonzero(self.mesh.vertex_on & BUILDING_EDGE),
+        )
+        for name in ("measured_z", "ground_kind", "ground_part"):
+            self.assertIn(name, built["attributes"])
+
+    def test_the_config_names_what_the_terrain_follows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            base = {"name": "x", "bbox": {"crs": "EPSG:28992", "xmin": 136000,
+                                          "ymin": 455000, "xmax": 137000, "ymax": 456000}}
+            path.write_text(json.dumps(base))
+            self.assertEqual(load_config(path).terrain["feature_edges"],
+                             ["water", "roads", "buildings"])
+            path.write_text(json.dumps({**base, "terrain": {"feature_edges": False}}))
+            self.assertEqual(load_config(path).terrain["feature_edges"], [])
+            path.write_text(json.dumps({**base, "terrain": {"feature_edges": ["Water"]}}))
+            self.assertEqual(load_config(path).terrain["feature_edges"], ["water"])
+            path.write_text(json.dumps({**base, "terrain": {"feature_edges": ["hedges"]}}))
+            with self.assertRaises(ValueError):
+                load_config(path)
+
+
+class TestTerrainMeshHelpers(unittest.TestCase):
+    """Each of these made a crack, an overlap or a hole over Bronbeek once.
+
+    The small test area never trips them, so each is pinned down here with
+    the shape that did.
+    """
+
+    def test_a_shared_edge_gets_identical_stations_from_both_sides(self):
+        import shapely
+
+        from src.terrain_mesh import _with_stations
+
+        rng = np.random.default_rng(5)
+        for _ in range(50):
+            a = rng.uniform(0, 500, 2).round(1)
+            b = a + rng.uniform(5, 30, 2).round(1)
+            c = a + np.array([0.0, -40.0])
+            d = a + np.array([0.0, 40.0])
+            left = _with_stations(shapely.Polygon([a, b, d]), 3.2)
+            right = _with_stations(shapely.Polygon([b, a, c]), 3.2)
+            ab = b - a
+
+            def on_ab(poly):
+                return {
+                    tuple(p) for p in np.asarray(poly.exterior.coords)
+                    if abs(ab[0] * (p - a)[1] - ab[1] * (p - a)[0]) < 1e-6 * np.hypot(*ab)
+                }
+
+            self.assertEqual(on_ab(left), on_ab(right))
+            self.assertGreater(len(on_ab(left)), 2)
+
+    def test_a_flat_triangle_keeps_its_middle_vertex(self):
+        from src.terrain_mesh import _without_flat_triangles
+
+        a, m, b, c = np.array([0.0, 0.0]), np.array([1.0, 0.0]), np.array([2.0, 0.0]), np.array([1.0, 1.0])
+        out = _without_flat_triangles(np.array([[a, m, b], [a, b, c]]))
+        self.assertEqual(len(out), 2)
+        used = {tuple(p) for t in out for p in t}
+        self.assertIn(tuple(m), used)
+        area = 0.5 * np.abs((out[:, 1, 0] - out[:, 0, 0]) * (out[:, 2, 1] - out[:, 0, 1])
+                            - (out[:, 2, 0] - out[:, 0, 0]) * (out[:, 1, 1] - out[:, 0, 1]))
+        self.assertAlmostEqual(float(area.sum()), 1.0)
+
+    def test_a_square_a_pointed_outline_slips_into_is_not_grid(self):
+        import shapely
+
+        from src.terrain_mesh import _core_cells
+
+        axis = np.arange(0.0, 12.01, 2.0)
+        notch = shapely.Polygon([(3.45, 12.0), (3.55, 12.0), (3.5, 4.5)])
+        area = shapely.box(0.0, 0.0, 12.0, 12.0).difference(notch)
+        taken = np.zeros((len(axis) - 1, len(axis) - 1), dtype=bool)
+        cells = {tuple(c) for c in _core_cells(area, axis, axis, taken)}
+        # The square from (2, 4) to (4, 6): its nine samples miss the notch.
+        self.assertNotIn((1, 2), cells)
+        self.assertIn((3, 2), cells)
+
+    def test_a_gap_left_at_the_bbox_edge_is_given_away(self):
+        import shapely
+
+        from src.terrain_mesh import _fill_gaps
+
+        frame = shapely.box(0.0, 0.0, 10.0, 10.0)
+        left = shapely.Polygon([(0, 0), (5, 0), (5, 10), (0.3, 10), (0, 9)])
+        right = shapely.box(5.0, 0.0, 10.0, 10.0)
+        filled = _fill_gaps([left, right], frame)
+        self.assertAlmostEqual(shapely.union_all(filled).area, 100.0, places=6)
+
+    def test_a_rung_grazing_the_outline_is_flagged(self):
+        import shapely
+
+        from src.terrain_mesh import _grazes
+
+        # An L-shaped region: a rung from one arm to the other can pass a
+        # hair's breadth from the inner corner at (5, 5).
+        outline = shapely.Polygon([(0, 0), (10, 0), (10, 10), (5, 10), (5, 5), (0, 5)]).boundary
+        clear = shapely.LineString([(0.0, 2.0), (10.0, 2.0)])
+        grazing = shapely.LineString([(0.0, 4.895), (10.0, 5.095)])  # 5 mm below the corner
+        self.assertEqual(list(_grazes([clear, grazing], outline)), [False, True])
+
+    def test_a_rung_middle_goes_into_the_hole_of_a_face_too(self):
+        import shapely
+
+        from src.terrain_mesh import _key, _with_middles
+
+        hole = [(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)]
+        face = shapely.Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [hole])
+        middle = np.array([5.0, 4.0])
+        middles = {tuple(sorted((_key((4.0, 4.0)), _key((6.0, 4.0))))): middle}
+        withd = _with_middles(face, middles)
+        self.assertIn(tuple(middle), {tuple(p) for p in np.asarray(withd.interiors[0].coords)})
+
+    def test_a_strip_too_narrow_for_rows_gets_no_grid_square(self):
+        """4.5 m of ground between two outlines: a 2 m square fits in it, a
+        row along each side does not. A lone square would only break up the
+        ladder straight across it."""
+        import shapely
+
+        from src.terrain_mesh import LAND, ROW, _mesh_region
+
+        axis = np.arange(0.0, 60.01, 2.0)
+        frame = shapely.segmentize(shapely.box(0.0, 0.0, 60.0, 60.0), 2.0001)
+        outer = shapely.difference(frame.buffer(8.0, join_style="mitre"), frame)
+        strip = shapely.box(10.0, 9.3, 40.0, 13.8)
+        taken = np.zeros((len(axis) - 1, len(axis) - 1), dtype=bool)
+        faces, cells, inset, _ = _mesh_region(
+            strip, LAND, frame, outer, axis, axis, taken, row_m=2.0, margin_m=0.7,
+        )
+        self.assertTrue(inset.is_empty)
+        self.assertEqual(len(cells), 0)
+        self.assertFalse(taken.any())
+        self.assertTrue(faces)
+        self.assertTrue(all(part == ROW for _, part in faces))
+
+    def test_nested_polygons_are_all_found(self):
+        import shapely
+
+        from src.terrain_mesh import _parts
+
+        nested = shapely.GeometryCollection([
+            shapely.MultiPolygon([shapely.box(0, 0, 1, 1), shapely.box(2, 0, 3, 1)]),
+            shapely.LineString([(0, 0), (5, 5)]),
+        ])
+        self.assertEqual(len(_parts(nested)), 2)
+
+
+class TestTerrainMeshAwkwardShapes(unittest.TestCase):
+    """Shapes that cracked the terrain while it was being built, one by one.
+
+    Each is meshed on its own, and the sheet has to stay closed. The guard
+    against each crack sits in `src/terrain_mesh.py`; the tests above check
+    each guard works, these that it is used.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.terrain = _outline_terrain()[0]
+
+    def _closed(self, **layers):
+        from src.terrain_mesh import build_terrain_mesh
+        from src.validate import CheckReport, check_terrain_mesh
+
+        mesh = build_terrain_mesh(self.terrain, **layers)
+        self.assertNotIn("fallback", mesh.stats)
+        report = CheckReport()
+        check_terrain_mesh(report, types_namespace(mesh=mesh))
+        verdict = {c.name: c for c in report.checks}["terrain_is_one_closed_sheet"]
+        self.assertTrue(verdict.passed, verdict.detail)
+        return mesh
+
+    @staticmethod
+    def _water(*rings, level=1.2):
+        from src.surfaces import WaterBody
+
+        rings = [np.array(r + r[:1], dtype=np.float64) for r in rings]
+        return [WaterBody(rings=rings, level_nap=level, area_m2=0.0, measured=True)]
+
+    def test_a_house_corner_just_inside_the_bbox(self):
+        """20 cm from the edge. Snapping the corners together pulled the
+        ground off the edge of the area and left a sliver of nothing."""
+        corners = np.array([[90.0, 2.0], [99.8, 7.1], [95.0, 16.0], [85.0, 11.0]])
+        roof = np.concatenate([corners, np.full((4, 1), 8.0)], axis=1)
+        house = types_namespace(roof_tris=roof[[[0, 1, 2], [0, 2, 3]]])
+        self._closed(buildings=types_namespace(buildings=[house]))
+
+    def test_a_small_island_in_a_ditch(self):
+        """No rung can cross the island, so the ladder cell around it has it
+        as a hole -- and still needs the bed points of the rungs on either
+        side, which the cells beside it are split at."""
+        from src.terrain_mesh import BED
+
+        ditch = [(10.0, 40.0), (50.0, 40.0), (50.0, 44.4), (10.0, 44.4)]
+        island = [(29.5, 41.7), (30.5, 41.7), (30.5, 42.7), (29.5, 42.7)]
+        mesh = self._closed(water=self._water(ditch, island))
+        self.assertTrue((mesh.edge_on & BED).any())
+
+    def test_a_ditch_that_tapers_to_half_a_metre(self):
+        """The rung across the end was snapped onto the far corner, so it
+        ran along the outline, and its bed point went into the water's side
+        of the bank only."""
+        ditch = [(10.0, 40.0), (40.0, 41.75), (40.0, 42.25), (10.0, 44.0)]
+        self._closed(water=self._water(ditch))
+
+
+def types_namespace(**kwargs):
+    import types
+
+    return types.SimpleNamespace(**kwargs)
 
 
 class TestIntermediatesNeedNoPickle(unittest.TestCase):
@@ -7798,10 +8472,13 @@ class TestUIServer(unittest.TestCase):
             payload.update(kw)
             return estimate(payload)["seconds"]
 
+        # The Utrecht runs predate the terrain mesh stage, so its own measured
+        # cost -- 48 s a square kilometre over Bronbeek -- is added to them.
+        mesh = 48.0
         measured = [
-            (seconds(1000, 4096, preview=True), 468),
-            (seconds(1000, 4096, preview=False), 218),
-            (seconds(500, 2048, preview=False), 75),
+            (seconds(1000, 4096, preview=True), 468 + mesh),
+            (seconds(1000, 4096, preview=False), 218 + mesh),
+            (seconds(500, 2048, preview=False), 75 + mesh / 4),
         ]
         for predicted, actual in measured:
             self.assertLess(

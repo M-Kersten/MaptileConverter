@@ -463,14 +463,9 @@ def check_roads(report: CheckReport, surfaces, terrain) -> None:
 
         # The terrain as drawn, under every corner and centre of every road
         # triangle. `lower_under` makes this true by construction; this is
-        # the check that it ran, and ran on the grid that was exported.
-        from .elevation import _triangulated_on_grid
-
+        # the check that it ran, and ran on the terrain that was exported.
         probe = np.vstack([tris.reshape(-1, 3), centroid])
-        drawn = _triangulated_on_grid(
-            np.asarray(terrain.heights, dtype=np.float64), terrain.xs, terrain.ys,
-            probe[:, 0], probe[:, 1],
-        )
+        drawn = np.asarray(terrain.ground(probe[:, 0], probe[:, 1]), dtype=np.float64)
         poking = probe[:, 2] - drawn
         report.add(
             "terrain_stays_under_roads",
@@ -563,13 +558,23 @@ def check_barriers(report: CheckReport, barriers, sampler=None) -> None:
     if sampler is not None:
         ground = np.asarray(sampler(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
         above = vertices[:, 2] - ground
-        # An awning is meant to be up in the air; everything else is meant to
-        # be standing on the pavement, and 8 m of garden wall is a mistake.
-        tallest = float(above.max())
+        # An awning or a canopy is meant to be up in the air; everything else
+        # is meant to be standing on the pavement, and 8 m of garden wall is a
+        # mistake. The awnings used to be measured too, and one 8 m up over a
+        # station forecourt sat exactly on the limit.
+        names = [str(n) for n in getattr(barriers, "kind_names", [])]
+        overhead = [i for i, n in enumerate(names) if n in ("awning", "canopy")]
+        standing = np.ones(len(vertices), dtype=bool)
+        kinds = getattr(barriers, "kind", None)
+        if overhead and kinds is not None and len(kinds) == len(triangles):
+            standing[:] = False
+            standing[triangles[~np.isin(kinds, overhead)].ravel()] = True
+        tallest = float(above[standing].max()) if standing.any() else 0.0
         report.add(
             "barriers_are_a_believable_height",
             tallest <= 8.0,
-            f"the highest point stands {tallest:.1f} m above the ground",
+            f"the highest point of anything standing on the ground is "
+            f"{tallest:.1f} m above it",
         )
         # Nothing should hang below its own embed depth, or a fence up a bank
         # has sunk out of sight.
@@ -867,17 +872,99 @@ def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
     if not built:
         return
 
-    n = int(terrain.n)
-    want_quads = (n - 1) ** 2
     quads = int(built.get("quads", 0))
     others = int(built.get("faces", 0)) - quads
+    mesh = getattr(terrain, "mesh", None)
+    if mesh is not None:
+        want_vertices = len(mesh.vertices)
+        want_quads = int((mesh.face_sizes == 4).sum())
+        want_others = len(mesh) - want_quads
+        plan = (
+            f"a mesh of {want_vertices} vertices, {want_quads} quads and "
+            f"{want_others} triangles"
+        )
+    else:
+        n = int(terrain.n)
+        want_vertices, want_quads, want_others = n * n, (n - 1) ** 2, 0
+        plan = f"a {n} x {n} grid of {want_quads} quads"
     report.add(
         "terrain_built_as_planned",
-        quads == want_quads and others == 0 and int(built.get("vertices", 0)) == n * n,
+        quads == want_quads and others == want_others
+        and int(built.get("vertices", 0)) == want_vertices,
         f"the model's terrain has {built.get('vertices', 0)} vertices, {quads} "
-        f"quads and {others} other faces, against a {n} x {n} grid of "
-        f"{want_quads} quads",
+        f"quads and {others} other faces, against {plan}",
     )
+
+
+def check_terrain_mesh(report: CheckReport, terrain, *, expect_outlines: bool = True) -> None:
+    """The terrain mesh is one closed sheet, and its edges follow the outlines.
+
+    Closed: every edge has a face on each side except along the bbox, no edge
+    has three, every face looks up, and together they cover the area. A crack
+    is a hole in the ground the size of a hairline, invisible until a drone's
+    shadow falls through it.
+    """
+    mesh = getattr(terrain, "mesh", None)
+    if mesh is None:
+        return
+    sizes = mesh.face_sizes.astype(np.int64)
+    loops = mesh.face_loops
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    following = np.arange(len(loops)) + 1
+    following[starts + sizes - 1] = starts
+    pairs = np.sort(np.column_stack([loops, loops[following]]), axis=1)
+    edges, counts = np.unique(pairs, axis=0, return_counts=True)
+    open_edges = edges[counts == 1]
+    # From the corner of the area: in RD metres the areas of small faces drown
+    # in the rounding of products near 10^11.
+    xy = mesh.vertices[:, :2]
+    lo = xy.min(axis=0)
+    xy = xy - lo
+    span = xy.max(axis=0)
+
+    def sides(points):
+        return np.column_stack([
+            np.abs(points[:, 0]) < 1e-6, np.abs(points[:, 0] - span[0]) < 1e-6,
+            np.abs(points[:, 1]) < 1e-6, np.abs(points[:, 1] - span[1]) < 1e-6,
+        ])
+
+    # Open only along one side of the area: an edge from one side to another
+    # cuts a corner off.
+    along = (sides(xy[open_edges[:, 0]]) & sides(xy[open_edges[:, 1]])).any(axis=1)
+    cracks = int((~along).sum())
+    shared_by_three = int((counts > 2).sum())
+    following_vertex = loops[following]
+    twice = np.add.reduceat(
+        xy[loops, 0] * xy[following_vertex, 1] - xy[following_vertex, 0] * xy[loops, 1], starts
+    ) if len(sizes) else np.zeros(0)
+    flipped = int((twice <= 0).sum())
+    covered = 0.5 * float(twice.sum())
+    whole = float(span[0] * span[1])
+    missing = abs(whole - covered)
+    report.add(
+        "terrain_is_one_closed_sheet",
+        cracks == 0 and shared_by_three == 0 and flipped == 0 and missing <= max(0.01, 1e-9 * whole),
+        f"{cracks} crack edges, {shared_by_three} edges with more than two faces "
+        f"and {flipped} faces upside down, over {len(mesh)} faces covering "
+        f"{covered:,.2f} of {whole:,.2f} m2",
+    )
+    stats = mesh.stats or {}
+    outlines = stats.get("outline_edges") or {}
+    followed = sum(int(outlines.get(name, 0)) for name in ("waterline", "road_edge", "building_edge"))
+    if expect_outlines:
+        report.add(
+            "terrain_follows_the_outlines",
+            followed > 0 or "fallback" not in stats,
+            (
+                f"{followed} edges along outlines ("
+                + ", ".join(f"{v} {k}" for k, v in outlines.items() if v)
+                + f"); {round(100 * float(stats.get('quad_share', 0)))}% of faces are quads"
+            )
+            if "fallback" not in stats
+            else f"the outlines could not be meshed, so the terrain is the plain grid: "
+            f"{stats['fallback']}",
+            severity="warning",
+        )
 
 
 def check_export(

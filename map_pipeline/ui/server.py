@@ -63,6 +63,9 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     "surfaces":           {"c": 1.0, "a": 30.0, "m": 2.5},
     "usage":              {"c": 0.5, "a": 5.0,  "m": 0.0},
     "buildings":          {"c": 2.0, "a": 75.0, "m": 0.0},
+    # The terrain's edges following the outlines: 48 s over the built-up
+    # Bronbeek square kilometre, most of it noding the narrow gardens.
+    "terrain_mesh":       {"c": 1.0, "a": 48.0, "m": 0.0},
     # The canopy model was always fetched; finding trees in it rather than only
     # sampling it at the registered points costs about three seconds a square
     # kilometre, measured.
@@ -119,6 +122,7 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
         "terrain": True,
         "aerial": True,
         "buildings": True,
+        "terrain_mesh": True,
         "surfaces": on("water") or on("land_cover"),
         "usage": on("usage"),
         "trees": on("trees"),

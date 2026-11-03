@@ -55,6 +55,10 @@ DEFAULTS: dict[str, Any] = {
         # Bronbeek: 2 m is within 11 cm on 95% of the ground at 251k vertices;
         # 4 m within 22 cm at 63k; 1 m within 6 cm at 1M.
         "grid_m": 2.0,
+        # Outlines the terrain's edges follow: the waterline, the road edge,
+        # the building outline, each with a row of quads along it and the grid
+        # inside. Empty gives the plain grid.
+        "feature_edges": ["water", "roads", "buildings"],
         "wcs_url": "https://service.pdok.nl/rws/ahn/wcs/v1_0",
         "timeout_s": 300,
         "max_retries": 4,
@@ -577,6 +581,26 @@ def load_config(path: str | Path) -> PipelineConfig:
     if not grid_m > 0:
         raise ValueError(f"terrain.grid_m must be positive, got {grid_m}")
     merged["terrain"]["grid_m"] = grid_m
+
+    edges = merged["terrain"].get("feature_edges")
+    if edges is None or edges is False:
+        edges = []
+    elif edges is True:
+        edges = ["water", "roads", "buildings"]
+    elif isinstance(edges, str):
+        edges = [edges]
+    known = ("water", "roads", "buildings")
+    cleaned = []
+    for source in edges:
+        source = str(source).strip().lower()
+        if source not in known:
+            raise ValueError(
+                f"terrain.feature_edges names {source!r}; it can follow "
+                f"{', '.join(known)}"
+            )
+        if source not in cleaned:
+            cleaned.append(source)
+    merged["terrain"]["feature_edges"] = cleaned
 
     # Both dials have a ceiling set by the source data. Past it you are
     # interpolating, not resolving, so the run just costs more.

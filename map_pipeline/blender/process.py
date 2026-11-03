@@ -619,13 +619,32 @@ def _terrain_summary() -> dict:
     }
 
 
-def build_terrain(scene: dict, work_dir: Path, material) -> object:
-    """A regular grid of quads from the AHN heights, draped with the aerial.
+# What the terrain mesh's bits mean, as vertex groups: select the group and
+# the waterline, the road edge or a building outline is selected. Matches
+# src/terrain_mesh.py, which this script may not import.
+OUTLINE_GROUPS = (
+    (1, "outline_waterline"),
+    (2, "outline_road"),
+    (4, "outline_building"),
+    (8, "outline_row"),
+    (16, "outline_bed"),
+)
+# Outlines proper, marked as seams so they show in edit mode. The rows and the
+# bed are loops beside them, not outlines.
+OUTLINE_SEAMS = 1 | 2 | 4
 
-    Every face is tagged with the surface it lies under, so the ground below a
-    road or a lawn is one click away; see `_tag_surface_regions`.
+
+def build_terrain(scene: dict, work_dir: Path, material) -> object:
+    """The terrain, draped with the aerial.
+
+    The mesh whose edges follow the outlines on the ground when the pipeline
+    made one (`terrain_mesh.npz`), else the regular grid. Every face is tagged
+    with the surface it lies under, so the ground below a road or a lawn is
+    one click away; see `_tag_surface_regions`.
     """
     data = np.load(work_dir / scene["terrain"]["file"])
+    if "face_loops" in data.files:
+        return _build_terrain_mesh(scene, work_dir, material, data)
     heights = data["heights"].astype(np.float64)
     xs = data["xs"]
     ys = data["ys"]
@@ -694,6 +713,88 @@ def build_terrain(scene: dict, work_dir: Path, material) -> object:
         f"{groups} surface regions tagged"
     )
     return obj
+
+
+def _build_terrain_mesh(scene: dict, work_dir: Path, material, data) -> object:
+    """The terrain mesh: quads and triangles, its outlines tagged and grouped."""
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    vertices = data["vertices"].astype(np.float64) - [origin_x, origin_y, z_offset]
+    sizes = data["face_sizes"].astype(np.int64)
+    loops = data["face_loops"].astype(np.int64)
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
+    uvs = planar_uv(vertices[loops][:, :2], scene["aerial"]["bbox_local"])
+    obj = build_mesh_object(
+        "Terrain",
+        vertices,
+        loops,
+        starts,
+        sizes,
+        uvs,
+        np.zeros(len(sizes)),
+        [material],
+        shade_smooth=True,
+    )
+    mesh = obj.data
+    groups = _tag_surface_regions(obj, scene, work_dir, vertices, loops, starts, sizes)
+    # The ground as surveyed, before anything was pushed down under a road, so
+    # the Maptile tools can put it back. Water beds are part of it: they are
+    # not a fit to the roads but a fix to the survey.
+    measured = mesh.attributes.new("measured_z", "FLOAT", "POINT")
+    measured.data.foreach_set(
+        "value", (data["measured_z"].astype(np.float64) - z_offset).astype(np.float32)
+    )
+    if len(mesh.polygons) == len(sizes):
+        for name, key in (("ground_kind", "face_kind"), ("ground_part", "face_part")):
+            if key in data.files:
+                attribute = mesh.attributes.new(name, "INT", "FACE")
+                attribute.data.foreach_set("value", data[key].astype(np.int32))
+    marked = _mark_outlines(obj, data)
+    _triangulate_on_export(obj, quads="FIXED")
+    quads = int((sizes == 4).sum())
+    log(
+        f"terrain: {len(vertices)} vertices, {len(sizes)} faces of which "
+        f"{quads} quads; {marked} outline edges marked; {groups} surface regions tagged"
+    )
+    return obj
+
+
+def _mark_outlines(obj, data) -> int:
+    """Seams, an `outline` edge attribute and a vertex group per outline kind."""
+    if "edges" not in data.files or not len(data["edges"]):
+        return 0
+    mesh = obj.data
+    wanted = data["edges"].astype(np.int64)
+    bits = data["edge_on"].astype(np.int64)
+    count = len(mesh.edges)
+    have = np.zeros(count * 2, dtype=np.int32)
+    mesh.edges.foreach_get("vertices", have)
+    have = np.sort(have.reshape(-1, 2).astype(np.int64), axis=1)
+    n = int(len(mesh.vertices)) + 1
+    have_key = have[:, 0] * n + have[:, 1]
+    order = np.argsort(have_key)
+    wanted = np.sort(wanted, axis=1)
+    wanted_key = wanted[:, 0] * n + wanted[:, 1]
+    at = np.clip(np.searchsorted(have_key[order], wanted_key), 0, count - 1)
+    found = have_key[order][at] == wanted_key
+    index = order[at[found]]
+    edge_bits = np.zeros(count, dtype=np.int32)
+    edge_bits[index] = bits[found]
+    attribute = mesh.attributes.new("outline", "INT", "EDGE")
+    attribute.data.foreach_set("value", edge_bits)
+    seams = (edge_bits & OUTLINE_SEAMS) > 0
+    try:
+        mesh.edges.foreach_set("use_seam", seams)
+    except Exception:  # noqa: BLE001 - a newer Blender keeps seams elsewhere
+        pass
+    if "vertex_on" in data.files:
+        vertex_bits = data["vertex_on"].astype(np.int64)
+        for bit, name in OUTLINE_GROUPS:
+            members = np.flatnonzero(vertex_bits & bit)
+            if len(members):
+                group = obj.vertex_groups.new(name=name)
+                group.add(members.tolist(), 1.0, "REPLACE")
+    return int((edge_bits > 0).sum())
 
 
 # ---------------------------------------------------------------------------

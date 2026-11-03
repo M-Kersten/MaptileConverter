@@ -9,7 +9,10 @@ Fit terrain under roads
     After moving, widening or adding road, push the terrain down wherever it
     would show through. The same rule the pipeline used: each point of road
     surface lowers the three corners of the terrain triangle under it just
-    enough, the corners under the road most. Only ever lowers.
+    enough, the corners under the road most. Only ever lowers, so a sculpt
+    survives it; to get ground back from under a road you moved away, Reset
+    first and Fit after. Works on the terrain whatever its faces: the grid,
+    the rows along the outlines, or anything you have remeshed.
 
 Reset terrain to survey
     Put every terrain vertex back at the surveyed height it was built from,
@@ -49,26 +52,139 @@ ROAD_COLLECTION = "Roads"
 TERRAIN_NAME = "Terrain"
 
 
-def _terrain_grid(obj):
-    """The terrain's vertices as an (n, n) grid, with its axes, or None."""
+# A face of the ground under a road, in the terrain's `ground_kind` attribute.
+GROUND_UNDER_ROAD = 1
+
+
+def _terrain_mesh(obj):
+    """The terrain as world-space vertices, triangles, and which vertices show.
+
+    Triangles as the export draws them: a quad split from its first corner to
+    its third, a larger face fanned from its first corner. A vertex shows if
+    any face round it is not ground under a road; without the attribute -- a
+    terrain someone has rebuilt -- every vertex counts as showing.
+    """
     mesh = obj.data
     count = len(mesh.vertices)
-    n = int(round(count ** 0.5))
-    if n * n != count or n < 2:
+    if count < 3 or not len(mesh.polygons):
         return None
     co = np.empty(count * 3)
     mesh.vertices.foreach_get("co", co)
-    co = co.reshape(-1, 3) @ np.asarray(obj.matrix_world)[:3, :3].T + np.asarray(
-        obj.matrix_world
-    )[:3, 3]
-    grid = co.reshape(n, n, 3)
-    xs, ys = grid[0, :, 0], grid[:, 0, 1]
-    # A regular grid keeps its rows and columns. Anything else has been
-    # remeshed, and the fast path below does not apply.
-    if not (np.allclose(grid[:, :, 0], xs[None, :], atol=1e-3)
-            and np.allclose(grid[:, :, 1], ys[:, None], atol=1e-3)):
-        return None
-    return grid, xs, ys
+    matrix = np.asarray(obj.matrix_world)
+    co = co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    starts = np.empty(len(mesh.polygons), dtype=np.int64)
+    totals = np.empty(len(mesh.polygons), dtype=np.int64)
+    mesh.polygons.foreach_get("loop_start", starts)
+    mesh.polygons.foreach_get("loop_total", totals)
+    loops = np.empty(len(mesh.loops), dtype=np.int64)
+    mesh.loops.foreach_get("vertex_index", loops)
+    fans = totals - 2
+    face = np.repeat(np.arange(len(totals)), fans)
+    step = np.arange(int(fans.sum())) - np.repeat(np.cumsum(fans) - fans, fans) + 1
+    first = starts[face]
+    triangles = np.column_stack(
+        [loops[first], loops[first + step], loops[first + step + 1]]
+    )
+    visible = np.ones(count, dtype=bool)
+    kind = mesh.attributes.get("ground_kind")
+    if kind is not None and kind.domain == "FACE":
+        values = np.empty(len(mesh.polygons), dtype=np.int32)
+        kind.data.foreach_get("value", values)
+        face_of_loop = np.repeat(np.arange(len(totals)), totals)
+        visible[:] = False
+        visible[loops[values[face_of_loop] != GROUND_UNDER_ROAD]] = True
+    return co, triangles, visible
+
+
+class TriangleLocator:
+    """Which triangle each point falls in; as src/terrain_mesh.py, verbatim."""
+
+    def __init__(self, xy, tris, *, cell, bounds):
+        self.xy = np.asarray(xy, dtype=np.float64)
+        self.tris = np.asarray(tris, dtype=np.int64)
+        self.cell = float(cell)
+        self.x0, self.y0, x1, y1 = (float(v) for v in bounds)
+        self.x1, self.y1 = x1, y1
+        self.nx = max(1, int(np.ceil((x1 - self.x0) / self.cell)))
+        self.ny = max(1, int(np.ceil((y1 - self.y0) / self.cell)))
+        a = self.xy[self.tris[:, 0]]
+        b = self.xy[self.tris[:, 1]]
+        c = self.xy[self.tris[:, 2]]
+        self.a = a
+        self.v0 = b - a
+        self.v1 = c - a
+        self.d00 = np.einsum("ij,ij->i", self.v0, self.v0)
+        self.d01 = np.einsum("ij,ij->i", self.v0, self.v1)
+        self.d11 = np.einsum("ij,ij->i", self.v1, self.v1)
+        denom = self.d00 * self.d11 - self.d01 * self.d01
+        self.ok = np.abs(denom) > 1e-12
+        self.inv = np.where(self.ok, 1.0 / np.where(self.ok, denom, 1.0), 0.0)
+        corners = np.stack([a, b, c], axis=1)
+        lo = np.floor((corners.min(axis=1) - [self.x0, self.y0]) / self.cell).astype(np.int64)
+        hi = np.floor((corners.max(axis=1) - [self.x0, self.y0]) / self.cell).astype(np.int64)
+        lo[:, 0] = np.clip(lo[:, 0], 0, self.nx - 1)
+        hi[:, 0] = np.clip(hi[:, 0], 0, self.nx - 1)
+        lo[:, 1] = np.clip(lo[:, 1], 0, self.ny - 1)
+        hi[:, 1] = np.clip(hi[:, 1], 0, self.ny - 1)
+        wide = hi[:, 0] - lo[:, 0] + 1
+        tall = hi[:, 1] - lo[:, 1] + 1
+        counts = wide * tall
+        owner = np.repeat(np.arange(len(self.tris)), counts)
+        start = np.cumsum(counts) - counts
+        k = np.arange(int(counts.sum())) - np.repeat(start, counts)
+        w = np.repeat(wide, counts)
+        bx = np.repeat(lo[:, 0], counts) + k % w
+        by = np.repeat(lo[:, 1], counts) + k // w
+        bucket = by * self.nx + bx
+        order = np.argsort(bucket, kind="stable")
+        self.bucket_tris = owner[order]
+        self.bucket_start = np.searchsorted(bucket[order], np.arange(self.nx * self.ny + 1))
+
+    def locate(self, x, y, chunk=200_000):
+        x = np.clip(np.asarray(x, dtype=np.float64).ravel(), self.x0, self.x1)
+        y = np.clip(np.asarray(y, dtype=np.float64).ravel(), self.y0, self.y1)
+        n = len(x)
+        tri = np.full(n, -1, dtype=np.int64)
+        weights = np.zeros((n, 3))
+        for begin in range(0, n, chunk):
+            end = min(n, begin + chunk)
+            t, w = self._locate(x[begin:end], y[begin:end])
+            tri[begin:end] = t
+            weights[begin:end] = w
+        return tri, weights
+
+    def _locate(self, x, y):
+        n = len(x)
+        bx = np.clip(np.floor((x - self.x0) / self.cell).astype(np.int64), 0, self.nx - 1)
+        by = np.clip(np.floor((y - self.y0) / self.cell).astype(np.int64), 0, self.ny - 1)
+        bucket = by * self.nx + bx
+        start = self.bucket_start[bucket]
+        count = self.bucket_start[bucket + 1] - start
+        point = np.repeat(np.arange(n), count)
+        offset = np.arange(int(count.sum())) - np.repeat(np.cumsum(count) - count, count)
+        cand = self.bucket_tris[np.repeat(start, count) + offset]
+        px = x[point] - self.a[cand, 0]
+        py = y[point] - self.a[cand, 1]
+        d20 = px * self.v0[cand, 0] + py * self.v0[cand, 1]
+        d21 = px * self.v1[cand, 0] + py * self.v1[cand, 1]
+        inv = self.inv[cand]
+        u = (self.d11[cand] * d20 - self.d01[cand] * d21) * inv
+        v = (self.d00[cand] * d21 - self.d01[cand] * d20) * inv
+        w0 = 1.0 - u - v
+        score = np.minimum(np.minimum(w0, u), v)
+        score = np.where(self.ok[cand], score, -np.inf)
+        tri = np.full(n, -1, dtype=np.int64)
+        weights = np.zeros((n, 3))
+        if not len(point):
+            return tri, weights
+        best = np.full(n, -np.inf)
+        np.maximum.at(best, point, score)
+        winner = (score == best[point]) & (score > -1e-6)
+        first = np.unique(point[winner], return_index=True)[1]
+        pick = np.flatnonzero(winner)[first]
+        tri[point[pick]] = cand[pick]
+        weights[point[pick]] = np.column_stack([w0[pick], u[pick], v[pick]])
+        return tri, weights
 
 
 def _road_triangles(context):
@@ -149,41 +265,34 @@ def _underside_points(tris, cell):
     return np.vstack([cells, corners, middles])
 
 
-def fit_terrain(grid, xs, ys, points, clearance=TERRAIN_CLEARANCE_M):
-    """Lower the grid heights so every point clears it; as src/elevation.py."""
-    n = len(xs)
-    heights = grid[:, :, 2].astype(np.float64).ravel()
-    if not len(points):
-        return heights.reshape(n, n), 0
-    step_x = (xs[-1] - xs[0]) / (n - 1)
-    step_y = (ys[-1] - ys[0]) / (n - 1)
-    fx = np.clip((points[:, 0] - xs[0]) / step_x, 0, n - 1)
-    fy = np.clip((points[:, 1] - ys[0]) / step_y, 0, n - 1)
-    i0 = np.minimum(np.floor(fx).astype(np.int64), n - 2)
-    j0 = np.minimum(np.floor(fy).astype(np.int64), n - 2)
-    tx, ty = fx - i0, fy - j0
-    lower = tx >= ty
-    base = j0 * n + i0
-    corners = np.stack(
-        [base, np.where(lower, base + 1, base + n + 1), np.where(lower, base + n + 1, base + n)],
-        axis=1,
+def fit_terrain(xyz, triangles, visible, points, clearance=TERRAIN_CLEARANCE_M, cell=2.0):
+    """Lower the terrain so every point clears it; as src/elevation.py.
+
+    Each point lies in one terrain triangle, and the smallest lowering that
+    clears it moves the triangle's corners in proportion to their weight, the
+    ones nobody sees (under a road all round) HIDDEN_VERTEX_WEIGHT times more.
+    Every corner takes the largest move any point asks of it. Only lowers.
+    """
+    z = np.asarray(xyz, dtype=np.float64)[:, 2].copy()
+    if not len(points) or not len(triangles):
+        return z, 0
+    xy = np.asarray(xyz, dtype=np.float64)[:, :2]
+    locator = TriangleLocator(
+        xy, triangles, cell=cell, bounds=(*xy.min(axis=0), *xy.max(axis=0))
     )
-    weights = np.stack(
-        [np.where(lower, 1 - tx, 1 - ty), np.where(lower, tx - ty, tx),
-         np.where(lower, ty, ty - tx)],
-        axis=1,
-    )
-    excess = (weights * heights[corners]).sum(axis=1) - (points[:, 2] - clearance)
+    tri, weights = locator.locate(points[:, 0], points[:, 1])
+    found = tri >= 0
+    corners = np.asarray(triangles, dtype=np.int64)[tri[found]]
+    w = weights[found]
+    excess = (w * z[corners]).sum(axis=1) - (points[found, 2] - clearance)
     bad = excess > 0.0
-    drop = np.zeros(heights.shape)
+    drop = np.zeros(len(z))
     if bad.any():
-        nearest = np.rint(fy).astype(np.int64) * n + np.rint(fx).astype(np.int64)
-        hidden = np.bincount(nearest, minlength=n * n) > 0
-        w = weights[bad]
-        share = w * np.where(hidden[corners[bad]], HIDDEN_VERTEX_WEIGHT, 1.0)
-        need = excess[bad, None] * share / np.maximum((w * share).sum(axis=1), 1e-12)[:, None]
+        wb = w[bad]
+        share = wb * np.where(visible[corners[bad]], 1.0, HIDDEN_VERTEX_WEIGHT)
+        need = excess[bad, None] * share / np.maximum((wb * share).sum(axis=1), 1e-12)[:, None]
         np.maximum.at(drop, corners[bad].ravel(), need.ravel())
-    return (heights - drop).reshape(n, n), int((drop > 1e-6).sum())
+    return z - drop, int((drop > 1e-6).sum())
 
 
 def _write_heights(obj, heights_world):
@@ -212,13 +321,13 @@ class MAPTILE_OT_fit_terrain(bpy.types.Operator):
         if terrain is None:
             self.report({"ERROR"}, f"no object called {TERRAIN_NAME}")
             return {"CANCELLED"}
-        found = _terrain_grid(terrain)
+        found = _terrain_mesh(terrain)
         if found is None:
-            self.report({"ERROR"}, "the terrain is no longer a regular grid")
+            self.report({"ERROR"}, "the terrain has no faces")
             return {"CANCELLED"}
-        grid, xs, ys = found
+        xyz, triangles, visible = found
         points = _underside_points(_road_triangles(context), ROAD_CELL_M)
-        heights, moved = fit_terrain(grid, xs, ys, points)
+        heights, moved = fit_terrain(xyz, triangles, visible, points)
         _write_heights(terrain, heights)
         self.report({"INFO"}, f"lowered {moved} terrain vertices")
         return {"FINISHED"}

@@ -398,7 +398,8 @@
       <p>
         <code>model.blend</code> &mdash; the model for editing in Blender: every
         layer its own collection, one object per building, street and tree,
-        roads and ground as clean quads.<br>
+        roads and ground as clean quads, the ground's edges following every
+        waterline, road edge and building.<br>
         <code>model.fbx</code> &mdash; the same model for Unity.<br>
         <code>maptile_tools.py</code> &mdash; Blender tools that keep the
         ground under the roads after you edit them.<br>
@@ -867,7 +868,7 @@ const DETAIL = {
 };
 const DETAIL_PLAIN = {
   draft: "Quick to build, to check an area before committing to it. The photo shows blocks and roads; the ground follows the land but not its kerbs.",
-  standard: "Cars and pavements read in the photo; ditches, ramps and embankments come through in the ground, which is a 2 m grid of quads.",
+  standard: "Cars and pavements read in the photo; ditches, ramps and embankments come through in the ground, a 2 m grid whose edges follow the waterlines, road edges and buildings.",
   high: "Road markings read in the photo and the ground carries kerbs and small steps. Heavy over a full square kilometre; best on a smaller area."
 };
 

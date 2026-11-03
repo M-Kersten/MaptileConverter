@@ -44,8 +44,10 @@ from src.elevation import (  # noqa: E402
     build_terrain,
     ensure_dsm,
     lower_under,
+    mesh_survey_error,
     raster_sampler,
 )
+from src.terrain_mesh import build_terrain_mesh  # noqa: E402
 from src.nwb import NWB_URL, fetch_centrelines  # noqa: E402
 from src.roads import (  # noqa: E402
     TERRAIN_CLEARANCE_M,
@@ -125,6 +127,7 @@ from src.validate import (  # noqa: E402
     check_vehicles,
     check_surfaces,
     check_terrain,
+    check_terrain_mesh,
     check_trees,
     write_report,
 )
@@ -493,9 +496,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         config.structures["bridges"] or config.structures["tunnels"]
     )
 
-    # Five fixed stages, plus one for aerial relighting, plus the optional
-    # sources, plus Blender.
-    total = 6 + sum(
+    # Five fixed stages, plus aerial relighting and the terrain mesh, plus
+    # the optional sources, plus Blender.
+    total = 7 + sum(
         (
             want_trees, want_surfaces, want_furniture, want_barriers,
             want_usage,
@@ -556,18 +559,6 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 deck_sampler=deck_dsm,
                 network=network,
             )
-            if surfaces.road_mesh is not None and len(surfaces.road_mesh):
-                # The roads are a separate surface laid on top, so the ground
-                # gets out of their way rather than the other way round, and
-                # everything placed from here on stands on the road where
-                # there is one.
-                terrain.road_top = road_top(surfaces.road_mesh, config.bbox)
-                lower_under(
-                    terrain,
-                    road_underside(surfaces.road_mesh, config.bbox),
-                    clearance_m=TERRAIN_CLEARANCE_M,
-                )
-                terrain.save(work_dir)
             if surfaces.class_grid is not None:
                 write_land_cover(surfaces, config.bbox, out_dir)
             if surfaces.water:
@@ -593,6 +584,40 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             usage=usage if len(usage) else None,
             facade_cfg=config.facade,
         )
+
+    with Stage("terrain mesh (outline edges)", next_step(), total):
+        # The ground's edges follow the outlines on it -- waterline, road
+        # edge, building -- so it is built once all three are known, and
+        # before anything is placed on it.
+        terrain.mesh = build_terrain_mesh(
+            terrain,
+            roads=surfaces.road_mesh,
+            water=surfaces.water,
+            buildings=buildings,
+            sources=config.terrain.get("feature_edges", ()),
+            water_depth_m=float(config.surfaces.get("water_depth_m", 1.2)),
+        )
+        if surfaces.road_mesh is not None and len(surfaces.road_mesh):
+            # The roads are a separate surface laid on top, so the ground
+            # gets out of their way rather than the other way round, and
+            # everything placed from here on stands on the road where there
+            # is one.
+            terrain.road_top = road_top(surfaces.road_mesh, config.bbox)
+            lower_under(
+                terrain,
+                road_underside(surfaces.road_mesh, config.bbox),
+                clearance_m=TERRAIN_CLEARANCE_M,
+            )
+        error = mesh_survey_error(terrain)
+        if error:
+            terrain.survey_error = error
+            LOG.info(
+                "terrain mesh within %.3f m of the survey on 95%% of the ground, "
+                "%.3f m on 99%%",
+                error["p95_m"],
+                error["p99_m"],
+            )
+        terrain.save(work_dir)
 
     trees = TreeSet()
     tree_texture = None
@@ -847,6 +872,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         )
         check_buildings_on_terrain(report, buildings, terrain)
         check_built_terrain(report, work_dir, terrain)
+        check_terrain_mesh(
+            report, terrain,
+            expect_outlines=bool(config.terrain.get("feature_edges")),
+        )
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
