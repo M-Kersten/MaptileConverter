@@ -1021,11 +1021,18 @@ def check_layered(
         got = above.get(role)
         if not got:
             continue
-        ok = got["min_m"] >= floor and got["max_m"] <= ceiling and not got.get("missed")
+        # Nothing past the object's own outline but rounding: a kerb is built
+        # inside it.
+        past = float(got.get("beyond_outline_m", 0.0))
+        ok = (
+            got["min_m"] >= floor and got["max_m"] <= ceiling
+            and not got.get("missed") and past <= 0.05
+        )
         lines.append(
             f"{role} {got['min_m']:.3f} to {got['max_m']:.3f} m "
             f"(built for {low:.2f}" + (f" to {high:.2f}" if high != low else "") + ")"
             + (f", {got['missed']} vertices not over the terrain" if got.get("missed") else "")
+            + (f", reaching {past:.2f} m past its outline" if past > 0.05 else "")
         )
         if not ok:
             wrong.append(role)
@@ -1279,12 +1286,30 @@ def check_fbx_reimport(report: CheckReport, fbx_path: Path, bbox: BBox) -> None:
         True,
         f"{len(objects)} meshes, spans {span_x:.1f} x {span_y:.1f} x {span_z:.1f} m",
     )
-    report.add(
-        "fbx_reimport_scale",
-        abs(span_x - bbox.width) < 150.0 and abs(span_y - bbox.height) < 150.0,
-        f"horizontal spans {span_x:.1f} x {span_y:.1f} m against a "
-        f"{bbox.width:.0f} x {bbox.height:.0f} m bbox",
+    # The terrain is cut to the bbox exactly, so it measures the scale exactly:
+    # the whole model also holds every building whose middle is inside, and
+    # at Hazeldonk two warehouses reach 100 m and more past the square.
+    terrain = next(
+        (o for o in objects if o.get("maptile_role") == "terrain" or o.name == "Terrain"),
+        None,
     )
+    if terrain is not None:
+        ends = [terrain.matrix_world @ mathutils.Vector(c) for c in terrain.bound_box]
+        ground_x = max(c.x for c in ends) - min(c.x for c in ends)
+        ground_y = max(c.y for c in ends) - min(c.y for c in ends)
+        report.add(
+            "fbx_reimport_scale",
+            abs(ground_x - bbox.width) < 1.0 and abs(ground_y - bbox.height) < 1.0,
+            f"the terrain spans {ground_x:.1f} x {ground_y:.1f} m against a "
+            f"{bbox.width:.0f} x {bbox.height:.0f} m bbox",
+        )
+    else:
+        report.add(
+            "fbx_reimport_scale",
+            abs(span_x - bbox.width) < 150.0 and abs(span_y - bbox.height) < 150.0,
+            f"horizontal spans {span_x:.1f} x {span_y:.1f} m against a "
+            f"{bbox.width:.0f} x {bbox.height:.0f} m bbox",
+        )
     report.add(
         "fbx_reimport_height",
         0.0 < span_z < 250.0,

@@ -679,6 +679,7 @@ def _layered_summary(layered: dict) -> dict:
     raw, evaluated = 0, 0
     heights: dict[str, list] = {}
     missed: dict[str, int] = {}
+    beyond: dict[str, float] = {}
     for name in layered.get("objects", []):
         obj = bpy.data.objects.get(name)
         if obj is None:
@@ -696,6 +697,18 @@ def _layered_summary(layered: dict) -> dict:
             mesh.vertices.foreach_get("co", co)
             matrix = np.asarray(obj.matrix_world)
             world = co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+            # How far the modifiers carried anything past the object's own
+            # outline: a runaway kerb mitre shows here and nowhere else.
+            own = np.empty(len(obj.data.vertices) * 3)
+            obj.data.vertices.foreach_get("co", own)
+            own = own.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+            if len(own) and len(world):
+                past = max(
+                    float((own[:, :2].min(axis=0) - world[:, :2].min(axis=0)).max()),
+                    float((world[:, :2].max(axis=0) - own[:, :2].max(axis=0)).max()),
+                    0.0,
+                )
+                beyond[role] = max(beyond.get(role, 0.0), past)
             for x, y, z in world:
                 ground = ground_under(x, y)
                 if ground is None:
@@ -710,6 +723,7 @@ def _layered_summary(layered: dict) -> dict:
             "max_m": round(float(np.max(values)), 4),
             "vertices": len(values),
             "missed": missed.get(role, 0),
+            "beyond_outline_m": round(beyond.get(role, 0.0), 3),
         }
         for role, values in heights.items()
         if values

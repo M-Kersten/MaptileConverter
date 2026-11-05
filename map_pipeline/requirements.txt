@@ -21,11 +21,13 @@ shapely>=2.1
 # and it serialises a list-valued coverage id into the query string. The WCS
 # request is a plain GET instead (see src/elevation.py).
 
-# Blender. The pip module runs the whole Blender stage headless without a
-# separate Blender install, and needs CPython 3.11.
-# If you would rather drive a Blender application install, skip this and pass
-# --blender /path/to/blender to pipeline.py.
-bpy>=4.2 ; python_version >= "3.11" and python_version < "3.12"
+# Blender 5. The pip module runs the whole Blender stage headless without a
+# separate Blender install, and is published for one CPython at a time: from
+# Blender 5.1 that is 3.13. Blender 5 is what the curb generator needs (it is
+# built on the Bevel geometry node), and there are no Blender 5 wheels for
+# Intel Macs: there, install the Blender application and pass
+# --blender /path/to/blender to pipeline.py, as anyone may.
+bpy>=5.2,<5.3 ; python_version >= "3.13" and python_version < "3.14" and (sys_platform == "win32" or (sys_platform == "darwin" and platform_machine == "arm64") or (sys_platform == "linux" and platform_machine == "x86_64"))
 
 # Optional, for CityJSON sanity checks outside the pipeline.
 # cjio

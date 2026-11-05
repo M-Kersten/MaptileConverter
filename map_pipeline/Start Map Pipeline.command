@@ -9,14 +9,15 @@ cd "$(dirname "$0")" || exit 1
 VENV=".venv"
 STAMP="$VENV/.installed"
 
-# bpy - Blender as a library - publishes wheels for CPython 3.11 only. On any
-# other version pip quietly installs everything else and the run then fails
-# several minutes in, at the Blender stage, with nothing obviously wrong. So
-# the version is checked here rather than discovered there.
+# bpy - Blender as a library - publishes wheels for one CPython at a time,
+# for Blender 5 that is 3.13. On any other version pip quietly installs
+# everything else and the run then fails several minutes in, at the Blender
+# stage, with nothing obviously wrong. So the version is checked here rather
+# than discovered there.
 PY=""
-for candidate in python3.11 python3 python; do
+for candidate in python3.13 python3 python; do
   if command -v "$candidate" >/dev/null 2>&1 &&
-     "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2]==(3,11) else 1)' 2>/dev/null; then
+     "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[:2]==(3,13) else 1)' 2>/dev/null; then
     PY="$candidate"
     break
   fi
@@ -25,19 +26,26 @@ done
 if [ -z "$PY" ]; then
   cat <<'MSG'
 
-  Python 3.11 was not found, and this needs that exact version:
-  Blender only publishes its Python library for 3.11.
+  Python 3.13 was not found, and this needs that exact version:
+  Blender 5 only publishes its Python library for 3.13.
 
   The easiest way on a Mac:
 
-      brew install python@3.11
+      brew install python@3.13
 
   or download it from
-  https://www.python.org/downloads/release/python-3119/
+  https://www.python.org/downloads/release/python-31317/
 
 MSG
   read -r -p "Press return to close."
   exit 1
+fi
+
+# An environment made for an earlier Blender holds the Python that Blender
+# needed then; it is made again rather than left with the old Blender in it.
+if [ -d "$VENV" ] && ! "$VENV/bin/python" -c 'import sys; sys.exit(0 if sys.version_info[:2]==(3,13) else 1)' 2>/dev/null; then
+  echo "Rebuilding the private Python environment for Python 3.13 and Blender 5."
+  rm -rf "$VENV"
 fi
 
 if [ ! -d "$VENV" ]; then

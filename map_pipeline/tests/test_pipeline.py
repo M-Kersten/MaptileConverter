@@ -4745,30 +4745,61 @@ class TestFindingBlender(unittest.TestCase):
         it, and named neither the bundle path nor how to point at one."""
         import pipeline
 
-        original = pipeline.search_for_blender
-        pipeline.search_for_blender = lambda: []
-        try:
-            import builtins
+        import unittest.mock as mock
 
-            real_import = builtins.__import__
-
-            def no_bpy(name, *args, **kwargs):
-                if name == "bpy":
-                    raise ImportError("no bpy")
-                return real_import(name, *args, **kwargs)
-
-            builtins.__import__ = no_bpy
-            try:
-                with self.assertRaises(SystemExit) as caught:
-                    pipeline.find_blender(None)
-            finally:
-                builtins.__import__ = real_import
-        finally:
-            pipeline.search_for_blender = original
+        with mock.patch.object(pipeline, "search_for_blender", return_value=[]), \
+                mock.patch.object(pipeline, "pip_bpy_version", return_value=None):
+            with self.assertRaises(SystemExit) as caught:
+                pipeline.find_blender(None)
 
         message = str(caught.exception)
         self.assertIn("Looked in", message)
         self.assertIn("/Applications/Blender.app", message)
+        self.assertIn("CPython 3.13", message)
+
+
+class TestChoosingBlender(unittest.TestCase):
+    """Blender 5 wherever there is one; an older one only with a warning."""
+
+    def _choose(self, installed, module):
+        import unittest.mock as mock
+
+        import pipeline
+
+        with mock.patch.object(pipeline, "search_for_blender", return_value=list(installed)), \
+                mock.patch.object(pipeline, "blender_version", side_effect=installed.get), \
+                mock.patch.object(pipeline, "pip_bpy_version", return_value=module):
+            with self.assertLogs("pipeline", level="INFO") as logs:
+                mode, command = pipeline.find_blender(None)
+        return mode, command, " ".join(logs.output)
+
+    def test_an_installed_blender_5_comes_first(self):
+        mode, command, said = self._choose(
+            {"/opt/blender-4.2/blender": (4, 2, 3), "/opt/blender-5.2/blender": (5, 2, 3)},
+            (5, 2, 3),
+        )
+        self.assertEqual((mode, command), ("executable", ["/opt/blender-5.2/blender"]))
+        self.assertIn("5.2.3", said)
+
+    def test_the_pip_module_wins_over_an_old_install(self):
+        """The machine that still has Blender 4.2 in Program Files."""
+        import sys
+
+        mode, command, said = self._choose({"C:/Blender 4.2/blender.exe": (4, 2, 0)}, (5, 2, 3))
+        self.assertEqual((mode, command), ("bpy", [sys.executable]))
+
+    def test_an_old_blender_is_used_but_named(self):
+        mode, command, said = self._choose({"/usr/bin/blender": (4, 2, 0)}, None)
+        self.assertEqual(command, ["/usr/bin/blender"])
+        self.assertIn("WARNING", said)
+        self.assertIn("no kerbs", said)
+
+    def test_the_versions_are_read_without_loading_blender(self):
+        import pipeline
+
+        version = pipeline.pip_bpy_version()
+        self.assertTrue(version is None or isinstance(version, tuple))
+        self.assertNotIn("bpy", sys.modules)
 
 
 class TestBag3dTiles(unittest.TestCase):
@@ -4912,7 +4943,7 @@ class TestDependencies(unittest.TestCase):
         self.assertIn("-m pip install -r", done.stderr)
 
     def test_the_windows_launcher_can_install_python_itself(self):
-        """Python 3.11 is the step colleagues get stuck on, so the launcher
+        """Python 3.13 is the step colleagues get stuck on, so the launcher
         offers to install it: per user, PATH untouched, and only a file whose
         hash matches the one python.org published."""
         raw = (REPO_ROOT / "Start Map Pipeline.bat").read_bytes()
@@ -4931,7 +4962,28 @@ class TestDependencies(unittest.TestCase):
         self.assertIn("Get-FileHash", text)
         # The hash check sits between the download and the install.
         self.assertLess(text.index("Get-FileHash"), text.index("start \"\" /wait \"%PY_SETUP%\""))
-        self.assertIn(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe", text)
+        self.assertIn(r"%LOCALAPPDATA%\Programs\Python\Python313\python.exe", text)
+        self.assertIn('set "PY_VERSION=3.13.', text)
+
+    def test_the_launchers_all_ask_for_the_python_blender_5_needs(self):
+        """bpy 5.1 and later is published for CPython 3.13 alone. A launcher
+        still asking for 3.11 builds an environment pip cannot put Blender 5
+        in, and one left from before keeps its old Blender: each rebuilds an
+        environment on another Python."""
+        requirement = next(
+            line for line in (REPO_ROOT / "requirements.txt").read_text().splitlines()
+            if line.startswith("bpy")
+        )
+        self.assertIn(">=5.2", requirement)
+        self.assertIn('python_version >= "3.13" and python_version < "3.14"', requirement)
+        for launcher in ("Start Map Pipeline.bat", "start-map-pipeline.sh",
+                         "Start Map Pipeline.command"):
+            text = (REPO_ROOT / launcher).read_text()
+            with self.subTest(launcher=launcher):
+                self.assertIn("sys.version_info[:2]==(3,13)", text)
+                self.assertNotIn("3.11", text)
+                self.assertNotIn("(3,11)", text)
+                self.assertIn("Rebuilding the private Python environment", text)
 
     def test_the_launchers_reinstall_when_requirements_change(self):
         """They used to install once and stamp it done, so an update that
@@ -5166,7 +5218,7 @@ def _blender_mesh_calls():
     to `build_mesh_object`, so the contract can be checked without Blender.
 
     The Blender stage is the one part of this pipeline the test suite cannot
-    execute: it needs `bpy`, which is 848 MB and CPython 3.11 only. So the
+    execute: it needs `bpy`, which is 880 MB and one CPython only. So the
     functions are exec'd against a stubbed `build_mesh_object` and stubbed
     materials instead, which is enough to catch the shape mistakes -- and one
     of those shipped: `build_structures` welded its corners and then handed
@@ -6903,6 +6955,58 @@ class TestLayeredGround(unittest.TestCase):
         middles = shapely.points(points[unique[counts == 1]].mean(axis=1))
         self.assertLess(float(shapely.distance(rim, middles).max()), 1e-9)
 
+    @staticmethod
+    def _coverage(walkway):
+        """A 20 m square: one walkway, road everywhere else."""
+        import shapely
+
+        from src.layered import ROAD, WALKWAY, _code
+
+        frame = shapely.box(0.0, 0.0, 20.0, 20.0)
+        road = shapely.set_precision(frame.difference(walkway), 0.01)
+        return [(walkway, _code(WALKWAY, "Beton_Geel")), (road, _code(ROAD, "Asfalt"))]
+
+    def test_a_needle_on_a_walkway_is_trimmed_off(self):
+        """A 1.4 degree needle tip: measured on the curb generator, a tip that
+        sharp throws its kerb tens of metres (825 m at Hazeldonk). The tip
+        goes to the road beside it; nothing else moves."""
+        import shapely
+
+        from src.layered import WALKWAY, _hairpins, _without_hairpins
+
+        walkway = shapely.Polygon([(0, 0), (10, 0), (10, 1.9), (18, 2.0), (10, 2.1),
+                                   (10, 4), (0, 4)])
+        pieces, removed = _without_hairpins(self._coverage(walkway))
+        self.assertGreaterEqual(removed, 1)
+        trimmed = next(p for p, k in pieces if k // 16 == WALKWAY)
+        self.assertEqual(_hairpins(trimmed), set())
+        self.assertAlmostEqual(trimmed.area, 40.0, places=6)
+        self.assertAlmostEqual(sum(p.area for p, _ in pieces), 400.0, places=6)
+        self.assertTrue(shapely.union_all([p for p, _ in pieces]).equals(
+            shapely.box(0.0, 0.0, 20.0, 20.0)))
+
+    def test_a_tapering_path_keeps_its_taper(self):
+        """A path narrowing to a point over 15 m is a path: trimming it corner
+        by corner once ate 900 m2 of Hazeldonk's footpaths."""
+        import shapely
+
+        from src.layered import WALKWAY, _without_hairpins
+
+        walkway = shapely.Polygon([(0, 0), (4, 0), (19, 1.5), (4, 3), (0, 3)])
+        pieces, _ = _without_hairpins(self._coverage(walkway))
+        kept = next(p for p, k in pieces if k // 16 == WALKWAY)
+        self.assertAlmostEqual(kept.area, walkway.area, places=6)
+
+    def test_a_walkway_too_thin_for_kerbs_joins_its_neighbour(self):
+        import shapely
+
+        from src.layered import ROAD, _without_hairpins
+
+        walkway = shapely.Polygon([(2, 5), (12, 5.2), (2, 5.4)])
+        pieces, removed = _without_hairpins(self._coverage(walkway))
+        self.assertEqual([k // 16 for _, k in pieces], [ROAD, ROAD])
+        self.assertAlmostEqual(sum(p.area for p, _ in pieces), 400.0, places=6)
+
     def test_a_quad_is_the_two_triangles_that_were_fitted(self):
         from src.layered import _faces
 
@@ -7721,6 +7825,13 @@ class TestTerrainGrid(unittest.TestCase):
         spiked = json.loads(json.dumps(good))
         spiked["height_above_terrain"]["walkway"] = {"min_m": -0.383, "max_m": 0.653}
         self.assertFalse(run(spiked)["layers_lie_on_the_terrain"].passed)
+        # And the kerb mitre that ran 825 m off a needle tip: right height,
+        # wrong place.
+        runaway = json.loads(json.dumps(good))
+        runaway["height_above_terrain"]["walkway"]["beyond_outline_m"] = 825.0
+        verdict = run(runaway)["layers_lie_on_the_terrain"]
+        self.assertFalse(verdict.passed)
+        self.assertIn("825.00 m past its outline", verdict.detail)
         flat = dict(good, walkway_faces_evaluated=100)
         self.assertFalse(run(flat)["walkways_have_kerbs"].passed)
         old_blender = dict(good, curb_generator=False, kerbed_objects=0)

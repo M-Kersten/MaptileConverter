@@ -64,24 +64,31 @@ whenever the two differ, so an update that adds a package installs it on the
 next start. A pipeline run checks the same list before it does anything else,
 and stops with the exact command to fix it if a package is missing.
 
-**The first run downloads about a gigabyte and takes several minutes.** 848 MB
-of that is Blender, which ships as a Python library here so nobody has to
+**The first run downloads about a gigabyte and takes several minutes.** 880 MB
+of that is Blender 5, which ships as a Python library here so nobody has to
 install Blender separately. Every run after that opens the page in seconds.
 
-**It needs CPython 3.11, and only 3.11.** Blender publishes its Python library
-for that version alone. On anything else pip installs the other dependencies
+**It needs CPython 3.13, and only 3.13.** The model is built with Blender 5,
+and Blender publishes its Python library for one Python at a time: from
+Blender 5.1 that is 3.13. On anything else pip installs the other dependencies
 happily and the run then fails minutes later at the Blender stage, with nothing
 that points at the version, so the launchers check first.
 
-**On Windows the launcher installs it for you.** When it finds no Python 3.11 it
-asks, and on *Y* downloads the official 3.11.9 installer from python.org (25 MB),
+**On Windows the launcher installs it for you.** When it finds no Python 3.13 it
+asks, and on *Y* downloads the official 3.13.17 installer from python.org (30 MB),
 checks it against the SHA-256 pinned in the `.bat`, and installs it for your
 Windows user only: no administrator rights, nothing added to PATH, any other
-Python left alone. It lands in `%LOCALAPPDATA%\Programs\Python\Python311`,
+Python left alone. It lands in `%LOCALAPPDATA%\Programs\Python\Python313`,
 where the launcher looks for it next time. On *N*, or if anything fails, it
-opens the download page instead. 3.11.9 is the last 3.11 release python.org
-built Windows installers for. The macOS and Linux launchers still point you at
-`brew install python@3.11` or your package manager, which need your password.
+opens the download page instead. 3.13.17 is the newest 3.13 release python.org
+built a Windows installer for. The macOS and Linux launchers still point you at
+`brew install python@3.13` or your package manager, which need your password.
+
+**An environment from before Blender 5 is rebuilt.** One made on Python 3.11
+holds Blender 4.2, which pip cannot replace there, so each launcher checks the
+environment's Python and makes it again when it is not 3.13 — one more long
+first start. Intel Macs get no Blender 5 Python library at all: there, install
+the Blender application, which the pipeline finds by itself.
 
 On macOS the first double-click is blocked by Gatekeeper because the file came
 from the internet: right-click it, choose **Open**, and confirm once.
@@ -179,7 +186,10 @@ blender --background --python blender/process.py -- --work work/<area> --out out
 
 Blender is located in this order: an explicit `--blender`, then `blender` on
 `PATH`, then the places the installers actually put it, then the pip `bpy`
-module (`pip install bpy`, CPython 3.11). All of them produce the same output.
+module (`pip install -r requirements.txt`, CPython 3.13) — and among those, a
+Blender 5 first: an installed one, else the pip module. An older Blender is used
+only when there is nothing newer, and the run says the walkways will have no
+kerbs. The Blender found, and its version, are in the log.
 
 **On macOS, Blender is never on `PATH`.** It installs as `Blender.app`, and the
 executable lives inside the bundle at `Contents/MacOS/Blender`, so a `PATH`
@@ -669,6 +679,15 @@ How it is built (`src/layered.py`):
 * **Outlines.** The polygons are cut into one region per spot, simplified
   together by up to `outline_m` (25 cm) so that an edge two regions share stays
   shared, and snapped to a 1 cm grid.
+* **Hairpins.** The curb generator mitres its kerb at every corner, and at a
+  corner that turns back on itself the mitre runs away: measured, a 2° tip
+  throws the kerb 3 m, a 3° notch 10 m, and at Hazeldonk a needle in a
+  footpath outline sent one kerb vertex 825 m off. A walkway corner under 20°
+  is taken out where that moves no more than 2 m² (under 6°, always), from the
+  walkway and the piece beside it alike, so the pieces still tile the area; a
+  walkway too thin for a kerb on each side, or a small one keeping a corner
+  under 6°, becomes part of its neighbour. At Hazeldonk that is 0.3% of the
+  footpath area.
 * **Terrain.** A triangulation of the outlines, refined until it fits the
   survey: in each round, the surveyed grid node (2 m apart at Standard detail)
   furthest from the surface in every triangle that misses by more than
@@ -727,10 +746,10 @@ node, which only Blender 5 has. `blender/assets/curb_generator.blend` holds it
 as the modellers made it, taken unchanged from their Hazeldonk file, and it is
 appended into every model, so every walkway in a file shares one node group: change
 the group and every kerb changes; change a modifier's inputs and only that
-object's do. The pipeline uses the Blender on the PATH, else the newest one
-installed in the usual places, else the pip `bpy` module; pass `--blender` to
-choose. The pip module is Blender 4.x, and with it the walkways are left flat
-and the run says so (`walkways_have_kerbs` warns).
+object's do. The pip `bpy` module the launchers install is Blender 5.2, so
+this works out of the box; an installed Blender 5 is used in preference. With
+an older Blender the walkways are left flat and the run says so
+(`walkways_have_kerbs` warns).
 
 The layered style's settings, all optional:
 
@@ -744,12 +763,12 @@ The layered style's settings, all optional:
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
 
-Over the Hazeldonk square kilometre the terrain is 26,770 faces (48% quads) on
-19,889 vertices, every surveyed 2 m node within 0.50 m of it and 95% of the
+Over the Hazeldonk square kilometre the terrain is 26,650 faces (48% quads) on
+19,804 vertices, every surveyed 2 m node within 0.50 m of it and 95% of the
 0.5 m survey within 0.30 m; there are 19 layer objects, 6 of them walkways
-whose 2,999 faces become 23,241 with their kerbs. The ground takes 23 seconds
-to build and the Blender stage 11; the whole run takes 6½ minutes, most of it
-relighting the aerial, and passes all 57 checks. The modellers' own terrain
+whose 2,818 faces become 21,783 with their kerbs. The ground takes 23 seconds
+to build and the Blender stage, on the pip `bpy` 5.2, 12; the whole run takes
+6½ minutes, most of it relighting the aerial, and passes all 60 checks. The modellers' own terrain
 has about 2,100 faces: holding every node to half a metre everywhere costs
 more, and `tolerance_m` trades the one for the other.
 

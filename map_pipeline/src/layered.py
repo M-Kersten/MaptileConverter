@@ -291,6 +291,7 @@ def build_layered_ground(
     pieces = _regions(frame, layers, station_m=1e9) if layers else [(frame, 0)]
     pieces = _simplify(pieces, outline_m, frame)
     pieces = _islands(pieces)
+    pieces, hairpins = _without_hairpins(pieces)
     timings = {"regions_s": round(time.time() - started, 1)}
 
     # ---- the terrain: a triangulation refined until it fits the survey -----
@@ -361,6 +362,7 @@ def build_layered_ground(
         "grid_error_p95_m": round(float(np.percentile(error, 95)), 3) if len(error) else 0.0,
         "refinement_rounds": int(rounds),
         "outline_edges_missing": int(missing),
+        "walkway_hairpins_removed": int(hairpins),
         "faces_by_layer": {
             LAYER_NAMES[k]: int((face_layer == k).sum()) for k in LAYER_NAMES
         },
@@ -449,6 +451,136 @@ def _islands(pieces):
         if ring.intersection(around).length >= ISLAND_SHARE * ring.length:
             out[i] = (polygon, island)
     return out
+
+
+HAIRPIN_DEG = 20.0
+
+
+# ... and how much area taking one corner away may move between pieces: a
+# needle or a slit is trimmed, a footpath that tapers over twenty metres is not.
+HAIRPIN_MAX_M2 = 2.0
+# Below this a corner is trimmed whatever it moves: measured on the curb
+# generator, a 2 degree tip throws its kerb 3 m, a 3 degree notch 10 m.
+HAIRPIN_ALWAYS_DEG = 6.0
+# A walkway narrower than twice this -- the kerb's width -- has no room for a
+# kerb on each side; one no larger than SLIVER_MAX_M2 with a corner under
+# HAIRPIN_ALWAYS_DEG is a sliver too.
+SLIVER_M = 0.3
+SLIVER_MAX_M2 = 50.0
+
+
+def _hairpins(polygon, limit_deg: float = HAIRPIN_DEG, max_m2: float | None = None) -> set:
+    """Grid keys of the corners where an outline turns back on itself.
+
+    With `max_m2`, only those whose triangle with the two corners either side
+    -- what taking the corner away moves -- is no larger than that, unless
+    the corner is sharper than `HAIRPIN_ALWAYS_DEG`.
+    """
+    keys = set()
+    cos_limit = np.cos(np.radians(limit_deg))
+    for ring in [polygon.exterior, *polygon.interiors]:
+        c = np.asarray(ring.coords)[:-1, :2]
+        if len(c) < 3:
+            continue
+        back = np.roll(c, 1, axis=0) - c
+        ahead = np.roll(c, -1, axis=0) - c
+        lengths = np.hypot(*back.T) * np.hypot(*ahead.T)
+        cosine = np.where(
+            lengths > 0, (back * ahead).sum(axis=1) / np.maximum(lengths, 1e-18), -1.0
+        )
+        sharp = cosine > cos_limit
+        if max_m2 is not None:
+            area = 0.5 * np.abs(back[:, 0] * ahead[:, 1] - back[:, 1] * ahead[:, 0])
+            sharp &= (area <= max_m2) | (cosine > np.cos(np.radians(HAIRPIN_ALWAYS_DEG)))
+        for point in c[sharp]:
+            keys.add(tuple(np.rint(point / GRID_SIZE).astype(np.int64)))
+    return keys
+
+
+def _without_hairpins(pieces, limit_deg: float = HAIRPIN_DEG):
+    """Walkway corners sharper than `limit_deg` taken out of every piece.
+
+    The curb generator insets its kerb by mitring each corner, and at a
+    corner of a few degrees the mitre runs away: at Hazeldonk a kerb vertex
+    landed 825 m off a 2.7 degree needle tip in a footpath outline. The tip
+    goes from the walkway and from whatever shares it, so the pieces still
+    tile the area; the sliver changes hands. Returns the pieces and how many
+    corners went.
+    """
+    import shapely
+
+    def without(polygon, drop):
+        rings = []
+        for ring in [polygon.exterior, *polygon.interiors]:
+            c = np.asarray(ring.coords)[:-1, :2]
+            keys = [tuple(k) for k in np.rint(c / GRID_SIZE).astype(np.int64)]
+            kept = c[[k not in drop for k in keys]]
+            rings.append(kept)
+        if len(rings[0]) < 3:
+            return None
+        made = shapely.Polygon(rings[0], [r for r in rings[1:] if len(r) >= 3])
+        return made if made.is_valid and made.area > 0 else None
+
+    removed = 0
+    # Taking a needle's tip leaves the corner behind it as the new tip, so
+    # this goes round until none is left.
+    for _ in range(50):
+        drop = set()
+        for polygon, code in pieces:
+            if code // 16 == WALKWAY:
+                drop |= _hairpins(polygon, limit_deg, HAIRPIN_MAX_M2)
+        if not drop:
+            break
+        # A corner whose removal would break any piece stays.
+        for _ in range(len(drop) + 1):
+            out, broken = [], set()
+            for polygon, code in pieces:
+                corners = {
+                    tuple(k) for ring in [polygon.exterior, *polygon.interiors]
+                    for k in np.rint(np.asarray(ring.coords)[:, :2] / GRID_SIZE).astype(np.int64)
+                }
+                if not corners & drop:
+                    out.append((polygon, code))
+                    continue
+                made = without(polygon, drop)
+                if made is None:
+                    broken |= corners & drop
+                out.append((made, code))
+            if not broken:
+                break
+            drop -= broken
+        if not drop or broken:
+            break
+        pieces = out
+        removed += len(drop)
+
+    # A walkway still with one, and too thin for a kerb either side -- or
+    # small and with a corner sharp enough to throw its kerb -- is a sliver
+    # that cannot lose its tip without vanishing: it joins the neighbour it
+    # shares most outline with.
+    walkways = [
+        i for i, (p, k) in enumerate(pieces)
+        if k // 16 == WALKWAY and _hairpins(p, limit_deg) and (
+            shapely.maximum_inscribed_circle(p).length < SLIVER_M
+            or (p.area <= SLIVER_MAX_M2 and _hairpins(p, HAIRPIN_ALWAYS_DEG))
+        )
+    ]
+    if walkways:
+        others = [i for i, (_, k) in enumerate(pieces) if k // 16 != WALKWAY]
+        tree = shapely.STRtree(np.array([pieces[i][0] for i in others], dtype=object))
+        pieces = list(pieces)
+        for i in walkways:
+            polygon = pieces[i][0]
+            near = tree.query(polygon, predicate="intersects")
+            shared = [
+                (polygon.boundary.intersection(pieces[others[j]][0].boundary).length, others[j])
+                for j in near
+            ]
+            if shared:
+                _, best = max(shared)
+                pieces[i] = (polygon, pieces[best][1])
+                removed += 1
+    return pieces, removed
 
 
 def _constraints(pieces):

@@ -867,16 +867,15 @@ def check_environment() -> list[str]:
 
     # Not shutil.which: on macOS Blender is an .app bundle, so its executable
     # is never on PATH however it was installed.
-    from pipeline import search_for_blender
+    from pipeline import pip_bpy_version, search_for_blender
 
-    if not search_for_blender():
-        try:
-            import bpy  # noqa: F401
-        except ImportError:
-            notes.append(
-                "no Blender found: install it from blender.org, or "
-                "pip install bpy (CPython 3.11)"
-            )
+    # The pip module by its package record: importing it here would load all
+    # of Blender into the web server.
+    if not search_for_blender() and pip_bpy_version() is None:
+        notes.append(
+            "no Blender found: install Blender 5 from blender.org, or "
+            "pip install -r requirements.txt (CPython 3.13)"
+        )
     return notes
 
 

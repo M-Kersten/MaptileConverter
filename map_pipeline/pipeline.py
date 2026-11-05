@@ -274,10 +274,56 @@ def search_for_blender() -> list[str]:
     return found
 
 
+# The Blender the pipeline is built for: the curb generator needs the Bevel
+# geometry node, which Blender 5 brought. An older one still builds the
+# model, with the walkways flat.
+BLENDER_WANTED = (5, 0)
+
+
+def blender_version(executable: str) -> tuple[int, ...] | None:
+    """The version an installed Blender reports, or None if it will not say."""
+    import re
+
+    try:
+        result = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"Blender (\d+)\.(\d+)(?:\.(\d+))?", result.stdout or "")
+    return tuple(int(g) for g in match.groups() if g is not None) if match else None
+
+
+def pip_bpy_version() -> tuple[int, ...] | None:
+    """The pip `bpy` module's version, read without importing Blender."""
+    from importlib import metadata
+
+    try:
+        text = metadata.version("bpy")
+    except metadata.PackageNotFoundError:
+        return None
+    parts = []
+    for piece in text.split(".")[:3]:
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
+
+def _named(version: tuple[int, ...] | None) -> str:
+    return ".".join(str(v) for v in version) if version else "of unknown version"
+
+
 def find_blender(explicit: str | None) -> tuple[str, list[str]]:
     """Work out how to run the Blender stage.
 
-    Returns the mode ("executable" or "bpy") and the command prefix.
+    Returns the mode ("executable" or "bpy") and the command prefix. An
+    explicit `--blender` is used as given. Otherwise a Blender 5 installed on
+    this machine, then the pip module if it is Blender 5 -- which is what the
+    launchers install -- and only then an older Blender, saying what that
+    costs: a machine with Blender 4.2 still installed would otherwise go on
+    using it and lose the kerbs without a word.
     """
     if explicit:
         path = Path(explicit).expanduser()
@@ -289,28 +335,42 @@ def find_blender(explicit: str | None) -> tuple[str, list[str]]:
         return "executable", [str(path) if path.is_file() else explicit]
 
     found = search_for_blender()
-    if found:
-        LOG.info("using Blender at %s", found[0])
-        return "executable", [found[0]]
+    versions: dict[str, tuple[int, ...] | None] = {}
+    for executable in found:
+        versions[executable] = blender_version(executable)
+        if (versions[executable] or (0,)) >= BLENDER_WANTED:
+            LOG.info("using Blender %s at %s", _named(versions[executable]), executable)
+            return "executable", [executable]
 
-    try:
-        import bpy  # noqa: F401
-    except ImportError:
-        looked = "\n  ".join(
-            [shutil.which("blender") or "PATH (blender, Blender, blender.exe)"]
-            + [str(Path(p).expanduser()) for p in BLENDER_GLOBS]
+    module = pip_bpy_version()
+    if module is not None and module >= BLENDER_WANTED:
+        LOG.info("using the pip bpy module, Blender %s", _named(module))
+        return "bpy", [sys.executable]
+
+    older = "the walkways will have no kerbs: the curb generator needs Blender 5"
+    if found:
+        LOG.warning(
+            "using Blender %s at %s; %s", _named(versions[found[0]]), found[0], older
         )
-        raise SystemExit(
-            "no Blender available. Looked in:\n  "
-            + looked
-            + "\n\nIf Blender is installed somewhere else, pass it directly -- "
-            "on a Mac the app bundle itself is fine:\n"
-            "  python pipeline.py --config config.json "
-            "--blender /Applications/Blender.app\n"
-            "Otherwise install the pip module with `pip install bpy`, which "
-            "needs CPython 3.11."
-        ) from None
-    return "bpy", [sys.executable]
+        return "executable", [found[0]]
+    if module is not None:
+        LOG.warning("using the pip bpy module, Blender %s; %s", _named(module), older)
+        return "bpy", [sys.executable]
+
+    looked = "\n  ".join(
+        [shutil.which("blender") or "PATH (blender, Blender, blender.exe)"]
+        + [str(Path(p).expanduser()) for p in BLENDER_GLOBS]
+    )
+    raise SystemExit(
+        "no Blender available. Looked in:\n  "
+        + looked
+        + "\n\nIf Blender is installed somewhere else, pass it directly -- "
+        "on a Mac the app bundle itself is fine:\n"
+        "  python pipeline.py --config config.json "
+        "--blender /Applications/Blender.app\n"
+        "Otherwise install Blender 5 from blender.org, or the pip module with "
+        "`pip install -r requirements.txt`, which needs CPython 3.13."
+    )
 
 
 def run_blender_script(
