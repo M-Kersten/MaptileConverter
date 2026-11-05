@@ -12,7 +12,10 @@ Fit terrain under roads
     enough, the corners under the road most. Only ever lowers, so a sculpt
     survives it; to get ground back from under a road you moved away, Reset
     first and Fit after. Works on the terrain whatever its faces: the grid,
-    the rows along the outlines, or anything you have remeshed.
+    the rows along the outlines, or anything you have remeshed. In the
+    layered style the roads, walkways and grass are wrapped or draped onto
+    the terrain and follow it by themselves; only one whose Shrinkwrap or
+    drape was removed or applied is fitted under.
 
 Reset terrain to survey
     Put every terrain vertex back at the surveyed height it was built from,
@@ -20,9 +23,9 @@ Reset terrain to survey
 
 Drop selected onto ground
     Move each selected object straight down (or up) so its origin sits on the
-    road or terrain under it. Buildings, trees and road pieces all have their
-    origin on the ground, so this is how something moved sideways gets back
-    onto the surface.
+    road, walkway, grass or terrain under it. Buildings, trees and road
+    pieces all have their origin on the ground, so this is how something
+    moved sideways gets back onto the surface.
 
 Export FBX for Unity
     The pipeline's own export settings, so a re-export from an edited model
@@ -34,12 +37,14 @@ Only bpy and numpy are used, both of which Blender bundles.
 bl_info = {
     "name": "Maptile tools",
     "author": "MaptileConverter",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > Maptile",
     "description": "Keep roads and terrain fitted together while editing",
     "category": "Object",
 }
+
+import contextlib
 
 import bpy
 import numpy as np
@@ -50,10 +55,51 @@ HIDDEN_VERTEX_WEIGHT = 4.0
 ROAD_CELL_M = 0.25
 ROAD_COLLECTION = "Roads"
 TERRAIN_NAME = "Terrain"
+# What blender/process.py stores as `maptile_role` on the layered style's
+# objects: the terrain, and what lies on it.
+GROUND_ROLES = ("road", "walkway", "grass")
 
 
 # A face of the ground under a road, in the terrain's `ground_kind` attribute.
 GROUND_UNDER_ROAD = 1
+
+
+def _terrain_object():
+    """The terrain: the object the pipeline marked as one, else by its name."""
+    for obj in bpy.data.objects:
+        if obj.type == "MESH" and obj.get("maptile_role") == "terrain":
+            return obj
+    return bpy.data.objects.get(TERRAIN_NAME)
+
+
+def _follows(obj, terrain) -> bool:
+    """Whether a layer is wrapped or draped onto the terrain, so moves with it.
+
+    Roads and lawns carry a Shrinkwrap; a kerbed walkway the pipeline's
+    Maptile_Drape geometry nodes, which read the terrain the same way.
+    """
+    for m in obj.modifiers:
+        if not m.show_viewport:
+            continue
+        if m.type == "SHRINKWRAP" and m.target == terrain:
+            return True
+        group = getattr(m, "node_group", None) if m.type == "NODES" else None
+        if group is not None and group.name.startswith("Maptile_Drape"):
+            return True
+    return False
+
+
+def _road_objects(terrain):
+    """What the terrain has to stay under: the roads, less any wrapped onto it."""
+    found = []
+    collection = bpy.data.collections.get(ROAD_COLLECTION)
+    if collection is not None:
+        found.extend(o for o in collection.all_objects if o.type == "MESH")
+    for obj in bpy.data.objects:
+        if obj.type == "MESH" and obj.get("maptile_role") in ("road", "walkway"):
+            if obj not in found:
+                found.append(obj)
+    return [o for o in found if terrain is None or not _follows(o, terrain)]
 
 
 def _terrain_mesh(obj):
@@ -61,8 +107,9 @@ def _terrain_mesh(obj):
 
     Triangles as the export draws them: a quad split from its first corner to
     its third, a larger face fanned from its first corner. A vertex shows if
-    any face round it is not ground under a road; without the attribute -- a
-    terrain someone has rebuilt -- every vertex counts as showing.
+    any face round it is not ground under a road (or, in the layered style,
+    under a layer); without the attribute -- a terrain someone has rebuilt --
+    every vertex counts as showing.
     """
     mesh = obj.data
     count = len(mesh.vertices)
@@ -86,13 +133,21 @@ def _terrain_mesh(obj):
         [loops[first], loops[first + step], loops[first + step + 1]]
     )
     visible = np.ones(count, dtype=bool)
-    kind = mesh.attributes.get("ground_kind")
-    if kind is not None and kind.domain == "FACE":
-        values = np.empty(len(mesh.polygons), dtype=np.int32)
-        kind.data.foreach_get("value", values)
+    covered = None
+    for name, test in (
+        ("ground_kind", lambda v: v == GROUND_UNDER_ROAD),
+        ("ground_layer", lambda v: v != 0),
+    ):
+        attribute = mesh.attributes.get(name)
+        if attribute is not None and attribute.domain == "FACE":
+            values = np.empty(len(mesh.polygons), dtype=np.int32)
+            attribute.data.foreach_get("value", values)
+            covered = test(values)
+            break
+    if covered is not None:
         face_of_loop = np.repeat(np.arange(len(totals)), totals)
         visible[:] = False
-        visible[loops[values[face_of_loop] != GROUND_UNDER_ROAD]] = True
+        visible[loops[~covered[face_of_loop]]] = True
     return co, triangles, visible
 
 
@@ -187,16 +242,11 @@ class TriangleLocator:
         return tri, weights
 
 
-def _road_triangles(context):
+def _road_triangles(context, objects):
     """World-space triangles of every road surface, kerbs and skirts left out."""
-    collection = bpy.data.collections.get(ROAD_COLLECTION)
-    if collection is None:
-        return np.zeros((0, 3, 3))
     depsgraph = context.evaluated_depsgraph_get()
     out = []
-    for obj in collection.all_objects:
-        if obj.type != "MESH":
-            continue
+    for obj in objects:
         evaluated = obj.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh()
         try:
@@ -317,16 +367,20 @@ class MAPTILE_OT_fit_terrain(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        terrain = bpy.data.objects.get(TERRAIN_NAME)
+        terrain = _terrain_object()
         if terrain is None:
-            self.report({"ERROR"}, f"no object called {TERRAIN_NAME}")
+            self.report({"ERROR"}, f"no terrain: no object called {TERRAIN_NAME}")
             return {"CANCELLED"}
         found = _terrain_mesh(terrain)
         if found is None:
             self.report({"ERROR"}, "the terrain has no faces")
             return {"CANCELLED"}
+        roads = _road_objects(terrain)
+        if not roads:
+            self.report({"INFO"}, "nothing to fit: every road follows the terrain")
+            return {"FINISHED"}
         xyz, triangles, visible = found
-        points = _underside_points(_road_triangles(context), ROAD_CELL_M)
+        points = _underside_points(_road_triangles(context, roads), ROAD_CELL_M)
         heights, moved = fit_terrain(xyz, triangles, visible, points)
         _write_heights(terrain, heights)
         self.report({"INFO"}, f"lowered {moved} terrain vertices")
@@ -340,7 +394,7 @@ class MAPTILE_OT_reset_terrain(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        terrain = bpy.data.objects.get(TERRAIN_NAME)
+        terrain = _terrain_object()
         measured = terrain and terrain.data.attributes.get("measured_z")
         if not measured:
             self.report({"ERROR"}, "the terrain carries no surveyed heights")
@@ -367,12 +421,15 @@ class MAPTILE_OT_drop_to_ground(bpy.types.Operator):
         depsgraph = context.evaluated_depsgraph_get()
         scene = context.scene
         targets = set()
-        terrain = bpy.data.objects.get(TERRAIN_NAME)
+        terrain = _terrain_object()
         if terrain is not None:
             targets.add(terrain.name)
         roads = bpy.data.collections.get(ROAD_COLLECTION)
         if roads is not None:
             targets.update(o.name for o in roads.all_objects)
+        targets.update(
+            o.name for o in bpy.data.objects if o.get("maptile_role") in GROUND_ROLES
+        )
         moved = 0
         for obj in context.selected_objects:
             origin = obj.matrix_world.translation.copy()
@@ -401,27 +458,48 @@ class MAPTILE_OT_drop_to_ground(bpy.types.Operator):
         return {"FINISHED"}
 
 
+@contextlib.contextmanager
+def render_modifiers():
+    """Every modifier as the render has it, for as long as an export runs.
+
+    As blender/process.py: the FBX exporter applies what the viewport shows,
+    so the triangulation that is on for render only is switched on for it.
+    """
+    switched = []
+    for obj in bpy.data.objects:
+        for modifier in getattr(obj, "modifiers", ()):
+            if modifier.show_viewport != modifier.show_render:
+                switched.append((modifier, modifier.show_viewport))
+                modifier.show_viewport = modifier.show_render
+    try:
+        yield len(switched)
+    finally:
+        for modifier, shown in switched:
+            modifier.show_viewport = shown
+
+
 def export_unity_fbx(path):
     """The pipeline's export settings: see blender/process.py export_fbx."""
-    bpy.ops.export_scene.fbx(
-        filepath=str(path),
-        use_selection=False,
-        apply_unit_scale=True,
-        apply_scale_options="FBX_SCALE_ALL",
-        global_scale=1.0,
-        axis_forward="-Z",
-        axis_up="Y",
-        bake_space_transform=False,
-        object_types={"MESH", "EMPTY"},
-        use_mesh_modifiers=True,
-        use_mesh_modifiers_render=True,
-        use_custom_props=True,
-        mesh_smooth_type="FACE",
-        use_tspace=True,
-        path_mode="STRIP",
-        embed_textures=False,
-        bake_anim=False,
-    )
+    with render_modifiers():
+        bpy.ops.export_scene.fbx(
+            filepath=str(path),
+            use_selection=False,
+            apply_unit_scale=True,
+            apply_scale_options="FBX_SCALE_ALL",
+            global_scale=1.0,
+            axis_forward="-Z",
+            axis_up="Y",
+            bake_space_transform=False,
+            object_types={"MESH", "EMPTY"},
+            use_mesh_modifiers=True,
+            use_mesh_modifiers_render=True,
+            use_custom_props=True,
+            mesh_smooth_type="FACE",
+            use_tspace=True,
+            path_mode="STRIP",
+            embed_textures=False,
+            bake_anim=False,
+        )
 
 
 class MAPTILE_OT_export_unity(bpy.types.Operator):

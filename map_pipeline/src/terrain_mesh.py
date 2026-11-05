@@ -95,6 +95,9 @@ class TerrainMesh:
     edge_on: np.ndarray  # (E,) bits
     grid_m: float = 2.0
     stats: dict = field(default_factory=dict)
+    # Bucket size for point location. A coarse mesh has faces of hundreds of
+    # square metres, which a grid-sized bucket would list thousands of times.
+    locator_cell: float | None = None
 
     def __len__(self) -> int:
         return int(len(self.face_sizes))
@@ -129,7 +132,7 @@ class TerrainMesh:
             triangles, _ = self.triangles()
             xy = self.vertices[:, :2]
             cached = TriangleLocator(
-                xy, triangles, cell=max(self.grid_m, 0.5),
+                xy, triangles, cell=self.locator_cell or max(self.grid_m, 0.5),
                 bounds=(*xy.min(axis=0), *xy.max(axis=0)),
             )
             self._locator = cached

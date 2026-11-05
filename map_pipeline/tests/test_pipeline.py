@@ -618,6 +618,35 @@ class TestTrees(unittest.TestCase):
         self.assertEqual(float(point_like[0]), 0.0)
         self.assertEqual(float(wider[0]), 14.0)
 
+    def test_registered_trees_may_stand_close_found_ones_may_not(self):
+        """Hazeldonk's register has clumps planted 0.7 m apart, which is the
+        register's business. A found tree that close to another is the
+        detector drawing one twice -- including a pair the old check, which
+        only compared neighbours in order of x, could not see."""
+        from src.geo import BBox
+        from src.validate import CheckReport, check_trees
+
+        class Trees:
+            def __init__(self, points):
+                self.trees = [types_namespace(x=x, y=y, height_m=8.0, detected=found)
+                              for x, y, found in points]
+                self.superseded_dropped = 0
+
+            def __len__(self):
+                return len(self.trees)
+
+        def verdict(points):
+            report = CheckReport()
+            check_trees(report, Trees(points), BBox(0.0, 0.0, 100.0, 100.0))
+            return {c.name: c for c in report.checks}["no_two_trees_share_a_spot"]
+
+        far = [(80.0, 80.0, True), (90.0, 10.0, True)]
+        self.assertTrue(verdict([(10.0, 10.0, False), (10.5, 10.5, False), *far]).passed)
+        self.assertFalse(verdict([(10.0, 10.0, False), (10.5, 10.5, True), *far]).passed)
+        hidden = [(20.0, 20.0, True), (20.5, 70.0, False), (20.9, 20.3, True), *far]
+        self.assertFalse(verdict(hidden).passed)
+        self.assertIn("0.95 m", verdict(hidden).detail)
+
 
 class TestTreeDetection(unittest.TestCase):
     """Finding the trees the BGT never registered.
@@ -4971,6 +5000,65 @@ class TestConfig(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_config(path)
 
+    def _load(self, raw: dict):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(raw))
+            return load_config(path)
+
+    BBOX = {"crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
+            "xmax": 137000, "ymax": 456000}
+
+    def test_the_default_style_is_the_modellers(self):
+        """Layered unless asked: no water, no street-by-street road meshes,
+        no parked cars, and object names prefixed after the area."""
+        config = self._load({"name": "hazeldonk_west", "bbox": self.BBOX})
+        self.assertEqual(config.style, "layered")
+        self.assertFalse(config.surfaces["water"])
+        self.assertFalse(config.surfaces["road_geometry"])
+        self.assertEqual(config.terrain["feature_edges"], [])
+        self.assertFalse(config.vehicles["cars"])
+        self.assertEqual(config.layered["prefix"], "Hazeldonk_West")
+        self.assertEqual(config.as_dict()["style"], "layered")
+        survey = self._load({"name": "x", "bbox": self.BBOX, "style": "Survey"})
+        self.assertEqual(survey.style, "survey")
+        self.assertTrue(survey.surfaces["water"])
+        self.assertTrue(survey.surfaces["road_geometry"])
+
+    def test_a_style_preset_gives_way_except_where_it_cannot(self):
+        """Cars can be asked for in the layered style; water cannot, since the
+        coarse terrain has no bed for it, and the file is told so."""
+        raw = {"name": "x", "bbox": self.BBOX, "vehicles": {"cars": True},
+               "surfaces": {"water": True}}
+        with self.assertLogs("src.config", level="WARNING") as logs:
+            config = self._load(raw)
+        self.assertTrue(config.vehicles["cars"])
+        self.assertFalse(config.surfaces["water"])
+        self.assertIn("surfaces.water", " ".join(logs.output))
+        self.assertTrue(self._load({**raw, "style": "survey"}).surfaces["water"])
+
+    def test_the_layered_settings_are_checked(self):
+        base = {"name": "x", "bbox": self.BBOX}
+        with self.assertRaises(ValueError):
+            self._load({**base, "style": "handmade"})
+        for bad in ({"tolerance_m": 0}, {"focus_m": -1}, {"road_lift_m": -0.1},
+                    {"curb": {"height_offset_curb_m": 0.2}}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self._load({**base, "layered": bad})
+        config = self._load({**base, "layered": {"prefix": " Tankstation ",
+                                                 "tolerance_m": "0.25"}})
+        self.assertEqual(config.layered["prefix"], "Tankstation")
+        self.assertEqual(config.layered["tolerance_m"], 0.25)
+        self.assertEqual(config.layered["curb"]["height_m"], 0.15)
+
+    def test_an_area_name_makes_a_clean_prefix(self):
+        from src.config import default_prefix
+
+        self.assertEqual(default_prefix("hazeldonk_west"), "Hazeldonk_West")
+        self.assertEqual(default_prefix("A12 knooppunt-Gouwe"), "A12_Knooppunt_Gouwe")
+        self.assertEqual(default_prefix("café de Ĳssel/2"), "Cafe_De_IJssel2")
+        self.assertEqual(default_prefix("__"), "Area")
+
     def test_defaults_fill_in_missing_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "minimal.json"
@@ -6405,11 +6493,15 @@ class TestTerrainMesh(unittest.TestCase):
     def test_the_config_names_what_the_terrain_follows(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
-            base = {"name": "x", "bbox": {"crs": "EPSG:28992", "xmin": 136000,
-                                          "ymin": 455000, "xmax": 137000, "ymax": 456000}}
+            base = {"name": "x", "style": "survey",
+                    "bbox": {"crs": "EPSG:28992", "xmin": 136000,
+                             "ymin": 455000, "xmax": 137000, "ymax": 456000}}
             path.write_text(json.dumps(base))
             self.assertEqual(load_config(path).terrain["feature_edges"],
                              ["water", "roads", "buildings"])
+            # The layered style's terrain follows its own layers' outlines.
+            path.write_text(json.dumps({**base, "style": "layered"}))
+            self.assertEqual(load_config(path).terrain["feature_edges"], [])
             path.write_text(json.dumps({**base, "terrain": {"feature_edges": False}}))
             self.assertEqual(load_config(path).terrain["feature_edges"], [])
             path.write_text(json.dumps({**base, "terrain": {"feature_edges": ["Water"]}}))
@@ -6607,6 +6699,690 @@ def types_namespace(**kwargs):
     import types
 
     return types.SimpleNamespace(**kwargs)
+
+
+def _rect_ring(x0, y0, x1, y1):
+    return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]], dtype=float)
+
+
+def _layered_fixture():
+    """A 160 m square with everything the layered ground is made of.
+
+    Lumpy ground with the motorway on a 2 m bank along the south, a street
+    across the middle with a footpath either side and a brick side street
+    off it to the north, a lawn, a green traffic island in the street (a
+    hole in the street's polygon, as the BGT has it), and a bridge deck at
+    level 1, which the layers leave to the structures stage.
+    """
+    from src.elevation import TerrainResult
+    from src.geo import BBox
+    from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY, GroundArea
+
+    bbox = BBox(1000.0, 2000.0, 1160.0, 2160.0)
+    axis_x = np.linspace(bbox.xmin, bbox.xmax, 81)
+    axis_y = np.linspace(bbox.ymin, bbox.ymax, 81)
+    gx, gy = np.meshgrid(axis_x, axis_y)
+    heights = (
+        3.0 + 1.5 * np.sin((gx - 1000.0) / 23.0) * np.cos((gy - 2000.0) / 31.0)
+        + np.clip((20.0 - np.abs(gy - 2020.0)) / 5.0, 0.0, 2.0)
+    ).astype(np.float32)
+    terrain = TerrainResult(
+        heights=heights.copy(), xs=axis_x, ys=axis_y, bbox=bbox, center_z_nap=3.0,
+        nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
+        coverage_id="t", resolution_m=0.5, measured=heights.copy(),
+    )
+    island = _rect_ring(1120.0, 2078.0, 1130.0, 2082.0)
+    areas = [
+        GroundArea([_rect_ring(1000.0, 2010.0, 1160.0, 2030.0)], MOTORWAY, "Asfalt"),
+        GroundArea([_rect_ring(1000.0, 2075.0, 1160.0, 2085.0), island[::-1]], ROAD, "Asfalt"),
+        GroundArea([_rect_ring(1075.0, 2085.0, 1085.0, 2160.0)], ROAD, "Bakstenen"),
+        GroundArea([_rect_ring(1000.0, 2072.0, 1160.0, 2075.0)], WALKWAY, "Beton_Geel"),
+        GroundArea([_rect_ring(1000.0, 2085.0, 1075.0, 2088.0)], WALKWAY, "Beton_Geel"),
+        GroundArea([_rect_ring(1085.0, 2085.0, 1160.0, 2088.0)], WALKWAY, "Beton_Geel"),
+        GroundArea([island], GRASS, "Gras"),
+        GroundArea([_rect_ring(1100.0, 2100.0, 1150.0, 2150.0)], GRASS, "Gras"),
+        GroundArea([_rect_ring(1030.0, 2000.0, 1040.0, 2045.0)], ROAD, "Asfalt", level=1),
+    ]
+    return terrain, areas
+
+
+class TestLayeredGround(unittest.TestCase):
+    """The modellers' ground: a coarse terrain and the layers lying on it.
+
+    What the person opening the model gets: a terrain no further from the
+    survey than asked, every road, walkway and lawn an object of its own
+    whose outline is an edge of that terrain, named the way the hand-made
+    file names them, and every placed thing standing on the layer under it.
+    """
+
+    TOLERANCE = 0.3
+
+    @classmethod
+    def setUpClass(cls):
+        from src.layered import build_layered_ground
+
+        cls.terrain, cls.areas = _layered_fixture()
+        cls.ground = build_layered_ground(
+            cls.terrain, cls.areas, prefix="T", tolerance_m=cls.TOLERANCE, focus_m=50.0,
+        )
+        cls.mesh = cls.ground.mesh
+
+    def _at(self, x, y):
+        """The face under RD point (x, y): its layer and material name."""
+        from src.layered import MATERIAL_NAMES
+
+        tri, _ = self.mesh.locator().locate(np.array([x]), np.array([y]))
+        _, owner = self.mesh.triangles()
+        face = int(owner[tri[0]])
+        material = int(self.ground.face_material[face])
+        return int(self.mesh.face_kind[face]), (MATERIAL_NAMES[material] if material >= 0 else None)
+
+    def test_the_bgt_is_read_the_way_the_modellers_draw_it(self):
+        from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY, classify
+
+        cases = [
+            ("wegdeel", {"functie": "rijbaan autosnelweg", "fysiek_voorkomen": "gesloten verharding"},
+             (MOTORWAY, "Asfalt")),
+            ("wegdeel", {"functie": "rijbaan autoweg"}, (MOTORWAY, "Asfalt")),
+            ("wegdeel", {"functie": "rijbaan lokale weg", "fysiek_voorkomen": "gesloten verharding"},
+             (ROAD, "Asfalt")),
+            ("wegdeel", {"functie": "rijbaan lokale weg", "plus_fysiek_voorkomen": "klinkers"},
+             (ROAD, "Bakstenen")),
+            ("wegdeel", {"functie": "fietspad"}, (ROAD, "Fietspad")),
+            ("wegdeel", {"functie": "voetpad"}, (WALKWAY, "Beton_Geel")),
+            ("wegdeel", {"functie": "voetgangersgebied"}, (WALKWAY, "Beton_Geel")),
+            ("wegdeel", {"functie": "ruiterpad", "fysiek_voorkomen": "onverhard"}, None),
+            ("ondersteunendwegdeel", {"functie": "verkeerseiland", "fysiek_voorkomen": "open verharding"},
+             (WALKWAY, "Beton_Geel")),
+            ("ondersteunendwegdeel", {"functie": "verkeerseiland", "fysiek_voorkomen": "groenvoorziening"},
+             (GRASS, "Gras")),
+            ("ondersteunendwegdeel", {"functie": "berm", "fysiek_voorkomen": "groenvoorziening"},
+             (GRASS, "Gras")),
+            ("ondersteunendwegdeel", {"functie": "berm", "fysiek_voorkomen": "half verhard"},
+             (ROAD, "Verharding")),
+            ("ondersteunendwegdeel", {"functie": "berm", "fysiek_voorkomen": "onverhard"}, None),
+            ("begroeidterreindeel", {"fysiek_voorkomen": "grasland overig"}, (GRASS, "Gras")),
+            ("onbegroeidterreindeel", {"fysiek_voorkomen": "gesloten verharding"},
+             (ROAD, "Verharding")),
+            ("onbegroeidterreindeel", {"fysiek_voorkomen": "zand"}, None),
+            ("waterdeel", {"type": "watergang"}, None),
+        ]
+        for collection, properties, want in cases:
+            with self.subTest(collection=collection, properties=properties):
+                self.assertEqual(classify(collection, properties), want)
+
+    def test_the_terrain_is_one_closed_sheet(self):
+        from src.validate import CheckReport, check_terrain_mesh
+
+        report = CheckReport()
+        check_terrain_mesh(report, types_namespace(mesh=self.mesh), expect_outlines=False)
+        failed = [str(c) for c in report.checks if not c.passed]
+        self.assertEqual(failed, [])
+        names = {c.name for c in report.checks}
+        self.assertIn("terrain_follows_the_layer_outlines", names)
+        self.assertEqual(self.ground.stats["outline_edges_missing"], 0)
+
+    def test_no_face_is_flat(self):
+        """A zero-area triangle dropped from the triangulation leaves its
+        neighbours a T-junction apart: Hazeldonk had three such cracks."""
+        xy = self.mesh.vertices[:, :2] - self.mesh.vertices[:, :2].min(axis=0)
+        loops = self.mesh.face_loops
+        following = np.arange(len(loops)) + 1
+        starts = self.mesh.loop_starts
+        following[starts + self.mesh.face_sizes - 1] = starts
+        twice = np.add.reduceat(
+            xy[loops, 0] * xy[loops[following], 1] - xy[loops[following], 0] * xy[loops, 1], starts
+        )
+        self.assertGreater(float(twice.min()), 1e-6)
+
+    def test_every_surveyed_node_is_within_the_tolerance(self):
+        """Measured on the faces as drawn, each quad split first corner to
+        third as Blender draws it and the export cuts it."""
+        stats = self.ground.stats
+        self.assertLessEqual(stats["grid_error_max_m"], self.TOLERANCE + 1e-9)
+        gx, gy = np.meshgrid(self.terrain.xs, self.terrain.ys)
+        drawn = self.mesh.locator().interpolate(
+            self.mesh.vertices[:, 2], gx.ravel(), gy.ravel()
+        )
+        error = np.abs(drawn - self.terrain.measured.ravel())
+        self.assertLessEqual(float(np.nanmax(error)), self.TOLERANCE + 1e-6)
+        # Coarse: far fewer vertices than the grid it was fitted to.
+        self.assertLess(len(self.mesh.vertices), 0.5 * gx.size)
+        self.assertGreater(stats["quad_share"], 0.2)
+
+    def test_a_flat_triangle_is_mended_not_dropped(self):
+        """Three outline points on a line, (0,0), (1,0) and (2,0): the
+        triangulator gave Hazeldonk a flat triangle along them, under a
+        triangle that spans the line whole. Dropped, the middle point is a
+        corner below the line and not above it: a crack. Mended, the
+        triangle above is split at the middle point."""
+        from src.layered import _without_flat
+
+        points = np.array([[0.0, 0.0], [2.0, 0.0], [1.0, 1.0], [1.0, 0.0], [1.0, -1.0]])
+        a, b, c, m, d = range(5)
+        tris = np.array([[a, b, c], [a, m, b], [a, d, m], [m, d, b]])
+        mended = _without_flat(points, tris)
+        corners = points[mended]
+        twice = ((corners[:, 1, 0] - corners[:, 0, 0]) * (corners[:, 2, 1] - corners[:, 0, 1])
+                 - (corners[:, 2, 0] - corners[:, 0, 0]) * (corners[:, 1, 1] - corners[:, 0, 1]))
+        self.assertTrue((twice > 0).all(), "a flat or flipped triangle is left")
+        self.assertAlmostEqual(float(twice.sum()) / 2.0, 2.0)
+        edges = np.sort(np.vstack([mended[:, [0, 1]], mended[:, [1, 2]], mended[:, [2, 0]]]), axis=1)
+        unique, counts = np.unique(edges, axis=0, return_counts=True)
+        outside = {tuple(sorted(e)) for e in ((a, c), (c, b), (b, d), (d, a))}
+        for edge, count in zip(map(tuple, unique), counts):
+            self.assertEqual(count, 1 if edge in outside else 2, f"edge {edge}")
+
+    def test_the_triangulation_has_no_flat_triangle_in_it(self):
+        """Points on the 1 cm grid the outlines are snapped to, for which the
+        triangulator returns a flat triangle along (-5.65, 3.57), (-3.67,
+        5.88) and (-1.75, 8.12), inside the hull (found by search: about one
+        set in two thousand). Dropped, it leaves three cracks."""
+        import shapely
+
+        from src.layered import _delaunay
+
+        points = np.array([
+            [-5.65, 3.57], [-3.67, 5.88], [-2.99, 6.68], [-1.75, 8.12], [-0.71, 20.15],
+            [0.86, 11.17], [1.88, -4.39], [10.35, -4.0], [11.42, 24.51], [13.41, 4.61],
+            [16.14, 11.69],
+        ])
+        tris = _delaunay(points)
+        corners = points[tris]
+        twice = ((corners[:, 1, 0] - corners[:, 0, 0]) * (corners[:, 2, 1] - corners[:, 0, 1])
+                 - (corners[:, 2, 0] - corners[:, 0, 0]) * (corners[:, 1, 1] - corners[:, 0, 1]))
+        self.assertGreater(float(twice.min()), 1e-9)
+        hull = shapely.convex_hull(shapely.multipoints(points)).area
+        self.assertAlmostEqual(float(twice.sum()) / 2.0, hull, places=9)
+        edges = np.sort(np.vstack([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+        unique, counts = np.unique(edges, axis=0, return_counts=True)
+        self.assertLessEqual(int(counts.max()), 2)
+        # An edge with a face on one side only is on the hull: inside it, that
+        # is a crack, the middle point a corner on one side and not the other.
+        rim = shapely.convex_hull(shapely.multipoints(points)).exterior
+        middles = shapely.points(points[unique[counts == 1]].mean(axis=1))
+        self.assertLess(float(shapely.distance(rim, middles).max()), 1e-9)
+
+    def test_a_quad_is_the_two_triangles_that_were_fitted(self):
+        from src.layered import _faces
+
+        # Two triangles sharing the edge (0, 0)-(2, 2), the long way across
+        # the quad: split the other way, the quad is a different surface.
+        points = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
+        tris = np.array([[0, 1, 2], [0, 2, 3]])
+        faces, codes = _faces(points, tris, np.zeros(2, dtype=np.int64))
+        self.assertEqual(len(faces), 1)
+        quad = list(faces[0])
+        self.assertEqual({quad[0], quad[2]}, {0, 2})
+        self.assertEqual(sorted(quad), [0, 1, 2, 3])
+
+    def test_each_area_is_its_layer(self):
+        from src.layered import GRASS, MOTORWAY, ROAD, TERRAIN, WALKWAY
+
+        probes = {
+            (1080.0, 2020.0): (MOTORWAY, "Asfalt"),
+            (1050.0, 2080.0): (ROAD, "Asfalt"),
+            (1080.0, 2120.0): (ROAD, "Bakstenen"),
+            (1050.0, 2073.5): (WALKWAY, "Beton_Geel"),
+            (1125.0, 2125.0): (GRASS, "Gras"),
+            (1010.0, 2150.0): (TERRAIN, None),
+        }
+        for (x, y), want in probes.items():
+            with self.subTest(x=x, y=y):
+                self.assertEqual(self._at(x, y), want)
+
+    def test_a_green_island_in_the_street_is_raised_and_kerbed(self):
+        """Paving all round, small: a walkway, so the curb generator kerbs it,
+        still green on top. The lawn beside the side street stays grass."""
+        from src.layered import GRASS, WALKWAY
+
+        self.assertEqual(self._at(1125.0, 2080.0), (WALKWAY, "Gras"))
+        self.assertEqual(self._at(1110.0, 2110.0), (GRASS, "Gras"))
+
+    def test_a_bridge_deck_is_left_to_the_structures(self):
+        from src.layered import TERRAIN
+
+        self.assertEqual(self.ground.stats["parts_on_bridges_or_tunnels"], 1)
+        self.assertEqual(self._at(1035.0, 2040.0), (TERRAIN, None))
+
+    def test_the_objects_are_named_and_grouped_as_the_modellers_do(self):
+        from src.layered import TERRAIN
+
+        names = self.ground.object_names
+        pattern = re.compile(
+            r"^T_(Snelweg|Centrum_(Oost|West)_(Wegen|Voetpaden|Gras)"
+            r"|(Wegen|Voetpaden|Gras)_Afstand_[NZ][OW])$"
+        )
+        for name in names:
+            self.assertRegex(name, pattern)
+        self.assertEqual(len(set(names)), len(names))
+        self.assertIn("T_Snelweg", names)
+        self.assertTrue(any("Centrum" in n for n in names))
+        self.assertTrue(any("Afstand" in n for n in names))
+        self.assertEqual(self.ground.terrain_name, "T_Terrein")
+        layer = np.asarray(self.mesh.face_kind)
+        owner = self.ground.face_object
+        np.testing.assert_array_equal(owner < 0, layer == TERRAIN)
+        for index, object_layer in enumerate(self.ground.object_layer):
+            np.testing.assert_array_equal(layer[owner == index], object_layer)
+
+    def test_no_walkway_is_split_between_two_objects(self):
+        """The curb generator kerbs every edge where an object ends, so a
+        footpath cut in two would get a kerb across it."""
+        from src.layered import WALKWAY
+
+        mesh = self.mesh
+        sizes = mesh.face_sizes.astype(np.int64)
+        face_of = np.repeat(np.arange(len(sizes)), sizes)
+        following = np.arange(len(mesh.face_loops)) + 1
+        following[mesh.loop_starts + sizes - 1] = mesh.loop_starts
+        edges = np.sort(np.column_stack([mesh.face_loops, mesh.face_loops[following]]), axis=1)
+        walk = mesh.face_kind[face_of] == WALKWAY
+        seen: dict = {}
+        shared = 0
+        for edge, face in zip(map(tuple, edges[walk]), face_of[walk]):
+            if edge in seen:
+                shared += 1
+                self.assertEqual(self.ground.face_object[seen[edge]],
+                                 self.ground.face_object[face])
+            seen[edge] = face
+        self.assertGreater(shared, 0)
+
+    def test_things_stand_on_the_layer_under_them(self):
+        from src.layered import GRASS, ROAD, TERRAIN, WALKWAY
+
+        top = self.ground.top
+        self.assertAlmostEqual(top[WALKWAY], 0.05 + 0.13)
+        for (x, y), layer in {
+            (1050.0, 2080.0): ROAD, (1050.0, 2073.5): WALKWAY,
+            (1125.0, 2125.0): GRASS, (1010.0, 2150.0): TERRAIN,
+        }.items():
+            with self.subTest(layer=layer):
+                ground = self.mesh.locator().interpolate(
+                    self.mesh.vertices[:, 2], np.array([x]), np.array([y])
+                )[0]
+                self.assertAlmostEqual(
+                    float(self.ground.surface_at(x, y)), ground + top.get(layer, 0.0), places=6
+                )
+
+    def test_the_file_for_blender_needs_no_pickle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.ground.save(Path(tmp))
+            data = np.load(path)  # allow_pickle defaults to False
+            for key in data.files:
+                self.assertNotEqual(data[key].dtype, object, key)
+            self.assertEqual([str(n) for n in data["object_names"]], self.ground.object_names)
+            self.assertEqual(str(data["terrain_name"]), "T_Terrein")
+            self.assertEqual(len(data["face_object"]), len(self.mesh))
+
+    def test_zones_and_names(self):
+        from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY, object_name, zone_of
+
+        self.assertEqual(zone_of(10.0, -10.0, 250.0), (True, "Centrum_Oost"))
+        self.assertEqual(zone_of(-0.1, 300.0, 250.0), (False, "Afstand_NW"))
+        self.assertEqual(zone_of(300.0, -300.0, 250.0), (False, "Afstand_ZO"))
+        self.assertEqual(object_name("P", ROAD, (True, "Centrum_West")), "P_Centrum_West_Wegen")
+        self.assertEqual(object_name("P", GRASS, (False, "Afstand_NO")), "P_Gras_Afstand_NO")
+        self.assertEqual(object_name("P", WALKWAY, (True, "Centrum_Oost")),
+                         "P_Centrum_Oost_Voetpaden")
+        self.assertEqual(object_name("P", MOTORWAY, (False, "Afstand_ZW")), "P_Snelweg")
+
+
+def _process_namespace(names, extra=None):
+    """Functions and constants from blender/process.py, without Blender.
+
+    Each is exec'd on its own into one namespace, with whatever stand-ins for
+    bpy the caller passes in `extra`.
+    """
+    import ast
+    import contextlib
+
+    source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+    namespace = {"np": np, "Path": Path, "log": lambda *a: None, "contextlib": contextlib}
+    namespace.update(extra or {})
+    for node in ast.parse(source).body:
+        wanted = (
+            isinstance(node, ast.FunctionDef) and node.name in names
+        ) or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(n, ast.Name) and n.id in names
+                for target in node.targets for n in ast.walk(target)
+            )
+        )
+        if wanted:
+            exec(compile(ast.Module([node], []), "process.py", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+class _FakeModifiers(list):
+    def new(self, name, kind):
+        modifier = _FakeModifier(name=name, type=kind, show_viewport=True, show_render=True)
+        self.append(modifier)
+        return modifier
+
+
+class _FakeModifier(dict):
+    """A modifier: attributes as Blender's, item access as Blender 4's inputs."""
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.__dict__.update(kwargs)
+
+
+class _FakeMesh:
+    def __init__(self, vertices, loops, sizes):
+        self.co = np.asarray(vertices, dtype=np.float64)
+        self.loops = np.asarray(loops)
+        self.polygons = list(range(len(sizes)))
+        self.vertices = list(range(len(self.co)))
+        self.made = {}
+        starts = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
+        following = np.arange(len(self.loops)) + 1
+        following[starts + np.asarray(sizes) - 1] = starts
+        pairs = np.sort(np.column_stack([self.loops, self.loops[following]]), axis=1)
+        self.edge_pairs = np.unique(pairs, axis=0)
+        mesh = self
+
+        class Attributes:
+            @staticmethod
+            def new(name, kind, domain):
+                values = {}
+                mesh.made[name] = values
+
+                class data:  # noqa: N801 - mirrors bpy
+                    @staticmethod
+                    def foreach_set(key, array):
+                        values[key] = np.array(array)
+
+                return types_namespace(data=data)
+
+        class Edges(list):
+            @staticmethod
+            def foreach_get(key, out):
+                out[:] = mesh.edge_pairs.ravel()
+
+            @staticmethod
+            def foreach_set(key, array):
+                mesh.made["edge_" + key] = np.array(array)
+
+        self.attributes = Attributes
+        self.edges = Edges(range(len(self.edge_pairs)))
+
+
+class _FakeMeshObject(dict):
+    def __init__(self, name, vertices, loops, starts, sizes, uvs, slots, materials):
+        super().__init__()
+        self.name = name
+        self.type = "MESH"
+        self.data = _FakeMesh(vertices, loops, sizes)
+        self.modifiers = _FakeModifiers()
+        self.groups = {}
+        self.uvs, self.slots, self.materials = len(uvs), np.asarray(slots), list(materials)
+        owner = self
+
+        class Groups:
+            @staticmethod
+            def new(name):
+                members = []
+                owner.groups[name] = members
+                return types_namespace(add=lambda ids, w, mode: members.extend(ids))
+
+        self.vertex_groups = Groups
+
+
+class TestLayeredInBlender(unittest.TestCase):
+    """The Blender stage's half of the layered style, without Blender.
+
+    The functions are exec'd from blender/process.py against stand-ins that
+    record what Blender would be asked to make: which objects, their
+    vertices, and the modifiers stacked on each.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from src.layered import build_layered_ground
+
+        terrain, areas = _layered_fixture()
+        cls.ground = build_layered_ground(terrain, areas, prefix="T", focus_m=50.0)
+        cls.folder = Path(tempfile.mkdtemp())
+        cls.ground.save(cls.folder)
+
+    @staticmethod
+    def _group(name, sockets):
+        items = [types_namespace(item_type="SOCKET", in_out="INPUT", name=n, identifier=i)
+                 for n, i in sockets]
+        items.append(types_namespace(item_type="SOCKET", in_out="OUTPUT", name="Geometry",
+                                     identifier="Socket_0"))
+        return types_namespace(name=name, interface=types_namespace(items_tree=items))
+
+    @classmethod
+    def _curb_group(cls):
+        return cls._group("CurbGenerator", [
+            ("Width", "Socket_2"), ("Height", "Socket_3"),
+            ("Height Offset Curb", "Socket_4"), ("Walkway Material", "Socket_5"),
+            ("Curb Material", "Socket_6"),
+        ])
+
+    def _build(self, curb_group):
+        made = []
+
+        def build_mesh_object(name, vertices, loops, starts, sizes, uvs, slots, materials, **kw):
+            obj = _FakeMeshObject(name, vertices, loops, starts, sizes, uvs, slots, materials)
+            made.append(obj)
+            return obj
+
+        class _Layer:
+            def __init__(self, *args):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        namespace = _process_namespace(
+            {"build_layered", "_layer_objects", "_mark_layer_outlines", "_shrinkwrap",
+             "_weighted_normals", "_triangulate_on_export", "set_modifier_input",
+             "planar_uv", "LAYER_ROAD", "LAYER_MOTORWAY", "LAYER_WALKWAY", "LAYER_GRASS",
+             "LAYER_ROLES"},
+            {"build_mesh_object": build_mesh_object, "_Layer": _Layer,
+             "make_plain_material": lambda name, rgb, rough: f"material {name}",
+             "load_curb_generator": lambda: curb_group,
+             "_flatten_group": lambda: self._group("Maptile_Flatten", []),
+             "_drape_group": lambda: self._group(
+                 "Maptile_Drape", [("Terrain", "Socket_1"), ("Lift", "Socket_2")])},
+        )
+        # Unpacked from the tuple assignment above.
+        self.assertIn("LAYER_WALKWAY", namespace)
+        scene = {
+            "origin_rd": [1080.0, 2080.0], "ground_z_offset_nap": 0.0,
+            "aerial": {"bbox_local": [-80.0, -80.0, 80.0, 80.0]},
+            "layered": {
+                "file": "layered_ground.npz", "prefix": "T", "kerbs": True,
+                "curb": {"Width": 0.3, "Height": 0.15, "Height Offset Curb": 0.02},
+                "walkway_material": "", "curb_material": "Beton",
+            },
+        }
+        summary = namespace["build_layered"](scene, self.folder, "aerial")
+        return summary, {obj.name: obj for obj in made}
+
+    def test_one_object_for_the_terrain_and_one_per_layer_name(self):
+        summary, made = self._build(self._curb_group())
+        self.assertEqual(summary["terrain"], "T_Terrein")
+        self.assertEqual(summary["objects"], self.ground.object_names)
+        self.assertEqual(set(made), {"T_Terrein", *self.ground.object_names})
+        terrain = made["T_Terrein"]
+        self.assertEqual(terrain["maptile_role"], "terrain")
+        self.assertEqual(len(terrain.data.polygons), len(self.ground.mesh))
+        np.testing.assert_array_equal(
+            terrain.data.made["ground_layer"]["value"], self.ground.mesh.face_kind
+        )
+        self.assertTrue(terrain.data.made["edge_use_seam"].any())
+        self.assertIn("outline_walkway", terrain.groups)
+        for obj in made.values():
+            with self.subTest(obj=obj.name):
+                self.assertEqual(obj.uvs, len(obj.data.loops), "one UV per loop")
+                self.assertLess(int(obj.data.loops.max()), len(obj.data.co))
+
+    def test_each_layer_is_the_terrain_under_it_lifted_and_kept_on_it(self):
+        """A road or lawn is wrapped onto the terrain. A kerbed walkway is
+        laid flat for the curb generator and draped back on after: the
+        generator, made for level outlines, threw spikes up to 0.65 m on
+        ones that follow the survey."""
+        from src.layered import WALKWAY
+
+        _, made = self._build(self._curb_group())
+        terrain = made["T_Terrein"]
+        ground_z = {tuple(np.round(p[:2], 6)): p[2] for p in terrain.data.co}
+        for index, name in enumerate(self.ground.object_names):
+            obj = made[name]
+            layer = self.ground.object_layer[index]
+            lift = self.ground.lift[layer]
+            with self.subTest(obj=name):
+                below = np.array([ground_z[tuple(np.round(p[:2], 6))] for p in obj.data.co])
+                np.testing.assert_allclose(obj.data.co[:, 2] - below, lift, atol=1e-9)
+                kinds = [m.type for m in obj.modifiers]
+                # The triangulation last, so it cuts what the others made.
+                self.assertEqual(kinds[-1], "TRIANGULATE")
+                self.assertEqual(obj.modifiers[-1].quad_method, "FIXED")
+                self.assertFalse(obj.modifiers[-1].show_viewport)
+                self.assertTrue(obj.modifiers[-1].show_render)
+                if layer == WALKWAY:
+                    self.assertEqual(obj["maptile_role"], "walkway")
+                    self.assertEqual(kinds, ["NODES", "NODES", "NODES", "WEIGHTED_NORMAL",
+                                             "TRIANGULATE"])
+                    flatten, curb, drape = obj.modifiers[:3]
+                    self.assertEqual(flatten.node_group.name, "Maptile_Flatten")
+                    self.assertEqual(curb.node_group.name, "CurbGenerator")
+                    self.assertEqual(drape.node_group.name, "Maptile_Drape")
+                    self.assertIs(drape["Socket_1"], terrain)
+                    self.assertAlmostEqual(drape["Socket_2"], lift)
+                    continue
+                self.assertEqual(kinds, ["SHRINKWRAP", "TRIANGULATE"])
+                wrap = obj.modifiers[0]
+                self.assertIs(wrap.target, terrain)
+                # Not the modellers' "On Surface", which leaves a road under
+                # terrain raised past it.
+                self.assertEqual(wrap.wrap_mode, "OUTSIDE_SURFACE")
+                self.assertTrue(wrap.use_project_z)
+                self.assertTrue(wrap.use_negative_direction and wrap.use_positive_direction)
+                self.assertAlmostEqual(wrap.offset, lift)
+
+    def test_the_curb_generator_gets_its_settings(self):
+        summary, made = self._build(self._curb_group())
+        walkways = [n for n, layer in zip(self.ground.object_names, self.ground.object_layer)
+                    if made[n]["maptile_role"] == "walkway"]
+        self.assertTrue(walkways)
+        self.assertEqual(summary["kerbed_objects"], len(walkways))
+        self.assertTrue(summary["curb_generator"])
+        for name in walkways:
+            curb = made[name].modifiers[1]
+            self.assertEqual(curb["Socket_2"], 0.3)
+            self.assertEqual(curb["Socket_3"], 0.15)
+            self.assertEqual(curb["Socket_4"], 0.02)
+            self.assertEqual(curb["Socket_6"], "material Beton")
+            self.assertNotIn("Socket_5", curb, "no walkway material was asked for")
+
+    def test_without_the_curb_generator_the_walkways_lie_flat(self):
+        summary, made = self._build(None)
+        self.assertEqual(summary["kerbed_objects"], 0)
+        self.assertFalse(summary["curb_generator"])
+        for obj in made.values():
+            self.assertNotIn("NODES", [m.type for m in obj.modifiers])
+            if obj.get("maptile_role") == "walkway":
+                self.assertEqual([m.type for m in obj.modifiers], ["SHRINKWRAP", "TRIANGULATE"])
+
+    def test_inputs_are_set_the_way_each_blender_keeps_them(self):
+        namespace = _process_namespace({"set_modifier_input"})
+        group = self._curb_group()
+        old = _FakeModifier(node_group=group)
+        self.assertTrue(namespace["set_modifier_input"](old, "Height", 0.2))
+        self.assertEqual(old["Socket_3"], 0.2)
+        self.assertFalse(namespace["set_modifier_input"](old, "Geometry", 1))
+        self.assertFalse(namespace["set_modifier_input"](old, "Colour", 1))
+        inputs = types_namespace(Socket_3=types_namespace(value=None))
+        new = _FakeModifier(node_group=group, properties=types_namespace(inputs=inputs))
+        self.assertTrue(namespace["set_modifier_input"](new, "Height", 0.2))
+        self.assertEqual(inputs.Socket_3.value, 0.2)
+        self.assertNotIn("Socket_3", new)
+
+    def test_the_export_switches_on_what_only_the_render_shows(self):
+        """Blender's FBX exporter applies the modifiers the viewport shows,
+        whatever its render option says: measured on 4.2 and 5.2, a
+        render-only triangulation never reached the file."""
+        for path in (REPO_ROOT / "blender" / "process.py",
+                     REPO_ROOT / "blender" / "maptile_tools.py"):
+            with self.subTest(file=path.name):
+                import ast
+
+                source = path.read_text(encoding="utf-8")
+                tree = ast.parse(source)
+                function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                                and n.name in ("export_fbx", "export_unity_fbx"))
+                blocks = [n for n in ast.walk(function) if isinstance(n, ast.With)]
+                self.assertTrue(any(
+                    "render_modifiers" in ast.unparse(item.context_expr)
+                    and any("export_scene.fbx" in ast.unparse(c) for c in ast.walk(block))
+                    for block in blocks for item in block.items
+                ), f"{function.name} exports outside render_modifiers()")
+
+        objects = []
+        for flags in ((False, True), (True, False), (True, True), (False, False)):
+            modifiers = _FakeModifiers()
+            modifier = modifiers.new("m", "TRIANGULATE")
+            modifier.show_viewport, modifier.show_render = flags
+            objects.append(types_namespace(modifiers=modifiers))
+        objects.append(types_namespace())  # an empty: no modifiers at all
+        bpy = types_namespace(data=types_namespace(objects=objects))
+        namespace = _process_namespace({"render_modifiers"}, {"bpy": bpy})
+        before = [(o.modifiers[0].show_viewport, o.modifiers[0].show_render)
+                  for o in objects[:4]]
+        with namespace["render_modifiers"]() as switched:
+            self.assertEqual(switched, 2)
+            for obj in objects[:4]:
+                self.assertEqual(obj.modifiers[0].show_viewport, obj.modifiers[0].show_render)
+        after = [(o.modifiers[0].show_viewport, o.modifiers[0].show_render) for o in objects[:4]]
+        self.assertEqual(after, before)
+
+    def test_the_tools_find_the_layered_objects(self):
+        import ast
+
+        source = (REPO_ROOT / "blender" / "maptile_tools.py").read_text(encoding="utf-8")
+        terrain = types_namespace(type="MESH", name="T_Terrein", get=lambda k, d=None: (
+            "terrain" if k == "maptile_role" else d), modifiers=[])
+
+        def layer(name, role, wrapped):
+            wrap = types_namespace(type="SHRINKWRAP", target=terrain, show_viewport=True)
+            return types_namespace(type="MESH", name=name, modifiers=[wrap] if wrapped else [],
+                                   get=lambda k, d=None: role if k == "maptile_role" else d)
+
+        road = layer("T_Centrum_Oost_Wegen", "road", True)
+        applied = layer("T_Wegen_Afstand_NO", "road", False)
+        grass = layer("T_Gras_Afstand_NO", "grass", False)
+        walkway = layer("T_Centrum_Oost_Voetpaden", "walkway", False)
+        walkway.modifiers.append(types_namespace(
+            type="NODES", show_viewport=True, node_group=types_namespace(name="Maptile_Drape")))
+        other = types_namespace(type="MESH", name="Terrain", modifiers=[],
+                                get=lambda k, d=None: d)
+        bpy = types_namespace(data=types_namespace(
+            objects=[other, road, applied, grass, walkway, terrain],
+            collections=types_namespace(get=lambda name: None),
+        ))
+        namespace = {"bpy": bpy, "np": np}
+        for node in ast.parse(source).body:
+            if (isinstance(node, ast.FunctionDef) and node.name in
+                    ("_terrain_object", "_follows", "_road_objects")) or (
+                    isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) in
+                    ("ROAD_COLLECTION", "TERRAIN_NAME", "GROUND_ROLES")):
+                exec(compile(ast.Module([node], []), "maptile_tools.py", "exec"), namespace)
+        self.assertIs(namespace["_terrain_object"](), terrain)
+        # The wrapped road and the draped walkway follow the terrain; the
+        # road whose wrap was applied does not, and is what the terrain must
+        # stay under.
+        self.assertEqual(namespace["_road_objects"](terrain), [applied])
+        self.assertIn("grass", namespace["GROUND_ROLES"])
 
 
 class TestIntermediatesNeedNoPickle(unittest.TestCase):
@@ -6862,6 +7638,102 @@ class TestTerrainGrid(unittest.TestCase):
                 check_built_terrain(report, work, Grid())
                 verdict = {c.name: c for c in report.checks}["terrain_built_as_planned"]
                 self.assertEqual(verdict.passed, ok, (faces, quads, verts))
+                self.assertNotIn(
+                    "terrain_exported_as_triangles", {c.name for c in report.checks}
+                )
+
+    def test_the_exported_terrain_is_checked_for_whole_quads(self):
+        """A quad the FBX leaves whole is cut by Unity, not along the
+        diagonal everything was placed on."""
+        from src.validate import CheckReport, check_built_terrain
+
+        class Grid:
+            n = 5
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            for left, ok in ((0, True), (16, False)):
+                (work / "blender_summary.json").write_text(json.dumps({"terrain": {
+                    "faces": 16, "quads": 16, "vertices": 25,
+                    "exported_faces": 32 - left, "exported_non_triangles": left,
+                }}))
+                report = CheckReport()
+                check_built_terrain(report, work, Grid())
+                verdict = {c.name: c for c in report.checks}["terrain_exported_as_triangles"]
+                self.assertEqual(verdict.passed, ok, left)
+
+    def test_a_coarse_terrain_is_held_to_its_own_tolerance(self):
+        from src.validate import CheckReport, check_terrain
+
+        terrain = self._flat_terrain()
+        for p95, ok in ((0.31, True), (0.62, False)):
+            terrain.survey_error = {"p50_m": 0.1, "p95_m": p95, "p99_m": 0.7,
+                                    "over_25cm": 0.09, "tolerance_m": 0.5,
+                                    "over_tolerance": 0.004}
+            report = CheckReport()
+            check_terrain(report, terrain, terrain.bbox)
+            verdict = {c.name: c for c in report.checks}["terrain_follows_the_survey"]
+            self.assertEqual(verdict.passed, ok, p95)
+            self.assertIn("0.50 m the terrain is built to", verdict.detail)
+
+    def test_the_layered_ground_is_checked_as_blender_built_it(self):
+        from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY
+        from src.validate import CheckReport, check_layered
+
+        ground = types_namespace(
+            object_names=["P_Snelweg", "P_Centrum_Oost_Wegen", "P_Centrum_Oost_Voetpaden",
+                          "P_Gras_Afstand_NO"],
+            lift={ROAD: 0.05, MOTORWAY: 0.05, WALKWAY: 0.05, GRASS: 0.02},
+        )
+        good = {
+            "objects": list(ground.object_names), "kerbed_objects": 1,
+            "curb_generator": True, "walkway_faces": 100, "walkway_faces_evaluated": 700,
+            "height_above_terrain": {
+                "road": {"min_m": 0.049, "max_m": 0.058},
+                "walkway": {"min_m": 0.05, "max_m": 0.2},
+                "grass": {"min_m": 0.0199, "max_m": 0.021},
+            },
+        }
+
+        def run(layered, kerbs=True):
+            with tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                summary = {"terrain": {}}
+                if layered is not None:
+                    summary["layered"] = layered
+                (work / "blender_summary.json").write_text(json.dumps(summary))
+                report = CheckReport()
+                check_layered(report, work, ground, kerbs=kerbs, kerb_top_m=0.18)
+                return {c.name: c for c in report.checks}
+
+        verdicts = run(good)
+        self.assertEqual([str(v) for v in verdicts.values() if not v.passed], [])
+        self.assertEqual(set(verdicts), {"ground_layers_built", "layers_lie_on_the_terrain",
+                                         "walkways_have_kerbs"})
+        floating = json.loads(json.dumps(good))
+        floating["height_above_terrain"]["road"]["max_m"] = 0.11
+        self.assertFalse(run(floating)["layers_lie_on_the_terrain"].passed)
+        sunk = json.loads(json.dumps(good))
+        sunk["height_above_terrain"]["grass"]["min_m"] = -0.01
+        self.assertFalse(run(sunk)["layers_lie_on_the_terrain"].passed)
+        # What the first Hazeldonk run measured: kerb spikes on outlines that
+        # follow the survey.
+        spiked = json.loads(json.dumps(good))
+        spiked["height_above_terrain"]["walkway"] = {"min_m": -0.383, "max_m": 0.653}
+        self.assertFalse(run(spiked)["layers_lie_on_the_terrain"].passed)
+        flat = dict(good, walkway_faces_evaluated=100)
+        self.assertFalse(run(flat)["walkways_have_kerbs"].passed)
+        old_blender = dict(good, curb_generator=False, kerbed_objects=0)
+        old_blender["height_above_terrain"] = dict(
+            good["height_above_terrain"], walkway={"min_m": 0.05, "max_m": 0.051})
+        verdicts = run(old_blender)
+        self.assertEqual(verdicts["walkways_have_kerbs"].severity, "warning")
+        self.assertFalse(verdicts["walkways_have_kerbs"].passed)
+        self.assertTrue(verdicts["layers_lie_on_the_terrain"].passed)
+        self.assertNotIn("walkways_have_kerbs", run(good, kerbs=False))
+        missing = dict(good, objects=good["objects"][:2])
+        self.assertFalse(run(missing)["ground_layers_built"].passed)
+        self.assertFalse(run(None)["ground_layers_built"].passed)
 
 
 class TestPathsOverWater(unittest.TestCase):
@@ -8656,7 +9528,7 @@ class TestUIPage(unittest.TestCase):
     def test_the_panel_reads_as_numbered_steps(self):
         self.assertEqual(
             self.page.step_titles,
-            ["Choose an area", "Choose how much detail",
+            ["Choose an area", "Choose the style and detail",
              "Choose what to include", "Build"],
         )
         self.assertEqual(
@@ -8692,11 +9564,58 @@ class TestUIPage(unittest.TestCase):
         self.assertEqual(options, set(DETAIL_PRESETS))
 
     def test_there_are_no_sliders_left(self):
-        """The ask was fewer controls. What is left: where, how much detail,
-        which layers, and whether to add collision shapes and previews."""
+        """The ask was fewer controls. What is left: where, which style, how
+        much detail, which layers, and whether to add collision shapes and
+        previews."""
         self.assertNotIn('type="range"', self.html)
         controls = set(re.findall(r'<(?:input|select)[^>]*\bid="(\w+)"', self.html))
-        self.assertEqual(controls, {"q", "size", "name", "detail", "preview", "collision"})
+        self.assertEqual(
+            controls, {"q", "size", "name", "style", "detail", "preview", "collision"}
+        )
+
+    def test_the_styles_match_the_server(self):
+        """The page greys out what a style cannot have and unticks what it
+        starts without; the config decides both. Held equal here: a source
+        the page lets through in a style that cannot build it would be
+        dropped by the config with only a log line to say so."""
+        from src.config import STYLE_LOCKED, STYLE_PRESETS
+        from src.sources import SOURCES
+
+        body = re.search(r"const STYLE = \{(.*?)\n\};", self.html, re.S).group(1)
+        shown = {
+            name: {
+                key: set(re.findall(r'"(\w+)"', ids))
+                for key, ids in re.findall(r"(\w+): \[([^\]]*)\]", values)
+            }
+            for name, values in re.findall(r"(\w+):\s*\{([^}]*)\}", body)
+        }
+        self.assertEqual(set(shown), set(STYLE_PRESETS))
+        options = set(re.findall(r'<option value="(\w+)"', re.search(
+            r'<select id="style">(.*?)</select>', self.html, re.S).group(1)))
+        self.assertEqual(options, set(STYLE_PRESETS))
+
+        def value(tree: dict, path) -> object:
+            for key in path:
+                tree = tree.get(key, {}) if isinstance(tree, dict) else {}
+            return tree if not isinstance(tree, dict) or tree else None
+
+        for style in STYLE_PRESETS:
+            locked = {
+                source.id for source in SOURCES
+                if source.toggles and all(
+                    STYLE_LOCKED[style].get(tuple(path)) is False for path in source.toggles
+                )
+            }
+            unticked = {
+                source.id for source in SOURCES
+                if source.toggles and source.id not in locked and all(
+                    value(STYLE_PRESETS[style], path) is False for path in source.toggles
+                )
+            }
+            self.assertEqual(shown[style]["locked"], locked, style)
+            self.assertEqual(shown[style]["unticked"], unticked, style)
+        sentences = re.search(r"const STYLE_PLAIN = \{(.*?)\n\};", self.html, re.S).group(1)
+        self.assertEqual(set(re.findall(r"^\s*(\w+):", sentences, re.M)), set(STYLE_PRESETS))
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

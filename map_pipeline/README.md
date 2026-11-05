@@ -29,6 +29,15 @@ output/<area_name>/
 
 The pipeline stops there. No Unity layer, no viewer, no WebGL build.
 
+**Two styles of ground.** By default the ground is built the way our 3D
+modellers build an area by hand — the *layered* style: a coarse terrain that
+stays within half a metre of the survey, with every road, walkway and lawn a
+flat object of its own lying on it, named and grouped as in their files, and
+kerbs made by their curb generator so they stay editable. The *survey* style is
+the ground as measured: a fine terrain whose edges follow every waterline, road
+edge and building, the roads as meshes of their own, and water. See
+[Two styles of ground](#two-styles-of-ground).
+
 ## Running it
 
 There is a small web UI, and there is the command line. They do the same thing:
@@ -91,10 +100,15 @@ python ui/server.py --open
 ```
 
 Open <http://127.0.0.1:8765>. The panel runs top to bottom in four numbered
-steps — **choose an area**, **choose how much detail**, **choose what to
+steps — **choose an area**, **choose the style and detail**, **choose what to
 include**, **build** — and the defaults in all four are the ones to use. Search
 for a place or click the map, press **Build model**, and watch the log. When it
 finishes you get the check results, the preview renders and download links.
+
+The style is *Layered* (as the modellers build it) or *Survey* (the ground as
+measured). In the layered style the water source is greyed out — that style has
+no water — and cars and boats start unticked, as the modellers' files have
+none; tick them to add them.
 
 The page is written for someone who has never opened a GIS or a 3D package.
 **Detail is one choice, not a panel of sliders**: Draft, Standard or High (see
@@ -213,10 +227,17 @@ dimensional `np.cross` is on that list today.
   "name": "demo_area",
   "bbox": { "crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
             "xmax": 137000, "ymax": 456000 },
+  "style": "layered",
   "detail": "standard",
   "export": { "collision": true }
 }
 ```
+
+`style` is `layered` (the default) or `survey`; see
+[Two styles of ground](#two-styles-of-ground). Like `detail`, a style only
+fills in defaults, so anything the file sets wins — with two exceptions the
+layered style cannot honour: it has no water and no survey-style road meshes,
+and a file that asks for them is told so in the log.
 
 `detail` is `draft`, `standard` or `high` and fills in the photo resolution,
 the ground grid and the wall textures (table below). Anything set explicitly in
@@ -449,8 +470,10 @@ outliner and an empty that everything in it hangs from:
 
 | Collection / parent | What is in it |
 | --- | --- |
-| `Terrain` | one object, the ground; its edges follow the outlines (see [Terrain](#terrain)) |
-| `Roads` | one object per street, junction and paving area (see [Roads](#roads)) |
+| `<Prefix>_Terrain` | layered style: the terrain `<Prefix>_Terrein`, and the road, motorway and walkway objects lying on it (see [Two styles of ground](#two-styles-of-ground)) |
+| `Terrain Cutout` | layered style: the grass objects |
+| `Terrain` | survey style: one object, the ground; its edges follow the outlines (see [Terrain](#terrain)) |
+| `Roads` | survey style: one object per street, junction and paving area (see [Roads](#roads)) |
 | `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
 | `Water` | water surfaces and beds |
 | `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
@@ -465,6 +488,12 @@ of that shape changes; move or scale a tree and only it does.
 **Quads stay quads in Blender.** The ground and the roads carry a *Triangulate*
 modifier set to apply on render and export only, splitting every quad the same
 way the pipeline measured heights on. In the viewport you edit the quads.
+Blender's FBX exporter applies only what the viewport shows, whatever its
+render option says — measured on 4.2 and 5.2, a render-only modifier never
+reached the file, so until this was found Unity cut every quad its own way —
+and so the export, and the Maptile tools' re-export, switch every modifier to
+its render setting while they write and back after.
+`terrain_exported_as_triangles` checks the result.
 
 **The terrain's outlines are one click away.** Every outline is a vertex group
 on the `Terrain` object, so *Object Data Properties → Vertex Groups → Select*
@@ -501,12 +530,15 @@ add-on. Four buttons:
   so a sculpt survives it and running it twice changes nothing the second
   time; to get the ground back from under a road you moved away, Reset first
   and Fit after. It works on the terrain whatever its faces, including any you
-  have remeshed yourself. Kerb and skirt faces are left out.
+  have remeshed yourself. Kerb and skirt faces are left out. In the layered
+  style there is normally nothing to fit: the roads, walkways and lawns are
+  wrapped or draped onto the terrain and follow it. Only a layer whose
+  Shrinkwrap or drape was removed or applied is fitted under.
 * **Reset terrain to survey.** Puts every terrain vertex back on its measured
   height (`measured_z`), roads ignored.
 * **Drop selected onto ground.** Moves each selected object vertically onto the
-  road or terrain under it — for a lamppost after a road moved, or anything you
-  added.
+  road, walkway, lawn or terrain under it — for a lamppost after a road moved,
+  or anything you added.
 * **Export FBX for Unity.** The pipeline's own export settings, so a re-export
   after editing lands in Unity exactly like the original did.
 
@@ -590,6 +622,139 @@ cache makes repeat runs faster than the API anyway:
 ```json
 "buildings": { "sources": ["tiles"] }
 ```
+
+## Two styles of ground
+
+The modellers sent a hand-made model of Tankstation Hazeldonk to say how they
+want an area built. It is built in layers, each a separate object a person can
+grab: a **terrain** of about 2,100 faces for the square kilometre with the
+aerial on it; **roads, the motorway, walkways and grass** as flat faces lying a
+few centimetres above it (grass at 2 cm, everything paved at 5 cm), each in a
+flat colour of its own; and **no modelled kerbs**: every walkway and traffic
+island is a flat outline carrying their *CurbGenerator* geometry-nodes
+modifier, which raises it and builds the kerb round it, so editing the outline
+edits the kerb. The *layered* style builds that from the open data, and it is
+the default. The *survey* style is what the pipeline built before; the
+sections from [Terrain](#terrain) to [Street detail](#street-detail) describe
+it.
+
+### The layered style
+
+How it is built (`src/layered.py`):
+
+* **What each BGT polygon is.** Road parts, supporting road parts and the
+  vegetated and unvegetated terrain parts are read into five layers:
+
+  | BGT | Layer | Material |
+  | --- | --- | --- |
+  | `wegdeel`, carriageway of a motorway (*autosnelweg*, *autoweg*) | motorway | `Asfalt` |
+  | `wegdeel`, footpath or pedestrian area | walkway | `Beton_Geel` |
+  | `wegdeel`, cycle path | road | `Fietspad` |
+  | `wegdeel`, brick or tiled carriageway | road | `Bakstenen` |
+  | `wegdeel`, unpaved | terrain | — |
+  | `wegdeel`, any other | road | `Asfalt` |
+  | `ondersteunendwegdeel`, traffic island, paved / green | walkway / grass | `Beton_Geel` / `Gras` |
+  | `ondersteunendwegdeel`, verge, green / paved | grass / road | `Gras` / `Verharding` |
+  | `begroeidterreindeel` | grass | `Gras` |
+  | `onbegroeidterreindeel`, paved / not | road / terrain | `Verharding` / — |
+
+  `Asfalt`, `Bakstenen`, `Beton`, `Beton_Geel` and `Gras` are the modellers'
+  own materials, colours included; `Fietspad` and `Verharding` are the two
+  surfaces their square did not need. A green polygon of at most 2,500 m² with
+  paving round at least 90% of its edge is an island: a walkway, so it gets
+  kerbs, still green on top. Parts on bridges and in tunnels
+  (`relatieve_hoogteligging` not 0) are left to the structures stage. Water is
+  left out, as the modellers left it out; the terrain and the aerial carry the
+  ditches.
+* **Outlines.** The polygons are cut into one region per spot, simplified
+  together by up to `outline_m` (25 cm) so that an edge two regions share stays
+  shared, and snapped to a 1 cm grid.
+* **Terrain.** A triangulation of the outlines, refined until it fits the
+  survey: in each round, the surveyed grid node (2 m apart at Standard detail)
+  furthest from the surface in every triangle that misses by more than
+  `tolerance_m` (0.5 m) is added, and an outline edge the triangulation lost
+  is split until it is back. Every
+  outline is an edge of the terrain, so each layer is the terrain's own faces
+  under it — nothing on a layer can dip under the ground or float off it. Pairs
+  of triangles that make a well-shaped quad are joined, each quad keeping as
+  its first-to-third diagonal the edge the fit measured, which is how Blender
+  draws a quad and how the export cuts it. The modellers' own terrain is within
+  0.98 m of the survey on 95% of the ground.
+* **Objects.** Every layer is grouped as the modellers group theirs: the
+  motorway is one object, `<Prefix>_Snelweg`; within `focus_m` (250 m) of the
+  centre each layer is split east and west, `<Prefix>_Centrum_Oost_Wegen`;
+  outside it by quadrant, `<Prefix>_Wegen_Afstand_NO`. The words are
+  `Wegen`, `Voetpaden` and `Gras`. A walkway goes whole to the side its middle
+  is on, because the curb generator kerbs every edge where an object ends.
+  `<Prefix>` is `layered.prefix`, or the area name: `hazeldonk_west` gives
+  `Hazeldonk_West_Terrein`.
+* **Placing things.** Trees, lamp posts and fences stand on the top of the layer
+  under them: the terrain plus 5 cm on a road, plus the curb generator's raise
+  (13 cm more) on a walkway.
+
+In Blender every layer object carries the modellers' modifier stack, with two
+changes measured to be needed:
+
+| Modifier | On | What it does |
+| --- | --- | --- |
+| *Shrinkwrap* (project along Z, both ways, offset the lift, snap *Outside Surface*) | roads, motorway, grass | keeps it on the terrain: reshape the terrain and the layers follow |
+| *Flatten for kerbs* (`Maptile_Flatten`) | walkways | lays the outline flat for the curb generator |
+| *CurbGenerator* | walkways | raises the walkway and builds the kerb round its outline |
+| *Drape on terrain* (`Maptile_Drape`) | walkways | lifts every vertex by the terrain's height under it, plus the lift: follows the terrain like a Shrinkwrap |
+| *WeightedNormal* | walkways, terrain | the modellers' shading |
+| *Triangulate for export* (render only) | every layer, terrain | cuts quads as the terrain is cut, so a road stays parallel to it |
+
+The two changes. The modellers' Shrinkwrap snaps *On Surface*, which offsets
+towards where a vertex was: raise the terrain past a road and the road ends up
+5 cm under it. *Outside Surface* offsets the same way but always up. And the
+curb generator was made for their level outlines: on outlines that follow the
+survey it threw kerb spikes — over Hazeldonk 1.5% of kerb vertices stood up to
+0.65 m off the ground, at slopes and at outline points a few centimetres lower
+than their neighbours — while the same outlines laid flat came out exact. So it
+is handed the outline flat, and the result is draped back onto the terrain:
+every walkway vertex then stands exactly its lift plus its own height in the
+kerb above the ground, on any slope. Editing is unchanged: move the outline
+and the kerb follows; reshape the terrain and the walkway follows.
+
+The terrain carries the aerial, a `ground_layer` face attribute (0 terrain,
+1 road, 4 motorway, 5 walkway, 6 grass), seams where the layer changes and a
+vertex group per layer outline (`outline_road`, `outline_motorway`,
+`outline_walkway`, `outline_grass`), so *Select* on a group picks every
+walkway edge at once.
+
+**Kerbs need Blender 5.** The curb generator is built on the *Bevel* geometry
+node, which only Blender 5 has. `blender/assets/curb_generator.blend` holds it
+as the modellers made it, taken unchanged from their Hazeldonk file, and it is
+appended into every model, so every walkway in a file shares one node group: change
+the group and every kerb changes; change a modifier's inputs and only that
+object's do. The pipeline uses the Blender on the PATH, else the newest one
+installed in the usual places, else the pip `bpy` module; pass `--blender` to
+choose. The pip module is Blender 4.x, and with it the walkways are left flat
+and the run says so (`walkways_have_kerbs` warns).
+
+The layered style's settings, all optional:
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `layered.prefix` | the area name | what every ground object's name starts with |
+| `layered.tolerance_m` | 0.5 | how far any surveyed grid node may be from the terrain |
+| `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
+| `layered.focus_m` | 250 | half the side of the middle square split east and west |
+| `layered.road_lift_m`, `grass_lift_m` | 0.05, 0.02 | how far the layers lie above the terrain |
+| `layered.kerbs` | true | the curb generator on every walkway |
+| `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
+
+Over the Hazeldonk square kilometre the terrain is 26,770 faces (48% quads) on
+19,889 vertices, every surveyed 2 m node within 0.50 m of it and 95% of the
+0.5 m survey within 0.30 m; there are 19 layer objects, 6 of them walkways
+whose 2,999 faces become 23,241 with their kerbs. The ground takes 23 seconds
+to build and the Blender stage 11; the whole run takes 6½ minutes, most of it
+relighting the aerial, and passes all 57 checks. The modellers' own terrain
+has about 2,100 faces: holding every node to half a metre everywhere costs
+more, and `tolerance_m` trades the one for the other.
+
+Not in it yet: the motorway's guardrails, and the modellers' hand-made
+buildings — the buildings are 3DBAG's, as in the survey style.
 
 ## Terrain
 
@@ -1663,6 +1828,16 @@ The road and terrain checks are the ones to read after a change to either:
 survey), `terrain_stays_under_roads` (no ground through a road),
 `terrain_follows_the_survey`, `terrain_is_one_closed_sheet` (no cracks, no
 overlaps, nothing upside down) and `terrain_follows_the_outlines`.
+
+In the layered style the road checks give way to its own, read back from what
+Blender built: `ground_layers_built` (every road, walkway and grass object is
+in the model), `layers_lie_on_the_terrain` (each layer's vertices, after the
+modifiers, stand their lift above the terrain, and a walkway no higher than its
+kerb), `walkways_have_kerbs` (the curb generator ran),
+`terrain_follows_the_layer_outlines` and `terrain_follows_the_survey`, which
+holds the coarse terrain to its own tolerance rather than to the survey
+style's 25 cm. In both styles `terrain_exported_as_triangles` checks the FBX
+holds the terrain cut as the pipeline cut it.
 
 ## Attribution
 

@@ -144,7 +144,21 @@ def check_terrain(report: CheckReport, terrain, bbox: BBox) -> None:
     # about the spacing chosen rather than a defect, and it warns: the share of
     # ground more than 25 cm off was 0.8% at 2 m over Bronbeek and 3.3% at 4 m.
     survey = getattr(terrain, "survey_error", None)
-    if survey:
+    if survey and "tolerance_m" in survey:
+        # The layered style's terrain is coarse on purpose, built so every
+        # surveyed grid node is within a tolerance; the half-metre survey
+        # between the nodes is held to the same figure.
+        tolerance = float(survey["tolerance_m"])
+        report.add(
+            "terrain_follows_the_survey",
+            survey["p95_m"] <= tolerance,
+            f"within {survey['p95_m']:.2f} m of the 0.5 m survey on 95% of the "
+            f"ground and {survey['p99_m']:.2f} m on 99%; "
+            f"{100 * survey['over_tolerance']:.2f}% is further off than the "
+            f"{tolerance:.2f} m the terrain is built to",
+            severity="warning",
+        )
+    elif survey:
         report.add(
             "terrain_follows_the_survey",
             survey["over_25cm"] <= 0.05,
@@ -276,6 +290,39 @@ def check_buildings_on_terrain(
     )
 
 
+def _closest_pair(points: np.ndarray, involving: np.ndarray, *, within: float) -> float:
+    """The shortest distance between two points, one of them `involving`.
+
+    Only pairs closer than `within` are looked at, through cells that size;
+    with none, infinity.
+    """
+    n = len(points)
+    if n < 2 or not involving.any():
+        return np.inf
+    cells = np.floor(points / within).astype(np.int64)
+    cells -= cells.min(axis=0) - 1  # every cell and its neighbours positive
+    width = int(cells[:, 1].max()) + 2
+    keys = cells[:, 0] * width + cells[:, 1]
+    order = np.argsort(keys, kind="stable")
+    ordered = keys[order]
+    best = np.inf
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            wanted = keys + dx * width + dy
+            low = np.searchsorted(ordered, wanted, side="left")
+            count = np.searchsorted(ordered, wanted, side="right") - low
+            first = np.repeat(np.arange(n), count)
+            if not len(first):
+                continue
+            step = np.arange(len(first)) - np.repeat(np.cumsum(count) - count, count)
+            second = order[np.repeat(low, count) + step]
+            keep = (first < second) & (involving[first] | involving[second])
+            if keep.any():
+                gaps = np.hypot(*(points[first[keep]] - points[second[keep]]).T)
+                best = min(best, float(gaps.min()))
+    return best if best < within else np.inf
+
+
 def check_trees(report: CheckReport, trees, bbox: BBox) -> None:
     """Trees are inside the area, plausibly tall, and not duplicated."""
     if trees is None or not len(trees):
@@ -317,19 +364,20 @@ def check_trees(report: CheckReport, trees, bbox: BBox) -> None:
         f"{int((~detected).sum())} from the BGT register, "
         f"{int(detected.sum())} found in the canopy model",
     )
-    # No two trees on the same spot. The detector places one seed per crown,
-    # and a registered tree reserves its own crown before any seed is taken, so
-    # a pair closer than a metre means that reservation is not working and the
-    # model has a tree drawn twice.
+    # No found tree on the spot of another. The detector places one seed per
+    # crown, and a registered tree reserves its own crown before any seed is
+    # taken, so a found tree within a metre of another means that reservation
+    # is not working and the model has a tree drawn twice. Two registered
+    # trees that close are the register's own: Hazeldonk has clumps planted
+    # 0.7 m apart.
     points = np.column_stack([xs, ys])
-    order = np.lexsort((points[:, 1], points[:, 0]))
-    ordered = points[order]
-    gaps = np.hypot(*(np.diff(ordered, axis=0)).T)
-    closest = float(gaps.min()) if len(gaps) else np.inf
+    closest = _closest_pair(points, detected, within=3.0)
     report.add(
         "no_two_trees_share_a_spot",
         closest >= 1.0,
-        f"the closest two trees are {closest:.2f} m apart",
+        f"the closest found tree is {closest:.2f} m from another tree"
+        if np.isfinite(closest)
+        else "no found tree is within 3 m of another tree",
     )
     # A detected tree taller than anything that grows here is a structure the
     # building footprints did not cover.
@@ -894,6 +942,116 @@ def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
         f"the model's terrain has {built.get('vertices', 0)} vertices, {quads} "
         f"quads and {others} other faces, against {plan}",
     )
+    if "exported_non_triangles" in built:
+        # The pipeline placed everything on the quads cut first corner to
+        # third; a face the FBX leaves whole, Unity cuts its own way.
+        left = int(built["exported_non_triangles"])
+        report.add(
+            "terrain_exported_as_triangles",
+            left == 0,
+            f"{int(built.get('exported_faces', 0))} terrain faces in the FBX, "
+            f"{left} of them not triangles",
+        )
+
+
+def check_layered(
+    report: CheckReport, work_dir: Path, ground, *, kerbs: bool, kerb_top_m: float
+) -> None:
+    """The layered style's ground as Blender built it.
+
+    Every road, walkway and grass object is in the model; each lies on the
+    terrain at its offset, which is what its modifiers are there to keep,
+    and no part of a walkway stands higher than the curb generator builds
+    (`kerb_top_m` above the walkway's foot); and the walkways have kerbs,
+    which only the curb generator makes. Read back from Blender's own
+    summary, as with the terrain: the plan says nothing about what the
+    modifiers did with it.
+    """
+    if ground is None:
+        return
+    summary_path = work_dir / "blender_summary.json"
+    if not summary_path.is_file():
+        return
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return
+    built = summary.get("layered") or {}
+    wanted = [name for name in ground.object_names if name]
+    made = set(built.get("objects") or [])
+    absent = [name for name in wanted if name not in made]
+    report.add(
+        "ground_layers_built",
+        bool(built) and not absent,
+        f"{len(wanted) - len(absent)} of {len(wanted)} road, walkway and grass "
+        f"objects are in the model"
+        + (f"; missing {', '.join(absent[:5])}" if absent else ""),
+    )
+    if not built:
+        return
+
+    from .layered import GRASS, MOTORWAY, ROAD, WALKWAY
+
+    kerbed = bool(kerbs and built.get("curb_generator"))
+    lift = ground.lift
+
+    def wrapped(low, high):
+        # A Shrinkwrap offsets along the terrain's normal, which on a 60
+        # degree bank puts a layer between half and twice its lift above the
+        # ground straight down.
+        return low, high, 0.5 * low, 2.0 * high
+
+    # What each role is built to stand above the terrain under it, and the
+    # band it may measure in.
+    expect = {
+        "road": wrapped(min(lift[ROAD], lift[MOTORWAY]), max(lift[ROAD], lift[MOTORWAY])),
+        "grass": wrapped(lift[GRASS], lift[GRASS]),
+        # Draped, a kerbed walkway is exact: from its lift to the top of the
+        # kerb, to the half centimetre.
+        "walkway": (
+            (lift[WALKWAY], lift[WALKWAY] + kerb_top_m,
+             lift[WALKWAY] - 0.005, lift[WALKWAY] + kerb_top_m + 0.005)
+            if kerbed
+            else wrapped(lift[WALKWAY], lift[WALKWAY])
+        ),
+    }
+    above = built.get("height_above_terrain") or {}
+    lines, wrong = [], []
+    for role, (low, high, floor, ceiling) in expect.items():
+        got = above.get(role)
+        if not got:
+            continue
+        ok = got["min_m"] >= floor and got["max_m"] <= ceiling and not got.get("missed")
+        lines.append(
+            f"{role} {got['min_m']:.3f} to {got['max_m']:.3f} m "
+            f"(built for {low:.2f}" + (f" to {high:.2f}" if high != low else "") + ")"
+            + (f", {got['missed']} vertices not over the terrain" if got.get("missed") else "")
+        )
+        if not ok:
+            wrong.append(role)
+    if lines:
+        report.add(
+            "layers_lie_on_the_terrain",
+            not wrong,
+            "height above the terrain: " + "; ".join(lines),
+        )
+    if kerbs:
+        if not built.get("curb_generator"):
+            report.add(
+                "walkways_have_kerbs",
+                False,
+                "the curb generator needs Blender 5, so the walkways are flat",
+                severity="warning",
+            )
+        else:
+            raw = int(built.get("walkway_faces", 0))
+            evaluated = int(built.get("walkway_faces_evaluated", 0))
+            report.add(
+                "walkways_have_kerbs",
+                evaluated > raw > 0,
+                f"{int(built.get('kerbed_objects', 0))} walkway objects with the curb "
+                f"generator: {raw} faces become {evaluated} with their kerbs",
+            )
 
 
 def check_terrain_mesh(report: CheckReport, terrain, *, expect_outlines: bool = True) -> None:
@@ -949,6 +1107,19 @@ def check_terrain_mesh(report: CheckReport, terrain, *, expect_outlines: bool = 
         f"{covered:,.2f} of {whole:,.2f} m2",
     )
     stats = mesh.stats or {}
+    if "outline_edges_missing" in stats:
+        # The layered style: a road's or a lawn's outline is a terrain edge,
+        # or the layer object there takes in a sliver of the next one.
+        left = int(stats["outline_edges_missing"])
+        report.add(
+            "terrain_follows_the_layer_outlines",
+            left == 0,
+            "every outline of a road, walkway or lawn is an edge of the terrain"
+            if left == 0
+            else f"{left} outline edges are not terrain edges; the faces there "
+            f"went to whichever layer their middle lies in",
+            severity="warning",
+        )
     outlines = stats.get("outline_edges") or {}
     followed = sum(int(outlines.get(name, 0)) for name in ("waterline", "road_edge", "building_edge"))
     if expect_outlines:
@@ -1147,7 +1318,9 @@ __all__ = [
     "check_built_terrain",
     "check_export",
     "check_fbx_reimport",
+    "check_layered",
     "check_roads",
     "check_terrain",
+    "check_terrain_mesh",
     "write_report",
 ]

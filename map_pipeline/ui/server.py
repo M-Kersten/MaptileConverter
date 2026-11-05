@@ -347,8 +347,8 @@ _OVERRIDES = {
 def build_config(payload: dict) -> dict:
     """Turn the form payload into a pipeline config.
 
-    The form sends an area, a detail level, the layers wanted and whether to
-    add collision shapes. Everything else is the pipeline's default, which is
+    The form sends an area, a style, a detail level, the layers wanted and
+    whether to add collision shapes. Everything else is the pipeline's default, which is
     the point: the settings that used to be sliders either follow from the
     detail level or have one right answer.
     """
@@ -362,8 +362,9 @@ def build_config(payload: dict) -> dict:
             "xmax": float(bbox["xmax"]),
             "ymax": float(bbox["ymax"]),
         },
-        # Resolved by load_config against DETAIL_PRESETS.
+        # Resolved by load_config against DETAIL_PRESETS and STYLE_PRESETS.
         "detail": str(payload.get("detail", "standard")),
+        "style": str(payload.get("style", "layered")),
         "export": {
             # Physics proxies for a simulation. Off by default: they add to the
             # FBX and most people want a picture.

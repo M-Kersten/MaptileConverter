@@ -109,6 +109,10 @@ class TerrainResult:
     # outlines on the ground (see terrain_mesh.py). Until it is built, the
     # grid is what is drawn.
     mesh: object | None = None
+    # In the modellers' style, the roads, walkways and grass lying on the
+    # terrain (`layered.LayeredGround`). Everything placed on the model then
+    # stands on the layer at its spot. See `surface`.
+    layers: object | None = None
 
     @property
     def n(self) -> int:
@@ -147,8 +151,13 @@ class TerrainResult:
         On a road that is the road. Everywhere else it is the terrain exactly
         as it is drawn (`ground`), so a lamp post or a tree trunk stands on the
         face it will be seen standing on rather than on a curve between them.
+        In the modellers' style it is whichever layer lies there: the road,
+        the raised walkway, the grass.
         """
         ground = self.ground(x, y)
+        if self.layers is not None:
+            top = np.asarray(self.layers.surface_at(x, y), dtype=np.float64)
+            return np.where(np.isfinite(top), top, ground)
         if self.road_top is None:
             return ground
         top = self.road_top(x, y)
@@ -1025,12 +1034,15 @@ def _lower_mesh_under(terrain: TerrainResult, points: np.ndarray, *, clearance_m
     return terrain.conformed
 
 
-def mesh_survey_error(terrain: TerrainResult, *, step: int = 2) -> dict:
+def mesh_survey_error(
+    terrain: TerrainResult, *, step: int = 2, tolerance_m: float | None = None
+) -> dict:
     """How far the terrain mesh, as surveyed, strays from the survey under it.
 
     The same measure as for the grid (`_survey_error`), against every `step`th
     measured pixel each way, and leaving out the water: under it the bed is
-    put there on purpose, below anything the scanner saw.
+    put there on purpose, below anything the scanner saw. A mesh built to a
+    `tolerance_m` also gets the share of the ground further off than that.
     """
     import rasterio
 
@@ -1069,12 +1081,16 @@ def mesh_survey_error(terrain: TerrainResult, *, step: int = 2) -> dict:
     if not len(error):
         return {}
     p50, p95, p99 = np.percentile(error, [50, 95, 99])
-    return {
+    out = {
         "p50_m": round(float(p50), 3),
         "p95_m": round(float(p95), 3),
         "p99_m": round(float(p99), 3),
         "over_25cm": round(float((error > 0.25).mean()), 4),
     }
+    if tolerance_m is not None:
+        out["tolerance_m"] = float(tolerance_m)
+        out["over_tolerance"] = round(float((error > tolerance_m).mean()), 4)
+    return out
 
 
 __all__ = [

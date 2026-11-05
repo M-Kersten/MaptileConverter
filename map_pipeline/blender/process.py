@@ -16,6 +16,7 @@ X = east, Y = up, Z = north.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import sys
@@ -68,6 +69,17 @@ def reset_scene() -> None:
             collection.remove(item)
 
 
+def new_node_material(name: str):
+    """A material with a node tree, on Blender 4 and 5 alike.
+
+    Blender 5 gives every material its nodes and deprecates the switch.
+    """
+    material = bpy.data.materials.new(name=name)
+    if bpy.app.version < (5, 0, 0):
+        material.use_nodes = True
+    return material
+
+
 def make_textured_material(
     name: str, image_path: Path, roughness: float, normal_path: Path | None = None
 ):
@@ -78,8 +90,7 @@ def make_textured_material(
     goes through a Normal Map node, which the FBX exporter writes to the
     material's bump slot.
     """
-    material = bpy.data.materials.new(name=name)
-    material.use_nodes = True
+    material = new_node_material(name)
     nodes = material.node_tree.nodes
     links = material.node_tree.links
 
@@ -237,21 +248,48 @@ def _triangulate_on_export(obj, quads: str = "FIXED") -> None:
     """Triangulate for the FBX, and only for the FBX.
 
     The .blend keeps its quads and n-gons, which is what an editor wants; the
-    modifier is off in the viewport and on for render, and the export applies
-    render modifiers. That decides the split here, where it can be matched,
-    rather than leaving it to Unity's importer: the terrain's squares are cut
-    first corner to third, south-west to north-east, which is the surface the
-    pipeline placed every tree and lamp post on. N-gons -- junctions and the
-    edges of car parks, some of them concave -- are cut by Blender's own
-    polygon fill rather than by whatever an importer does with them.
+    modifier is off in the viewport and on for render, and export_fbx turns
+    render modifiers on while it writes. That decides the split here, where
+    it can be matched, rather than leaving it to Unity's importer: the
+    terrain's squares are cut first corner to third, south-west to
+    north-east, which is the surface the pipeline placed every tree and lamp
+    post on. N-gons -- junctions and the edges of car parks, some of them
+    concave -- are cut by Blender's own polygon fill rather than by whatever
+    an importer does with them.
     """
     if not hasattr(obj, "modifiers") or getattr(obj, "type", "MESH") != "MESH":
         return
     modifier = obj.modifiers.new("Triangulate for export", "TRIANGULATE")
     modifier.quad_method = quads
     modifier.ngon_method = "BEAUTY"
+    if hasattr(modifier, "keep_custom_normals"):
+        # The weighted normals of the layered ground survive the cut.
+        modifier.keep_custom_normals = True
     modifier.show_viewport = False
     modifier.show_render = True
+
+
+@contextlib.contextmanager
+def render_modifiers():
+    """Every modifier as the render has it, for as long as an export runs.
+
+    The FBX exporter evaluates the scene as the viewport shows it, whatever
+    its "use render settings" option says: measured on Blender 4.2 and 5.2, a
+    triangulation switched on for render only never reached the file, so
+    Unity cut the quads and n-gons its own way. For the export each
+    modifier's viewport switch is set to its render switch, and back after.
+    """
+    switched = []
+    for obj in bpy.data.objects:
+        for modifier in getattr(obj, "modifiers", ()):
+            if modifier.show_viewport != modifier.show_render:
+                switched.append((modifier, modifier.show_viewport))
+                modifier.show_viewport = modifier.show_render
+    try:
+        yield len(switched)
+    finally:
+        for modifier, shown in switched:
+            modifier.show_viewport = shown
 
 
 class _Layer:
@@ -411,8 +449,7 @@ def build_water(scene: dict, work_dir: Path, material):
 
 def make_plain_material(name: str, colour, roughness: float):
     """An untextured Principled BSDF: a kerb is grey concrete, not photo."""
-    material = bpy.data.materials.new(name=name)
-    material.use_nodes = True
+    material = new_node_material(name)
     bsdf = material.node_tree.nodes.get("Principled BSDF")
     if bsdf is not None:
         bsdf.inputs["Base Color"].default_value = (*colour, 1.0)
@@ -602,9 +639,91 @@ def _tag_surface_regions(
     return made
 
 
-def _terrain_summary() -> dict:
+def _layered_summary(layered: dict) -> dict:
+    """What the modifiers actually made of the layers, for the checks.
+
+    Faces per walkway object once evaluated, so a check can tell kerbs from a
+    flat outline; and how high every evaluated vertex of every layer stands
+    above the terrain, by role, so it can tell a road lying 5 cm up from one
+    the Shrinkwrap left floating or sunk.
+    """
+    from mathutils import Vector
+    from mathutils.bvhtree import BVHTree
+    from mathutils.geometry import barycentric_transform
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    terrain = bpy.data.objects.get(layered.get("terrain", ""))
+    tree = None
+    if terrain is not None:
+        # The terrain laid flat, so the nearest point of it is the point
+        # straight below, edge of the area included; the height is then read
+        # off the same triangle standing up.
+        holder = terrain.evaluated_get(depsgraph)
+        mesh = holder.to_mesh()
+        mesh.calc_loop_triangles()
+        standing = [terrain.matrix_world @ v.co for v in mesh.vertices]
+        tris = [tuple(t.vertices) for t in mesh.loop_triangles]
+        holder.to_mesh_clear()
+        flat = [Vector((p.x, p.y, 0.0)) for p in standing]
+        tree = BVHTree.FromPolygons(flat, tris)
+
+    def ground_under(x, y):
+        point, _, index, _ = tree.find_nearest(Vector((x, y, 0.0)))
+        if index is None:
+            return None
+        a, b, c = tris[index]
+        return barycentric_transform(
+            point, flat[a], flat[b], flat[c], standing[a], standing[b], standing[c]
+        ).z
+
+    raw, evaluated = 0, 0
+    heights: dict[str, list] = {}
+    missed: dict[str, int] = {}
+    for name in layered.get("objects", []):
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            continue
+        role = str(obj.get("maptile_role", "ground"))
+        holder = obj.evaluated_get(depsgraph)
+        mesh = holder.to_mesh()
+        try:
+            if role == "walkway":
+                raw += len(obj.data.polygons)
+                evaluated += len(mesh.polygons)
+            if tree is None:
+                continue
+            co = np.empty(len(mesh.vertices) * 3)
+            mesh.vertices.foreach_get("co", co)
+            matrix = np.asarray(obj.matrix_world)
+            world = co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+            for x, y, z in world:
+                ground = ground_under(x, y)
+                if ground is None:
+                    missed[role] = missed.get(role, 0) + 1
+                    continue
+                heights.setdefault(role, []).append(z - ground)
+        finally:
+            holder.to_mesh_clear()
+    above = {
+        role: {
+            "min_m": round(float(np.min(values)), 4),
+            "max_m": round(float(np.max(values)), 4),
+            "vertices": len(values),
+            "missed": missed.get(role, 0),
+        }
+        for role, values in heights.items()
+        if values
+    }
+    return {
+        "walkway_faces": raw,
+        "walkway_faces_evaluated": evaluated,
+        "height_above_terrain": above,
+    }
+
+
+def _terrain_summary(name: str = "Terrain") -> dict:
     """Vertex and face counts of the terrain as built, for the checks to read."""
-    obj = bpy.context.scene.objects.get("Terrain")
+    obj = bpy.context.scene.objects.get(name)
     if obj is None or obj.type != "MESH":
         return {}
     mesh = obj.data
@@ -794,6 +913,376 @@ def _mark_outlines(obj, data) -> int:
             if len(members):
                 group = obj.vertex_groups.new(name=name)
                 group.add(members.tolist(), 1.0, "REPLACE")
+    return int((edge_bits > 0).sum())
+
+
+# ---------------------------------------------------------------------------
+# The modellers' style: a coarse terrain with the ground layers on it
+# ---------------------------------------------------------------------------
+
+# Layer numbers as src/layered.py writes them; this script may not import it.
+LAYER_ROAD, LAYER_MOTORWAY, LAYER_WALKWAY, LAYER_GRASS = 1, 4, 5, 6
+LAYER_ROLES = {
+    LAYER_ROAD: "road", LAYER_MOTORWAY: "road",
+    LAYER_WALKWAY: "walkway", LAYER_GRASS: "grass",
+}
+CURB_ASSET = Path(__file__).resolve().with_name("assets") / "curb_generator.blend"
+CURB_GROUP = "CurbGenerator"
+
+
+def set_modifier_input(modifier, name: str, value) -> bool:
+    """Set a geometry-nodes modifier input by the name its interface shows.
+
+    Blender 4 keeps the values as ID properties on the modifier; Blender 5
+    under ``modifier.properties.inputs``, one struct per socket.
+    """
+    for item in modifier.node_group.interface.items_tree:
+        if getattr(item, "item_type", "") != "SOCKET" or item.in_out != "INPUT":
+            continue
+        if item.name != name:
+            continue
+        holder = getattr(modifier, "properties", None)
+        if holder is not None and hasattr(holder, "inputs"):
+            getattr(holder.inputs, item.identifier).value = value
+        else:
+            modifier[item.identifier] = value
+        return True
+    return False
+
+
+def load_curb_generator():
+    """The modellers' curb generator, appended from the asset in the repo.
+
+    It is built on the Bevel geometry node, which only Blender 5 has; with an
+    older Blender the walkways are left flat and the run says so.
+    """
+    group = bpy.data.node_groups.get(CURB_GROUP)
+    if group is not None:
+        return group
+    if bpy.app.version < (5, 0, 0):
+        log(
+            f"WARNING: the curb generator needs Blender 5; this is "
+            f"{bpy.app.version_string}, so the walkways are left flat without kerbs"
+        )
+        return None
+    if not CURB_ASSET.is_file():
+        log(f"WARNING: {CURB_ASSET} is missing, so the walkways get no kerbs")
+        return None
+    with bpy.data.libraries.load(str(CURB_ASSET), link=False) as (source, target):
+        target.node_groups = [n for n in source.node_groups if n == CURB_GROUP]
+    return bpy.data.node_groups.get(CURB_GROUP)
+
+
+def _shrinkwrap(obj, target, offset: float) -> None:
+    """Keep a layer on the terrain as the modellers do: projected straight
+    down onto it, `offset` above. Move the terrain and the layer follows.
+
+    Their files use the "On Surface" snap, which offsets towards where the
+    vertex was: raise the terrain past a road and the road ends up 5 cm
+    under it (measured). "Outside Surface" offsets the same way but always
+    to the side the terrain faces, up, so the layer stays on top whichever
+    way the terrain is moved. ("Above Surface" offsets along the smoothed
+    normal instead, which stood roads 16 cm off a steep bank.)
+    """
+    modifier = obj.modifiers.new("Shrinkwrap", "SHRINKWRAP")
+    modifier.target = target
+    modifier.wrap_method = "PROJECT"
+    modifier.wrap_mode = "OUTSIDE_SURFACE"
+    modifier.use_project_z = True
+    modifier.use_negative_direction = True
+    modifier.use_positive_direction = True
+    modifier.offset = float(offset)
+
+
+FLATTEN_GROUP = "Maptile_Flatten"
+DRAPE_GROUP = "Maptile_Drape"
+
+
+def _flatten_group():
+    """Geometry nodes: every point to height 0.
+
+    The curb generator was made for the modellers' level outlines. On an
+    outline that follows the survey it throws spikes: measured over
+    Hazeldonk, 1.5% of kerb vertices stood up to 0.65 m off the ground,
+    while the same outlines laid flat came out exact. So it is handed the
+    outline flat, and `_drape_group` puts the result back on the terrain.
+    """
+    group = bpy.data.node_groups.get(FLATTEN_GROUP)
+    if group is not None:
+        return group
+    group = bpy.data.node_groups.new(FLATTEN_GROUP, "GeometryNodeTree")
+    group.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    group.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    nodes, links = group.nodes, group.links
+    source, sink = nodes.new("NodeGroupInput"), nodes.new("NodeGroupOutput")
+    position = nodes.new("GeometryNodeInputPosition")
+    split = nodes.new("ShaderNodeSeparateXYZ")
+    level = nodes.new("ShaderNodeCombineXYZ")
+    move = nodes.new("GeometryNodeSetPosition")
+    links.new(position.outputs["Position"], split.inputs[0])
+    links.new(split.outputs["X"], level.inputs["X"])
+    links.new(split.outputs["Y"], level.inputs["Y"])
+    links.new(source.outputs[0], move.inputs["Geometry"])
+    links.new(level.outputs[0], move.inputs["Position"])
+    links.new(move.outputs[0], sink.inputs[0])
+    return group
+
+
+def _drape_group():
+    """Geometry nodes: every point raised by the terrain's height under it.
+
+    Each vertex keeps its height above the ground -- a kerb stays 15 cm on a
+    slope -- and, like a Shrinkwrap, follows the terrain when it is edited.
+    The height under a point is read off a flattened copy of the terrain
+    that carries its own heights: the nearest point of that copy is the
+    point straight below, so nothing is missed the way a ray down misses a
+    vertex on the edge of the area or exactly on an edge between faces.
+    """
+    group = bpy.data.node_groups.get(DRAPE_GROUP)
+    if group is not None:
+        return group
+    group = bpy.data.node_groups.new(DRAPE_GROUP, "GeometryNodeTree")
+    face = group.interface
+    face.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    face.new_socket("Terrain", in_out="INPUT", socket_type="NodeSocketObject")
+    lift = face.new_socket("Lift", in_out="INPUT", socket_type="NodeSocketFloat")
+    lift.default_value = 0.05
+    face.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    nodes, links = group.nodes, group.links
+    source, sink = nodes.new("NodeGroupInput"), nodes.new("NodeGroupOutput")
+
+    def level(field):
+        """(x, y, 0) of a position field."""
+        split = nodes.new("ShaderNodeSeparateXYZ")
+        flat = nodes.new("ShaderNodeCombineXYZ")
+        links.new(field, split.inputs[0])
+        links.new(split.outputs["X"], flat.inputs["X"])
+        links.new(split.outputs["Y"], flat.inputs["Y"])
+        return flat.outputs[0], split.outputs["Z"]
+
+    # The terrain, its heights captured, laid flat.
+    terrain = nodes.new("GeometryNodeObjectInfo")
+    terrain.transform_space = "RELATIVE"
+    links.new(source.outputs["Terrain"], terrain.inputs["Object"])
+    capture = nodes.new("GeometryNodeCaptureAttribute")
+    capture.domain = "POINT"
+    capture.capture_items.new("FLOAT", "Height")
+    links.new(terrain.outputs["Geometry"], capture.inputs[0])
+    flat_terrain, terrain_z = level(nodes.new("GeometryNodeInputPosition").outputs[0])
+    links.new(terrain_z, capture.inputs["Height"])
+    lay = nodes.new("GeometryNodeSetPosition")
+    links.new(capture.outputs[0], lay.inputs["Geometry"])
+    links.new(flat_terrain, lay.inputs["Position"])
+
+    # Each point's height on it, plus the lift, added to the point's own.
+    sample = nodes.new("GeometryNodeSampleNearestSurface")
+    sample.data_type = "FLOAT"
+    links.new(lay.outputs[0], sample.inputs["Mesh"])
+    links.new(capture.outputs["Height"], sample.inputs["Value"])
+    flat_point, _ = level(nodes.new("GeometryNodeInputPosition").outputs[0])
+    links.new(flat_point, sample.inputs["Sample Position"])
+    height = nodes.new("ShaderNodeMath")
+    height.operation = "ADD"
+    links.new(sample.outputs["Value"], height.inputs[0])
+    links.new(source.outputs["Lift"], height.inputs[1])
+    up = nodes.new("ShaderNodeCombineXYZ")
+    links.new(height.outputs[0], up.inputs["Z"])
+    move = nodes.new("GeometryNodeSetPosition")
+    links.new(source.outputs["Geometry"], move.inputs["Geometry"])
+    links.new(up.outputs[0], move.inputs["Offset"])
+    links.new(move.outputs[0], sink.inputs[0])
+    return group
+
+
+def _weighted_normals(obj, keep_sharp: bool) -> None:
+    modifier = obj.modifiers.new("WeightedNormal", "WEIGHTED_NORMAL")
+    modifier.mode = "FACE_AREA"
+    modifier.keep_sharp = keep_sharp
+
+
+def build_layered(scene: dict, work_dir: Path, aerial_material) -> dict:
+    """The terrain, then every road, walkway and grass object lying on it.
+
+    Each object is the terrain's own faces under it, lifted, with a
+    Shrinkwrap holding it there; walkways also carry the curb generator,
+    which raises them and builds the kerb. Returns counts for the summary.
+    """
+    cfg = scene["layered"]
+    data = np.load(work_dir / cfg["file"])
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    vertices = data["vertices"].astype(np.float64) - [origin_x, origin_y, z_offset]
+    sizes = data["face_sizes"].astype(np.int64)
+    loops = data["face_loops"].astype(np.int64)
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
+    face_layer = data["face_layer"].astype(np.int64)
+    face_material = data["face_material"].astype(np.int64)
+    face_object = data["face_object"].astype(np.int64)
+    names = [str(n) for n in data["object_names"]]
+    layers = [int(v) for v in data["object_layer"]]
+    lifts = [float(v) for v in data["object_lift"]]
+    material_names = [str(n) for n in data["material_names"]]
+    bbox_local = scene["aerial"]["bbox_local"]
+    prefix = str(cfg.get("prefix") or "Area")
+
+    materials = {
+        name: make_plain_material(name, tuple(rgb), float(rough))
+        for name, rgb, rough in zip(
+            material_names, data["material_rgb"], data["material_roughness"]
+        )
+    }
+
+    # ---- the terrain -------------------------------------------------------
+    with _Layer(f"{prefix}_Terrain", f"{prefix}_Terrain"):
+        terrain = build_mesh_object(
+            str(data["terrain_name"]),
+            vertices,
+            loops,
+            starts,
+            sizes,
+            planar_uv(vertices[loops][:, :2], bbox_local),
+            np.zeros(len(sizes)),
+            [aerial_material],
+            shade_smooth=True,
+        )
+        terrain["maptile_role"] = "terrain"
+        mesh = terrain.data
+        measured = mesh.attributes.new("measured_z", "FLOAT", "POINT")
+        measured.data.foreach_set("value", vertices[:, 2].astype(np.float32))
+        if len(mesh.polygons) == len(sizes):
+            attribute = mesh.attributes.new("ground_layer", "INT", "FACE")
+            attribute.data.foreach_set("value", face_layer.astype(np.int32))
+        marked = _mark_layer_outlines(terrain, data)
+        _weighted_normals(terrain, keep_sharp=False)
+        _triangulate_on_export(terrain, quads="FIXED")
+
+        curb_group = load_curb_generator() if cfg.get("kerbs", True) else None
+        made = _layer_objects(
+            scene, cfg, vertices, loops, starts, sizes, face_material, face_object,
+            names, layers, lifts, material_names, materials, terrain, curb_group,
+            only=lambda layer: layer != LAYER_GRASS,
+        )
+    with _Layer("Terrain Cutout", "Terrain_Cutout"):
+        made += _layer_objects(
+            scene, cfg, vertices, loops, starts, sizes, face_material, face_object,
+            names, layers, lifts, material_names, materials, terrain, curb_group,
+            only=lambda layer: layer == LAYER_GRASS,
+        )
+    kerbed = sum(1 for _, layer, kerbs in made if kerbs)
+    log(
+        f"layered ground: terrain {len(vertices)} vertices, {len(sizes)} faces of which "
+        f"{int((sizes == 4).sum())} quads, {marked} outline edges marked; "
+        f"{len(made)} layer objects, {kerbed} with the curb generator"
+    )
+    return {
+        "terrain": terrain.name,
+        "objects": [name for name, _, _ in made],
+        "kerbed_objects": kerbed,
+        "curb_generator": curb_group is not None,
+    }
+
+
+def _layer_objects(
+    scene, cfg, vertices, loops, starts, sizes, face_material, face_object,
+    names, layers, lifts, material_names, materials, terrain, curb_group, only,
+) -> list:
+    """One object per name: its faces of the terrain, lifted and wrapped on."""
+    made = []
+    bbox_local = scene["aerial"]["bbox_local"]
+    curb_settings = dict(cfg.get("curb") or {})
+    curb_material = materials.get(str(cfg.get("curb_material") or "Beton"))
+    if curb_material is None:
+        curb_material = make_plain_material(str(cfg.get("curb_material")), (0.8, 0.8, 0.8), 0.5)
+    walkway_name = str(cfg.get("walkway_material") or "")
+    walkway_material = materials.get(walkway_name) if walkway_name else None
+    for index, name in enumerate(names):
+        layer = layers[index]
+        if not name or not only(layer):
+            continue
+        faces = np.flatnonzero(face_object == index)
+        if not len(faces):
+            continue
+        face_sizes = sizes[faces]
+        face_loops = np.concatenate([loops[starts[f]: starts[f] + sizes[f]] for f in faces])
+        used, local = np.unique(face_loops, return_inverse=True)
+        local = local.ravel()
+        points = vertices[used].copy()
+        points[:, 2] += lifts[index]
+        local_starts = np.concatenate([[0], np.cumsum(face_sizes)[:-1]]).astype(np.int64)
+        slots = sorted({int(m) for m in face_material[faces] if m >= 0})
+        slot_of = {m: i for i, m in enumerate(slots)}
+        obj = build_mesh_object(
+            name,
+            points,
+            local,
+            local_starts,
+            face_sizes,
+            planar_uv(points[local][:, :2], bbox_local),
+            np.array([slot_of.get(int(m), 0) for m in face_material[faces]]),
+            [materials[material_names[m]] for m in slots] or [curb_material],
+            shade_smooth=False,
+        )
+        obj["maptile_role"] = LAYER_ROLES.get(layer, "ground")
+        kerbs = layer == LAYER_WALKWAY and curb_group is not None
+        if kerbs:
+            # Flat in, kerbs on, back onto the terrain: see _flatten_group.
+            flatten = obj.modifiers.new("Flatten for kerbs", "NODES")
+            flatten.node_group = _flatten_group()
+            modifier = obj.modifiers.new("CurbGenerator", "NODES")
+            modifier.node_group = curb_group
+            for key, value in curb_settings.items():
+                if not set_modifier_input(modifier, key, value):
+                    log(f"WARNING: the curb generator has no input called {key!r}")
+            set_modifier_input(modifier, "Curb Material", curb_material)
+            if walkway_material is not None:
+                set_modifier_input(modifier, "Walkway Material", walkway_material)
+            drape = obj.modifiers.new("Drape on terrain", "NODES")
+            drape.node_group = _drape_group()
+            set_modifier_input(drape, "Terrain", terrain)
+            set_modifier_input(drape, "Lift", lifts[index])
+            _weighted_normals(obj, keep_sharp=True)
+        else:
+            _shrinkwrap(obj, terrain, lifts[index])
+        # Cut as the terrain under it is cut, so a road stays parallel to it.
+        _triangulate_on_export(obj, quads="FIXED")
+        made.append((name, layer, kerbs))
+    return made
+
+
+def _mark_layer_outlines(obj, data) -> int:
+    """Seams where the layer changes, and a vertex group per layer outline."""
+    if "edges" not in data.files or not len(data["edges"]):
+        return 0
+    mesh = obj.data
+    wanted = np.sort(data["edges"].astype(np.int64), axis=1)
+    bits = data["edge_on"].astype(np.int64)
+    count = len(mesh.edges)
+    have = np.zeros(count * 2, dtype=np.int32)
+    mesh.edges.foreach_get("vertices", have)
+    have = np.sort(have.reshape(-1, 2).astype(np.int64), axis=1)
+    n = int(len(mesh.vertices)) + 1
+    have_key = have[:, 0] * n + have[:, 1]
+    order = np.argsort(have_key)
+    wanted_key = wanted[:, 0] * n + wanted[:, 1]
+    at = np.clip(np.searchsorted(have_key[order], wanted_key), 0, count - 1)
+    found = have_key[order][at] == wanted_key
+    edge_bits = np.zeros(count, dtype=np.int32)
+    edge_bits[order[at[found]]] = bits[found]
+    attribute = mesh.attributes.new("outline", "INT", "EDGE")
+    attribute.data.foreach_set("value", edge_bits)
+    try:
+        mesh.edges.foreach_set("use_seam", edge_bits > 0)
+    except Exception:  # noqa: BLE001 - a newer Blender keeps seams elsewhere
+        pass
+    vertex_bits = data["vertex_on"].astype(np.int64)
+    for layer, label in (
+        (LAYER_ROAD, "outline_road"), (LAYER_MOTORWAY, "outline_motorway"),
+        (LAYER_WALKWAY, "outline_walkway"), (LAYER_GRASS, "outline_grass"),
+    ):
+        members = np.flatnonzero(vertex_bits & (1 << layer))
+        if len(members):
+            group = obj.vertex_groups.new(name=label)
+            group.add(members.tolist(), 1.0, "REPLACE")
     return int((edge_bits > 0).sum())
 
 
@@ -2267,8 +2756,8 @@ FBX_SETTINGS = dict(
     # Empties carry the hierarchy: Roads, Buildings, Trees and the rest are
     # parents in Unity as they are in Blender.
     object_types={"MESH", "EMPTY"},
-    # The triangulation modifiers are render-only, so the export applies them
-    # and the .blend keeps its quads.
+    # The triangulation modifiers are render-only, so the .blend keeps its
+    # quads; export_fbx switches them on while it writes.
     use_mesh_modifiers=True,
     use_mesh_modifiers_render=True,
     # BAG id, build year and height per building; height per tree. Unity can
@@ -2282,7 +2771,7 @@ FBX_SETTINGS = dict(
 )
 
 
-def export_fbx(out_path: Path) -> None:
+def export_fbx(out_path: Path, terrain: str | None = None) -> dict:
     """Write the scene to FBX for Unity.
 
     Blender is right-handed Z-up and Unity is left-handed Y-up. Exporting with
@@ -2292,10 +2781,34 @@ def export_fbx(out_path: Path) -> None:
 
     Texture paths are stripped to bare filenames because the images are written
     next to the FBX, which is where Unity looks for them.
+
+    Returns the terrain's faces as written, `terrain` naming it, so a check
+    can tell a triangulated export from one Unity will cut itself.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    bpy.ops.export_scene.fbx(filepath=str(out_path), **FBX_SETTINGS)
+    with render_modifiers():
+        bpy.ops.export_scene.fbx(filepath=str(out_path), **FBX_SETTINGS)
+        written = _faces_as_evaluated(terrain) if terrain else {}
     log(f"exported {out_path}")
+    return written
+
+
+def _faces_as_evaluated(name: str) -> dict:
+    """Face counts of an object with its modifiers applied."""
+    obj = bpy.context.scene.objects.get(name)
+    if obj is None or obj.type != "MESH":
+        return {}
+    evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    mesh = evaluated.to_mesh()
+    try:
+        totals = np.empty(len(mesh.polygons), dtype=np.int64)
+        mesh.polygons.foreach_get("loop_total", totals)
+    finally:
+        evaluated.to_mesh_clear()
+    return {
+        "exported_faces": int(len(totals)),
+        "exported_non_triangles": int((totals != 3).sum()),
+    }
 
 
 def save_blend(out_dir: Path, name: str = "model.blend") -> Path:
@@ -2423,16 +2936,22 @@ def main() -> int:
     # Each layer its own collection in the .blend and its own parent in the
     # FBX, so Unity's hierarchy reads Roads > Road_Velperweg rather than a
     # flat list of two thousand names.
-    with _Layer("Terrain"):
-        build_terrain(scene, work_dir, aerial_material)
-    with _Layer("Roads", "Roads"):
-        # Just above the terrain, one object per street, junction and stretch
-        # of paving, each surface class its own material slot.
-        build_roads(
-            scene,
-            work_dir,
-            lambda name: make_textured_material(name, aerial_texture, roughness=0.85),
-        )
+    layered = None
+    if scene.get("style") == "layered" and scene.get("layered"):
+        # The modellers' ground: the coarse terrain, and the roads, walkways
+        # and grass as objects of their own lying on it.
+        layered = build_layered(scene, work_dir, aerial_material)
+    else:
+        with _Layer("Terrain"):
+            build_terrain(scene, work_dir, aerial_material)
+        with _Layer("Roads", "Roads"):
+            # Just above the terrain, one object per street, junction and
+            # stretch of paving, each surface class its own material slot.
+            build_roads(
+                scene,
+                work_dir,
+                lambda name: make_textured_material(name, aerial_texture, roughness=0.85),
+            )
     with _Layer("Buildings", "Buildings"):
         build_buildings(
             scene, work_dir, facade_materials, aerial_material, ground_materials
@@ -2526,7 +3045,8 @@ def main() -> int:
         f"Y [{min(ys):.1f}, {max(ys):.1f}] Z [{min(zs):.1f}, {max(zs):.1f}]"
     )
 
-    export_fbx(out_dir / scene["export"]["fbx_name"])
+    terrain_name = layered["terrain"] if layered else "Terrain"
+    written = export_fbx(out_dir / scene["export"]["fbx_name"], terrain_name)
     blend = save_blend(out_dir, scene["export"].get("blend_name", "model.blend"))
 
     summary = {
@@ -2562,8 +3082,10 @@ def main() -> int:
         # mesh the Python stages built in memory, which says nothing about what
         # this script drew: a scene.json missing its mesh_file shipped the
         # plain grid for weeks with every terrain check passing.
-        "terrain": _terrain_summary(),
+        "terrain": {**_terrain_summary(terrain_name), **written},
     }
+    if layered:
+        summary["layered"] = {**layered, **_layered_summary(layered)}
     (work_dir / "blender_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )

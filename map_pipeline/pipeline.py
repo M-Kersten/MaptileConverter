@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -48,6 +49,11 @@ from src.elevation import (  # noqa: E402
     raster_sampler,
 )
 from src.terrain_mesh import build_terrain_mesh  # noqa: E402
+from src.layered import GRASS as GRASS_LAYER  # noqa: E402
+from src.layered import MOTORWAY as MOTORWAY_LAYER  # noqa: E402
+from src.layered import ROAD as ROAD_LAYER  # noqa: E402
+from src.layered import WALKWAY as WALKWAY_LAYER  # noqa: E402
+from src.layered import build_layered_ground  # noqa: E402
 from src.nwb import NWB_URL, fetch_centrelines  # noqa: E402
 from src.roads import (  # noqa: E402
     TERRAIN_CLEARANCE_M,
@@ -121,6 +127,7 @@ from src.validate import (  # noqa: E402
     check_export,
     check_fbx_reimport,
     check_barriers,
+    check_layered,
     check_furniture,
     check_rails,
     check_structures,
@@ -364,8 +371,11 @@ def run_blender_stage(
     write is the real test.
     """
     error_file = work_dir / "blender_error.txt"
-    if error_file.exists():
-        error_file.unlink()
+    # The checks read Blender's summary back; one left by an earlier run would
+    # vouch for a model this run did not build.
+    for stale in (error_file, work_dir / "blender_summary.json"):
+        if stale.exists():
+            stale.unlink()
 
     result = run_blender_script(
         "process.py",
@@ -414,6 +424,36 @@ def _collision_metadata(work_dir: Path) -> dict:
         return {}
     collision = summary.get("collision") or {}
     return {"collision": collision} if collision.get("objects") else {}
+
+
+def layered_scene(config: PipelineConfig, ground) -> dict:
+    """What the Blender stage needs to build the modellers' ground."""
+    settings = config.layered
+    curb = settings["curb"]
+    return {
+        "file": "layered_ground.npz",
+        "prefix": str(settings["prefix"]),
+        "kerbs": bool(settings.get("kerbs", True)),
+        # The curb generator's own inputs, by the names its interface uses.
+        "curb": {
+            "Width": float(curb["width_m"]),
+            "Height": float(curb["height_m"]),
+            "Height Offset Curb": float(curb["height_offset_curb_m"]),
+            "Curb Slant": float(curb["slant"]),
+            "Bevel": float(curb["bevel_m"]),
+            "Bevel Inner": float(curb["bevel_inner_m"]),
+            "Walkway Height Offset": float(curb["walkway_height_offset_m"]),
+            "Bevel Curb Outer": bool(curb["bevel_curb_outer"]),
+            "Bevel Curb Inner": bool(curb["bevel_curb_inner"]),
+            "Smooth by Angle": math.radians(float(curb["smooth_angle_deg"])),
+        },
+        "walkway_material": str(curb.get("walkway_material") or ""),
+        "curb_material": str(curb.get("curb_material") or "Beton"),
+        "stats": {
+            k: v for k, v in ground.stats.items()
+            if k in ("faces", "vertices", "quad_share", "grid_error_max_m")
+        },
+    }
 
 
 def run(config: PipelineConfig, args: argparse.Namespace) -> int:
@@ -485,8 +525,13 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 "attempt it anyway."
             )
 
+    layered = config.style == "layered"
     want_trees = bool(config.trees["enabled"])
-    want_surfaces = bool(config.surfaces["water"] or config.surfaces["land_cover"])
+    # The layered ground is made of the BGT surfaces, so it needs them even
+    # with water and land cover both off.
+    want_surfaces = bool(
+        config.surfaces["water"] or config.surfaces["land_cover"] or layered
+    )
     want_furniture = bool(config.furniture["enabled"])
     want_barriers = bool(config.barriers["enabled"])
     want_usage = bool(config.usage["enabled"])
@@ -524,7 +569,13 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     surfaces = SurfaceSet()
     water_texture = None
     if want_surfaces:
-        with Stage("ground surfaces (BGT water and land cover)", next_step(), total):
+        with Stage(
+            "ground surfaces (BGT roads, paving and green)"
+            if layered
+            else "ground surfaces (BGT water and land cover)",
+            next_step(),
+            total,
+        ):
             # A road on a bridge takes its height from the surface model, so
             # that has to be here before the road geometry is built.
             deck_dsm = None
@@ -558,6 +609,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 terrain=terrain,
                 deck_sampler=deck_dsm,
                 network=network,
+                # The modellers' style draws every road, verge and island
+                # polygon as a layer of its own.
+                keep_areas=layered,
             )
             if surfaces.class_grid is not None:
                 write_land_cover(surfaces, config.bbox, out_dir)
@@ -585,39 +639,82 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             facade_cfg=config.facade,
         )
 
-    with Stage("terrain mesh (outline edges)", next_step(), total):
-        # The ground's edges follow the outlines on it -- waterline, road
-        # edge, building -- so it is built once all three are known, and
-        # before anything is placed on it.
-        terrain.mesh = build_terrain_mesh(
-            terrain,
-            roads=surfaces.road_mesh,
-            water=surfaces.water,
-            buildings=buildings,
-            sources=config.terrain.get("feature_edges", ()),
-            water_depth_m=float(config.surfaces.get("water_depth_m", 1.2)),
-        )
-        if surfaces.road_mesh is not None and len(surfaces.road_mesh):
-            # The roads are a separate surface laid on top, so the ground
-            # gets out of their way rather than the other way round, and
-            # everything placed from here on stands on the road where there
-            # is one.
-            terrain.road_top = road_top(surfaces.road_mesh, config.bbox)
-            lower_under(
+    ground_layers = None
+    if layered:
+        with Stage("terrain and ground layers", next_step(), total):
+            # The modellers' ground: a coarse terrain within tolerance of the
+            # survey, the roads, walkways and grass lying on it as objects of
+            # their own. Built before anything is placed, which then stands on
+            # whichever layer is under it.
+            settings = config.layered
+            curb = settings["curb"]
+            ground_layers = build_layered_ground(
                 terrain,
-                road_underside(surfaces.road_mesh, config.bbox),
-                clearance_m=TERRAIN_CLEARANCE_M,
+                surfaces.areas,
+                prefix=str(settings["prefix"]),
+                tolerance_m=float(settings["tolerance_m"]),
+                outline_m=float(settings["outline_m"]),
+                focus_m=float(settings["focus_m"]),
+                lift={
+                    ROAD_LAYER: float(settings["road_lift_m"]),
+                    MOTORWAY_LAYER: float(settings["road_lift_m"]),
+                    WALKWAY_LAYER: float(settings["road_lift_m"]),
+                    GRASS_LAYER: float(settings["grass_lift_m"]),
+                },
+                walkway_raise_m=(
+                    float(curb["height_m"]) - float(curb["height_offset_curb_m"])
+                    if settings.get("kerbs", True)
+                    else 0.0
+                ),
             )
-        error = mesh_survey_error(terrain)
-        if error:
-            terrain.survey_error = error
-            LOG.info(
-                "terrain mesh within %.3f m of the survey on 95%% of the ground, "
-                "%.3f m on 99%%",
-                error["p95_m"],
-                error["p99_m"],
+            terrain.mesh = ground_layers.mesh
+            terrain.layers = ground_layers
+            ground_layers.save(work_dir)
+            error = mesh_survey_error(terrain, tolerance_m=float(settings["tolerance_m"]))
+            if error:
+                terrain.survey_error = error
+                LOG.info(
+                    "terrain within %.3f m of the survey on 95%% of the ground, "
+                    "%.3f m on 99%%",
+                    error["p95_m"],
+                    error["p99_m"],
+                )
+            terrain.save(work_dir)
+
+    else:
+        with Stage("terrain mesh (outline edges)", next_step(), total):
+            # The ground's edges follow the outlines on it -- waterline, road
+            # edge, building -- so it is built once all three are known, and
+            # before anything is placed on it.
+            terrain.mesh = build_terrain_mesh(
+                terrain,
+                roads=surfaces.road_mesh,
+                water=surfaces.water,
+                buildings=buildings,
+                sources=config.terrain.get("feature_edges", ()),
+                water_depth_m=float(config.surfaces.get("water_depth_m", 1.2)),
             )
-        terrain.save(work_dir)
+            if surfaces.road_mesh is not None and len(surfaces.road_mesh):
+                # The roads are a separate surface laid on top, so the ground
+                # gets out of their way rather than the other way round, and
+                # everything placed from here on stands on the road where there
+                # is one.
+                terrain.road_top = road_top(surfaces.road_mesh, config.bbox)
+                lower_under(
+                    terrain,
+                    road_underside(surfaces.road_mesh, config.bbox),
+                    clearance_m=TERRAIN_CLEARANCE_M,
+                )
+            error = mesh_survey_error(terrain)
+            if error:
+                terrain.survey_error = error
+                LOG.info(
+                    "terrain mesh within %.3f m of the survey on 95%% of the ground, "
+                    "%.3f m on 99%%",
+                    error["p95_m"],
+                    error["p99_m"],
+                )
+            terrain.save(work_dir)
 
     trees = TreeSet()
     tree_texture = None
@@ -815,6 +912,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 str(k): v for k, v in STRUCTURE_KIND_NAMES.items()
             },
             ground_variants=ground_variants,
+            layered=(
+                layered_scene(config, ground_layers)
+                if ground_layers is not None
+                else None
+            ),
         )
 
     if not args.skip_blender:
@@ -876,6 +978,19 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             report, terrain,
             expect_outlines=bool(config.terrain.get("feature_edges")),
         )
+        if not args.skip_blender:
+            curb = config.layered["curb"]
+            check_layered(
+                report, work_dir, ground_layers,
+                kerbs=bool(config.layered.get("kerbs", True)),
+                # The kerb's top, or the walkway's where the generator lifts
+                # it by its own offset at a tight corner, whichever is higher.
+                kerb_top_m=max(
+                    float(curb["height_m"]),
+                    float(curb["height_m"]) - float(curb["height_offset_curb_m"])
+                    + float(curb["walkway_height_offset_m"]),
+                ),
+            )
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_furniture(report, furniture if want_furniture else None, config.bbox)

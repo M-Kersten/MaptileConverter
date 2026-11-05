@@ -91,7 +91,9 @@ def setup_render(engine: str, size: int) -> None:
         scene.cycles.samples = 32
 
     world = bpy.data.worlds.new("PreviewWorld")
-    world.use_nodes = True
+    if bpy.app.version < (5, 0, 0):
+        # Blender 5 gives a new world its nodes and deprecates the switch.
+        world.use_nodes = True
     world.node_tree.nodes["Background"].inputs[0].default_value = (0.55, 0.68, 0.85, 1)
     world.node_tree.nodes["Background"].inputs[1].default_value = 1.4
     scene.world = world

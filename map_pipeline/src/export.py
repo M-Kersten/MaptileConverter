@@ -185,6 +185,7 @@ def write_scene_description(
     structure_kind_names: dict | None = None,
     car_colours: int = 6,
     ground_variants: int = 0,
+    layered: dict | None = None,
 ) -> Path:
     """Write scene.json: everything the Blender stage needs, and nothing else.
 
@@ -328,6 +329,13 @@ def write_scene_description(
             ),
         },
     }
+    # The modellers' style: the ground is the coarse terrain with roads,
+    # walkways and grass as their own objects on it, and the walkways carry
+    # the curb generator. Blender builds that instead of the terrain mesh and
+    # the street objects.
+    if layered:
+        scene["style"] = "layered"
+        scene["layered"] = dict(layered)
 
     work_dir.mkdir(parents=True, exist_ok=True)
     path = work_dir / "scene.json"

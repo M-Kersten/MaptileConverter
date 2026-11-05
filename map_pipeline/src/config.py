@@ -24,6 +24,51 @@ AERIAL_SOURCE_M_PER_PX = 0.08
 
 DEFAULTS: dict[str, Any] = {
     "name": "demo_area",
+    # How the ground is built. "layered" is the way the modellers build it by
+    # hand: a coarse terrain with roads, walkways and grass as separate flat
+    # objects on top and the curb generator on every walkway (see
+    # src/layered.py). "survey" is the dense terrain that follows the survey
+    # to the centimetre, with every street its own quad-strip object.
+    "style": "layered",
+    "layered": {
+        # What every ground object's name starts with; empty takes the area
+        # name ("hazeldonk" gives Hazeldonk_Terrein, Hazeldonk_Snelweg).
+        "prefix": "",
+        # How far any surveyed point may be from the terrain. The hand-made
+        # Hazeldonk terrain is within 0.98 m on 95% of the ground; 0.5 m
+        # everywhere costs about 27k faces over a square kilometre.
+        "tolerance_m": 0.5,
+        # How far a simplified outline may stray from the BGT's.
+        "outline_m": 0.25,
+        # The middle of the area, grouped into an east and a west object per
+        # layer; outside it, one per quadrant. The modellers' VP_Oost_Wegen
+        # and Wegen_Afstand_NO.
+        "focus_m": 250.0,
+        # How far each layer is lifted off the terrain, as the modellers'
+        # shrinkwrap offsets do: enough to keep it from flickering.
+        "road_lift_m": 0.05,
+        "grass_lift_m": 0.02,
+        # The curb generator on every walkway and traffic island. Needs
+        # Blender 5; with an older one the walkways stay flat.
+        "kerbs": True,
+        # The modellers' own settings for it.
+        "curb": {
+            "width_m": 0.3,
+            "height_m": 0.15,
+            "height_offset_curb_m": 0.02,
+            "slant": 0.6,
+            "bevel_m": 0.02,
+            "bevel_inner_m": 0.015,
+            "walkway_height_offset_m": 0.05,
+            "bevel_curb_outer": True,
+            "bevel_curb_inner": True,
+            "smooth_angle_deg": 46.0,
+            # Empty keeps each walkway's own material (Beton_Geel, or Gras on
+            # a green island); a name puts that material on every walkway.
+            "walkway_material": "",
+            "curb_material": "Beton",
+        },
+    },
     "aerial": {
         "layer": "Luchtfoto Actueel Ortho 8cm RGB",
         "size_px": 4096,
@@ -397,6 +442,28 @@ DETAIL_PRESETS: dict[str, dict] = {
 }
 
 
+# What each style changes in the other sections, applied before the file's
+# own settings so anything set explicitly still wins. The modellers' ground
+# has no water and no street-by-street road objects, and their file has no
+# parked cars.
+STYLE_PRESETS: dict[str, dict] = {
+    "layered": {
+        "surfaces": {"water": False, "road_geometry": False},
+        "terrain": {"feature_edges": []},
+        "vehicles": {"cars": False, "boats": False},
+    },
+    "survey": {},
+}
+
+# What a style cannot do at all, whatever the file says. The layered ground
+# makes its own roads, so the survey style's would lie on top of them, and it
+# has no bed for water to sit in: a water surface would cut through it.
+STYLE_LOCKED: dict[str, dict[tuple[str, str], object]] = {
+    "layered": {("surfaces", "water"): False, ("surfaces", "road_geometry"): False},
+    "survey": {},
+}
+
+
 # Settings that no longer do anything, and what took their place. A config
 # that still carries one loads, and says so, rather than failing or being
 # silently ignored.
@@ -452,6 +519,20 @@ def detail_settings(detail: str, side_m: float) -> dict:
     }
 
 
+def default_prefix(name: str) -> str:
+    """Object-name prefix from an area name: "hazeldonk_west" -> "Hazeldonk_West"."""
+    import re
+    import unicodedata
+
+    # Accents dropped rather than the letters: "Café" -> "Cafe".
+    plain = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode()
+    words = [w for w in re.split(r"[\s_\-]+", plain) if w]
+    cleaned = "_".join(w[:1].upper() + w[1:] for w in words)
+    # Blender and Unity both take anything, but a file system path does not.
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "", cleaned)
+    return cleaned or "Area"
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Merge `override` into `base`, recursing into nested dicts."""
     out = copy.deepcopy(base)
@@ -470,6 +551,8 @@ class PipelineConfig:
     name: str
     bbox: BBox
     geo: GeoContext
+    style: str
+    layered: dict[str, Any]
     aerial: dict[str, Any]
     terrain: dict[str, Any]
     buildings: dict[str, Any]
@@ -499,6 +582,8 @@ class PipelineConfig:
         """
         return {
             "name": self.name,
+            "style": self.style,
+            "layered": self.layered,
             "aerial": self.aerial,
             "terrain": self.terrain,
             "buildings": self.buildings,
@@ -546,7 +631,21 @@ def load_config(path: str | Path) -> PipelineConfig:
         base = _deep_merge(
             DEFAULTS, detail_settings(raw["detail"], max(bbox.width, bbox.height))
         )
+    style = str(raw.get("style", DEFAULTS["style"]) or "").strip().lower()
+    if style not in STYLE_PRESETS:
+        raise ValueError(
+            f"style must be one of {', '.join(STYLE_PRESETS)}, got {raw.get('style')!r}"
+        )
+    base = _deep_merge(base, STYLE_PRESETS[style])
     merged = _deep_merge(base, {k: v for k, v in raw.items() if k != "detail"})
+    merged["style"] = style
+    for (section, key), value in STYLE_LOCKED[style].items():
+        if merged.get(section, {}).get(key, value) != value:
+            LOG.warning(
+                "%s.%s cannot be %r in the %s style; using %r",
+                section, key, merged[section][key], style, value,
+            )
+        merged.setdefault(section, {})[key] = value
     warnings = validate_bbox(bbox)
     for warning in warnings:
         LOG.warning("%s", warning)
@@ -657,10 +756,31 @@ def load_config(path: str | Path) -> PipelineConfig:
         )
     merged["buildings"]["clip_mode"] = clip_mode
 
+    layered = merged["layered"]
+    for key in ("tolerance_m", "focus_m"):
+        value = float(layered[key])
+        if not value > 0:
+            raise ValueError(f"layered.{key} must be positive, got {value}")
+        layered[key] = value
+    for key in ("outline_m", "road_lift_m", "grass_lift_m"):
+        value = float(layered[key])
+        if value < 0:
+            raise ValueError(f"layered.{key} must not be negative, got {value}")
+        layered[key] = value
+    prefix = str(layered.get("prefix") or "").strip()
+    layered["prefix"] = prefix or default_prefix(name)
+    curb = layered["curb"]
+    if not 0 < float(curb["height_offset_curb_m"]) < float(curb["height_m"]):
+        raise ValueError(
+            "layered.curb.height_offset_curb_m must be between 0 and the kerb height"
+        )
+
     return PipelineConfig(
         name=name,
         bbox=bbox,
         geo=GeoContext.from_bbox(bbox),
+        style=style,
+        layered=layered,
         aerial=merged["aerial"],
         terrain=merged["terrain"],
         buildings=merged["buildings"],
@@ -684,6 +804,9 @@ __all__ = [
     "DETAIL_PRESETS",
     "PipelineConfig",
     "RETIRED",
+    "STYLE_LOCKED",
+    "STYLE_PRESETS",
+    "default_prefix",
     "detail_settings",
     "load_config",
 ]

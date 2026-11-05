@@ -318,8 +318,18 @@
 
   <fieldset>
     <legend>
-      <span class="step"><span class="stepnum">2</span><span class="steptitle">Choose how much detail</span></span>
+      <span class="step"><span class="stepnum">2</span><span class="steptitle">Choose the style and detail</span></span>
     </legend>
+
+    <label for="style">Style
+      <span class="help" tabindex="0" role="button" aria-label="About the style"
+        data-tip="How the ground is made. <b>Layered</b> is how our 3D modellers build an area by hand: a coarse terrain, with the roads, walkways and lawns as separate objects lying on it, so each can be selected, moved and given its own material. Walkways get kerbs from the curb generator, which needs Blender 5. <b>Survey</b> keeps the ground as measured, with water, and the roads as meshes of their own.">?</span>
+    </label>
+    <select id="style">
+      <option value="layered" selected>Layered &mdash; as our modellers build it</option>
+      <option value="survey">Survey &mdash; the ground as measured</option>
+    </select>
+    <div class="plain" id="stylePlain"></div>
 
     <label for="detail">Detail
       <span class="help" tabindex="0" role="button" aria-label="About detail"
@@ -397,8 +407,10 @@
       <p>A folder <code>output/&lt;name&gt;/</code> holding:</p>
       <p>
         <code>model.blend</code> &mdash; the model for editing in Blender: every
-        layer its own collection, one object per building, street and tree,
-        roads and ground as clean quads, the ground's edges following every
+        layer its own collection, one object per building and tree. In the
+        layered style the ground is a coarse terrain with the roads, walkways
+        and lawns as objects of their own lying on it; in the survey style the
+        roads and ground are clean quads, the ground's edges following every
         waterline, road edge and building.<br>
         <code>model.fbx</code> &mdash; the same model for Unity.<br>
         <code>maptile_tools.py</code> &mdash; Blender tools that keep the
@@ -412,7 +424,12 @@
         <b>Blender:</b> open <code>model.blend</code>. The <i>Maptile</i> tab in
         the sidebar (N) has the tools; if it is missing, allow scripts when
         Blender asks, or install <code>maptile_tools.py</code> as an add-on.
-        After moving or widening a road, press <i>Fit terrain under roads</i>.
+        In the layered style the roads, walkways and lawns follow the terrain
+        by themselves: reshape the terrain and they move with it. Each
+        walkway's kerb is its <i>CurbGenerator</i> modifier, so edit the
+        walkway's outline and the kerb follows. Use Blender 5 for the kerbs.
+        In the survey style, after moving or widening a road, press
+        <i>Fit terrain under roads</i>.
       </p>
       <p>
         <b>Unity:</b> drag the folder into Assets. On the FBX set
@@ -871,6 +888,27 @@ const DETAIL_PLAIN = {
   standard: "Cars and pavements read in the photo; ditches, ramps and embankments come through in the ground, a 2 m grid whose edges follow the waterlines, road edges and buildings.",
   high: "Road markings read in the photo and the ground carries kerbs and small steps. Heavy over a full square kilometre; best on a smaller area."
 };
+/* In the layered style the ground is the same at every level: detail is the
+   photo and the walls. */
+const DETAIL_PLAIN_LAYERED = {
+  draft: "Quick to build, to check an area before committing to it. The photo shows blocks and roads.",
+  standard: "Cars and pavements read in the photo; the walls carry their windows.",
+  high: "Road markings read in the photo. Heavy over a full square kilometre; best on a smaller area."
+};
+
+/* What each style does to the sources. Must match STYLE_PRESETS and
+   STYLE_LOCKED in src/config.py: "locked" sources cannot be used in the
+   style at all, "unticked" ones start off and may be ticked. */
+const STYLE = {
+  layered: { locked: ["water"], unticked: ["vehicles"] },
+  survey:  { locked: [], unticked: [] }
+};
+const STYLE_PLAIN = {
+  layered: "A coarse terrain within half a metre of the survey, with every road, walkway and lawn an object of its own lying on it, named and grouped as the modellers group theirs. Walkways get kerbs you can edit (Blender 5). No water.",
+  survey: "The ground as measured: a fine grid whose edges follow every waterline, road edge and building, the roads as meshes of their own with kerbs, and water."
+};
+
+function currentStyle() { return STYLE[$("style").value] || STYLE.layered; }
 
 function quality() {
   const side = sel.size;
@@ -888,17 +926,21 @@ function quality() {
 
 function updateQuality() {
   const q = quality();
+  const layered = $("style").value === "layered";
   $("detailNumbers").innerHTML =
     `<b>photo</b> ${q.cm} cm/px, ${q.sizePx} px<br>`
-    + `<b>ground</b> every ${q.grid} m, ${(q.vertices / 1000).toFixed(0)}k points<br>`
+    + (layered
+      ? `<b>ground</b> within 0.5 m of the survey, measured every ${q.grid} m<br>`
+      : `<b>ground</b> every ${q.grid} m, ${(q.vertices / 1000).toFixed(0)}k points<br>`)
     + `<b>walls</b> ${q.facadePx} px a storey`;
-  $("detailPlain").textContent = DETAIL_PLAIN[q.detail] || "";
+  $("detailPlain").textContent = (layered ? DETAIL_PLAIN_LAYERED : DETAIL_PLAIN)[q.detail] || "";
+  $("stylePlain").textContent = STYLE_PLAIN[$("style").value] || "";
   const notes = [];
   if (q.sizePx > UNITY_MAX_TEXTURE)
     notes.push(`Using Unity? The photo is bigger than it will import (${UNITY_MAX_TEXTURE} px) and gets shrunk on the way in. A smaller area keeps this detail. Blender takes it as it is.`);
   else if (q.sizePx > 2048)
     notes.push("Using Unity? It shrinks imported textures to 2048 px until you raise Max Size on the texture. Blender takes it as it is.");
-  if (q.vertices > 1.5e6)
+  if (!layered && q.vertices > 1.5e6)
     notes.push(`That is ${(q.vertices / 1e6).toFixed(1)} million points of ground. It will open, but expect a slow import and a heavy scene.`);
   $("qualityNote").innerHTML = notes.map(escapeHtml).join("<br>");
   $("qualityNote").style.color = "var(--muted)";
@@ -906,6 +948,22 @@ function updateQuality() {
 
 $("detail").addEventListener("change", updateQuality);
 $("name").addEventListener("input", updateAreaPlain);
+
+/* Switching style: a source the style starts without is unticked, once, and
+   ticked again on the way back unless the user has touched it since. */
+const styleUnticked = new Set();
+function applyStyle() {
+  const style = currentStyle();
+  for (const id of styleUnticked) sourceOff.delete(id);
+  styleUnticked.clear();
+  for (const id of style.unticked) {
+    if (!sourceOff.has(id)) { sourceOff.add(id); styleUnticked.add(id); }
+  }
+  updateQuality();
+  renderSources();
+  refreshEstimate();
+}
+$("style").addEventListener("change", applyStyle);
 
 /* ---------- estimate ---------- */
 function humanTime(seconds) {
@@ -1015,7 +1073,9 @@ $("run").onclick = async () => {
   const payload = {
     name: $("name").value.trim(),
     bbox: bbox(),
-    // Everything else follows from these. See DETAIL_PRESETS in src/config.py.
+    // Everything else follows from these. See DETAIL_PRESETS and
+    // STYLE_PRESETS in src/config.py.
+    style: $("style").value,
     detail: $("detail").value,
     sources: selectedSources(),
     preview: $("preview").checked,
@@ -1162,10 +1222,14 @@ function showResult(area) {
 let sourceList = [];                       // as described by the server
 const sourceOff = new Set();               // ids the user has turned off
 
+function lockedByStyle(id) { return currentStyle().locked.includes(id); }
+
+function sourceOn(s) {
+  return s.required || (!sourceOff.has(s.id) && !lockedByStyle(s.id));
+}
+
 function selectedSources() {
-  return sourceList
-    .filter(s => s.required || !sourceOff.has(s.id))
-    .map(s => s.id);
+  return sourceList.filter(sourceOn).map(s => s.id);
 }
 
 function renderSources() {
@@ -1177,12 +1241,14 @@ function renderSources() {
     row.className = "src";
     row.dataset.id = s.id;
 
+    const locked = lockedByStyle(s.id);
     const box = document.createElement("input");
     box.type = "checkbox";
-    box.checked = s.required || !sourceOff.has(s.id);
-    box.disabled = !!s.required;
+    box.checked = sourceOn(s);
+    box.disabled = !!s.required || locked;
     box.onchange = () => {
       if (box.checked) sourceOff.delete(s.id); else sourceOff.add(s.id);
+      styleUnticked.delete(s.id);
       // Only the state is refreshed, not the markup: rebuilding the list here
       // would drop focus on the box that was just toggled.
       updateSourceStates();
@@ -1193,6 +1259,7 @@ function renderSources() {
     name.className = "name";
     name.innerHTML =
       `<b>${escapeHtml(s.label)}</b>${s.required ? " <span class='who'>· required</span>" : ""}` +
+      `${locked ? " <span class='who'>· not in this style</span>" : ""}` +
       `<div class="who">${escapeHtml(s.provider)}${
         s.ok === false ? " · " + escapeHtml(s.detail) :
         s.degraded ? " · on the backup service" : ""}</div>`;
@@ -1212,7 +1279,7 @@ function updateSourceStates() {
   for (const row of document.querySelectorAll(".src")) {
     const s = byId[row.dataset.id];
     if (!s) continue;
-    const on = s.required || !sourceOff.has(s.id);
+    const on = sourceOn(s);
     row.classList.toggle("off", !on);
     row.classList.toggle("blocked", !!s.required && s.ok === false);
     row.querySelector(".dot").className =
@@ -1222,7 +1289,7 @@ function updateSourceStates() {
 
   const blocking = sourceList.filter(s => s.required && s.ok === false);
   const optionalDown = sourceList.filter(
-    s => !s.required && s.ok === false && !sourceOff.has(s.id));
+    s => !s.required && s.ok === false && sourceOn(s));
 
   let note = "";
   if (blocking.length) {
@@ -1262,8 +1329,7 @@ $("recheck").onclick = () => { checkServices(); };
 /* ---------- start ---------- */
 fitToSelection();
 updateBboxInfo();
-updateQuality();
-refreshEstimate();
+applyStyle();
 checkServices();
 
 probeTileSource().then(source => {

@@ -186,6 +186,9 @@ class SurfaceSet:
     water_bed: np.ndarray | None = None
     counts: dict[str, int] = field(default_factory=dict)
     stats_by_collection: dict[str, str] = field(default_factory=dict)
+    # Every BGT road, verge, island and terrain polygon with the layer it is
+    # drawn as, for the modellers' style (`layered.GroundArea`).
+    areas: list = field(default_factory=list)
 
     @property
     def water_area_m2(self) -> float:
@@ -301,6 +304,7 @@ def build_surfaces(
     terrain,
     deck_sampler=None,
     network=None,
+    keep_areas: bool = False,
 ) -> SurfaceSet:
     """Fetch water and land cover, classify the terrain grid, build the roads.
 
@@ -308,7 +312,9 @@ def build_surfaces(
     bridge; without one they are draped on the ground like everything else.
     ``network`` is the NWB road network the cross-sections are cut along; see
     `roads`. Without it every road is still built, from centrelines drawn down
-    the middle of the road itself.
+    the middle of the road itself. ``keep_areas`` keeps every road, verge,
+    island and terrain polygon with the layer the modellers' style draws it as
+    (`SurfaceSet.areas`).
     """
     import rasterio
 
@@ -513,6 +519,9 @@ def build_surfaces(
         result.counts["road_kerb_faces"] = int(mesh.stats.get("kerb_faces", 0))
         result.counts["road_objects"] = len(mesh.object_names)
 
+    if keep_areas:
+        result.areas = _ground_areas(bbox, fetch_kwargs, result)
+
     # Outside the water block, and guarded: land cover and water are
     # independently switchable, so this ran on a None grid whenever water was
     # on and land cover was off.
@@ -528,6 +537,53 @@ def build_surfaces(
 
     save_surfaces(result, bbox, work_dir)
     return result
+
+
+AREA_COLLECTIONS = (
+    "wegdeel",
+    # Verges and traffic islands: the islands are what the curb generator
+    # raises, and land cover never needed them.
+    "ondersteunendwegdeel",
+    "begroeidterreindeel",
+    "onbegroeidterreindeel",
+)
+
+
+def _ground_areas(bbox: BBox, fetch_kwargs: dict, result: SurfaceSet) -> list:
+    """Every polygon the layered ground draws, with its layer and material.
+
+    The collections land cover already read come back from the run's cache.
+    """
+    from .layered import LAYER_NAMES, GroundArea, classify
+
+    areas = []
+    for collection in AREA_COLLECTIONS:
+        features, stats = fetch_current(collection, bbox, **fetch_kwargs)
+        result.stats_by_collection.setdefault(collection, stats.summary())
+        for feature in features:
+            properties = feature.get("properties") or {}
+            kind = classify(collection, properties)
+            if kind is None:
+                continue
+            try:
+                level = int(properties.get("relatieve_hoogteligging") or 0)
+            except (TypeError, ValueError):
+                level = 0
+            for rings in polygon_rings(feature.get("geometry")):
+                clipped = [clip_ring_to_bbox(ring, bbox) for ring in rings]
+                clipped = [ring for ring in clipped if len(ring) >= 4]
+                if clipped:
+                    areas.append(GroundArea(clipped, kind[0], kind[1], level))
+    counts: dict[str, int] = {}
+    for area in areas:
+        name = LAYER_NAMES[area.layer]
+        counts[name] = counts.get(name, 0) + 1
+    result.counts["ground_areas"] = len(areas)
+    LOG.info(
+        "ground layers: %d areas (%s)",
+        len(areas), ", ".join(f"{v} {k}" for k, v in sorted(counts.items())),
+    )
+    return areas
 
 
 def triangulate_water(bodies: list[WaterBody]) -> tuple[np.ndarray, np.ndarray]:
