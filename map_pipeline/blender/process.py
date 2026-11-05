@@ -1196,6 +1196,62 @@ def build_layered(scene: dict, work_dir: Path, aerial_material) -> dict:
     }
 
 
+def split_pinches(points, loops, starts, sizes):
+    """Each outline vertex where two outlines touch, made one per side.
+
+    Where two footpaths meet at a single corner -- or one footpath meets
+    itself -- four outline edges share a vertex. The curb generator follows
+    an outline expecting two at every vertex; at four it pairs the wrong
+    ones and its kerb flies off, 800 m sideways over Utrecht and a metre up
+    elsewhere. Every fan of faces round such a vertex but the first gets its
+    own copy of it, in the same place, so each outline is a simple loop.
+    Returns the points and the loops.
+    """
+    loops = np.asarray(loops, dtype=np.int64).copy()
+    starts = np.asarray(starts, dtype=np.int64)
+    sizes = np.asarray(sizes, dtype=np.int64)
+    face_of = np.repeat(np.arange(len(sizes)), sizes)
+    following = np.arange(len(loops)) + 1
+    following[starts + sizes - 1] = starts
+    pairs = np.sort(np.column_stack([loops, loops[following]]), axis=1)
+    _, inverse, counts = np.unique(pairs, axis=0, return_inverse=True, return_counts=True)
+    inverse = inverse.ravel()
+    outline = counts[inverse] == 1
+    per_vertex = np.bincount(pairs[outline].ravel(), minlength=len(points))
+    pinched = np.flatnonzero(per_vertex > 2)
+    if not len(pinched):
+        return points, loops
+    extra = []
+    for vertex in pinched.tolist():
+        at = np.flatnonzero(loops == vertex)
+        faces = face_of[at].tolist()
+        parent = {f: f for f in faces}
+
+        def root(f):
+            while parent[f] != f:
+                parent[f] = parent[parent[f]]
+                f = parent[f]
+            return f
+
+        # Faces round the vertex are one fan where they share an inner edge
+        # through it.
+        by_edge: dict[int, list[int]] = {}
+        for loop in np.flatnonzero((pairs == vertex).any(axis=1) & ~outline).tolist():
+            by_edge.setdefault(int(inverse[loop]), []).append(int(face_of[loop]))
+        for owners in by_edge.values():
+            for other in owners[1:]:
+                parent[root(other)] = root(owners[0])
+        fans: dict[int, list[int]] = {}
+        for loop, face in zip(at.tolist(), faces):
+            fans.setdefault(root(face), []).append(loop)
+        for members in list(fans.values())[1:]:
+            loops[members] = len(points) + len(extra)
+            extra.append(points[vertex])
+    if extra:
+        points = np.vstack([points, np.array(extra)])
+    return points, loops
+
+
 def _layer_objects(
     scene, cfg, vertices, loops, starts, sizes, face_material, face_object,
     names, layers, lifts, material_names, materials, terrain, curb_group, only,
@@ -1223,6 +1279,8 @@ def _layer_objects(
         points = vertices[used].copy()
         points[:, 2] += lifts[index]
         local_starts = np.concatenate([[0], np.cumsum(face_sizes)[:-1]]).astype(np.int64)
+        if layer == LAYER_WALKWAY and curb_group is not None:
+            points, local = split_pinches(points, local, local_starts, face_sizes)
         slots = sorted({int(m) for m in face_material[faces] if m >= 0})
         slot_of = {m: i for i, m in enumerate(slots)}
         obj = build_mesh_object(
@@ -2830,15 +2888,17 @@ def save_blend(out_dir: Path, name: str = "model.blend") -> Path:
 
     Texture paths are made relative, so the folder can be moved or zipped and
     the .blend still finds its images beside it. The Maptile tools go in as a
-    text block registered on load (when Blender is allowed to run scripts) and
-    as a file next to the .blend to install as an add-on.
+    text block to run from the Text Editor, and as a file next to the .blend
+    to install once as an add-on. The text block is not marked to register
+    itself on load: Blender stops every file that asks that with a security
+    warning, which is what everyone opening a model met first.
     """
     tools = Path(__file__).with_name("maptile_tools.py")
     if tools.is_file():
         shutil.copyfile(tools, out_dir / tools.name)
         text = bpy.data.texts.load(str(out_dir / tools.name))
         text.name = tools.name
-        text.use_module = True
+        text.use_module = False
     path = out_dir / name
     # No model.blend1 backup beside it: this is a fresh file every run.
     bpy.context.preferences.filepaths.save_version = 0

@@ -7288,6 +7288,7 @@ class TestLayeredInBlender(unittest.TestCase):
 
         namespace = _process_namespace(
             {"build_layered", "_layer_objects", "_mark_layer_outlines", "_shrinkwrap",
+             "split_pinches",
              "_weighted_normals", "_triangulate_on_export", "set_modifier_input",
              "planar_uv", "LAYER_ROAD", "LAYER_MOTORWAY", "LAYER_WALKWAY", "LAYER_GRASS",
              "LAYER_ROLES"},
@@ -7397,6 +7398,34 @@ class TestLayeredInBlender(unittest.TestCase):
             self.assertNotIn("NODES", [m.type for m in obj.modifiers])
             if obj.get("maptile_role") == "walkway":
                 self.assertEqual([m.type for m in obj.modifiers], ["SHRINKWRAP", "TRIANGULATE"])
+
+    def test_footpaths_touching_at_a_corner_get_a_vertex_each(self):
+        """Two footpaths meeting at one corner share a vertex with four outline
+        edges, and the curb generator, following each outline, paired the
+        wrong two: over Utrecht kerbs flew 800 m off. Split, each outline is
+        a simple loop; nothing moves."""
+        split = _process_namespace({"split_pinches"})["split_pinches"]
+        points = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+                           [2, 1, 0], [2, 2, 0], [1, 2, 0]], dtype=float)
+        loops = np.array([0, 1, 2, 3, 2, 4, 5, 6])
+        starts, sizes = np.array([0, 4]), np.array([4, 4])
+        new_points, new_loops = split(points, loops, starts, sizes)
+        self.assertEqual(len(new_points), 8)
+        self.assertEqual(new_loops[:4].tolist(), [0, 1, 2, 3])
+        self.assertNotEqual(new_loops[4], 2)
+        np.testing.assert_array_equal(new_points[new_loops[4]], points[2])
+        # Every outline vertex now has exactly two outline edges.
+        following = np.array([1, 2, 3, 0, 5, 6, 7, 4])
+        pairs = np.sort(np.column_stack([new_loops, new_loops[following]]), axis=1)
+        _, inverse, counts = np.unique(pairs, axis=0, return_inverse=True, return_counts=True)
+        per_vertex = np.bincount(pairs[counts[inverse.ravel()] == 1].ravel())
+        self.assertEqual(set(per_vertex[per_vertex > 0].tolist()), {2})
+        # Two faces sharing an edge through the corner stay one fan.
+        joined = np.array([0, 1, 2, 3, 1, 4, 2])
+        same_points, same_loops = split(
+            np.vstack([points[:3], points[3:4], [[2, 0, 0]]]), joined,
+            np.array([0, 4]), np.array([4, 3]))
+        self.assertEqual(same_loops.tolist(), joined.tolist())
 
     def test_inputs_are_set_the_way_each_blender_keeps_them(self):
         namespace = _process_namespace({"set_modifier_input"})

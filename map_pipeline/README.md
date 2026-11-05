@@ -527,11 +527,13 @@ editing on, moving a waterline takes the bank with it.
 
 ### The Maptile tools
 
-`maptile_tools.py` is saved into the file as a script that registers on load,
-and beside it as an add-on. If the **Maptile** tab is missing from the sidebar
-(N), Blender did not run the script: allow it when Blender asks (or *File →
-Preferences → Save & Load → Auto Run Python Scripts*), or install the `.py` as an
-add-on. Four buttons:
+`maptile_tools.py` is written beside every `model.blend`. **Install it once as
+an add-on** — *Edit → Preferences → Add-ons*, the ⌄ menu at the top right,
+*Install from Disk…*, pick the file, tick it — and the **Maptile** tab is in the
+sidebar (N) of every model from then on. It is also inside each `.blend` as a
+text block: to use the tools without installing, open it in the Text Editor and
+press *Run Script*. The file does not run it by itself on opening, because
+Blender halts every file that asks to with a security warning. Four buttons:
 
 * **Fit terrain under roads.** After moving, widening or raising a road, the
   ground under it is wrong. This redoes the pipeline's fit: the same points,
@@ -734,6 +736,13 @@ is handed the outline flat, and the result is draped back onto the terrain:
 every walkway vertex then stands exactly its lift plus its own height in the
 kerb above the ground, on any slope. Editing is unchanged: move the outline
 and the kerb follows; reshape the terrain and the walkway follows.
+
+One more thing the generator needs: every outline vertex with exactly two
+outline edges. Where two footpaths touch at a single corner — common in a
+city — four meet at one vertex, the generator pairs the wrong two, and the kerb
+flies off: over Utrecht by 800 m, elsewhere a metre into the air. Each
+walkway object is built with such a vertex split, one copy per side in the same
+place, so every outline is a simple loop.
 
 The terrain carries the aerial, a `ground_layer` face attribute (0 terrain,
 1 road, 4 motorway, 5 walkway, 6 grass), seams where the layer changes and a
