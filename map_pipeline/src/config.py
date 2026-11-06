@@ -48,6 +48,13 @@ DEFAULTS: dict[str, Any] = {
         # shrinkwrap offsets do: enough to keep it from flickering.
         "road_lift_m": 0.05,
         "grass_lift_m": 0.02,
+        # How the terrain is laid out: "quads", rows along the outlines and a
+        # grid that coarsens away from the middle, or "triangles", the
+        # triangulation refined until it is within tolerance_m everywhere.
+        "mesher": "quads",
+        # How far below the water level a ditch is cut. No water surface is
+        # drawn in this style: this is the dip in the ground.
+        "ditch_depth_m": 0.6,
         # The curb generator on every walkway and traffic island. Needs
         # Blender 5; with an older one the walkways stay flat.
         "kerbs": True,
@@ -444,11 +451,12 @@ DETAIL_PRESETS: dict[str, dict] = {
 
 # What each style changes in the other sections, applied before the file's
 # own settings so anything set explicitly still wins. The modellers' ground
-# has no water and no street-by-street road objects, and their file has no
-# parked cars.
+# has no street-by-street road objects, and their file has no parked cars.
+# Water is fetched, but as ditches and canals cut into the ground, not as a
+# surface of its own: see `layered`.
 STYLE_PRESETS: dict[str, dict] = {
     "layered": {
-        "surfaces": {"water": False, "road_geometry": False},
+        "surfaces": {"road_geometry": False},
         "terrain": {"feature_edges": []},
         "vehicles": {"cars": False, "boats": False},
     },
@@ -456,10 +464,9 @@ STYLE_PRESETS: dict[str, dict] = {
 }
 
 # What a style cannot do at all, whatever the file says. The layered ground
-# makes its own roads, so the survey style's would lie on top of them, and it
-# has no bed for water to sit in: a water surface would cut through it.
+# makes its own roads, so the survey style's would lie on top of them.
 STYLE_LOCKED: dict[str, dict[tuple[str, str], object]] = {
-    "layered": {("surfaces", "water"): False, ("surfaces", "road_geometry"): False},
+    "layered": {("surfaces", "road_geometry"): False},
     "survey": {},
 }
 
@@ -762,7 +769,11 @@ def load_config(path: str | Path) -> PipelineConfig:
         if not value > 0:
             raise ValueError(f"layered.{key} must be positive, got {value}")
         layered[key] = value
-    for key in ("outline_m", "road_lift_m", "grass_lift_m"):
+    mesher = str(layered.get("mesher", "quads")).strip().lower()
+    if mesher not in ("quads", "triangles"):
+        raise ValueError(f"layered.mesher must be 'quads' or 'triangles', got {mesher!r}")
+    layered["mesher"] = mesher
+    for key in ("outline_m", "road_lift_m", "grass_lift_m", "ditch_depth_m"):
         value = float(layered[key])
         if value < 0:
             raise ValueError(f"layered.{key} must not be negative, got {value}")

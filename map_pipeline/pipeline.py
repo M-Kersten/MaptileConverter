@@ -675,7 +675,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             )
             if surfaces.class_grid is not None:
                 write_land_cover(surfaces, config.bbox, out_dir)
-            if surfaces.water:
+            # The layered style cuts the water into the ground as ditches and
+            # canals and draws no surface over it, as the modellers do.
+            if surfaces.water and not layered:
                 water_texture = generate_water_texture(work_dir)
 
     usage = UsageSet()
@@ -726,6 +728,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     if settings.get("kerbs", True)
                     else 0.0
                 ),
+                # Carved in as ditches and canals; no water surface is drawn.
+                water=surfaces.water,
+                ditch_depth_m=float(settings["ditch_depth_m"]),
+                mesher=str(settings["mesher"]),
             )
             terrain.mesh = ground_layers.mesh
             terrain.layers = ground_layers
@@ -1050,6 +1056,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     float(curb["height_m"]) - float(curb["height_offset_curb_m"])
                     + float(curb["walkway_height_offset_m"]),
                 ),
+                kerb_width_m=float(curb["width_m"]),
             )
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)

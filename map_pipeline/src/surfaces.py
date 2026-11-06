@@ -405,8 +405,11 @@ def build_surfaces(
 
             # Rings gathered per class, so one collection can paint several.
             by_class: dict[int, list[list[np.ndarray]]] = {}
-            want_geometry = collection == "wegdeel" and bool(
-                surfaces_cfg.get("road_geometry", True)
+            # The layered style draws no road mesh, but the outlines are
+            # still wanted: the tree detector keeps off roads and parking
+            # with them.
+            want_geometry = collection == "wegdeel" and (
+                bool(surfaces_cfg.get("road_geometry", True)) or keep_areas
             )
             for feature in features:
                 properties = feature.get("properties") or {}
@@ -487,6 +490,8 @@ def build_surfaces(
         result.water_bed = np.flipud(bed)
 
     if result.roads:
+        result.counts["road_parts"] = len(result.roads)
+    if result.roads and bool(surfaces_cfg.get("road_geometry", True)):
         from .roads import KERB_M, build_road_mesh
 
         result.road_lift_m = float(surfaces_cfg.get("road_lift_m", 0.03))
@@ -513,7 +518,6 @@ def build_surfaces(
         on_bridges = sum(1 for part in result.roads if part.level > 0)
         if on_bridges:
             result.counts["road_parts_on_bridges"] = on_bridges
-        result.counts["road_parts"] = len(result.roads)
         result.counts["road_faces"] = int(mesh.stats.get("faces", 0))
         result.counts["road_quad_share"] = float(mesh.stats.get("quad_share", 0.0))
         result.counts["road_kerb_faces"] = int(mesh.stats.get("kerb_faces", 0))

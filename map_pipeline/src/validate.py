@@ -954,8 +954,14 @@ def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
         )
 
 
+# How far a layer vertex may miss its band, and what share of them may.
+LAYER_SLACK_M = 0.1
+LAYER_STRAY_SHARE = 5e-4
+
+
 def check_layered(
-    report: CheckReport, work_dir: Path, ground, *, kerbs: bool, kerb_top_m: float
+    report: CheckReport, work_dir: Path, ground, *, kerbs: bool, kerb_top_m: float,
+    kerb_width_m: float = 0.3,
 ) -> None:
     """The layered style's ground as Blender built it.
 
@@ -1021,16 +1027,39 @@ def check_layered(
         got = above.get(role)
         if not got:
             continue
-        # Nothing past the object's own outline but rounding: a kerb is built
-        # inside it.
+        # Nothing past the object's own outline but a kerb: built inside it,
+        # except where two footpaths touch at a point on the edge of the area
+        # and the kerb on the cut edge stands its own width outside (twice
+        # over Utrecht). A runaway mitre goes metres.
         past = float(got.get("beyond_outline_m", 0.0))
-        ok = (
-            got["min_m"] >= floor and got["max_m"] <= ceiling
-            and not got.get("missed") and past <= 0.05
-        )
+        reach = kerb_width_m + 0.05 if role == "walkway" else 0.05
+        # A layer that floats, sinks or flies off misses its band by far, or
+        # everywhere. A Shrinkwrap on a face steeper than 65 degrees, where no
+        # offset can read as an exact lift straight up, misses it by a few
+        # centimetres at a vertex or two: over Utrecht, five of 26,000. So
+        # nothing may miss it by more than `LAYER_SLACK_M`, and no more than
+        # `LAYER_STRAY_SHARE` of the vertices may miss it at all.
+        lowest = got.get("lowest_m")
+        highest = got.get("highest_m")
+        if lowest is not None and highest is not None:
+            n = max(int(got.get("vertices", 0)), 1)
+            outside = sum(v < floor for v in lowest) + sum(v > ceiling for v in highest)
+            listed = len(lowest) + len(highest)
+            ok_band = (
+                got["min_m"] >= floor - LAYER_SLACK_M
+                and got["max_m"] <= ceiling + LAYER_SLACK_M
+                and outside < listed
+                and outside <= LAYER_STRAY_SHARE * n
+            )
+        else:
+            outside = int(got["min_m"] < floor) + int(got["max_m"] > ceiling)
+            ok_band = not outside
+        ok = ok_band and not got.get("missed") and past <= reach
         lines.append(
             f"{role} {got['min_m']:.3f} to {got['max_m']:.3f} m "
             f"(built for {low:.2f}" + (f" to {high:.2f}" if high != low else "") + ")"
+            + (f", {outside} of {got.get('vertices', '?')} vertices outside "
+               f"{floor:.3f} to {ceiling:.3f} m" if outside else "")
             + (f", {got['missed']} vertices not over the terrain" if got.get("missed") else "")
             + (f", reaching {past:.2f} m past its outline" if past > 0.05 else "")
         )

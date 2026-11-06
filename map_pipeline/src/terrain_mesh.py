@@ -842,21 +842,28 @@ def _snap(points: np.ndarray) -> np.ndarray:
     return np.round(np.asarray(points, dtype=np.float64) / GRID_SIZE) * GRID_SIZE
 
 
-def _cross_rungs(parts, frame, *, row_m: float, margin_m: float, snap_m: float = 0.6):
+def _cross_rungs(
+    parts, frame, *, row_m: float, margin_m: float, snap_m: float = 0.6, rows=None,
+    square_deg: float | None = None,
+):
     """Rungs straight across the visible regions too narrow for two rows.
 
     Returns the regions with the far end of each such rung added to the
     outline it lands on -- on both regions sharing that edge, so neither has
-    a vertex the other lacks -- and the rungs per region index.
+    a vertex the other lacks -- and the rungs per region index. `rows`, when
+    given, is the row width of each region in place of `row_m`. With
+    `square_deg`, a rung must meet the far outline within that many degrees
+    of square: across a wide paved area a long reach otherwise finds the
+    outline round a corner, on a slant, and the ladder becomes a fan.
     """
     import shapely
 
-    reach = 2.0 * row_m + 2.0 * margin_m
     bounds = frame.bounds
     found: dict[int, list] = {}
     for index, (polygon, kind) in enumerate(parts):
         if kind in HIDDEN:
             continue
+        reach = 2.0 * (row_m if rows is None else float(rows[index])) + 2.0 * margin_m
         rings = [np.asarray(r.coords)[:-1, :2] for r in [polygon.exterior, *polygon.interiors]]
         starts, directions = [], []
         for coords in rings:
@@ -879,6 +886,11 @@ def _cross_rungs(parts, frame, *, row_m: float, margin_m: float, snap_m: float =
         hits = shapely.intersection(rays, polygon.boundary)
         stations = np.vstack(rings)
         tree = shapely.STRtree(shapely.points(stations))
+        if square_deg is not None:
+            seg_a = np.vstack([c for c in rings if len(c) >= 3])
+            seg_b = np.vstack([np.roll(c, -1, axis=0) for c in rings if len(c) >= 3])
+            edge_tree = shapely.STRtree(shapely.linestrings(np.stack([seg_a, seg_b], axis=1)))
+            limit = float(np.cos(np.radians(90.0 - square_deg)))
         candidates = []
         for k, hit in enumerate(hits):
             if hit is None or hit.is_empty:
@@ -889,6 +901,12 @@ def _cross_rungs(parts, frame, *, row_m: float, margin_m: float, snap_m: float =
             end = points[j]
             if _on_frame(end[None, :], bounds)[0]:
                 continue
+            if square_deg is not None:
+                e = int(edge_tree.query_nearest(shapely.Point(end))[0])
+                tangent = seg_b[e] - seg_a[e]
+                tangent = tangent / max(float(np.linalg.norm(tangent)), 1e-12)
+                if abs(float(np.dot(tangent, directions[k]))) > limit:
+                    continue
             near = tree.query_nearest(shapely.Point(end), max_distance=snap_m)
             snapped = len(near) > 0
             if snapped:

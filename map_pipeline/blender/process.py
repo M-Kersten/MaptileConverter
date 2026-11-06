@@ -639,6 +639,10 @@ def _tag_surface_regions(
     return made
 
 
+# How many of the lowest and the highest layer vertices the summary lists.
+EXTREMES = 50
+
+
 def _layered_summary(layered: dict) -> dict:
     """What the modifiers actually made of the layers, for the checks.
 
@@ -668,13 +672,17 @@ def _layered_summary(layered: dict) -> dict:
         tree = BVHTree.FromPolygons(flat, tris)
 
     def ground_under(x, y):
+        """The terrain's height straight below, and how upright it is there."""
         point, _, index, _ = tree.find_nearest(Vector((x, y, 0.0)))
         if index is None:
             return None
         a, b, c = tris[index]
-        return barycentric_transform(
+        z = barycentric_transform(
             point, flat[a], flat[b], flat[c], standing[a], standing[b], standing[c]
         ).z
+        normal = (standing[b] - standing[a]).cross(standing[c] - standing[a])
+        upright = abs(normal.z) / normal.length if normal.length > 0 else 1.0
+        return z, upright
 
     raw, evaluated = 0, 0
     heights: dict[str, list] = {}
@@ -709,12 +717,25 @@ def _layered_summary(layered: dict) -> dict:
                     0.0,
                 )
                 beyond[role] = max(beyond.get(role, 0.0), past)
+            # A Shrinkwrap offsets along the normal of the face it hits, so on
+            # a slope its lift reads taller straight up, and at a crease it may
+            # have hit the face beside the one straight below. Of the height
+            # straight up and the height square to the slope, the one nearer
+            # the object's own offset is kept. The walkways are draped
+            # straight up, and measured so.
+            wrap = next((m for m in obj.modifiers if m.type == "SHRINKWRAP"), None)
+            offset = float(wrap.offset) if wrap is not None else None
             for x, y, z in world:
                 ground = ground_under(x, y)
                 if ground is None:
                     missed[role] = missed.get(role, 0) + 1
                     continue
-                heights.setdefault(role, []).append(z - ground)
+                gap = z - ground[0]
+                if offset is not None:
+                    square = gap * ground[1]
+                    if abs(square - offset) < abs(gap - offset):
+                        gap = square
+                heights.setdefault(role, []).append(gap)
         finally:
             holder.to_mesh_clear()
     above = {
@@ -722,6 +743,9 @@ def _layered_summary(layered: dict) -> dict:
             "min_m": round(float(np.min(values)), 4),
             "max_m": round(float(np.max(values)), 4),
             "vertices": len(values),
+            # The extremes, so a check can count how many miss its band.
+            "lowest_m": [round(float(v), 4) for v in np.sort(values)[:EXTREMES]],
+            "highest_m": [round(float(v), 4) for v in np.sort(values)[::-1][:EXTREMES]],
             "missed": missed.get(role, 0),
             "beyond_outline_m": round(beyond.get(role, 0.0), 3),
         }

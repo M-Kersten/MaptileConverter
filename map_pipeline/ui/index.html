@@ -323,7 +323,7 @@
 
     <label for="style">Style
       <span class="help" tabindex="0" role="button" aria-label="About the style"
-        data-tip="How the ground is made. <b>Layered</b> is how our 3D modellers build an area by hand: a coarse terrain, with the roads, walkways and lawns as separate objects lying on it, so each can be selected, moved and given its own material. Walkways get kerbs from the curb generator, which needs Blender 5. <b>Survey</b> keeps the ground as measured, with water, and the roads as meshes of their own.">?</span>
+        data-tip="How the ground is made. <b>Layered</b> is how our 3D modellers build an area by hand: a coarse terrain, with the roads, walkways and lawns as separate objects lying on it, so each can be selected, moved and given its own material. Walkways get kerbs from the curb generator, which needs Blender 5; ditches and canals are cut into the ground. <b>Survey</b> keeps the ground as measured, with water surfaces, and the roads as meshes of their own.">?</span>
     </label>
     <select id="style">
       <option value="layered" selected>Layered &mdash; as our modellers build it</option>
@@ -901,11 +901,11 @@ const DETAIL_PLAIN_LAYERED = {
    STYLE_LOCKED in src/config.py: "locked" sources cannot be used in the
    style at all, "unticked" ones start off and may be ticked. */
 const STYLE = {
-  layered: { locked: ["water"], unticked: ["vehicles"] },
+  layered: { locked: [], unticked: ["vehicles"] },
   survey:  { locked: [], unticked: [] }
 };
 const STYLE_PLAIN = {
-  layered: "A coarse terrain within half a metre of the survey, with every road, walkway and lawn an object of its own lying on it, named and grouped as the modellers group theirs. Walkways get kerbs you can edit (Blender 5). No water.",
+  layered: "A terrain of quads whose edge loops follow the roads, verges and ditches, coarser away from the middle, with every road, walkway and lawn an object of its own lying on it, named and grouped as the modellers group theirs. Walkways get kerbs you can edit (Blender 5). Ditches and canals are cut into the ground, without a water surface.",
   survey: "The ground as measured: a fine grid whose edges follow every waterline, road edge and building, the roads as meshes of their own with kerbs, and water."
 };
 

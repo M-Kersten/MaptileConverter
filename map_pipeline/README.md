@@ -30,9 +30,9 @@ output/<area_name>/
 The pipeline stops there. No Unity layer, no viewer, no WebGL build.
 
 **Two styles of ground.** By default the ground is built the way our 3D
-modellers build an area by hand — the *layered* style: a coarse terrain that
-stays within half a metre of the survey, with every road, walkway and lawn a
-flat object of its own lying on it, named and grouped as in their files, and
+modellers build an area by hand — the *layered* style: a terrain of quads
+whose edge loops follow the roads, verges and ditches, coarser away from the
+middle, with every road, walkway and lawn a flat object of its own lying on it, named and grouped as in their files, and
 kerbs made by their curb generator so they stay editable. The *survey* style is
 the ground as measured: a fine terrain whose edges follow every waterline, road
 edge and building, the roads as meshes of their own, and water. See
@@ -113,9 +113,9 @@ for a place or click the map, press **Build model**, and watch the log. When it
 finishes you get the check results, the preview renders and download links.
 
 The style is *Layered* (as the modellers build it) or *Survey* (the ground as
-measured). In the layered style the water source is greyed out — that style has
-no water — and cars and boats start unticked, as the modellers' files have
-none; tick them to add them.
+measured). In the layered style water is cut into the ground as ditches, with
+no water surface, and cars and boats start unticked, as the modellers' files
+have none; tick them to add them.
 
 The page is written for someone who has never opened a GIS or a 3D package.
 **Detail is one choice, not a panel of sliders**: Draft, Standard or High (see
@@ -245,9 +245,9 @@ dimensional `np.cross` is on that list today.
 
 `style` is `layered` (the default) or `survey`; see
 [Two styles of ground](#two-styles-of-ground). Like `detail`, a style only
-fills in defaults, so anything the file sets wins — with two exceptions the
-layered style cannot honour: it has no water and no survey-style road meshes,
-and a file that asks for them is told so in the log.
+fills in defaults, so anything the file sets wins — with one exception the
+layered style cannot honour: it makes its own roads, so it has no survey-style
+road meshes, and a file that asks for them is told so in the log.
 
 `detail` is `draft`, `standard` or `high` and fills in the photo resolution,
 the ground grid and the wall textures (table below). Anything set explicitly in
@@ -675,9 +675,10 @@ How it is built (`src/layered.py`):
   surfaces their square did not need. A green polygon of at most 2,500 m² with
   paving round at least 90% of its edge is an island: a walkway, so it gets
   kerbs, still green on top. Parts on bridges and in tunnels
-  (`relatieve_hoogteligging` not 0) are left to the structures stage. Water is
-  left out, as the modellers left it out; the terrain and the aerial carry the
-  ditches.
+  (`relatieve_hoogteligging` not 0) are left to the structures stage. BGT
+  water (`waterdeel`) is a region of terrain of its own: no water surface is
+  drawn, as in the modellers' file, but the ditch is cut into the ground (see
+  *Ditches* below).
 * **Outlines.** The polygons are cut into one region per spot, simplified
   together by up to `outline_m` (25 cm) so that an edge two regions share stays
   shared, and snapped to a 1 cm grid.
@@ -690,17 +691,55 @@ How it is built (`src/layered.py`):
   walkway too thin for a kerb on each side, or a small one keeping a corner
   under 6°, becomes part of its neighbour. At Hazeldonk that is 0.3% of the
   footpath area.
-* **Terrain.** A triangulation of the outlines, refined until it fits the
-  survey: in each round, the surveyed grid node (2 m apart at Standard detail)
-  furthest from the surface in every triangle that misses by more than
-  `tolerance_m` (0.5 m) is added, and an outline edge the triangulation lost
-  is split until it is back. Every
-  outline is an edge of the terrain, so each layer is the terrain's own faces
-  under it — nothing on a layer can dip under the ground or float off it. Pairs
-  of triangles that make a well-shaped quad are joined, each quad keeping as
-  its first-to-third diagonal the edge the fit measured, which is how Blender
-  draws a quad and how the export cuts it. The modellers' own terrain is within
-  0.98 m of the survey on 95% of the ground.
+* **Terrain, in quads** (`src/layered_mesh.py`). The modellers' feedback on
+  the first version, a triangulation refined until it fitted the survey, was:
+  quads rather than a complete triangulation, with minimal but realistic height
+  variation; whole continuous quads along the roads; edge loops that follow
+  the shape; points where outlines meet (round a roundabout); the ditches; and
+  fewer points far away. So each region is meshed the way they lay theirs out:
+  * *Rungs across.* Every outline gets stations 4 m apart (8 m beyond
+    `focus_m`). A road narrower than about 20 m gets rungs straight across from
+    kerb to kerb — one quad across, one after the other along the road, and
+    radial quads round a roundabout. A rung must meet the far kerb within 30°
+    of square, and lands on the station across from it where one is within
+    2 m, so the two kerbs' stations pair up into one ladder.
+  * *Loops along.* Grass and open ground narrower than about 13 m — a verge,
+    the strip between two carriageways, the slope of a dike — get rungs across
+    too, each cut into pieces about 4 m long, so the cuts line up into edge
+    loops running along the strip.
+  * *Rows and grid.* Wider ground gets a row of quads along each outline (6 m
+    on grass and open ground, 10 m along a road, 2 m along a footpath, a yard
+    or water) and a 4 m grid inside, lined up with the stations so the rows
+    meet it square on. Away from the middle the grid squares merge, two by two,
+    to 8 m within `focus_m` and up to 32 m beyond, wherever the survey under the
+    merged square stays within `tolerance_m`; a 4 m square that misses it by
+    more splits into 2 m ones. A square beside smaller ones takes their corner
+    on its side, as a quad and a triangle, so there is never a crack.
+  * *Loop cuts to the survey.* Where a face is still more than `tolerance_m`
+    off a surveyed grid node inside it — the ballast ridge of a railway, the
+    crest of a dike in a verge — an edge loop is cut through it and carried on
+    through the quads beside it, as Blender's loop cut does, ending in a
+    triangle.
+  * *A closed sheet.* Regions are meshed one by one, so a gap between two
+    pieces of the outline coverage goes to the neighbour sharing most edge
+    with it first; afterwards vertices within 1.2 cm of each other are made
+    one, sliver triangles are folded into the face beside them, and any hole
+    still left is filled.
+  * Heights are the survey grid's at every vertex, read between its nodes
+    too. The 0.5 m survey read at an outline point on a retaining wall made
+    faces standing nearly upright, on which a draped kerb and the check
+    measuring it picked different faces.
+
+  Every outline is an edge of the terrain, so each layer is the terrain's own
+  faces under it — nothing on a layer can dip under the ground or float off
+  it. `layered.mesher: "triangles"` gives the old triangulation back, and is
+  what a quad mesh that fails falls back to.
+* **Ditches.** Water is meshed like the rest, with rungs across a ditch split
+  at the middle: the middle line is the bed, `ditch_depth_m` (0.6 m) below the
+  water level read from the survey, and the bank keeps its surveyed height;
+  no bank is cut steeper than 45°. A wider pond or canal gets a row for its
+  bank and a flat bed inside. Trees are kept off water, roads and parking as in
+  the survey style.
 * **Objects.** Every layer is grouped as the modellers group theirs: the
   motorway is one object, `<Prefix>_Snelweg`; within `focus_m` (250 m) of the
   centre each layer is split east and west, `<Prefix>_Centrum_Oost_Wegen`;
@@ -765,21 +804,32 @@ The layered style's settings, all optional:
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `layered.prefix` | the area name | what every ground object's name starts with |
-| `layered.tolerance_m` | 0.5 | how far any surveyed grid node may be from the terrain |
+| `layered.tolerance_m` | 0.5 | how far the terrain may miss a surveyed grid node before the grid stays fine or a loop is cut there |
+| `layered.mesher` | `"quads"` | `"quads"`, or `"triangles"` for the triangulation refined to `tolerance_m` |
+| `layered.ditch_depth_m` | 0.6 | how far below its water level a ditch is cut |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.focus_m` | 250 | half the side of the middle square split east and west |
 | `layered.road_lift_m`, `grass_lift_m` | 0.05, 0.02 | how far the layers lie above the terrain |
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
 
-Over the Hazeldonk square kilometre the terrain is 26,650 faces (48% quads) on
-19,804 vertices, every surveyed 2 m node within 0.50 m of it and 95% of the
-0.5 m survey within 0.30 m; there are 19 layer objects, 6 of them walkways
-whose 2,818 faces become 21,783 with their kerbs. The ground takes 23 seconds
-to build and the Blender stage, on the pip `bpy` 5.2, 12; the whole run takes
-6½ minutes, most of it relighting the aerial, and passes all 60 checks. The modellers' own terrain
-has about 2,100 faces: holding every node to half a metre everywhere costs
-more, and `tolerance_m` trades the one for the other.
+Over the Hazeldonk square kilometre the terrain is 61,997 faces, 58% of them
+quads, on 49,224 vertices: 4 m squares in the middle, up to 32 m in the far
+fields, rungs across every road and loops along every verge, 119 ditches cut
+in. 95% of the 0.5 m survey is within 0.24 m of it, and 0.7% further than half
+a metre (it was 26,650 triangles and quads within 0.30 m with the old
+triangulation; the modellers' own terrain has about 2,100 faces and is within
+0.98 m on 95%). There are 19 layer objects, 6 of them walkways whose 3,828
+faces become 24,223 with their kerbs. The ground takes 25 seconds to build; the
+whole run takes about 4 minutes, most of it relighting the aerial, and passes
+all 63 checks.
+
+Over Utrecht centre — quays, retaining walls, underpasses — the terrain is
+100,657 faces. A handful of layer vertices on faces steeper than 65° stand a
+few centimetres outside their lift band, which `layers_lie_on_the_terrain`
+allows up to 0.05% of the vertices and 10 cm each. And where two footpaths touch at a single point on
+the edge of the area, the kerb on the cut edge stands its own width outside
+it, which the check also allows: a runaway kerb goes metres.
 
 Not in it yet: the motorway's guardrails, and the modellers' hand-made
 buildings — the buildings are 3DBAG's, as in the survey style.

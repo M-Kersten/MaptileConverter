@@ -12,14 +12,15 @@ each a separate object a person can grab:
   outline carrying the modellers' curb generator, which raises the walkway and
   builds the kerb round it. Edit the outline and the kerb follows.
 
-Here the same layers come from the BGT. The terrain is a triangulation of the
-survey: start from the outlines of every layer, add the surveyed point that is
-furthest from the surface until none is further than `tolerance_m`. The
-outlines are edges of it, so each layer is simply the terrain's own faces
-under it, lifted -- no face of a road can dip under the ground or float off it.
+Here the same layers come from the BGT. The terrain is laid out in quads
+along the outlines of every layer (`layered_mesh`): rungs straight across the
+roads, loops along the verges, a grid inside that coarsens away from the
+middle, and loops cut wherever a face still misses the survey. The outlines
+are edges of it, so each layer is simply the terrain's own faces under it,
+lifted -- no face of a road can dip under the ground or float off it.
 
-Water is left out, as the modellers left it out: the terrain and the aerial
-carry the ditches. Bridges and tunnels are left to the structures stage.
+Water gets no surface, as in the modellers' file, but its ditches are cut into
+the terrain. Bridges and tunnels are left to the structures stage.
 """
 
 from __future__ import annotations
@@ -88,6 +89,15 @@ ISLAND_MAX_M2 = 2500.0
 # How far each layer's top is above the terrain, for what stands on it: a
 # lamp post on a footpath stands on the walkway the curb generator raised.
 DEFAULT_OFFSETS = {ROAD: 0.05, MOTORWAY: 0.05, WALKWAY: 0.05, GRASS: 0.02}
+
+# Ground under water: terrain, carved down to a bed, with no layer on it. A
+# terrain code of its own (material slot 15, which no material uses) only so
+# the mesher can tell it apart; it comes out as plain terrain.
+WATER_CODE = TERRAIN * 16 + 15
+# How far under the water level the bed of a ditch is cut. No water surface
+# is drawn over it, so this is the dip itself, not a depth for a plane to
+# hide: enough to read as a ditch from the air.
+DITCH_DEPTH_M = 0.6
 
 
 def _code(layer: int, material: str) -> int:
@@ -250,13 +260,22 @@ def build_layered_ground(
     lift: dict[int, float] | None = None,
     walkway_raise_m: float = 0.13,
     max_rounds: int = 60,
+    water=(),
+    ditch_depth_m: float = DITCH_DEPTH_M,
+    mesher: str = "quads",
 ) -> LayeredGround:
-    """The coarse terrain and its layers, from the survey and the BGT areas.
+    """The terrain and its layers, from the survey and the BGT areas.
 
-    `tolerance_m` is how far any surveyed grid node may be from the terrain;
-    `outline_m` how far a simplified outline may stray from the BGT's. Faces
-    in the middle `focus_m` of the area are grouped east and west of the
-    centre, the rest by quadrant, as the modellers group theirs.
+    `tolerance_m` is how far the terrain may be from the survey where it is
+    simplified; `outline_m` how far a simplified outline may stray from the
+    BGT's. `water` is the WaterBody list: carved into the terrain as ditches
+    and canals `ditch_depth_m` below their level. Faces in the middle
+    `focus_m` of the area are grouped east and west of the centre, the rest by
+    quadrant, as the modellers group theirs.
+
+    `mesher` "quads" lays the terrain out in quads (`layered_mesh`);
+    "triangles" is the triangulation refined until every grid node is within
+    `tolerance_m`, which is also what a failed quad mesh falls back to.
     """
     import shapely
 
@@ -282,7 +301,20 @@ def build_layered_ground(
         polygon = _polygonal(shapely.Polygon(rings[0], rings[1:]))
         if not polygon.is_empty:
             by_code.setdefault(_code(area.layer, area.material), []).append(polygon)
+    bodies = []
+    for body in water or ():
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] - [ox, oy] for r in body.rings]
+        rings = [r for r in rings if len(r) >= 4]
+        if not rings:
+            continue
+        polygon = _polygonal(shapely.Polygon(rings[0], rings[1:]))
+        if polygon.is_empty:
+            continue
+        by_code.setdefault(WATER_CODE, []).append(polygon)
+        bodies.append((polygon.simplify(0.2), float(body.level_nap)))
     order = [_code(layer, material) for layer, material in PRIORITY]
+    # Water after the paving, so a road over a culvert stays a road.
+    order.insert(order.index(_code(GRASS, "Gras")), WATER_CODE)
     layers = [
         (code, _polygonal(shapely.union_all(np.array(by_code[code], dtype=object))))
         for code in order
@@ -294,32 +326,66 @@ def build_layered_ground(
     pieces, hairpins = _without_hairpins(pieces)
     timings = {"regions_s": round(time.time() - started, 1)}
 
-    # ---- the terrain: a triangulation refined until it fits the survey -----
-    t = time.time()
     gx, gy = np.meshgrid(xs - ox, ys - oy)
     grid_xy = np.column_stack([gx.ravel(), gy.ravel()])
     grid_z = np.asarray(terrain.measured if terrain.measured is not None else terrain.heights,
                         dtype=np.float64).ravel()
-    points, segments = _constraints(pieces)
+    missing, rounds = 0, 0
+    mesh_stats: dict = {}
+    face_part = None
+    built = None
+    if mesher == "quads":
+        from .layered_mesh import quad_terrain
 
-    def heights_at(xy):
-        return np.asarray(terrain.sample(xy[:, 0] + ox, xy[:, 1] + oy), dtype=np.float64)
+        t = time.time()
+        try:
+            built = quad_terrain(
+                terrain, pieces, bodies, codes_wet=WATER_CODE,
+                tolerance_m=float(tolerance_m), focus_m=float(focus_m),
+                depth_m=float(ditch_depth_m),
+                # Roads get rows wide enough to ladder straight across;
+                # yards, forecourts and footpaths the grid's.
+                paved_codes={
+                    _code(MOTORWAY, "Asfalt"), _code(ROAD, "Asfalt"),
+                    _code(ROAD, "Bakstenen"), _code(ROAD, "Fietspad"),
+                },
+                narrow_codes={_code(WALKWAY, "Beton_Geel"), _code(ROAD, "Verharding")},
+            )
+        except Exception as exc:  # noqa: BLE001 - the triangulation always works
+            LOG.warning(
+                "layered ground: the quad terrain could not be built (%s); "
+                "using the triangulation", exc,
+            )
+            mesh_stats["quad_failure"] = str(exc)[:200]
+        timings["terrain_s"] = round(time.time() - t, 1)
+    if built is not None:
+        vertices_rd, sizes, loops, codes, face_part, quad_stats = built
+        mesh_stats.update(quad_stats)
+        points = vertices_rd[:, :2] - [ox, oy]
+        z = vertices_rd[:, 2].copy()
+    else:
+        # ---- a triangulation refined until it fits the survey -------------
+        t = time.time()
+        points, segments = _constraints(pieces)
 
-    points, z, tris, missing, rounds = _fit(
-        points, segments, heights_at, grid_xy, grid_z,
-        tolerance_m=float(tolerance_m), bounds=(0.0, 0.0, width, height),
-        max_rounds=max_rounds,
-    )
-    timings["terrain_s"] = round(time.time() - t, 1)
+        def heights_at(xy):
+            return np.asarray(terrain.sample(xy[:, 0] + ox, xy[:, 1] + oy), dtype=np.float64)
 
-    # ---- faces: each triangle takes the region it lies in -----------------
-    t = time.time()
-    tri_code = _classify_triangles(points, tris, pieces)
-    faces, codes = _faces(points, tris, tri_code)
-    timings["faces_s"] = round(time.time() - t, 1)
+        points, z, tris, missing, rounds = _fit(
+            points, segments, heights_at, grid_xy, grid_z,
+            tolerance_m=float(tolerance_m), bounds=(0.0, 0.0, width, height),
+            max_rounds=max_rounds,
+        )
+        timings["terrain_s"] = round(time.time() - t, 1)
 
-    sizes = np.array([len(f) for f in faces], dtype=np.int64)
-    loops = np.concatenate(faces).astype(np.int64) if faces else np.zeros(0, np.int64)
+        # ---- faces: each triangle takes the region it lies in -------------
+        t = time.time()
+        tri_code = _classify_triangles(points, tris, pieces)
+        faces, codes = _faces(points, tris, tri_code)
+        timings["faces_s"] = round(time.time() - t, 1)
+        mesh_stats["mesher"] = "triangles"
+        sizes = np.array([len(f) for f in faces], dtype=np.int64)
+        loops = np.concatenate(faces).astype(np.int64) if faces else np.zeros(0, np.int64)
     face_layer, face_material = _split_code(codes)
     face_material = np.where(face_layer == TERRAIN, -1, face_material)
 
@@ -331,7 +397,10 @@ def build_layered_ground(
         face_sizes=sizes.astype(np.int32),
         face_loops=loops,
         face_kind=face_layer.astype(np.int8),
-        face_part=np.zeros(len(sizes), dtype=np.int8),
+        face_part=(
+            np.zeros(len(sizes), dtype=np.int8) if face_part is None
+            else np.asarray(face_part, dtype=np.int8)
+        ),
         vertex_on=vertex_on,
         edges=edges,
         edge_on=edge_on,
@@ -348,10 +417,16 @@ def build_layered_ground(
     top[WALKWAY] = lift[WALKWAY] + float(walkway_raise_m)
 
     # ---- how well it fits -------------------------------------------------
-    locator = TriangleLocator(points, tris, cell=8.0, bounds=(0.0, 0.0, width, height))
-    drawn = locator.interpolate(z, grid_xy[:, 0], grid_xy[:, 1])
+    locator = mesh.locator()
+    drawn = locator.interpolate(mesh.vertices[:, 2], grid_xy[:, 0] + ox, grid_xy[:, 1] + oy)
     error = np.abs(drawn - grid_z)
-    error = error[np.isfinite(error)]
+    # Under water the terrain is carved below the survey on purpose.
+    wet = np.zeros(len(grid_xy), dtype=bool)
+    if bodies:
+        wet_area = shapely.union_all(np.array([b for b, _ in bodies], dtype=object))
+        shapely.prepare(wet_area)
+        wet = shapely.intersects_xy(wet_area, grid_xy[:, 0], grid_xy[:, 1])
+    error = error[np.isfinite(error) & ~wet]
     quads = int((sizes == 4).sum())
     stats = {
         "faces": int(len(sizes)),
@@ -363,6 +438,8 @@ def build_layered_ground(
         "refinement_rounds": int(rounds),
         "outline_edges_missing": int(missing),
         "walkway_hairpins_removed": int(hairpins),
+        "water_bodies": int(len(bodies)),
+        **mesh_stats,
         "faces_by_layer": {
             LAYER_NAMES[k]: int((face_layer == k).sum()) for k in LAYER_NAMES
         },

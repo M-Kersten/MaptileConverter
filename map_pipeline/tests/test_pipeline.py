@@ -5062,11 +5062,12 @@ class TestConfig(unittest.TestCase):
             "xmax": 137000, "ymax": 456000}
 
     def test_the_default_style_is_the_modellers(self):
-        """Layered unless asked: no water, no street-by-street road meshes,
-        no parked cars, and object names prefixed after the area."""
+        """Layered unless asked: water fetched (for the ditches), no
+        street-by-street road meshes, no parked cars, and object names
+        prefixed after the area."""
         config = self._load({"name": "hazeldonk_west", "bbox": self.BBOX})
         self.assertEqual(config.style, "layered")
-        self.assertFalse(config.surfaces["water"])
+        self.assertTrue(config.surfaces["water"])
         self.assertFalse(config.surfaces["road_geometry"])
         self.assertEqual(config.terrain["feature_edges"], [])
         self.assertFalse(config.vehicles["cars"])
@@ -5078,16 +5079,19 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(survey.surfaces["road_geometry"])
 
     def test_a_style_preset_gives_way_except_where_it_cannot(self):
-        """Cars can be asked for in the layered style; water cannot, since the
-        coarse terrain has no bed for it, and the file is told so."""
+        """Cars can be asked for in the layered style; the survey style's road
+        meshes cannot, since the layered ground makes its own roads, and the
+        file is told so."""
         raw = {"name": "x", "bbox": self.BBOX, "vehicles": {"cars": True},
-               "surfaces": {"water": True}}
+               "surfaces": {"road_geometry": True}}
         with self.assertLogs("src.config", level="WARNING") as logs:
             config = self._load(raw)
         self.assertTrue(config.vehicles["cars"])
-        self.assertFalse(config.surfaces["water"])
-        self.assertIn("surfaces.water", " ".join(logs.output))
-        self.assertTrue(self._load({**raw, "style": "survey"}).surfaces["water"])
+        self.assertFalse(config.surfaces["road_geometry"])
+        self.assertIn("surfaces.road_geometry", " ".join(logs.output))
+        self.assertTrue(
+            self._load({**raw, "style": "survey"}).surfaces["road_geometry"]
+        )
 
     def test_the_layered_settings_are_checked(self):
         base = {"name": "x", "bbox": self.BBOX}
@@ -6798,6 +6802,253 @@ def _layered_fixture():
     return terrain, areas
 
 
+class TestLayeredSurfaces(unittest.TestCase):
+    """What the layered style fetches besides its own ground."""
+
+    def _build(self, surfaces_cfg: dict, keep_areas: bool):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import rasterio
+        from rasterio.transform import from_origin
+
+        import src.surfaces as surfaces_module
+        from src.geo import BBox
+
+        bbox = BBox(1000.0, 2000.0, 1100.0, 2100.0)
+        square = {"type": "Polygon", "coordinates": [[
+            [1020, 2020], [1060, 2020], [1060, 2030], [1020, 2030], [1020, 2020],
+        ]]}
+        ditch = {"type": "Polygon", "coordinates": [[
+            [1010, 2060], [1090, 2060], [1090, 2063], [1010, 2063], [1010, 2060],
+        ]]}
+        features = {
+            "wegdeel": [{"geometry": square, "properties": {
+                "functie": "parkeervlak", "fysiek_voorkomen": "gesloten verharding"}}],
+            "waterdeel": [{"geometry": ditch, "properties": {"type": "watergang"}}],
+        }
+
+        def fetch(collection, _bbox, **_kwargs):
+            stats = SimpleNamespace(summary=lambda: {}, current_features=0)
+            return features.get(collection, []), stats
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tif = Path(tmp) / "dtm.tif"
+            with rasterio.open(
+                tif, "w", driver="GTiff", width=200, height=200, count=1,
+                dtype="float32", transform=from_origin(1000.0, 2100.0, 0.5, 0.5),
+            ) as dataset:
+                dataset.write(np.full((1, 200, 200), 5.0, dtype=np.float32))
+            terrain = SimpleNamespace(
+                n=51, geotiff_path=tif,
+                sample=lambda x, y: np.full(np.shape(x), 5.0),
+            )
+            cfg = {"page_limit": 1000, "timeout_s": 1, "max_retries": 0,
+                   "max_pages": 1, "water": True, "land_cover": True,
+                   "water_depth_m": 1.0, **surfaces_cfg}
+            with mock.patch.object(surfaces_module, "fetch_current", fetch), \
+                    mock.patch.object(surfaces_module, "build_road_mesh", create=True):
+                return surfaces_module.build_surfaces(
+                    bbox, Path(tmp), surfaces_cfg=cfg, terrain=terrain,
+                    keep_areas=keep_areas,
+                )
+
+    def test_the_outlines_the_tree_detector_needs_are_kept(self):
+        """Trees stood on parking lots in the layered style: it built no road
+        mesh, so it kept no road outlines, and the detector had nothing to keep
+        off. The outlines are kept now, the survey style's road mesh still
+        not built, and the water is there for the water mask and the ditches."""
+        from src.surfaces import CLASS_PARKING
+        from src.trees import _rasterize_roads, _rasterize_water
+
+        surfaces = self._build({"road_geometry": False}, keep_areas=True)
+        self.assertEqual([p.surface_class for p in surfaces.roads], [CLASS_PARKING])
+        self.assertIsNone(surfaces.road_mesh)
+        self.assertEqual(len(surfaces.water), 1)
+        bounds, shape = (1000.0, 2000.0, 1100.0, 2100.0), (100, 100)
+        roads = _rasterize_roads(surfaces, bounds, shape, {CLASS_PARKING})
+        self.assertAlmostEqual(roads.sum(), 400, delta=60)
+        self.assertAlmostEqual(_rasterize_water(surfaces, bounds, shape).sum(), 240, delta=60)
+
+        # Without the layered ground nothing asks for the outlines.
+        self.assertEqual(self._build({"road_geometry": False}, keep_areas=False).roads, [])
+
+
+class TestQuadTerrain(unittest.TestCase):
+    """The layered terrain laid out in quads, as the modellers asked for."""
+
+    @classmethod
+    def setUpClass(cls):
+        from src.layered import build_layered_ground
+        from src.surfaces import WaterBody
+
+        cls.terrain, cls.areas = _layered_fixture()
+        cls.ditch = WaterBody(
+            rings=[_rect_ring(1100.0, 2040.0, 1150.0, 2043.0)], level_nap=2.0,
+            area_m2=150.0, measured=True,
+        )
+        cls.ground = build_layered_ground(
+            cls.terrain, cls.areas, prefix="T", water=[cls.ditch]
+        )
+
+    def _faces(self, ground, layer):
+        mesh = ground.mesh
+        starts = mesh.loop_starts
+        for f in np.flatnonzero(mesh.face_kind == layer):
+            yield mesh.vertices[mesh.face_loops[starts[f]: starts[f] + mesh.face_sizes[f]]]
+
+    def test_the_terrain_is_quads(self):
+        """"Complete triangulation < some quads": the default is the quad mesh."""
+        stats = self.ground.stats
+        self.assertEqual(stats["mesher"], "quads")
+        self.assertGreater(stats["quad_share"], 0.8)
+        self.assertTrue(set(np.unique(self.ground.mesh.face_sizes)) <= {3, 4})
+
+    def test_a_road_is_one_quad_from_kerb_to_kerb(self):
+        """"Prefer whole continuous quads for roads": away from the junction
+        and the island, every face of the 10 m street runs right across it."""
+        from src.layered import ROAD
+
+        across = []
+        for corners in self._faces(self.ground, ROAD):
+            x, y = corners[:, 0], corners[:, 1]
+            if 1010.0 < x.min() and x.max() < 1060.0 and y.min() >= 2074.9 and y.max() <= 2085.1:
+                across.append(len(corners) == 4 and y.min() < 2075.1 and y.max() > 2084.9)
+        self.assertGreater(len(across), 5)
+        self.assertTrue(all(across))
+
+    def test_a_ditch_is_cut_into_the_ground(self):
+        """"Missing ditches": the middle of a ditch is cut below its banks --
+        `ditch_depth_m` below the water level, but no steeper than 45° from
+        the bank, as no ditch is -- and no water surface is drawn."""
+        v = self.ground.mesh.vertices
+        middle = (v[:, 0] > 1102) & (v[:, 0] < 1148) & (np.abs(v[:, 1] - 2041.5) < 0.2)
+        banks = (v[:, 0] > 1102) & (v[:, 0] < 1148) & (
+            (np.abs(v[:, 1] - 2040.0) < 0.05) | (np.abs(v[:, 1] - 2043.0) < 0.05))
+        self.assertTrue(middle.any())
+        self.assertTrue(banks.any())
+        for x, y, z in v[middle]:
+            near = banks & (np.abs(v[:, 0] - x) < 4.0)
+            drop = v[near, 2] - z
+            self.assertTrue((drop > 0.3).all())
+            run = np.hypot(v[near, 0] - x, v[near, 1] - y)
+            self.assertTrue((drop <= run + 1e-6).all())
+        self.assertGreater(self.ground.stats["water_faces"], 0)
+        self.assertEqual(self.ground.stats["water_bodies"], 1)
+
+    def test_the_survey_is_kept_within_the_tolerance(self):
+        """"Height missing": loops are cut where a face misses the survey."""
+        self.assertLessEqual(self.ground.stats["grid_error_max_m"], 0.5 + 1e-6)
+        self.assertGreater(self.ground.stats["loops_cut_to_the_survey"], 0)
+
+    def test_far_away_the_grid_is_coarser(self):
+        """"Simplifying the amount of points for far away terrain"."""
+        from src.layered import build_layered_ground
+
+        far = build_layered_ground(self.terrain, self.areas, prefix="T", focus_m=40.0)
+        self.assertEqual(set(self.ground.stats["grid_blocks"]), {"4 m"})
+        self.assertIn("16 m", far.stats["grid_blocks"])
+        self.assertLess(far.stats["faces"], self.ground.stats["faces"])
+        # Bigger squares beside smaller ones share every corner: still one
+        # closed sheet.
+        self._assert_closed(far.mesh)
+
+    def test_the_quad_terrain_is_one_closed_sheet(self):
+        self._assert_closed(self.ground.mesh)
+
+    def _assert_closed(self, mesh):
+        """Every inner edge is shared by two faces, and the faces cover the area."""
+        starts = mesh.loop_starts
+        nxt = np.arange(len(mesh.face_loops)) + 1
+        nxt[starts + mesh.face_sizes - 1] = starts
+        pairs = np.sort(np.column_stack([mesh.face_loops, mesh.face_loops[nxt]]), axis=1)
+        _, counts = np.unique(pairs, axis=0, return_counts=True)
+        self.assertLessEqual(counts.max(), 2)
+        tris, _ = mesh.triangles()
+        p = mesh.vertices[:, :2]
+        a, b, c = p[tris[:, 0]], p[tris[:, 1]], p[tris[:, 2]]
+        area = 0.5 * np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                            - (c[:, 0] - a[:, 0]) * (b[:, 1] - a[:, 1]))
+        self.assertAlmostEqual(area.sum(), 160.0 * 160.0, delta=1.0)
+        # Open edges only along the edge of the area.
+        once = np.unique(pairs, axis=0, return_counts=True)
+        edges = once[0][once[1] == 1]
+        mid = 0.5 * (p[edges[:, 0]] + p[edges[:, 1]])
+        on_frame = (
+            (np.abs(mid[:, 0] - 1000) < 1e-3) | (np.abs(mid[:, 0] - 1160) < 1e-3)
+            | (np.abs(mid[:, 1] - 2000) < 1e-3) | (np.abs(mid[:, 1] - 2160) < 1e-3)
+        )
+        self.assertTrue(on_frame.all())
+
+    def test_a_loop_is_cut_along_a_ridge(self):
+        """A crest between two edges gets a loop along it, quads either side."""
+        from src.layered_mesh import _loop_cuts
+
+        def ridge(p):
+            return np.maximum(0.0, 1.0 - np.abs(p[:, 0] - 4.0) / 2.0)
+
+        xy = np.array([[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]])
+        gx, gy = np.meshgrid(np.arange(9.0), np.arange(9.0))
+        nodes = np.column_stack([gx.ravel(), gy.ravel()])
+        out = _loop_cuts(
+            xy, np.array([4]), np.arange(4), np.array([0]), np.array([0]), np.array([0]),
+            height_at=ridge, nodes_xy=nodes, nodes_z=ridge(nodes), tolerance_m=0.6,
+            skip_kind=2,
+        )
+        new_xy, sizes, loops, _, _, _, cuts = out
+        self.assertEqual(cuts, 1)
+        self.assertEqual(list(sizes), [4, 4])
+        crest = new_xy[np.unique(loops)]
+        self.assertEqual(int((np.abs(crest[:, 0] - 4.0) < 1e-9).sum()), 2)
+
+    def test_a_gap_between_two_pieces_is_not_a_hole(self):
+        """Regions are meshed one by one, so a sliver no piece covers -- left
+        where a hairpin was trimmed -- went to nobody: at Hazeldonk, 23 crack
+        edges. It goes to the neighbour sharing most outline with it."""
+        import shapely
+
+        from src.layered_mesh import quad_terrain
+        from src.terrain_mesh import TerrainMesh
+
+        west = shapely.Polygon([(0, 0), (80, 0), (79.8, 160), (0, 160)])
+        east = shapely.Polygon([(80, 0), (160, 0), (160, 160), (80, 160)])
+        vertices, sizes, loops, codes, part, _ = quad_terrain(
+            self.terrain, [(west, 0), (east, 6 * 16 + 6)], [], codes_wet=15,
+            tolerance_m=0.5, focus_m=250.0, depth_m=0.6, paved_codes=set(),
+        )
+        mesh = TerrainMesh(
+            vertices=vertices, measured_z=vertices[:, 2], face_sizes=sizes,
+            face_loops=loops, face_kind=np.zeros(len(sizes), dtype=np.int8),
+            face_part=part.astype(np.int8), vertex_on=np.zeros(len(vertices), dtype=np.int32),
+            edges=np.zeros((0, 2), dtype=np.int64), edge_on=np.zeros(0, dtype=np.int32),
+        )
+        self._assert_closed(mesh)
+
+    def test_a_ditch_bank_is_held_to_its_slope_against_the_bank_edge(self):
+        """The bank's vertices can be metres apart along it while the bank is
+        30 cm away: measured to the vertices, the bed dropped 0.9 m in those
+        30 cm, a wall 70° steep, and Shrinkwrap threw the grass beside it 13 cm
+        up. Measured to the bank edge, the drop is at most the run."""
+        from src.layered_mesh import _gentle_banks
+
+        xy = np.array([[0.0, 0.0], [6.0, 0.0], [3.0, -0.3], [0.0, 5.0], [6.0, 5.0]])
+        heights = np.array([1.0, 1.0, -0.5, 1.0, 1.0])
+        # A water triangle under the bank edge 0-1, and land above it.
+        loops = np.array([1, 0, 2, 0, 1, 4, 3])
+        sizes = np.array([3, 4])
+        kind = np.array([2, 0])
+        out = _gentle_banks(heights, loops, sizes, kind, xy, 2)
+        self.assertAlmostEqual(out[2], 1.0 - 0.3, places=6)
+        self.assertTrue(np.allclose(out[[0, 1, 3, 4]], 1.0))
+
+    def test_the_triangulation_can_still_be_asked_for(self):
+        from src.layered import build_layered_ground
+
+        ground = build_layered_ground(self.terrain, self.areas, prefix="T", mesher="triangles")
+        self.assertEqual(ground.stats["mesher"], "triangles")
+        self.assertLessEqual(ground.stats["grid_error_max_m"], 0.5 + 1e-6)
+
+
 class TestLayeredGround(unittest.TestCase):
     """The modellers' ground: a coarse terrain and the layers lying on it.
 
@@ -7861,6 +8112,35 @@ class TestTerrainGrid(unittest.TestCase):
         verdict = run(runaway)["layers_lie_on_the_terrain"]
         self.assertFalse(verdict.passed)
         self.assertIn("825.00 m past its outline", verdict.detail)
+        # Utrecht: five of 26,000 vertices a few centimetres out, on faces
+        # steeper than 65 degrees. Not a layer gone wrong.
+        steep = json.loads(json.dumps(good))
+        steep["height_above_terrain"]["road"] = {
+            "min_m": 0.014, "max_m": 0.11, "vertices": 120000,
+            "lowest_m": [0.014] + [0.049] * 49, "highest_m": [0.11] + [0.058] * 49,
+        }
+        verdict = run(steep)["layers_lie_on_the_terrain"]
+        self.assertTrue(verdict.passed, verdict.detail)
+        self.assertIn("2 of 120000 vertices outside", verdict.detail)
+        # But a road sunk by more than the slack anywhere still fails ...
+        deep = json.loads(json.dumps(steep))
+        deep["height_above_terrain"]["road"]["min_m"] = -0.2
+        deep["height_above_terrain"]["road"]["lowest_m"][0] = -0.2
+        self.assertFalse(run(deep)["layers_lie_on_the_terrain"].passed)
+        # ... and so does a share of strays, each only a little out.
+        many = json.loads(json.dumps(steep))
+        many["height_above_terrain"]["road"]["lowest_m"] = [0.02] * 50
+        many["height_above_terrain"]["road"]["vertices"] = 20000
+        self.assertFalse(run(many)["layers_lie_on_the_terrain"].passed)
+        # A kerb a kerb's width past its outline, where two footpaths touch
+        # on the edge of the area, passes; more does not.
+        edge = json.loads(json.dumps(good))
+        edge["height_above_terrain"]["walkway"]["beyond_outline_m"] = 0.3
+        verdict = run(edge)["layers_lie_on_the_terrain"]
+        self.assertTrue(verdict.passed, verdict.detail)
+        self.assertIn("0.30 m past its outline", verdict.detail)
+        edge["height_above_terrain"]["walkway"]["beyond_outline_m"] = 0.6
+        self.assertFalse(run(edge)["layers_lie_on_the_terrain"].passed)
         flat = dict(good, walkway_faces_evaluated=100)
         self.assertFalse(run(flat)["walkways_have_kerbs"].passed)
         old_blender = dict(good, curb_generator=False, kerbed_objects=0)
