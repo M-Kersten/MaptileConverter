@@ -635,7 +635,10 @@ def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) ->
         if deck_at is not None:
             deck = np.asarray(deck_at(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
             on_deck = vertices[:, 2] - deck
-            nearer = np.isfinite(on_deck) & (np.abs(on_deck) < np.abs(above))
+            # On the deck only from its surface up (less the embed allowed
+            # below): a wall the BGT puts under a bridge stands in the water
+            # beneath the deck, on the bed, and is measured from there.
+            nearer = np.isfinite(on_deck) & (on_deck >= -0.30) & (np.abs(on_deck) < np.abs(above))
             above = np.where(nearer, on_deck, above)
         # An awning or a canopy is meant to be up in the air; everything else
         # is meant to be standing on the pavement, and 8 m of garden wall is a

@@ -6207,6 +6207,36 @@ class TestBarrierHeightCheck(unittest.TestCase):
     def test_an_awning_eight_metres_up_is_not(self):
         self.assertTrue(self._verdict(self._barriers("awning", 8.5)).passed)
 
+    def test_a_parapet_is_measured_from_its_deck_and_a_wall_under_it_from_the_bed(self):
+        """Over a canal the ground is the bed. A parapet stands on the deck
+        four metres up; a wall the BGT puts under the bridge stands in the
+        water on the bed, and the deck over it is not its ground."""
+        from src.barriers import BarrierSet
+        from src.validate import CheckReport, check_barriers
+
+        bed, deck = -1.0, 3.8
+        # The parapet from just under the deck to a metre above it, and the
+        # wall from the bed to two metres below the deck.
+        vertices = np.array([
+            [0, 0, deck - 0.2], [4, 0, deck - 0.2], [4, 0, deck + 1.0], [0, 0, deck + 1.0],
+            [0, 1, bed], [4, 1, bed], [4, 1, deck - 2.0], [0, 1, deck - 2.0],
+        ], dtype=float)
+        barriers = BarrierSet(
+            vertices=vertices, uv=np.zeros((8, 2)),
+            triangles=np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]], dtype=np.int32),
+            material=np.zeros(4, np.int32), kind=np.zeros(4, np.int32),
+            material_names=["brick"], kind_names=["wall"], see_through=[],
+        )
+        report = CheckReport()
+        check_barriers(
+            report, barriers, lambda x, y: np.full(np.shape(x), bed),
+            deck_at=lambda x, y: np.full(np.shape(x), deck),
+        )
+        verdicts = {c.name: c for c in report.checks}
+        self.assertTrue(verdicts["barriers_sit_on_the_ground"].passed,
+                        verdicts["barriers_sit_on_the_ground"].detail)
+        self.assertTrue(verdicts["barriers_are_a_believable_height"].passed)
+
 
 def _outline_terrain():
     """A small area with everything the terrain mesh follows.
