@@ -649,19 +649,24 @@ def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) ->
             standing[:] = False
             standing[triangles[~np.isin(kinds, overhead)].ravel()] = True
         tallest = float(above[standing].max()) if standing.any() else 0.0
+        where_tall = vertices[np.flatnonzero(standing)[np.argmax(above[standing])]] if standing.any() else None
         report.add(
             "barriers_are_a_believable_height",
             tallest <= 8.0,
             f"the highest point of anything standing on the ground is "
-            f"{tallest:.1f} m above it",
+            f"{tallest:.1f} m above it"
+            + (f", at RD {where_tall[0]:.1f}, {where_tall[1]:.1f}" if tallest > 8.0 else ""),
         )
         # Nothing should hang below its own embed depth, or a fence up a bank
         # has sunk out of sight.
         deepest = float(-above.min())
+        where_deep = vertices[int(np.argmin(above))]
         report.add(
             "barriers_sit_on_the_ground",
             deepest <= 0.30,
-            f"the lowest point is {deepest:.2f} m below the ground",
+            f"the lowest point is {deepest:.2f} m below the ground"
+            + (f", at RD {where_deep[0]:.1f}, {where_deep[1]:.1f}, "
+               f"{where_deep[2]:.2f} m NAP" if deepest > 0.30 else ""),
         )
 
 
