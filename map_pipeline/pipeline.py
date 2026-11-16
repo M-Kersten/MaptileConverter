@@ -95,6 +95,7 @@ from src.structures import KIND_NAMES as STRUCTURE_KIND_NAMES  # noqa: E402
 from src.structures import (  # noqa: E402
     StructureSet,
     build_structures,
+    deck_surface,
     save_structures,
 )
 from src.surfaces import (  # noqa: E402
@@ -888,6 +889,25 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     fence_texture = None
     if want_barriers:
         with Stage("walls, fences and hedges (BGT)", next_step(), total):
+            # A parapet on a bridge stands on its deck, not on the ground (or
+            # canal bed) under it; the decks are read as the bridges stage
+            # will build them.
+            deck_at = None
+            if want_structures:
+                deck_dsm = ensure_dsm(
+                    terrain.bbox,
+                    work_dir,
+                    wcs_url=str(config.terrain["wcs_url"]),
+                    resolution_m=float(config.terrain["resolution_m"]),
+                    timeout=float(config.terrain["timeout_s"]),
+                    max_retries=int(config.terrain["max_retries"]),
+                )
+                deck_at = deck_surface(
+                    config.bbox,
+                    structures_cfg=config.structures,
+                    terrain=terrain,
+                    dsm_sampler=raster_sampler(deck_dsm) if deck_dsm else None,
+                )
             barriers = build_barriers(
                 config.bbox,
                 work_dir,
@@ -899,6 +919,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 collision=bool(config.export.get("collision", False)),
                 # The layered style builds quay walls as the face of the quay.
                 skip_styles=("quay_wall",) if len(harbour) else (),
+                deck_at=deck_at,
             )
             # Shares the furniture atlas: the same eight flat patches cover a
             # brick wall and a wooden bench, and one texture is one material.
@@ -959,6 +980,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 structures_cfg=config.structures,
                 terrain=terrain,
                 dsm_sampler=raster_sampler(dsm_path) if dsm_path else None,
+                # The layered style cuts canal beds below the water; a pier
+                # stands on the bed, not on the surveyed ground above it.
+                ground_at=ground_layers.surface_at if ground_layers is not None else None,
             )
             if len(structures.tris):
                 save_structures(structures, work_dir / "structures.npz")

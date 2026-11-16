@@ -8143,8 +8143,10 @@ class TestTerrainGrid(unittest.TestCase):
         """A tree, a post, a fence rail, a sleeper, a parked car: placed at a
         height, with no lift to absorb a difference, so it has to be the
         height the model draws -- the road top where there is one."""
+        # Barriers pick the drawn surface once per feature, and the deck over
+        # it where a barrier stands on a bridge (also on the drawn surface).
         for module, count in (
-            ("barriers", 3), ("furniture", 1), ("rails", 1), ("trees", 2),
+            ("barriers", 2), ("furniture", 1), ("rails", 1), ("trees", 2),
         ):
             text = (REPO_ROOT / "src" / f"{module}.py").read_text(encoding="utf-8")
             self.assertGreaterEqual(
@@ -9010,6 +9012,55 @@ class TestCollisionLayer(unittest.TestCase):
             )
         finally:
             barriers_module.fetch_current = real
+
+    def test_a_parapet_on_a_bridge_stands_on_the_deck(self):
+        """A bridge's parapet is a BGT wall up at the deck's level. Stood on
+        the ground under it -- the canal bed -- it was a wall from the bed to
+        above the deck, closing the canal under every bridge in Amsterdam."""
+        import tempfile
+
+        import src.barriers as barriers_module
+        from src.geo import BBox
+
+        lines = [
+            # The parapet across the canal, up on the deck.
+            {"properties": {"type": "muur", "relatieve_hoogteligging": 1},
+             "geometry": {"type": "LineString", "coordinates": [[40, 20], [40, 80]]}},
+            # A wall on the ground, which stays there.
+            {"properties": {"type": "muur", "relatieve_hoogteligging": 0},
+             "geometry": {"type": "LineString", "coordinates": [[70, 20], [70, 80]]}},
+        ]
+
+        def fake_fetch(collection, bbox, class_field=None, **kw):
+            return (lines if collection == "scheiding_lijn" else []), {}
+
+        class Terrain:
+            def surface(self, x, y):
+                # A canal bed at -1 m between y 30 and 70, quays at +1 m.
+                y = np.atleast_1d(np.asarray(y, float))
+                return np.where((y > 30) & (y < 70), -1.0, 1.0)
+
+        def deck_at(x, y):
+            x = np.atleast_1d(np.asarray(x, float))
+            return np.where((x > 35) & (x < 45), 2.5, np.nan)
+
+        real = barriers_module.fetch_current
+        barriers_module.fetch_current = fake_fetch
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                built = barriers_module.build_barriers(
+                    BBox(0.0, 0.0, 100.0, 100.0), Path(tmp),
+                    barriers_cfg={"page_limit": 10, "timeout_s": 1,
+                                  "max_retries": 1, "max_pages": 1},
+                    terrain=Terrain(), deck_at=deck_at,
+                )
+        finally:
+            barriers_module.fetch_current = real
+        v = built.vertices
+        parapet = v[np.abs(v[:, 0] - 40) < 1]
+        ground_wall = v[np.abs(v[:, 0] - 70) < 1]
+        self.assertGreaterEqual(parapet[:, 2].min(), 2.5 - 0.3)
+        self.assertLess(ground_wall[:, 2].min(), 0.0)
 
     def test_no_collider_is_swept_when_it_was_not_asked_for(self):
         """Another sweep of every thin run, and another copy in the npz, on a

@@ -534,11 +534,18 @@ def build_barriers(
     terrain,
     collision: bool = False,
     skip_styles=(),
+    deck_at=None,
 ) -> BarrierSet:
     """Fetch every barrier collection and turn it into draped geometry.
 
     `skip_styles` names styles left to someone else: the layered style builds
     quay walls as the face of the quay (`harbour`), not a wall standing on it.
+
+    `deck_at(x, y)` is the top of a bridge deck there, NaN off one
+    (`structures.deck_surface`). A barrier the BGT puts above the ground
+    (``relatieve_hoogteligging`` 1 or more) stands on it: the parapet of a
+    canal bridge, stood on the ground under it, was a wall from the canal bed
+    to above the deck, closing the canal under every bridge in Amsterdam.
 
     `collision` adds a second, fattened prism per thin run, for a simulation
     that needs a fence something cannot tunnel through. It costs another sweep
@@ -572,6 +579,12 @@ def build_barriers(
 
     skipped = set(skip_styles)
 
+    def on_deck(x, y):
+        """The deck where there is one, the ground elsewhere."""
+        below = np.asarray(terrain.surface(x, y), dtype=np.float64)
+        deck = np.asarray(deck_at(x, y), dtype=np.float64).reshape(below.shape)
+        return np.where(np.isfinite(deck), np.fmax(deck, below), below)
+
     def styled(table, collection, plus_type):
         style = apply_height_override(table.get((collection, plus_type)), heights)
         return None if style is not None and style.name in skipped else style
@@ -590,9 +603,15 @@ def build_barriers(
             continue
 
         for feature in features:
-            plus_type = feature_type(feature.get("properties") or {})
+            properties = feature.get("properties") or {}
+            plus_type = feature_type(properties)
             geometry = feature.get("geometry") or {}
             geometry_type = str(geometry.get("type") or "")
+            try:
+                raised = int(properties.get("relatieve_hoogteligging") or 0) > 0
+            except (TypeError, ValueError):
+                raised = False
+            ground = on_deck if raised and deck_at is not None else terrain.surface
 
             if geometry_type in ("LineString", "MultiLineString"):
                 style = styled(LINE_STYLES, collection, plus_type)
@@ -611,10 +630,10 @@ def build_barriers(
                         if _length(piece) < MIN_LENGTH_M:
                             continue
                         dense, _profile = _drape_points(
-                            piece, terrain.surface, step_m, drape_tolerance_m
+                            piece, ground, step_m, drape_tolerance_m
                         )
                         verts, tris, uvs = _sweep_line(
-                            dense, terrain.surface, style
+                            dense, ground, style
                         )
                         if len(tris):
                             chunks.append(
@@ -624,7 +643,7 @@ def build_barriers(
                             fat = collider_for(style)
                             if fat is not None:
                                 c_verts, c_tris, _ = _sweep_line(
-                                    dense, terrain.surface, fat
+                                    dense, ground, fat
                                 )
                                 if len(c_tris):
                                     collision_chunks.append((c_verts, c_tris))
@@ -638,7 +657,7 @@ def build_barriers(
                     if not rings:
                         continue
                     verts, tris, uvs = _extrude_rings(
-                        rings, terrain.surface, style, step_m
+                        rings, ground, style, step_m
                     )
                     if len(tris):
                         chunks.append((verts, tris, uvs, style))
@@ -646,7 +665,7 @@ def build_barriers(
                         fat = collider_for(style)
                         if fat is not None:
                             c_verts, c_tris, _ = _extrude_rings(
-                                rings, terrain.surface, fat, step_m
+                                rings, ground, fat, step_m
                             )
                             if len(c_tris):
                                 collision_chunks.append((c_verts, c_tris))

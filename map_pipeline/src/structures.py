@@ -246,6 +246,78 @@ def deck_corner_heights(flat, level: float, terrain, lift: float) -> np.ndarray:
     return np.maximum(np.full((len(flat), 3, 1), float(level)), ground) + float(lift)
 
 
+def deck_surface(bbox: BBox, *, structures_cfg: dict, terrain, dsm_sampler):
+    """The top of every bridge deck, as a function of position: `f(x, y)`
+    gives the deck's surface where a deck is and NaN everywhere else.
+
+    For the stages built before the bridges that have something standing on
+    one. A parapet on a canal bridge is a BGT wall up at the deck's level, and
+    stood on the ground under it -- in the layered style the canal bed -- it
+    was a wall five metres tall closing the canal under every bridge in
+    Amsterdam. Heights as `build_structures` gives the decks themselves.
+    """
+    import shapely
+
+    fetch_kwargs = dict(
+        page_limit=int(structures_cfg.get("page_limit", 1000)),
+        timeout=float(structures_cfg.get("timeout_s", 180)),
+        max_retries=int(structures_cfg.get("max_retries", 4)),
+        max_pages=int(structures_cfg.get("max_pages", 200)),
+    )
+    lift = float(structures_cfg.get("deck_lift_m", 0.05))
+    try:
+        features, _ = fetch_current(
+            "overbruggingsdeel", bbox, class_field="type_overbruggingsdeel", **fetch_kwargs
+        )
+    except Exception as exc:  # noqa: BLE001 - the barriers stay on the ground
+        LOG.warning("could not read BGT bridge decks: %s", exc)
+        features = []
+    decks, levels = [], []
+    for feature in features:
+        properties = feature.get("properties") or {}
+        if str(properties.get("type_overbruggingsdeel") or "").lower() not in DECK_TYPES:
+            continue
+        for group in polygon_rings(feature.get("geometry")):
+            clipped = [clip_ring_to_bbox(ring, bbox) for ring in group]
+            clipped = [r[:, :2] for r in clipped if len(r) >= 3]
+            if not clipped:
+                continue
+            flat = _triangulate(clipped)
+            if not len(flat):
+                continue
+            corners = flat.reshape(-1, 2)
+            under = np.asarray(terrain.sample(corners[:, 0], corners[:, 1]), dtype=np.float64)
+            level = (
+                deck_height(clipped, dsm_sampler, ground=float(np.median(under)))
+                if dsm_sampler is not None else None
+            )
+            if level is None:
+                level = float(under.max()) + float(structures_cfg.get("fallback_clearance_m", 5.0))
+            polygon = shapely.make_valid(shapely.Polygon(clipped[0], clipped[1:]))
+            if not polygon.is_empty:
+                decks.append(polygon)
+                levels.append(level)
+    if not decks:
+        return lambda x, y: np.full(np.shape(np.atleast_1d(x)), np.nan)
+    tree = shapely.STRtree(np.array(decks, dtype=object))
+    levels = np.asarray(levels)
+
+    def at(x, y):
+        x = np.atleast_1d(np.asarray(x, dtype=np.float64))
+        y = np.atleast_1d(np.asarray(y, dtype=np.float64))
+        out = np.full(x.shape, np.nan)
+        points = shapely.points(x, y)
+        hit_point, hit_deck = tree.query(points, predicate="intersects")
+        if len(hit_point):
+            out[hit_point] = np.fmax(out[hit_point], levels[hit_deck])
+            # Held up where the ground rises through the deck, as the deck is.
+            ground = np.asarray(terrain.sample(x[hit_point], y[hit_point]), dtype=np.float64)
+            out[hit_point] = np.fmax(out[hit_point], ground) + lift
+        return out
+
+    return at
+
+
 def build_structures(
     bbox: BBox,
     work_dir: Path,
@@ -253,8 +325,14 @@ def build_structures(
     structures_cfg: dict,
     terrain=None,
     dsm_sampler=None,
+    ground_at=None,
 ) -> StructureSet:
-    """Fetch bridge and tunnel parts and build them into geometry."""
+    """Fetch bridge and tunnel parts and build them into geometry.
+
+    `ground_at(x, y)`, the ground as built where that differs from the survey
+    -- the layered style cuts a canal's bed below its water -- is what a pier
+    stands on, so it reaches down into the water rather than stopping above it.
+    """
     result = StructureSet()
     fetch_kwargs = dict(
         page_limit=int(structures_cfg.get("page_limit", 1000)),
@@ -319,12 +397,12 @@ def build_structures(
             LOG.info("no bridges or tunnels in this area")
         return result
 
-    _build_geometry(result, terrain, dsm_sampler, structures_cfg)
+    _build_geometry(result, terrain, dsm_sampler, structures_cfg, ground_at=ground_at)
     return result
 
 
 def _build_geometry(
-    result: StructureSet, terrain, dsm_sampler, structures_cfg: dict
+    result: StructureSet, terrain, dsm_sampler, structures_cfg: dict, *, ground_at=None
 ) -> None:
     """Give every part a height and turn it into triangles."""
     tris: list[np.ndarray] = []
@@ -386,7 +464,10 @@ def _build_geometry(
         else:
             # A pier runs from under the deck down to whatever it stands on.
             for ring in part.rings:
-                base = terrain.sample(ring[:, 0], ring[:, 1])
+                base = np.asarray(terrain.sample(ring[:, 0], ring[:, 1]), dtype=np.float64)
+                if ground_at is not None:
+                    built = np.asarray(ground_at(ring[:, 0], ring[:, 1]), dtype=np.float64)
+                    base = np.where(np.isfinite(built), np.fmin(base, built), base)
                 add(extrude_ring(ring, level, np.minimum(base, level - 0.5)), KIND_PIER)
 
     result.counts["decks_measured_from_dsm"] = measured
@@ -481,6 +562,7 @@ __all__ = [
     "StructureSet",
     "build_structures",
     "deck_height",
+    "deck_surface",
     "extrude_ring",
     "save_structures",
     "tunnel_depth_profile",

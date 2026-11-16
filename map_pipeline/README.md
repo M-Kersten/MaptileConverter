@@ -1060,7 +1060,13 @@ notches over Amsterdam's centre; taken for islands, they were filled in from
 the quays at about +1 m with the bed sloping up to them, a mound across the
 canal under every bridge. A ground-level bridge part with at least half its
 outline on water is now water itself, so the surface and the cut bed pass
-under the deck; the piers are still built, from the deck down to the bed.
+under the deck; the piers are still built, from the deck down to the bed (the
+ground as the layered style builds it, not the survey, so they reach into the
+water). A bridge's parapets are BGT walls up at the deck's level
+(`relatieve_hoogteligging` 1); stood on the ground under them they were walls
+from the canal bed to above the deck, closing the canal under every bridge.
+A barrier above the ground now stands on the deck under it, read as the
+bridges stage reads the decks (`structures.deck_surface`).
 
 Separate waters keep separate levels: levels across one square kilometre of
 Utrecht run from −0.57 to 1.00 m NAP, so a single bed taken from the median
