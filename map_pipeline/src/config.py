@@ -52,9 +52,18 @@ DEFAULTS: dict[str, Any] = {
         # grid that coarsens away from the middle, or "triangles", the
         # triangulation refined until it is within tolerance_m everywhere.
         "mesher": "quads",
-        # How far below the water level a ditch is cut. No water surface is
-        # drawn in this style: this is the dip in the ground.
+        # How far below the water level a ditch is cut.
         "ditch_depth_m": 0.6,
+        # A flat water surface over every BGT water, as an object of its own
+        # (<prefix>_Water), at the level read from the survey.
+        "water_surface": True,
+        # Added to every water level: a tide. The survey's level is whatever
+        # the tide was the day it was flown; +1.0 over Rotterdam is about high
+        # water. In Blender the water object can be moved up and down too.
+        "water_level_offset_m": 0.0,
+        # Quay faces along the BGT quay walls, jetties and pontoons as decks,
+        # mooring posts as posts (src/harbour.py).
+        "harbour": True,
         # The curb generator on every walkway and traffic island. Needs
         # Blender 5; with an older one the walkways stay flat.
         "kerbs": True,
@@ -452,8 +461,8 @@ DETAIL_PRESETS: dict[str, dict] = {
 # What each style changes in the other sections, applied before the file's
 # own settings so anything set explicitly still wins. The modellers' ground
 # has no street-by-street road objects, and their file has no parked cars.
-# Water is fetched, but as ditches and canals cut into the ground, not as a
-# surface of its own: see `layered`.
+# Water is cut into the ground and covered by a flat object of its own; see
+# `layered` and `harbour`.
 STYLE_PRESETS: dict[str, dict] = {
     "layered": {
         "surfaces": {"road_geometry": False},
@@ -773,6 +782,9 @@ def load_config(path: str | Path) -> PipelineConfig:
     if mesher not in ("quads", "triangles"):
         raise ValueError(f"layered.mesher must be 'quads' or 'triangles', got {mesher!r}")
     layered["mesher"] = mesher
+    layered["water_surface"] = bool(layered.get("water_surface", True))
+    layered["harbour"] = bool(layered.get("harbour", True))
+    layered["water_level_offset_m"] = float(layered.get("water_level_offset_m", 0.0))
     for key in ("outline_m", "road_lift_m", "grass_lift_m", "ditch_depth_m"):
         value = float(layered[key])
         if value < 0:

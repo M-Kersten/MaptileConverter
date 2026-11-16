@@ -403,13 +403,18 @@ def _sink_water_bed(
     return out
 
 
-def build_water(scene: dict, work_dir: Path, material):
+def build_water(scene: dict, work_dir: Path, material, name: str = "Water",
+                offset_m: float = 0.0, file: str | None = None):
     """Flat surfaces over the BGT water outlines, one level per body.
 
     The outlines were triangulated upstream, where the triangulation library
-    lives. This script only gets what Blender itself bundles.
+    lives. This script only gets what Blender itself bundles. `offset_m`
+    raises or lowers every level: a tide.
     """
-    data = _load_surfaces(scene, work_dir)
+    if file:
+        data = np.load(work_dir / file) if (work_dir / file).is_file() else None
+    else:
+        data = _load_surfaces(scene, work_dir)
     if data is None or "water_tris" not in data.files:
         return None
 
@@ -423,7 +428,7 @@ def build_water(scene: dict, work_dir: Path, material):
     local = triangles.copy()
     local[:, :, 0] -= origin_x
     local[:, :, 1] -= origin_y
-    local[:, :, 2] -= z_offset
+    local[:, :, 2] -= z_offset - float(offset_m)
 
     corners = local.reshape(-1, 3)
     n_triangles = len(local)
@@ -432,7 +437,7 @@ def build_water(scene: dict, work_dir: Path, material):
     uvs = np.column_stack([corners[:, 0] / 8.0, corners[:, 1] / 8.0])
 
     obj = build_mesh_object(
-        "Water",
+        name,
         corners,
         np.arange(n_triangles * 3),
         np.arange(0, n_triangles * 3, 3),
@@ -445,6 +450,69 @@ def build_water(scene: dict, work_dir: Path, material):
     bodies = len(data["water_levels"]) if "water_levels" in data.files else 0
     log(f"water: {bodies} bodies, {n_triangles} triangles")
     return obj
+
+
+# The harbour's objects, by kind as harbour.npz numbers them: Dutch names as
+# the modellers name theirs, and a plain material each.
+HARBOUR_OBJECTS = {
+    "quay": ("Kademuren", "Beton", (0.8, 0.8, 0.8), 0.6),
+    "jetty": ("Steigers", "Hout", (0.16, 0.1, 0.055), 0.8),
+    "pontoon": ("Pontons", "Ponton", (0.12, 0.12, 0.13), 0.6),
+    "mooring_post": ("Meerpalen", "Meerpaal", (0.06, 0.05, 0.04), 0.7),
+}
+
+
+def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
+    """Quay faces, jetties, pontoons and mooring posts: one object per kind."""
+    import bmesh
+
+    path = work_dir / str(scene["layered"]["harbour"])
+    if not path.is_file():
+        return []
+    data = np.load(path)
+    tris = data["tris"].astype(np.float64)
+    kinds = data["tri_kind"].astype(np.int64)
+    names = [str(n) for n in data["kind_names"]]
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    tris = tris - [origin_x, origin_y, z_offset]
+    made = []
+    for k, kind in enumerate(names):
+        sel = tris[kinds == k]
+        if not len(sel) or kind not in HARBOUR_OBJECTS:
+            continue
+        word, material_name, rgb, rough = HARBOUR_OBJECTS[kind]
+        material = bpy.data.materials.get(material_name) or make_plain_material(
+            material_name, rgb, rough
+        )
+        corners = sel.reshape(-1, 3)
+        n = len(sel)
+        obj = build_mesh_object(
+            f"{prefix}_{word}",
+            corners,
+            np.arange(n * 3),
+            np.arange(0, n * 3, 3),
+            np.full(n, 3),
+            np.column_stack([corners[:, 0] / 2.0, corners[:, 1] / 2.0]),
+            np.zeros(n),
+            [material],
+            shade_smooth=False,
+        )
+        # One vertex per corner, and the faces turned outwards.
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        bm.to_mesh(obj.data)
+        bm.free()
+        obj["maptile_role"] = f"harbour_{kind}"
+        made.append(obj.name)
+        log(f"harbour: {obj.name}, {n} triangles")
+    return made
+
+
+# The layered style's water: a dark, slightly green harbour blue.
+WATER_RGB = (0.018, 0.045, 0.05)
 
 
 def make_plain_material(name: str, colour, roughness: float):
@@ -3055,7 +3123,29 @@ def main() -> int:
             scene, work_dir, facade_materials, aerial_material, ground_materials
         )
 
-    if "water" in extra_textures:
+    if layered is not None and scene["layered"].get("water_surface", True):
+        # The modellers' ground in flat colours, its water too: one object,
+        # at the levels read from the survey plus any tide set in the config.
+        # Move it up or down in Blender for another tide.
+        prefix = str(scene["layered"].get("prefix") or "Area")
+        # One object, so no empty to group it under (it would share its name).
+        with _Layer(f"{prefix}_Water"):
+            water = build_water(
+                scene,
+                work_dir,
+                make_plain_material("Water", WATER_RGB, 0.08),
+                name=f"{prefix}_Water",
+                offset_m=float(scene["layered"].get("water_level_offset_m", 0.0)),
+                file=str(scene["layered"].get("water_file") or "surfaces.npz"),
+            )
+            if water is not None:
+                water["maptile_role"] = "water"
+                layered["water_object"] = water.name
+    if layered is not None and scene["layered"].get("harbour"):
+        prefix = str(scene["layered"].get("prefix") or "Area")
+        with _Layer(f"{prefix}_Haven", f"{prefix}_Haven"):
+            layered["harbour_objects"] = build_harbour(scene, work_dir, prefix)
+    if layered is None and "water" in extra_textures:
         # Water is the one smooth thing in the scene, so it gets a low
         # roughness while everything else stays matte.
         with _Layer("Water"):

@@ -418,6 +418,28 @@ def check_surfaces(report: CheckReport, surfaces, terrain) -> None:
         bool((levels > -10).all() and (levels < 60).all()),
         f"levels between {levels.min():.2f} and {levels.max():.2f} m NAP",
     )
+    # One level per water: the BGT's polygons of one river are one surface.
+    # Read one by one, the ferries moored in one put it 4.5 m above the next.
+    import shapely
+
+    from .surfaces import water_groups
+
+    polygons = []
+    for body in surfaces.water:
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in body.rings if len(r) >= 4]
+        polygons.append(
+            shapely.make_valid(shapely.Polygon(rings[0], rings[1:])) if rings else shapely.Polygon()
+        )
+    groups = water_groups(polygons)
+    spread = max(
+        (float(np.ptp(levels[groups == g])) for g in np.unique(groups)), default=0.0
+    )
+    report.add(
+        "one_level_per_water",
+        spread < 0.01,
+        f"{len(np.unique(groups))} connected waters; the most the levels within "
+        f"one differ is {spread:.2f} m",
+    )
 
     if surfaces.water_bed is not None and surfaces.water_bed.size:
         bed = surfaces.water_bed
@@ -957,11 +979,39 @@ def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
 # How far a layer vertex may miss its band, and what share of them may.
 LAYER_SLACK_M = 0.1
 LAYER_STRAY_SHARE = 5e-4
+# ... and never fewer than this many, so a small layer gets the same few: the
+# Rotterdam harbour's 2,008 grass vertices had two on 65 degree slopes.
+LAYER_STRAY_MIN = 3
+
+
+def check_harbour(report: CheckReport, harbour) -> None:
+    """Quay faces reach under the water, and decks stand above it."""
+    if harbour is None or not len(harbour):
+        return
+    counts = ", ".join(f"{k.replace('_', ' ')} {v}" for k, v in harbour.counts.items())
+    report.add("harbour_built", True, counts)
+    below = np.asarray(harbour.quay_bottom_below_water, dtype=np.float64)
+    if len(below):
+        report.add(
+            "quay_faces_reach_under_water",
+            bool((below >= 1.0).all()),
+            f"{len(below)} quay stations, faces {below.min():.2f} to {below.max():.2f} m "
+            f"below the water",
+        )
+    tops = np.asarray(harbour.deck_top, dtype=np.float64)
+    if len(tops):
+        clear = tops - np.asarray(harbour.deck_level, dtype=np.float64)
+        report.add(
+            "decks_above_water",
+            bool((clear >= 0.1).all() and (clear <= 6.0).all()),
+            f"{len(tops)} jetty and pontoon decks, {clear.min():.2f} to {clear.max():.2f} m "
+            f"above the water",
+        )
 
 
 def check_layered(
     report: CheckReport, work_dir: Path, ground, *, kerbs: bool, kerb_top_m: float,
-    kerb_width_m: float = 0.3,
+    kerb_width_m: float = 0.3, water_expected: bool = False,
 ) -> None:
     """The layered style's ground as Blender built it.
 
@@ -995,6 +1045,12 @@ def check_layered(
     )
     if not built:
         return
+    if water_expected:
+        report.add(
+            "water_surface_built",
+            bool(built.get("water_object")),
+            f"{built.get('water_object') or 'no'} water object over the BGT water",
+        )
 
     from .layered import GRASS, MOTORWAY, ROAD, WALKWAY
 
@@ -1049,7 +1105,7 @@ def check_layered(
                 got["min_m"] >= floor - LAYER_SLACK_M
                 and got["max_m"] <= ceiling + LAYER_SLACK_M
                 and outside < listed
-                and outside <= LAYER_STRAY_SHARE * n
+                and outside <= max(LAYER_STRAY_SHARE * n, LAYER_STRAY_MIN)
             )
         else:
             outside = int(got["min_m"] < floor) + int(got["max_m"] > ceiling)
@@ -1372,6 +1428,7 @@ __all__ = [
     "check_built_terrain",
     "check_export",
     "check_fbx_reimport",
+    "check_harbour",
     "check_layered",
     "check_roads",
     "check_terrain",

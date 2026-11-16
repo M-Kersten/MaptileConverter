@@ -7024,6 +7024,40 @@ class TestQuadTerrain(unittest.TestCase):
         )
         self._assert_closed(mesh)
 
+    def test_two_pieces_overlapping_are_meshed_once(self):
+        """Two pieces both claiming a lens of ground were meshed twice, their
+        edges matching neither neighbour: 14 crack edges over Rotterdam."""
+        import shapely
+
+        from src.layered_mesh import quad_terrain
+        from src.terrain_mesh import TerrainMesh
+
+        west = shapely.Polygon([(0, 0), (80.6, 0), (80.6, 160), (0, 160)])
+        east = shapely.Polygon([(80, 0), (160, 0), (160, 160), (79.4, 160)])
+        vertices, sizes, loops, codes, part, stats = quad_terrain(
+            self.terrain, [(west, 0), (east, 6 * 16 + 6)], [], codes_wet=15,
+            tolerance_m=0.5, focus_m=250.0, depth_m=0.6, paved_codes=set(),
+        )
+        self.assertEqual(stats["pieces_overlapping"], 1)
+        mesh = TerrainMesh(
+            vertices=vertices, measured_z=vertices[:, 2], face_sizes=sizes,
+            face_loops=loops, face_kind=np.zeros(len(sizes), dtype=np.int8),
+            face_part=part.astype(np.int8), vertex_on=np.zeros(len(vertices), dtype=np.int32),
+            edges=np.zeros((0, 2), dtype=np.int64), edge_on=np.zeros(0, dtype=np.int32),
+        )
+        self._assert_closed(mesh)
+
+    def test_a_loose_piece_of_mesh_on_the_sheet_goes(self):
+        from src.layered_mesh import _floating
+
+        # A 2x2 sheet of unit squares, and one small square lying on it.
+        xy = np.array([[0, 0], [1, 0], [2, 0], [0, 1], [1, 1], [2, 1], [0, 2], [1, 2], [2, 2],
+                       [0.2, 0.2], [0.6, 0.2], [0.6, 0.6], [0.2, 0.6]], dtype=float)
+        faces = [[0, 1, 4, 3], [1, 2, 5, 4], [3, 4, 7, 6], [4, 5, 8, 7], [9, 10, 11, 12]]
+        sizes = np.array([4] * 5)
+        loops = np.array([i for f in faces for i in f])
+        self.assertEqual(list(_floating(xy, sizes, loops)), [False] * 4 + [True])
+
     def test_a_ditch_bank_is_held_to_its_slope_against_the_bank_edge(self):
         """The bank's vertices can be metres apart along it while the bank is
         30 cm away: measured to the vertices, the bed dropped 0.9 m in those
@@ -7040,6 +7074,25 @@ class TestQuadTerrain(unittest.TestCase):
         out = _gentle_banks(heights, loops, sizes, kind, xy, 2)
         self.assertAlmostEqual(out[2], 1.0 - 0.3, places=6)
         self.assertTrue(np.allclose(out[[0, 1, 3, 4]], 1.0))
+
+    def test_a_quay_holds_no_bank_up(self):
+        """Along a quay wall the water goes straight down, and further out the
+        quay edge must not lift the bed into a fake 45 degree bank either:
+        at Hoek van Holland it rose to +2.4 m two metres off the ferry quay."""
+        import shapely
+
+        from src.layered_mesh import _gentle_banks
+
+        xy = np.array([[0.0, 0.0], [6.0, 0.0], [3.0, -2.5], [0.0, 5.0], [6.0, 5.0]])
+        heights = np.array([4.3, 4.3, -0.9, 4.3, 4.3])
+        loops = np.array([1, 0, 2, 0, 1, 4, 3])
+        sizes = np.array([3, 4])
+        kind = np.array([2, 0])
+        quay = shapely.LineString([(0, 0), (6, 0)]).buffer(1.5)
+        out = _gentle_banks(heights, loops, sizes, kind, xy, 2, steep=quay)
+        self.assertAlmostEqual(out[2], -0.9, places=6)
+        # Without the quay the same bank holds the bed up at 45 degrees.
+        self.assertAlmostEqual(_gentle_banks(heights, loops, sizes, kind, xy, 2)[2], 4.3 - 2.5, places=6)
 
     def test_the_triangulation_can_still_be_asked_for(self):
         from src.layered import build_layered_ground
@@ -8132,6 +8185,14 @@ class TestTerrainGrid(unittest.TestCase):
         many["height_above_terrain"]["road"]["lowest_m"] = [0.02] * 50
         many["height_above_terrain"]["road"]["vertices"] = 20000
         self.assertFalse(run(many)["layers_lie_on_the_terrain"].passed)
+        # A small layer may have its few, as a big one may.
+        few = json.loads(json.dumps(good))
+        few["height_above_terrain"]["grass"] = {
+            "min_m": 0.0, "max_m": 0.024, "vertices": 2008,
+            "lowest_m": [0.0, 0.001] + [0.015] * 48, "highest_m": [0.024] * 50,
+        }
+        self.assertTrue(run(few)["layers_lie_on_the_terrain"].passed)
+        self.assertFalse(run(many)["layers_lie_on_the_terrain"].passed)
         # A kerb a kerb's width past its outline, where two footpaths touch
         # on the edge of the area, passes; more does not.
         edge = json.loads(json.dumps(good))
@@ -8143,6 +8204,18 @@ class TestTerrainGrid(unittest.TestCase):
         self.assertFalse(run(edge)["layers_lie_on_the_terrain"].passed)
         flat = dict(good, walkway_faces_evaluated=100)
         self.assertFalse(run(flat)["walkways_have_kerbs"].passed)
+        # The water object: wanted over a harbour, missing once by mistake.
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "blender_summary.json").write_text(json.dumps({"layered": good}))
+            report = CheckReport()
+            check_layered(report, work, ground, kerbs=True, kerb_top_m=0.18, water_expected=True)
+            self.assertFalse({c.name: c for c in report.checks}["water_surface_built"].passed)
+            (work / "blender_summary.json").write_text(
+                json.dumps({"layered": dict(good, water_object="P_Water")}))
+            report = CheckReport()
+            check_layered(report, work, ground, kerbs=True, kerb_top_m=0.18, water_expected=True)
+            self.assertTrue({c.name: c for c in report.checks}["water_surface_built"].passed)
         old_blender = dict(good, curb_generator=False, kerbed_objects=0)
         old_blender["height_above_terrain"] = dict(
             good["height_above_terrain"], walkway={"min_m": 0.05, "max_m": 0.051})
@@ -8154,6 +8227,150 @@ class TestTerrainGrid(unittest.TestCase):
         missing = dict(good, objects=good["objects"][:2])
         self.assertFalse(run(missing)["ground_layers_built"].passed)
         self.assertFalse(run(None)["ground_layers_built"].passed)
+
+
+class TestWaterLevels(unittest.TestCase):
+    """One level per water, from the water and not from what floats on it."""
+
+    def test_ships_do_not_set_the_level(self):
+        """In a harbour most returns over the water are ships and pontoons:
+        over the Maashaven 41,000 returns, the water's own around +0.5 m NAP
+        and the moored barges up to +5 m."""
+        from src.surfaces import surface_level
+
+        rng = np.random.default_rng(1)
+        water = rng.normal(0.5, 0.05, 2000)
+        ships = rng.uniform(2.0, 6.0, 30000)
+        level = surface_level(np.concatenate([water, ships]))
+        self.assertAlmostEqual(level, 0.5, delta=0.1)
+        self.assertIsNone(surface_level(np.array([0.5] * 10)))
+
+    def test_one_river_is_one_level(self):
+        """The BGT cuts the Nieuwe Waterweg into polygons; ferries moored in
+        one gave it +3.55 m NAP beside -0.99 m, and the terrain cut below each
+        left a 4.5 m cliff across the river."""
+        import shapely
+
+        from src.surfaces import water_groups, water_levels
+
+        river = [shapely.box(0, 0, 100, 50), shapely.box(100, 0, 200, 50), shapely.box(200, 0, 300, 50)]
+        pond = shapely.box(0, 200, 20, 220)
+        polygons = river + [pond]
+        rng = np.random.default_rng(2)
+        samples = [
+            rng.normal(-0.8, 0.03, 300),
+            np.concatenate([rng.normal(-0.8, 0.03, 40), rng.uniform(3.0, 4.0, 400)]),
+            np.zeros(0),  # no return at all: it is still river
+            rng.normal(2.6, 0.02, 200),
+        ]
+        groups = water_groups(polygons)
+        self.assertEqual(len(set(groups[:3])), 1)
+        self.assertNotEqual(groups[0], groups[3])
+        levels, measured = water_levels(polygons, samples, [np.nan] * 4)
+        self.assertTrue(np.allclose(levels[:3], levels[0]))
+        self.assertAlmostEqual(levels[0], -0.8, delta=0.05)
+        self.assertAlmostEqual(levels[3], 2.6, delta=0.05)
+        self.assertTrue(measured.all())
+
+    def test_water_with_no_reading_is_kept(self):
+        """A river polygon with no return and no surveyed bank was dropped and
+        drawn as land: 38,800 m2 of the Nieuwe Waterweg. It takes the level of
+        the waters that have one."""
+        import shapely
+
+        from src.surfaces import water_levels
+
+        polygons = [shapely.box(0, 0, 10, 10), shapely.box(500, 0, 510, 10)]
+        levels, measured = water_levels(
+            polygons, [np.full(100, 0.4), np.zeros(0)], [np.nan, np.nan]
+        )
+        self.assertTrue(np.isfinite(levels).all())
+        self.assertAlmostEqual(levels[1], 0.4, places=6)
+        self.assertEqual(list(measured), [True, False])
+
+
+class TestHarbour(unittest.TestCase):
+    """Quay faces, jetties, pontoons and mooring posts from the BGT."""
+
+    def _build(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import shapely
+
+        import src.harbour as harbour
+        from src.geo import BBox
+        from src.surfaces import WaterBody
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        # A basin in the south half, its north edge a quay wall at +3 m.
+        basin = WaterBody(rings=[np.array([[0, 0], [100, 0], [100, 50], [0, 50], [0, 0]], float)],
+                          level_nap=0.5, area_m2=5000.0, measured=True)
+        quay = shapely.LineString([(10, 50), (90, 50)])
+        jetty = {"type": "Polygon", "coordinates": [[[40, 30], [44, 30], [44, 49], [40, 49], [40, 30]]]}
+        platform = {"type": "Polygon", "coordinates": [[[40, 60], [60, 60], [60, 70], [40, 70], [40, 60]]]}
+        features = {
+            "kunstwerkdeel_vlak": [
+                {"geometry": jetty, "properties": {"type": "steiger"}},
+                {"geometry": platform, "properties": {"type": "perron"}},
+            ],
+            "waterinrichtingselement_punt": [
+                {"geometry": {"type": "Point", "coordinates": [70, 45]}, "properties": {"plus_type": "meerpaal"}},
+                {"geometry": {"type": "Point", "coordinates": [70, 90]}, "properties": {"plus_type": "meerpaal"}},
+            ],
+        }
+
+        def fetch(collection, _bbox, **_kwargs):
+            return features.get(collection, []), SimpleNamespace()
+
+        def ground(x, y):
+            y = np.asarray(y, dtype=float)
+            return np.where(y > 50, 3.0, -0.5)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(harbour, "fetch_current", fetch):
+            return harbour.build_harbour(
+                bbox, Path(tmp), water=[basin], quays=[quay], surface_at=ground,
+            )
+
+    def test_the_quay_face_runs_from_the_quay_top_to_under_the_water(self):
+        from src.harbour import COPING_M, QUAY, QUAY_REACH_M
+
+        built = self._build()
+        quay = built.tris[built.tri_kind == QUAY].reshape(-1, 3)
+        self.assertAlmostEqual(quay[:, 2].max(), 3.0, places=6)
+        self.assertAlmostEqual(quay[:, 2].min(), 0.5 - 1.5, places=6)
+        # Out over the water, never back over the quay.
+        self.assertGreaterEqual(quay[:, 1].min(), 50.0 - COPING_M - 1e-6)
+        self.assertLessEqual(quay[:, 1].max(), 50.0 + 1e-6)
+        # The wall's own 80 m, and the reach either end of it.
+        self.assertAlmostEqual(built.counts["quay_m"], 80.0 + 2 * QUAY_REACH_M, delta=0.5)
+
+    def test_a_jetty_stands_above_the_water_and_a_platform_on_land_is_no_jetty(self):
+        from src.harbour import DECK_ABOVE_M, JETTY
+
+        built = self._build()
+        self.assertEqual(built.counts.get("jetty"), 1)
+        self.assertNotIn("pontoon", built.counts)
+        self.assertAlmostEqual(float(built.deck_top[0]), 0.5 + DECK_ABOVE_M[JETTY], places=6)
+
+    def test_only_mooring_posts_in_the_water_are_built(self):
+        from src.harbour import POST
+
+        built = self._build()
+        self.assertEqual(built.counts["mooring_post"], 1)
+        posts = built.tris[built.tri_kind == POST].reshape(-1, 3)
+        self.assertLess(posts[:, 2].min(), 0.5)
+        self.assertGreater(posts[:, 2].max(), 2.5)
+
+    def test_the_checks_read_it(self):
+        from src.validate import CheckReport, check_harbour
+
+        report = CheckReport()
+        check_harbour(report, self._build())
+        verdicts = {c.name: c for c in report.checks}
+        self.assertEqual({"harbour_built", "quay_faces_reach_under_water", "decks_above_water"},
+                         set(verdicts))
+        self.assertTrue(all(v.passed for v in verdicts.values()))
 
 
 class TestPathsOverWater(unittest.TestCase):

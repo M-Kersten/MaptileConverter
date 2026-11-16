@@ -19,8 +19,10 @@ middle, and loops cut wherever a face still misses the survey. The outlines
 are edges of it, so each layer is simply the terrain's own faces under it,
 lifted -- no face of a road can dip under the ground or float off it.
 
-Water gets no surface, as in the modellers' file, but its ditches are cut into
-the terrain. Bridges and tunnels are left to the structures stage.
+Water is cut into the terrain, with a flat water object over it, and along
+quay walls the ground drops straight down (`harbour` builds the quay faces,
+jetties and mooring posts). Bridges and tunnels are left to the structures
+stage.
 """
 
 from __future__ import annotations
@@ -263,6 +265,7 @@ def build_layered_ground(
     water=(),
     ditch_depth_m: float = DITCH_DEPTH_M,
     mesher: str = "quads",
+    quays=(),
 ) -> LayeredGround:
     """The terrain and its layers, from the survey and the BGT areas.
 
@@ -350,6 +353,7 @@ def build_layered_ground(
                     _code(ROAD, "Bakstenen"), _code(ROAD, "Fietspad"),
                 },
                 narrow_codes={_code(WALKWAY, "Beton_Geel"), _code(ROAD, "Verharding")},
+                quays=quays,
             )
         except Exception as exc:  # noqa: BLE001 - the triangulation always works
             LOG.warning(

@@ -39,6 +39,7 @@ if __name__ == "__main__":
         raise SystemExit(2)
 
 from src.bgt import use_cache as bgt_cache  # noqa: E402
+from src.harbour import HarbourSet, build_harbour  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402
 from src.elevation import (  # noqa: E402
@@ -132,6 +133,7 @@ from src.validate import (  # noqa: E402
     check_rails,
     check_structures,
     check_vehicles,
+    check_harbour,
     check_surfaces,
     check_terrain,
     check_terrain_mesh,
@@ -486,7 +488,7 @@ def _collision_metadata(work_dir: Path) -> dict:
     return {"collision": collision} if collision.get("objects") else {}
 
 
-def layered_scene(config: PipelineConfig, ground) -> dict:
+def layered_scene(config: PipelineConfig, ground, harbour=None) -> dict:
     """What the Blender stage needs to build the modellers' ground."""
     settings = config.layered
     curb = settings["curb"]
@@ -507,6 +509,9 @@ def layered_scene(config: PipelineConfig, ground) -> dict:
             "Bevel Curb Inner": bool(curb["bevel_curb_inner"]),
             "Smooth by Angle": math.radians(float(curb["smooth_angle_deg"])),
         },
+        "water_surface": bool(settings.get("water_surface", True)),
+        "harbour": "harbour.npz" if harbour is not None and len(harbour) else "",
+        "water_level_offset_m": float(settings.get("water_level_offset_m", 0.0)),
         "walkway_material": str(curb.get("walkway_material") or ""),
         "curb_material": str(curb.get("curb_material") or "Beton"),
         "stats": {
@@ -628,6 +633,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     surfaces = SurfaceSet()
     water_texture = None
+    level_dsm = None
     if want_surfaces:
         with Stage(
             "ground surfaces (BGT roads, paving and green)"
@@ -639,7 +645,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             # A road on a bridge takes its height from the surface model, so
             # that has to be here before the road geometry is built.
             deck_dsm = None
-            if bool(config.surfaces.get("road_geometry", True)):
+            # The surface model also reads the water levels: the bare-earth
+            # model has next to nothing over water, and what it has is ships.
+            if bool(config.surfaces.get("road_geometry", True)) or bool(
+                config.surfaces.get("water", True)
+            ):
                 bridge_dsm = ensure_dsm(
                     terrain.bbox,
                     work_dir,
@@ -648,7 +658,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     timeout=float(config.terrain["timeout_s"]),
                     max_retries=int(config.terrain["max_retries"]),
                 )
-                deck_dsm = raster_sampler(bridge_dsm) if bridge_dsm else None
+                level_dsm = bridge_dsm
+                if bridge_dsm and bool(config.surfaces.get("road_geometry", True)):
+                    deck_dsm = raster_sampler(bridge_dsm)
 
             # The national road network, for where to cut across each street.
             # A failed fetch is an empty network, not a failed run.
@@ -672,11 +684,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # The modellers' style draws every road, verge and island
                 # polygon as a layer of its own.
                 keep_areas=layered,
+                level_raster=level_dsm,
             )
             if surfaces.class_grid is not None:
                 write_land_cover(surfaces, config.bbox, out_dir)
-            # The layered style cuts the water into the ground as ditches and
-            # canals and draws no surface over it, as the modellers do.
+            # The layered style draws its water in a flat colour of its own,
+            # not the photo texture.
             if surfaces.water and not layered:
                 water_texture = generate_water_texture(work_dir)
 
@@ -702,6 +715,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         )
 
     ground_layers = None
+    harbour = HarbourSet()
     if layered:
         with Stage("terrain and ground layers", next_step(), total):
             # The modellers' ground: a coarse terrain within tolerance of the
@@ -730,6 +744,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 ),
                 # Carved in as ditches and canals; no water surface is drawn.
                 water=surfaces.water,
+                quays=surfaces.quays,
                 ditch_depth_m=float(settings["ditch_depth_m"]),
                 mesher=str(settings["mesher"]),
             )
@@ -746,6 +761,23 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     error["p99_m"],
                 )
             terrain.save(work_dir)
+            if surfaces.water and bool(settings.get("harbour", True)):
+                # Quay faces, jetties, pontoons and mooring posts, at the
+                # water levels just read and the ground just built.
+                harbour = build_harbour(
+                    config.bbox,
+                    work_dir,
+                    water=surfaces.water,
+                    quays=surfaces.quays,
+                    surface_at=ground_layers.surface_at,
+                    dsm_path=level_dsm,
+                    fetch_kwargs={
+                        "page_limit": int(config.surfaces["page_limit"]),
+                        "timeout": float(config.surfaces["timeout_s"]),
+                        "max_retries": int(config.surfaces["max_retries"]),
+                        "max_pages": int(config.surfaces["max_pages"]),
+                    },
+                )
 
     else:
         with Stage("terrain mesh (outline edges)", next_step(), total):
@@ -865,6 +897,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # result in barriers.npz, is pure waste on a run that is not
                 # going to export it.
                 collision=bool(config.export.get("collision", False)),
+                # The layered style builds quay walls as the face of the quay.
+                skip_styles=("quay_wall",) if len(harbour) else (),
             )
             # Shares the furniture atlas: the same eight flat patches cover a
             # brick wall and a wooden bench, and one texture is one material.
@@ -979,7 +1013,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
             ground_variants=ground_variants,
             layered=(
-                layered_scene(config, ground_layers)
+                layered_scene(config, ground_layers, harbour)
                 if ground_layers is not None
                 else None
             ),
@@ -1057,9 +1091,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     + float(curb["walkway_height_offset_m"]),
                 ),
                 kerb_width_m=float(curb["width_m"]),
+                water_expected=bool(surfaces.water)
+                and bool(config.layered.get("water_surface", True)),
             )
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
+        check_harbour(report, harbour)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
         # Against what they were placed on: the model's own surface, which
         # is the road where there is one and the terrain as drawn elsewhere.

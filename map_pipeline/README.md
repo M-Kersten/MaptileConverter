@@ -113,8 +113,9 @@ for a place or click the map, press **Build model**, and watch the log. When it
 finishes you get the check results, the preview renders and download links.
 
 The style is *Layered* (as the modellers build it) or *Survey* (the ground as
-measured). In the layered style water is cut into the ground as ditches, with
-no water surface, and cars and boats start unticked, as the modellers' files
+measured). In the layered style water is cut into the ground and covered by a
+flat water object, harbours get quay faces, jetties and mooring posts, and cars
+and boats start unticked, as the modellers' files
 have none; tick them to add them.
 
 The page is written for someone who has never opened a GIS or a 3D package.
@@ -676,9 +677,8 @@ How it is built (`src/layered.py`):
   paving round at least 90% of its edge is an island: a walkway, so it gets
   kerbs, still green on top. Parts on bridges and in tunnels
   (`relatieve_hoogteligging` not 0) are left to the structures stage. BGT
-  water (`waterdeel`) is a region of terrain of its own: no water surface is
-  drawn, as in the modellers' file, but the ditch is cut into the ground (see
-  *Ditches* below).
+  water (`waterdeel`) is a region of terrain of its own, cut into the ground,
+  with a flat water surface over it (see *Water* below).
 * **Outlines.** The polygons are cut into one region per spot, simplified
   together by up to `outline_m` (25 cm) so that an edge two regions share stays
   shared, and snapped to a 1 cm grid.
@@ -734,12 +734,30 @@ How it is built (`src/layered.py`):
   faces under it — nothing on a layer can dip under the ground or float off
   it. `layered.mesher: "triangles"` gives the old triangulation back, and is
   what a quad mesh that fails falls back to.
-* **Ditches.** Water is meshed like the rest, with rungs across a ditch split
+* **Water.** Water is meshed like the rest, with rungs across a ditch split
   at the middle: the middle line is the bed, `ditch_depth_m` (0.6 m) below the
-  water level read from the survey, and the bank keeps its surveyed height;
-  no bank is cut steeper than 45°. A wider pond or canal gets a row for its
-  bank and a flat bed inside. Trees are kept off water, roads and parking as in
-  the survey style.
+  water level (one per connected water, see [Ground surfaces](#ground-surfaces)),
+  and the bank keeps its surveyed height; no bank is cut steeper than 45°. A
+  wider pond or canal gets a row for its bank and a flat bed inside. Over it
+  lies `<Prefix>_Water`, one flat object at the water levels plus
+  `water_level_offset_m`: a tide. Move it up or down in Blender for another.
+  Trees are kept off water, roads and parking as in the survey style.
+* **Harbours** (`src/harbour.py`). Water along a BGT quay wall (`scheiding`,
+  type `kademuur`) gets a 0.3 m row instead of 2 m, so the ground drops from
+  the quay top almost straight down. In front of that drop stands
+  `<Prefix>_Kademuren`, a 35 cm concrete strip along every stretch of
+  waterline within 1.5 m of a quay wall, its top flush with the quay and its
+  face running 1.5 m under the water: from the water the quay wall, from above
+  its coping. The barrier stage's 1.1 m wall on top of the quay is left out.
+  Jetties and pontoons (`kunstwerkdeel_vlak`, `steiger` and plus-type
+  `ponton`) are decks, `<Prefix>_Steigers` and `<Prefix>_Pontons`, at the
+  height the surface model saw on them (the lower quarter of its readings, so
+  a moored boat does not count), else 1.2 m (jetty) or 0.5 m (pontoon) above
+  the water. Mooring posts (`meerpaal`) are posts from 1.5 m under to 2.5 m
+  above the water, `<Prefix>_Meerpalen`. Ships, cranes and fender works are
+  not in the open data as 3D objects and are left to the modellers. Over
+  Rotterdam Rijnhaven–Maashaven: 2.78 km of quay, 12 jetties, 17 pontoons and
+  43 mooring posts.
 * **Objects.** Every layer is grouped as the modellers group theirs: the
   motorway is one object, `<Prefix>_Snelweg`; within `focus_m` (250 m) of the
   centre each layer is split east and west, `<Prefix>_Centrum_Oost_Wegen`;
@@ -807,6 +825,9 @@ The layered style's settings, all optional:
 | `layered.tolerance_m` | 0.5 | how far the terrain may miss a surveyed grid node before the grid stays fine or a loop is cut there |
 | `layered.mesher` | `"quads"` | `"quads"`, or `"triangles"` for the triangulation refined to `tolerance_m` |
 | `layered.ditch_depth_m` | 0.6 | how far below its water level a ditch is cut |
+| `layered.water_surface` | true | the flat water object over every BGT water |
+| `layered.water_level_offset_m` | 0 | added to every water level: a tide (the survey's is whatever the tide was when it was flown) |
+| `layered.harbour` | true | quay faces, jetties, pontoons and mooring posts |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.focus_m` | 250 | half the side of the middle square split east and west |
 | `layered.road_lift_m`, `grass_lift_m` | 0.05, 0.02 | how far the layers lie above the terrain |
@@ -992,13 +1013,33 @@ DTM is 73% empty over a canal against 47% on land, and the returns that do come
 back scatter over six metres. The gap filler then interpolates inward from the
 banks, which turns every canal into a bulge with lumps in it — the worst
 geometric artifact in the model. The BGT has the outlines, so the pipeline stops
-guessing: it takes a level per body from a low percentile of whatever lidar did
-return inside it, sinks the bed below that, and lays a flat surface on top.
+guessing: it takes a level per water from the lidar that did return inside
+it, sinks the bed below that, and lays a flat surface on top.
 
-The level is per body, not shared. Levels across one square kilometre of Utrecht
-run from −0.57 to 1.00 m NAP, so a single bed taken from the median would sit
-above the surface of the lowest canal and poke straight through it. A check
-asserts every bed clears its own surface.
+**One level per connected water, from the surface model.** The bare-earth DTM
+filters the water's own returns out and keeps mostly what stands on the water:
+over Rotterdam's Maashaven 1,236 returns, nearly all moored barges, against
+41,022 in the surface model (DSM), which has the water too. So the levels are
+read from the DSM where the run has one (it is fetched before the surfaces
+whenever water is on). And the BGT cuts a river or a harbour into polygons
+where its managers' plots meet, lines that mean nothing on the water: read one
+by one, the Nieuwe Waterweg at Hoek van Holland came out at −0.99 to +3.55 m
+NAP, the high one off the ferries moored in it. Now every polygon's returns
+are pooled with those of the polygons it touches (within 1 m), and the level
+is the median of the returns within 1 m of the lowest (`SHIP_CLEARANCE_M`):
+what stands more than a metre above the water is a ship, a pontoon or a jetty.
+A water with too few returns takes its banks' level; one with neither takes
+the median of the others, rather than being dropped and drawn as land (38,800
+m² of the Nieuwe Waterweg was). `one_level_per_water` checks it.
+
+Separate waters keep separate levels: levels across one square kilometre of
+Utrecht run from −0.57 to 1.00 m NAP, so a single bed taken from the median
+would sit above the surface of the lowest canal and poke straight through it.
+Waters that meet only outside the area can differ too: Rotterdam's Maashaven
+reads +0.66 m and the Nieuwe Maas +1.42 m, flown on different days at
+different tides. A lock between two waters whose polygons touch is the one
+place this is wrong: both sides get one level. A check asserts every bed
+clears its own surface.
 
 Water polygons are clipped to the bbox, unlike buildings. A canal runs a long
 way past the area and one Utrecht outline stretched the model 300 m beyond its

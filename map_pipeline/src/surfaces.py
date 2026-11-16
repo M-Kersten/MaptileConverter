@@ -189,6 +189,9 @@ class SurfaceSet:
     # Every BGT road, verge, island and terrain polygon with the layer it is
     # drawn as, for the modellers' style (`layered.GroundArea`).
     areas: list = field(default_factory=list)
+    # The BGT's quay walls (scheiding kademuur), lines and polygons in RD, for
+    # the layered style's quay faces (`harbour`).
+    quays: list = field(default_factory=list)
 
     @property
     def water_area_m2(self) -> float:
@@ -260,28 +263,24 @@ def clip_ring_to_bbox(ring: np.ndarray, bbox: BBox) -> np.ndarray:
     return np.vstack([points, points[0]])
 
 
-def _water_level(
-    rings: list[np.ndarray],
-    raster: np.ndarray,
-    bounds: tuple[float, float, float, float],
-    nodata_cutoff: float,
-) -> tuple[float, bool]:
-    """Work out the surface level of one water body.
+# Returns more than this above the lowest over a water are not the water: a
+# moored ship, a barge, a pontoon, a jetty. Lidar barely reflects off water --
+# 0 to 3% of a harbour basin has a return at all -- and in a harbour most of
+# the few it has are those.
+SHIP_CLEARANCE_M = 1.0
+# Water polygons this close together are one water, at one level.
+WATER_JOIN_M = 1.0
 
-    Where lidar did return something inside the polygon, a low percentile of
-    those samples is the water surface: the high ones are boats, bridges and
-    bank spill, and taking the median would ride up on them. With too few
-    returns, the ring vertices give the bank height and the water sits just
-    below that.
-    """
+
+def _water_samples(rings, raster, bounds, nodata_cutoff) -> np.ndarray:
+    """The surveyed heights inside one water polygon."""
     mask = rasterize_rings([rings], bounds, raster.shape)
     samples = raster[mask]
-    samples = samples[np.isfinite(samples) & (samples < nodata_cutoff)]
+    return samples[np.isfinite(samples) & (samples < nodata_cutoff)]
 
-    if len(samples) >= 25:
-        return float(np.percentile(samples, 20)), True
 
-    # Fall back to the banks: sample the raster along the outline.
+def _bank_level(rings, raster, bounds, nodata_cutoff) -> float:
+    """A level from the banks when the water itself has no returns: just below them."""
     left, bottom, right, top = bounds
     rows, cols = raster.shape
     cell_x = (right - left) / cols
@@ -292,8 +291,83 @@ def _water_level(
     bank = raster[row, col]
     bank = bank[np.isfinite(bank) & (bank < nodata_cutoff)]
     if len(bank):
-        return float(np.percentile(bank, 25) - 0.4), False
-    return float("nan"), False
+        return float(np.percentile(bank, 25) - 0.4)
+    return float("nan")
+
+
+def surface_level(samples: np.ndarray, min_samples: int = 25) -> float | None:
+    """The water surface from the returns over a water, or None with too few.
+
+    The lowest returns are the water; anything more than `SHIP_CLEARANCE_M`
+    above them stands on it. The 2nd percentile rather than the minimum, so
+    one stray low return does not set the level.
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    samples = samples[np.isfinite(samples)]
+    if len(samples) < min_samples:
+        return None
+    low = float(np.percentile(samples, 2))
+    near = samples[samples <= low + SHIP_CLEARANCE_M]
+    return float(np.median(near))
+
+
+def water_groups(polygons, join_m: float = WATER_JOIN_M) -> np.ndarray:
+    """A group number per polygon: those within `join_m` of each other share one.
+
+    The BGT cuts a river or a harbour into polygons wherever its managers'
+    plots meet, and those lines mean nothing on the water.
+    """
+    import shapely
+
+    polygons = np.asarray(polygons, dtype=object)
+    parent = np.arange(len(polygons))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    if len(polygons):
+        tree = shapely.STRtree(polygons)
+        a, b = tree.query(polygons, predicate="dwithin", distance=join_m)
+        for i, j in zip(a, b):
+            ri, rj = root(int(i)), root(int(j))
+            if ri != rj:
+                parent[max(ri, rj)] = min(ri, rj)
+    return np.array([root(i) for i in range(len(polygons))])
+
+
+def water_levels(polygons, samples, bank_levels) -> tuple[np.ndarray, np.ndarray]:
+    """One level per connected water, and whether it was measured.
+
+    Each polygon's returns are pooled with those of every polygon it touches,
+    and the level read from them all (`surface_level`): over Hoek van Holland
+    the polygons of one river read from -0.99 to +3.55 m NAP each, the high
+    ones off the ferries moored in them, and the terrain cut below each left a
+    4.5 m cliff across the Nieuwe Waterweg. A water with too few returns takes
+    the level of its banks; one with neither takes the median of the others,
+    rather than being dropped and drawn as land.
+    """
+    groups = water_groups(polygons)
+    levels = np.full(len(polygons), np.nan)
+    measured = np.zeros(len(polygons), dtype=bool)
+    for g in np.unique(groups):
+        members = np.flatnonzero(groups == g)
+        pooled = np.concatenate([samples[i] for i in members]) if len(members) else np.zeros(0)
+        level = surface_level(pooled)
+        if level is not None:
+            levels[members] = level
+            measured[members] = True
+            continue
+        banks = np.array([bank_levels[i] for i in members], dtype=np.float64)
+        banks = banks[np.isfinite(banks)]
+        if len(banks):
+            levels[members] = float(np.median(banks))
+    known = np.isfinite(levels)
+    if known.any() and not known.all():
+        levels[~known] = float(np.median(levels[known]))
+    return levels, measured
 
 
 def build_surfaces(
@@ -305,6 +379,7 @@ def build_surfaces(
     deck_sampler=None,
     network=None,
     keep_areas: bool = False,
+    level_raster=None,
 ) -> SurfaceSet:
     """Fetch water and land cover, classify the terrain grid, build the roads.
 
@@ -312,7 +387,9 @@ def build_surfaces(
     bridge; without one they are draped on the ground like everything else.
     ``network`` is the NWB road network the cross-sections are cut along; see
     `roads`. Without it every road is still built, from centrelines drawn down
-    the middle of the road itself. ``keep_areas`` keeps every road, verge,
+    the middle of the road itself. `level_raster`, the surface model's file,
+    reads the water levels: it has the water's own returns, which the
+    bare-earth model filters out, keeping mostly the ships. ``keep_areas`` keeps every road, verge,
     island and terrain polygon with the layer the modellers' style draws it as
     (`SurfaceSet.areas`).
     """
@@ -345,37 +422,56 @@ def build_surfaces(
         features, stats = fetch_current("waterdeel", bbox, **fetch_kwargs)
         result.stats_by_collection["waterdeel"] = stats.summary()
 
-        for feature in features:
-            for rings in polygon_rings(feature.get("geometry")):
-                # Level is read before clipping, so a body that mostly lies
-                # outside the area still gets its true surface height.
-                level, measured = _water_level(
-                    rings, raster, raster_bounds, NODATA_CUTOFF
-                )
-                if not np.isfinite(level):
-                    continue
+        import shapely
 
-                clipped = [clip_ring_to_bbox(ring, bbox) for ring in rings]
-                clipped = [ring for ring in clipped if len(ring) >= 3]
-                if not clipped:
-                    continue
-                rings = clipped
-
-                area = ring_area(rings[0]) - sum(ring_area(r) for r in rings[1:])
-                result.water.append(
-                    WaterBody(
-                        rings=rings,
-                        level_nap=level,
-                        area_m2=float(max(area, 0.0)),
-                        measured=measured,
-                    )
+        # Levels are read before clipping, so a body that mostly lies outside
+        # the area still gets its true surface height.
+        found = [rings for feature in features for rings in polygon_rings(feature.get("geometry"))]
+        found = [rings for rings in found if len(rings) and len(rings[0]) >= 4]
+        polygons = [
+            shapely.make_valid(shapely.Polygon(rings[0][:, :2], [r[:, :2] for r in rings[1:]]))
+            for rings in found
+        ]
+        level_source, level_bounds = raster, raster_bounds
+        if level_raster is not None and Path(level_raster).is_file():
+            with rasterio.open(level_raster) as dataset:
+                level_source = dataset.read(1).astype(np.float64)
+                level_bounds = (
+                    dataset.bounds.left, dataset.bounds.bottom,
+                    dataset.bounds.right, dataset.bounds.top,
                 )
+        samples = [
+            _water_samples(rings, level_source, level_bounds, NODATA_CUTOFF)
+            for rings in found
+        ]
+        banks = [_bank_level(rings, raster, raster_bounds, NODATA_CUTOFF) for rings in found]
+        levels, measured = water_levels(polygons, samples, banks)
+        result.counts["water_connected"] = int(len(np.unique(water_groups(polygons)))) if polygons else 0
+
+        for rings, level, was_measured in zip(found, levels, measured):
+            if not np.isfinite(level):
+                continue
+            clipped = [clip_ring_to_bbox(ring, bbox) for ring in rings]
+            clipped = [ring for ring in clipped if len(ring) >= 3]
+            if not clipped:
+                continue
+            area = ring_area(clipped[0]) - sum(ring_area(r) for r in clipped[1:])
+            result.water.append(
+                WaterBody(
+                    rings=clipped,
+                    level_nap=float(level),
+                    area_m2=float(max(area, 0.0)),
+                    measured=bool(was_measured),
+                )
+            )
 
         if result.water:
             levels = np.array([b.level_nap for b in result.water])
             LOG.info(
-                "%d water bodies covering %.0f m2, levels %.2f to %.2f m NAP",
+                "%d water bodies in %d connected waters, covering %.0f m2, levels "
+                "%.2f to %.2f m NAP",
                 len(result.water),
+                result.counts.get("water_connected", 0),
                 result.water_area_m2,
                 levels.min(),
                 levels.max(),
@@ -525,6 +621,8 @@ def build_surfaces(
 
     if keep_areas:
         result.areas = _ground_areas(bbox, fetch_kwargs, result)
+        if result.water:
+            result.quays = _quay_walls(bbox, fetch_kwargs)
 
     # Outside the water block, and guarded: land cover and water are
     # independently switchable, so this ran on a None grid whenever water was
@@ -541,6 +639,35 @@ def build_surfaces(
 
     save_surfaces(result, bbox, work_dir)
     return result
+
+
+def _quay_walls(bbox: BBox, fetch_kwargs: dict) -> list:
+    """The BGT's quay walls as shapely geometries, clipped to the area."""
+    import shapely
+    from shapely.geometry import shape
+
+    box = shapely.box(bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+    out = []
+    for collection in ("scheiding_lijn", "scheiding_vlak"):
+        try:
+            features, _ = fetch_current(collection, bbox, **fetch_kwargs)
+        except Exception as exc:  # noqa: BLE001 - quays are a refinement
+            LOG.warning("could not read BGT %s for quay walls: %s", collection, exc)
+            continue
+        for feature in features:
+            props = feature.get("properties") or {}
+            kind = str(props.get("plus_type") or props.get("type") or "").lower()
+            if "kademuur" not in kind and str(props.get("type") or "").lower() != "kademuur":
+                continue
+            try:
+                geometry = shapely.force_2d(shape(feature.get("geometry"))).intersection(box)
+            except Exception:  # noqa: BLE001 - one broken outline
+                continue
+            if not geometry.is_empty:
+                out.append(geometry)
+    if out:
+        LOG.info("%d quay walls", len(out))
+    return out
 
 
 AREA_COLLECTIONS = (

@@ -533,8 +533,12 @@ def build_barriers(
     barriers_cfg: dict,
     terrain,
     collision: bool = False,
+    skip_styles=(),
 ) -> BarrierSet:
     """Fetch every barrier collection and turn it into draped geometry.
+
+    `skip_styles` names styles left to someone else: the layered style builds
+    quay walls as the face of the quay (`harbour`), not a wall standing on it.
 
     `collision` adds a second, fattened prism per thin run, for a simulation
     that needs a fence something cannot tunnel through. It costs another sweep
@@ -566,8 +570,11 @@ def build_barriers(
         fat = collision_style(style, collision_m)
         return fat if fat != style else None
 
+    skipped = set(skip_styles)
+
     def styled(table, collection, plus_type):
-        return apply_height_override(table.get((collection, plus_type)), heights)
+        style = apply_height_override(table.get((collection, plus_type)), heights)
+        return None if style is not None and style.name in skipped else style
 
     chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray, BarrierStyle]] = []
     collision_chunks: list[tuple[np.ndarray, np.ndarray]] = []

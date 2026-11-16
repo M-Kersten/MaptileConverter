@@ -550,11 +550,18 @@ def _merge_slivers(local_xy, sizes, loops, face_kind, face_part, face_code,
     )
 
 
+# Water within this of a BGT quay wall is along the quay ...
+QUAY_REACH_M = 1.5
+# ... if this much of its outline is, and its row there is this wide.
+QUAY_MIN_M = 5.0
+QUAY_ROW_M = 0.3
+
 # The steepest a ditch bank is cut: one metre down per metre across, 45°.
 BANK_SLOPE = 1.0
 
 
-def _gentle_banks(heights, loops, sizes, face_kind, xy, wet_kind, slope=BANK_SLOPE):
+def _gentle_banks(heights, loops, sizes, face_kind, xy, wet_kind, slope=BANK_SLOPE,
+                  steep=None):
     """No point under water further below the bank than `slope` allows.
 
     A ditch a metre across cut `ditch_depth_m` below its level in the middle,
@@ -584,6 +591,11 @@ def _gentle_banks(heights, loops, sizes, face_kind, xy, wet_kind, slope=BANK_SLO
     nxt[starts + sizes - 1] = starts
     a_all, b_all = loops, loops[nxt]
     on_bank = wet & shore[a_all] & shore[b_all]
+    if steep is not None:
+        # A quay is no bank: the water goes straight down at it, and it holds
+        # nothing up further out either.
+        mid = 0.5 * (xy[a_all] + xy[b_all])
+        on_bank &= ~shapely.intersects_xy(steep, mid[:, 0], mid[:, 1])
     a, b = a_all[on_bank], b_all[on_bank]
     if not len(a):
         return heights
@@ -601,6 +613,10 @@ def _gentle_banks(heights, loops, sizes, face_kind, xy, wet_kind, slope=BANK_SLO
     distance = np.linalg.norm(p - foot, axis=1)
     floor = np.full(len(under), -np.inf)
     np.maximum.at(floor, u, bank_z - slope * distance)
+    if steep is not None:
+        # Along a quay wall the drop is the point.
+        near_quay = shapely.intersects_xy(steep, xy[under, 0], xy[under, 1])
+        floor[near_quay] = -np.inf
     out = heights.copy()
     out[under] = np.maximum(heights[under], floor)
     return out
@@ -657,6 +673,158 @@ def _weld(local_xy, sizes, loops, within=WELD_M):
     return xy, np.array(new_sizes, dtype=np.int64), np.array(new_loops, dtype=np.int64), int((target != np.arange(len(xy))).sum())
 
 
+def _floating(xy, sizes, loops) -> np.ndarray:
+    """Per face: whether it is in a piece of mesh that shares no edge with the
+    main sheet and lies on top of it."""
+    import shapely
+
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    nxt = np.arange(len(loops)) + 1
+    nxt[starts + sizes - 1] = starts
+    face_of_loop = np.repeat(np.arange(len(sizes)), sizes)
+    key = np.sort(np.column_stack([loops, loops[nxt]]), axis=1)
+    _, inverse = np.unique(key, axis=0, return_inverse=True)
+    inverse = inverse.ravel()
+    order = np.argsort(inverse, kind="stable")
+    parent = np.arange(len(sizes))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    same = inverse[order[1:]] == inverse[order[:-1]]
+    for i, j in zip(face_of_loop[order[:-1]][same], face_of_loop[order[1:]][same]):
+        ri, rj = root(int(i)), root(int(j))
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+    comp = np.array([root(i) for i in range(len(sizes))])
+    labels, counts = np.unique(comp, return_counts=True)
+    if len(labels) < 2:
+        return np.zeros(len(sizes), dtype=bool)
+    main = labels[np.argmax(counts)]
+    main_faces = np.flatnonzero(comp == main)
+    polygons = np.array([shapely.Polygon(xy[loops[starts[f]: starts[f] + sizes[f]]])
+                         for f in main_faces], dtype=object)
+    tree = shapely.STRtree(polygons)
+    stray = np.zeros(len(sizes), dtype=bool)
+    for label in labels:
+        if label == main:
+            continue
+        faces = np.flatnonzero(comp == label)
+        points = shapely.points([xy[loops[starts[f]: starts[f] + sizes[f]]].mean(axis=0) for f in faces])
+        hit, _ = tree.query(points, predicate="within")
+        if len(np.unique(hit)) == len(faces):
+            stray[faces] = True
+    return stray
+
+
+# A vertex this close to the middle of an edge it is not on is on it.
+T_JUNCTION_M = 0.1
+
+
+def _open_edges(xy, sizes, loops, size):
+    """Per loop: the edge to the next corner, and whether no other face shares it."""
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    nxt = np.arange(len(loops)) + 1
+    nxt[starts + sizes - 1] = starts
+    a, b = loops, loops[nxt]
+    key = np.sort(np.column_stack([a, b]), axis=1)
+    _, inverse, counts = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    lone = counts[inverse.ravel()] == 1
+    mid = 0.5 * (xy[a] + xy[b])
+    on_frame = (
+        (np.abs(mid[:, 0]) < 1e-6) | (np.abs(mid[:, 0] - size[0]) < 1e-6)
+        | (np.abs(mid[:, 1]) < 1e-6) | (np.abs(mid[:, 1] - size[1]) < 1e-6)
+    )
+    return a, b, lone & ~on_frame
+
+
+def _mend_t_junctions(xy, sizes, loops, face_kind, face_part, face_code, size,
+                      within=T_JUNCTION_M):
+    """An open edge with an open vertex beside it takes that vertex in.
+
+    Two neighbours meant to share an edge can come out with a vertex on one
+    side a few centimetres off the other's straight edge: an edge each, a
+    sliver between them, a crack. The face with the straight edge gets the
+    vertex, and is filled again if it is no longer a triangle or a quad.
+    """
+    import shapely
+
+    from .terrain_mesh import _fill, _quad_score
+
+    a, b, is_open = _open_edges(xy, sizes, loops, size)
+    if not is_open.any():
+        return sizes, loops, face_kind, face_part, face_code, 0
+    open_idx = np.flatnonzero(is_open)
+    open_vertices = np.unique(np.concatenate([a[open_idx], b[open_idx]]))
+    tree = shapely.STRtree(shapely.points(xy[open_vertices]))
+    segments = shapely.linestrings(np.stack([xy[a[open_idx]], xy[b[open_idx]]], axis=1))
+    seg, hit = tree.query(segments, predicate="dwithin", distance=within)
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    face_of_loop = np.repeat(np.arange(len(sizes)), sizes)
+    inserts: dict = {}  # loop index -> [(t, vertex)]
+    for s_i, v_i in zip(seg, hit):
+        loop = open_idx[s_i]
+        v = int(open_vertices[v_i])
+        p, q = xy[a[loop]], xy[b[loop]]
+        if v in (a[loop], b[loop]):
+            continue
+        d = q - p
+        t = float(np.dot(xy[v] - p, d) / max(float(np.dot(d, d)), 1e-12))
+        if not 0.02 < t < 0.98:
+            continue
+        inserts.setdefault(int(loop), []).append((t, v))
+    if not inserts:
+        return sizes, loops, face_kind, face_part, face_code, 0
+    faces = [list(map(int, loops[s0: s0 + n])) for s0, n in zip(starts, sizes)]
+    changed = {}
+    for loop, items in inserts.items():
+        f = int(face_of_loop[loop])
+        ring = changed.get(f, faces[f])
+        k = ring.index(int(a[loop]))
+        added = [v for _, v in sorted(items) if v not in ring]
+        if not added:
+            continue
+        changed[f] = ring[: k + 1] + added + ring[k + 1:]
+    out_faces, kind, part, code = [], [], [], []
+    for f, ring in enumerate(faces):
+        new = changed.get(f)
+        if new is None:
+            out_faces.append(ring)
+            kind.append(face_kind[f]); part.append(face_part[f]); code.append(face_code[f])
+            continue
+        coords = xy[new]
+        pieces = None
+        if len(new) == 4 and _quad_score(coords) is not None and _quad_score(coords) < 75.0:
+            pieces = [new]
+        else:
+            polygon = shapely.Polygon(coords)
+            if polygon.is_valid and polygon.area > 1e-9:
+                lookup = {tuple(c): i for c, i in zip(coords.tolist(), new)}
+                pieces = []
+                for q in _fill(polygon):
+                    ids = [lookup.get(tuple(c)) for c in np.asarray(q).tolist()]
+                    if None in ids:
+                        pieces = None
+                        break
+                    pieces.append(ids)
+        if not pieces:
+            out_faces.append(ring)
+            kind.append(face_kind[f]); part.append(face_part[f]); code.append(face_code[f])
+            continue
+        for piece in pieces:
+            out_faces.append(piece)
+            kind.append(face_kind[f]); part.append(face_part[f]); code.append(face_code[f])
+    return (
+        np.array([len(r) for r in out_faces], dtype=np.int64),
+        np.array([i for r in out_faces for i in r], dtype=np.int64),
+        np.array(kind, dtype=np.int64), np.array(part, dtype=np.int64),
+        np.array(code, dtype=np.int64), len(changed),
+    )
+
+
 def _patch_holes(xy, sizes, loops, face_kind, face_part, face_code, size):
     """Any hole left in the sheet filled, and any face lying loose on it dropped.
 
@@ -683,12 +851,11 @@ def _patch_holes(xy, sizes, loops, face_kind, face_part, face_code, size):
         )
         return a, b, lone & ~on_frame
 
-    # A face sharing no edge with any other lies on top of the sheet, not in
-    # it: it goes.
+    # A piece of mesh joined to the rest by no edge, lying on top of the sheet,
+    # is ground drawn twice: it goes. (A single loose face over Utrecht; a
+    # cluster of six edges over Rotterdam.)
     a, b, is_open = open_loops(sizes, loops)
-    face_of_loop = np.repeat(np.arange(len(sizes)), sizes)
-    shared = np.bincount(face_of_loop, weights=~is_open, minlength=len(sizes))
-    stray = shared == 0
+    stray = _floating(xy, sizes, loops)
     if stray.any():
         keep = ~stray
         loops = loops[np.repeat(keep, sizes)]
@@ -752,6 +919,49 @@ def _patch_holes(xy, sizes, loops, face_kind, face_part, face_code, size):
 def _signed_area(coords) -> float:
     c = np.asarray(coords, dtype=np.float64)
     return 0.5 * float(np.sum(c[:, 0] * np.roll(c[:, 1], -1) - np.roll(c[:, 0], -1) * c[:, 1]))
+
+
+def _without_overlaps(pieces):
+    """Pieces that overlap made not to: each loses what an earlier one covers.
+
+    Returns the pieces and how many overlaps there were. Taking the earlier
+    piece away leaves the later one's outline running exactly along the
+    earlier one's, so the two still share every vertex of that edge.
+    """
+    import shapely
+
+    from .terrain_mesh import GRID_SIZE
+
+    polygons = [p for p, _ in pieces]
+    codes = [c for _, c in pieces]
+    tree = shapely.STRtree(np.array(polygons, dtype=object))
+    a, b = tree.query(np.array(polygons, dtype=object), predicate="overlaps")
+    pairs = sorted({(int(min(i, j)), int(max(i, j))) for i, j in zip(a, b) if i != j})
+    count = 0
+    for i, j in pairs:
+        if polygons[i].is_empty or polygons[j].is_empty:
+            continue
+        shared = polygons[i].intersection(polygons[j])
+        if shared.area <= 1e-4:
+            continue
+        cut = shapely.set_precision(polygons[j].difference(polygons[i]), GRID_SIZE)
+        polygons[j] = _polygonal_only(cut)
+        count += 1
+    out = []
+    for polygon, code in zip(polygons, codes):
+        for part in _parts(polygon):
+            if part.area > 1e-4:
+                out.append((shapely.orient_polygons(part), code))
+    return out, count
+
+
+def _polygonal_only(geometry):
+    import shapely
+
+    parts = _parts(geometry)
+    if not parts:
+        return shapely.Polygon()
+    return shapely.MultiPolygon(parts) if len(parts) > 1 else parts[0]
 
 
 def _area(coords) -> float:
@@ -861,7 +1071,7 @@ def _blocks(owner, heights, g, centre, *, focus_m, near_m, base_level, tolerance
 
 
 def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, depth_m,
-                 paved_codes, narrow_codes=(), near_m: float = NEAR_CELL_M):
+                 paved_codes, narrow_codes=(), near_m: float = NEAR_CELL_M, quays=()):
     """The terrain mesh, quads first, conforming to every piece's outline.
 
     `pieces` are ``(polygon, code)`` in local coordinates from the first grid
@@ -919,6 +1129,10 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     filled = _fill_gaps(np.array([p for p, _ in pieces], dtype=object), frame)
     pieces = [(part, code) for polygon, (_, code) in zip(filled, pieces)
               for part in _parts(polygon)]
+    # And where two overlap, the overlap goes to the first: meshed twice it
+    # was ground drawn twice, its edges matching neither neighbour (fourteen
+    # over Rotterdam's Rijnhaven).
+    pieces, overlaps = _without_overlaps(pieces)
     parts, codes = [], []
     for polygon, code in pieces:
         polygon = _with_stations(polygon, spacing, centre, (width, height))
@@ -933,6 +1147,18 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
         else max(LAND_ROW_M, g)
         for (_, kind), c in zip(parts, codes)
     ]
+    # Water along a quay wall gets a row a hand's breadth wide: the ground
+    # drops from the quay top to the bed in that, as a quay does, rather than
+    # sloping down two metres of bank.
+    quay_zone = None
+    if quays:
+        quay_zone = shapely.union_all(np.array(
+            [shapely.transform(q, lambda c: c - shift) for q in quays], dtype=object
+        )).buffer(QUAY_REACH_M)
+        shapely.prepare(quay_zone)
+        for i, (polygon, kind) in enumerate(parts):
+            if kind == WATER and polygon.boundary.intersection(quay_zone).length > QUAY_MIN_M:
+                rows[i] = QUAY_ROW_M
     t = time.time()
     # A rung lands on the station across from it where there is one within
     # half a spacing: the two sides' stations then pair up into one ladder,
@@ -1086,6 +1312,9 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
         sizes, face_kind, face_part, face_code = (
             sizes[keep], face_kind[keep], face_part[keep], face_code[keep]
         )
+    sizes, loops, face_kind, face_part, face_code, mended = _mend_t_junctions(
+        local_xy, sizes, loops, face_kind, face_part, face_code, (width, height),
+    )
     sizes, loops, face_kind, face_part, face_code, patched = _patch_holes(
         local_xy, sizes, loops, face_kind, face_part, face_code, (width, height),
     )
@@ -1121,7 +1350,7 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     # faces to the survey.
     heights = np.asarray(terrain.sample(xy[:, 0], xy[:, 1]), dtype=np.float64)
     heights = _water_heights(heights, loops, sizes, face_kind, xy, bodies, shift, depth_m)
-    heights = _gentle_banks(heights, loops, sizes, face_kind, local_xy, WATER)
+    heights = _gentle_banks(heights, loops, sizes, face_kind, local_xy, WATER, steep=quay_zone)
     vertices = np.column_stack([xy, heights])
     sizes, loops = _orient(vertices, sizes, loops, face_part, face_kind, terrain)
 
@@ -1137,6 +1366,9 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
         "regions_meshed_without_rows": int(failed),
         "rungs_divided": int(divided),
         "regions_filled_whole": int(refilled),
+        "pieces_overlapping": int(overlaps),
+        "t_junctions_mended": int(mended),
+        "water_along_quays": int(sum(1 for r in rows if r == QUAY_ROW_M)),
         "loops_cut_to_the_survey": int(cuts),
         "slivers_merged": int(slivers),
         "vertices_welded": int(welded),
