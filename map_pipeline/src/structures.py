@@ -162,6 +162,31 @@ def extrude_ring(ring: np.ndarray, top, bottom) -> np.ndarray:
     return np.asarray(triangles)
 
 
+def _inside_points(rings: list[np.ndarray], spacing_m: float = 0.5) -> np.ndarray:
+    """A grid of points inside a polygon, at `spacing_m` (coarser on a big one).
+
+    The deck's height used to be read at the corners of its triangles: on a
+    small canal bridge that is six points, every one on the deck's edge, where
+    the surface model sees the water and the quay. One Amsterdam deck read
+    +0.90 m off them against +2.61 m over the deck itself, came out below the
+    ground beside it, was refused, and was guessed at five metres above the
+    canal instead.
+    """
+    import shapely
+
+    outer = np.asarray(rings[0], dtype=np.float64)[:, :2]
+    holes = [np.asarray(r, dtype=np.float64)[:, :2] for r in rings[1:] if len(r) >= 4]
+    polygon = shapely.make_valid(shapely.Polygon(outer, holes))
+    if polygon.is_empty or polygon.area <= 0:
+        return np.zeros((0, 2))
+    step = max(spacing_m, float(np.sqrt(polygon.area / 4000.0)))
+    x0, y0, x1, y1 = polygon.bounds
+    gx, gy = np.meshgrid(np.arange(x0 + step / 2, x1, step), np.arange(y0 + step / 2, y1, step))
+    gx, gy = gx.ravel(), gy.ravel()
+    inside = shapely.contains_xy(polygon, gx, gy)
+    return np.column_stack([gx[inside], gy[inside]])
+
+
 def deck_height(
     rings: list[np.ndarray], dsm_sampler, ground: float | None = None
 ) -> float | None:
@@ -175,7 +200,9 @@ def deck_height(
     if not len(triangles):
         return None
 
-    points = triangles.reshape(-1, 2)
+    points = _inside_points(rings)
+    if not len(points):
+        points = triangles.reshape(-1, 2)
     # Cap the work on a long viaduct; a few thousand samples is plenty for a
     # median.
     if len(points) > 4000:

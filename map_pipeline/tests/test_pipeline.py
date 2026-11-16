@@ -3598,6 +3598,23 @@ class TestStructures(unittest.TestCase):
             deck_height([self._square()], sampler, ground=0.0), 9.0, places=6
         )
 
+    def test_a_small_deck_is_read_over_itself_not_its_edges(self):
+        """Read at its triangles' corners, an Amsterdam canal bridge was six
+        points on its edges, where the surface model sees water and quay:
+        +0.90 m against +2.61 m on the deck. Refused as below the ground, it
+        was guessed at five metres over the canal."""
+        from src.structures import deck_height
+
+        deck = np.array([[0, 0], [18, 0], [18, 6], [0, 6], [0, 0]], dtype=float)
+
+        def sampler(x, y):
+            x = np.atleast_1d(np.asarray(x, float))
+            y = np.atleast_1d(np.asarray(y, float))
+            edge = (x < 0.3) | (x > 17.7) | (y < 0.3) | (y > 5.7)
+            return np.where(edge, 0.7, 2.6)
+
+        self.assertAlmostEqual(deck_height([deck], sampler, ground=1.9), 2.6, places=6)
+
     def test_a_deck_below_the_ground_it_crosses_is_not_a_deck(self):
         from src.structures import deck_height
 

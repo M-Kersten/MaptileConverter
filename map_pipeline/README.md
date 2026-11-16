@@ -1066,7 +1066,11 @@ water). A bridge's parapets are BGT walls up at the deck's level
 (`relatieve_hoogteligging` 1); stood on the ground under them they were walls
 from the canal bed to above the deck, closing the canal under every bridge.
 A barrier above the ground now stands on the deck under it, read as the
-bridges stage reads the decks (`structures.deck_surface`).
+bridges stage reads the decks (`structures.deck_surface`). A deck's height is
+the median of the surface model over a 0.5 m grid inside it; read at the
+corners of its triangles, a small canal bridge was six points on its edges,
+water and quay, and two of Amsterdam's 43 decks fell back to a guess five
+metres over the canal.
 
 Separate waters keep separate levels: levels across one square kilometre of
 Utrecht run from −0.57 to 1.00 m NAP, so a single bed taken from the median
