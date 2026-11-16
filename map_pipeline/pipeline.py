@@ -983,6 +983,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # The layered style cuts canal beds below the water; a pier
                 # stands on the bed, not on the surveyed ground above it.
                 ground_at=ground_layers.surface_at if ground_layers is not None else None,
+                # Railings along the sides of decks over water.
+                water=surfaces.water if want_surfaces else None,
             )
             if len(structures.tris):
                 save_structures(structures, work_dir / "structures.npz")

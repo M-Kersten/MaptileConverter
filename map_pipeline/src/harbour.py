@@ -20,8 +20,8 @@ the terrain under it is cut down:
   ferry berth and the fender runs along a quay. The BGT has them only as
   lines, and the water polygon runs under them. Out in the water a line is a
   catwalk `CATWALK_WIDTH_M` wide on posts, at the height the surface model saw
-  on it; tight along the waterline it is a fender, a thin strip from below the
-  water to the quay top.
+  on it, with a railing down both sides; tight along the waterline it is a
+  fender, a thin strip from below the water to the quay top.
 
 All of it is heights read off the water levels, which `surfaces` reads once
 per connected water from the surface model.
@@ -40,10 +40,10 @@ from .geo import BBox
 
 LOG = logging.getLogger(__name__)
 
-QUAY, JETTY, PONTOON, POST, CATWALK, FENDER = 0, 1, 2, 3, 4, 5
+QUAY, JETTY, PONTOON, POST, CATWALK, FENDER, RAILING = 0, 1, 2, 3, 4, 5, 6
 KIND_NAMES = {
     QUAY: "quay", JETTY: "jetty", PONTOON: "pontoon", POST: "mooring_post",
-    CATWALK: "catwalk", FENDER: "fender",
+    CATWALK: "catwalk", FENDER: "fender", RAILING: "railing",
 }
 # Fender-work lines: the plus-types read, how wide a catwalk is, how far
 # apart its posts stand, and how close to the waterline a line has to run,
@@ -255,6 +255,19 @@ def build_harbour(
                 tops.append(top)
                 deck_levels.append(level)
                 kind = CATWALK
+                # A railing down both sides, a hand's breadth in from the edge.
+                from .railings import open_runs, railing
+
+                for side in (1.0, -1.0):
+                    edge = shapely.offset_curve(part, side * (CATWALK_WIDTH_M / 2.0 - 0.1))
+                    for run in open_runs(edge, wet):
+                        points = shapely.get_coordinates(run)
+                        rail = railing(points, np.full(len(points), top))
+                        if len(rail):
+                            chunks.append((rail, RAILING))
+                            result.counts["railing_m"] = round(
+                                result.counts.get("railing_m", 0.0) + run.length, 1
+                            )
             if len(tris):
                 chunks.append((tris, kind))
                 key = f"{KIND_NAMES[kind]}_m"

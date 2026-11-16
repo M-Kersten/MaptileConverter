@@ -395,6 +395,9 @@ DEFAULTS: dict[str, Any] = {
         # Bridges and tunnels: the parts of the ground that are not the ground.
         "bridges": True,
         "tunnels": True,
+        # A railing along every side of a deck that is over water and not
+        # already walled by a BGT parapet or fence.
+        "railings": True,
         # A deck floats this far over its measured height, so it does not fight
         # the road riding on it for the same depth.
         "deck_lift_m": 0.05,

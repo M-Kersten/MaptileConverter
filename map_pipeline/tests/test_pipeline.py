@@ -3570,6 +3570,56 @@ class TestStructures(unittest.TestCase):
         walls = extrude_ring(closed, 10.0, heights)
         self.assertGreater(len(walls), 0)
 
+    def test_a_bridge_over_water_gets_railings_on_its_open_sides(self):
+        """Along each side of a deck that is over water, unless a BGT parapet
+        or fence already stands there; never across the ends on the quays."""
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import src.structures as structures
+        from src.geo import BBox
+        from src.railings import HEIGHT_M
+        from src.surfaces import WaterBody
+
+        canal = WaterBody(rings=[np.array([[0, 40], [100, 40], [100, 60], [0, 60], [0, 40]], float)],
+                          level_nap=-0.4, area_m2=2000.0, measured=True)
+
+        def deck(x0, x1):
+            return {"type": "Polygon", "coordinates": [[[x0, 35], [x1, 35], [x1, 65], [x0, 65], [x0, 35]]]}
+
+        rows = {
+            "overbruggingsdeel": [
+                {"geometry": deck(20, 30), "properties": {"type_overbruggingsdeel": "dek", "relatieve_hoogteligging": 1}},
+                {"geometry": deck(70, 80), "properties": {"type_overbruggingsdeel": "dek", "relatieve_hoogteligging": 1}},
+            ],
+            # A parapet down the west side of the second bridge.
+            "scheiding_lijn": [
+                {"geometry": {"type": "LineString", "coordinates": [[70, 35], [70, 65]]},
+                 "properties": {"type": "muur", "relatieve_hoogteligging": 1}},
+            ],
+        }
+
+        def fetch(collection, _bbox, **_kwargs):
+            return rows.get(collection, []), SimpleNamespace(summary=lambda: "")
+
+        class Terrain:
+            def sample(self, x, y):
+                return np.zeros(np.shape(np.atleast_1d(x)))
+
+        dsm = lambda x, y: np.full(np.shape(np.atleast_1d(x)), 2.0)  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(structures, "fetch_current", fetch):
+            built = structures.build_structures(
+                BBox(0.0, 0.0, 100.0, 100.0), Path(tmp), structures_cfg={"tunnels": False},
+                terrain=Terrain(), dsm_sampler=dsm, water=[canal],
+            )
+        rail = built.tris[built.tri_kind == structures.KIND_RAILING].reshape(-1, 3)
+        # Both sides of the first bridge, one side of the second: 3 x 20 m.
+        self.assertAlmostEqual(built.counts["railing_m"], 60.0, delta=0.5)
+        self.assertTrue(((rail[:, 1] >= 40.0 - 0.1) & (rail[:, 1] <= 60.0 + 0.1)).all())
+        self.assertFalse((np.abs(rail[:, 0] - 70.1) < 0.2).any())
+        self.assertAlmostEqual(rail[:, 2].max(), 2.0 + 0.05 + HEIGHT_M + 0.025, places=6)
+
     def test_mismatched_heights_are_refused_rather_than_broadcast(self):
         from src.structures import extrude_ring
 
@@ -8592,6 +8642,19 @@ class TestHarbour(unittest.TestCase):
         # Posts down into the water under it.
         self.assertAlmostEqual(walk[:, 2].min(), 0.5 - 1.5, places=6)
         self.assertAlmostEqual(walk[:, 1].max() - walk[:, 1].min(), CATWALK_WIDTH_M, delta=0.5)
+
+    def test_a_catwalk_has_a_railing_down_both_sides(self):
+        from src.harbour import CATWALK, RAILING
+        from src.railings import HEIGHT_M
+
+        built = self._build()
+        self.assertAlmostEqual(built.counts["railing_m"], 60.0, delta=0.5)
+        rail = built.tris[built.tri_kind == RAILING].reshape(-1, 3)
+        top = built.tris[built.tri_kind == CATWALK].reshape(-1, 3)[:, 2].max()
+        self.assertAlmostEqual(rail[:, 2].max(), top + HEIGHT_M + 0.025, places=6)
+        self.assertAlmostEqual(rail[:, 2].min(), top, places=6)
+        # Both sides of the 2 m catwalk along y = 20, nothing in its middle.
+        self.assertTrue((np.abs(rail[:, 1] - 20.0) > 0.8).all())
 
     def test_fender_works_along_the_quay_are_a_fender_up_to_the_quay_top(self):
         from src.harbour import FENDER

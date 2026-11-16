@@ -461,7 +461,10 @@ HARBOUR_OBJECTS = {
     "mooring_post": ("Meerpalen", "Meerpaal", (0.06, 0.05, 0.04), 0.7),
     "catwalk": ("Loopbruggen", "Beton", (0.8, 0.8, 0.8), 0.6),
     "fender": ("Remmingswerk", "Hout", (0.16, 0.1, 0.055), 0.8),
+    "railing": ("Leuningen", "Staal", (0.2, 0.22, 0.24), 0.4),
 }
+# Painted steel: the railings along bridges and catwalks.
+RAILING_MATERIAL = ("Staal", (0.2, 0.22, 0.24), 0.4)
 
 
 def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
@@ -2663,6 +2666,11 @@ def build_structures(scene: dict, work_dir: Path, material):
         # they address a buffer that no longer exists at that length.
         loop_xy = corners[indices][:, :2]
         uvs = np.column_stack([loop_xy[:, 0] / 6.0, loop_xy[:, 1] / 6.0])
+        # A railing is painted steel, not the concrete of the deck it is on.
+        own = (
+            bpy.data.materials.get(RAILING_MATERIAL[0])
+            or make_plain_material(*RAILING_MATERIAL)
+        ) if label == "railing" else material
         objects.append(
             build_mesh_object(
                 f"Structures_{label}",
@@ -2672,7 +2680,7 @@ def build_structures(scene: dict, work_dir: Path, material):
                 np.full(n_triangles, 3),
                 uvs,
                 np.zeros(n_triangles),
-                [material],
+                [own],
                 shade_smooth=False,
             )
         )

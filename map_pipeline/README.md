@@ -769,6 +769,14 @@ How it is built (`src/layered.py`):
   Rijnhaven–Maashaven: 2.78 km of quay, 12 jetties, 17 pontoons and 43 mooring
   posts; at the Hoek van Holland ferry terminal 82 m of catwalk and 175 m of
   fender.
+* **Railings** (`src/railings.py`). Along every side of a bridge deck that is
+  over water, and down both sides of every catwalk, unless a BGT wall, fence
+  or parapet already stands within 0.6 m of the edge: posts every 1.5 m, a
+  handrail at 1.0 m and a knee rail at 0.5 m, in plain steel, about 17
+  triangles a metre. Never across a deck's ends on the quays. Bridge railings
+  are `Structures_railing`, catwalk railings `<Prefix>_Leuningen`; a stand-in
+  for the railing of the place. `structures.railings` turns the bridge ones
+  off.
 * **Thin strips.** A ground polygon thinner than 0.5 m (twice its area over
   its perimeter) is folded into the neighbour it shares most outline with
   before meshing, land into land where it can. Three BGT borders 35–40 cm

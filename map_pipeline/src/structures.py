@@ -40,12 +40,14 @@ KIND_DECK = 0
 KIND_PIER = 1
 KIND_TUNNEL_ROAD = 2
 KIND_TUNNEL_WALL = 3
+KIND_RAILING = 4
 
 KIND_NAMES = {
     KIND_DECK: "deck",
     KIND_PIER: "pier",
     KIND_TUNNEL_ROAD: "tunnel_road",
     KIND_TUNNEL_WALL: "tunnel_wall",
+    KIND_RAILING: "railing",
 }
 
 # BGT type_overbruggingsdeel values worth building. "sloof" is the pile cap,
@@ -361,8 +363,13 @@ def build_structures(
     terrain=None,
     dsm_sampler=None,
     ground_at=None,
+    water=None,
 ) -> StructureSet:
     """Fetch bridge and tunnel parts and build them into geometry.
+
+    `water`, the WaterBody list, puts railings along the sides of every deck
+    that are over water and not already walled by a BGT barrier
+    (`structures.railings`).
 
     `ground_at(x, y)`, the ground as built where that differs from the survey
     -- the layered style cuts a canal's bed below its water -- is what a pier
@@ -432,12 +439,65 @@ def build_structures(
             LOG.info("no bridges or tunnels in this area")
         return result
 
-    _build_geometry(result, terrain, dsm_sampler, structures_cfg, ground_at=ground_at)
+    railing_cover = None
+    if water and bool(structures_cfg.get("railings", True)):
+        railing_cover = _railing_cover(bbox, water, fetch_kwargs)
+    _build_geometry(
+        result, terrain, dsm_sampler, structures_cfg, ground_at=ground_at,
+        railing_cover=railing_cover,
+    )
     return result
 
 
+def _railing_cover(bbox: BBox, water, fetch_kwargs: dict):
+    """The wet area, and the area a BGT barrier already guards, for railings."""
+    import shapely
+
+    from .railings import guarded_area
+
+    polygons = []
+    for body in water:
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in body.rings]
+        rings = [r for r in rings if len(r) >= 4]
+        if rings:
+            valid = shapely.make_valid(shapely.Polygon(rings[0], rings[1:]))
+            polygons.extend(p for p in shapely.get_parts(valid) if p.geom_type == "Polygon")
+    if not polygons:
+        return None
+    wet = shapely.union_all(np.array(polygons, dtype=object))
+    return wet, guarded_area(bbox, fetch_current, fetch_kwargs)
+
+
+def _deck_railings(rings, level: float, terrain, lift: float, cover, add) -> float:
+    """Railings along a deck's sides over water; returns their length."""
+    import shapely
+
+    from .railings import open_runs, railing
+
+    wet, guarded = cover
+    outline = np.asarray(rings[0], dtype=np.float64)[:, :2]
+    if len(outline) < 4:
+        return 0.0
+    # A hair inside the outline, so the railing stands on the deck's edge
+    # rather than over the water beside it.
+    deck = shapely.make_valid(shapely.Polygon(outline))
+    inner = deck.buffer(-0.1, join_style="mitre")
+    if inner.is_empty:
+        return 0.0
+    total = 0.0
+    for ring in shapely.get_parts(shapely.get_exterior_ring(shapely.get_parts(inner))):
+        for run in open_runs(ring, wet, guarded):
+            points = shapely.get_coordinates(run)
+            ground = np.asarray(terrain.sample(points[:, 0], points[:, 1]), dtype=np.float64)
+            base = np.maximum(level, np.where(np.isfinite(ground), ground, level)) + lift
+            add(railing(points, base), KIND_RAILING)
+            total += run.length
+    return total
+
+
 def _build_geometry(
-    result: StructureSet, terrain, dsm_sampler, structures_cfg: dict, *, ground_at=None
+    result: StructureSet, terrain, dsm_sampler, structures_cfg: dict, *, ground_at=None,
+    railing_cover=None,
 ) -> None:
     """Give every part a height and turn it into triangles."""
     tris: list[np.ndarray] = []
@@ -496,6 +556,9 @@ def _build_geometry(
             deck = np.dstack([flat, deck_corner_heights(flat, level, terrain, lift)])
             add(deck, KIND_DECK)
             result.deck_levels.append((flat.reshape(-1, 2), level))
+            if railing_cover is not None:
+                metres = _deck_railings(part.rings, level, terrain, lift, railing_cover, add)
+                result.counts["railing_m"] = round(result.counts.get("railing_m", 0.0) + metres, 1)
         else:
             # A pier runs from under the deck down to whatever it stands on.
             for ring in part.rings:
@@ -589,6 +652,7 @@ __all__ = [
     "deck_corner_heights",
     "KIND_NAMES",
     "KIND_PIER",
+    "KIND_RAILING",
     "KIND_TUNNEL_ROAD",
     "KIND_TUNNEL_WALL",
     "MAX_DECK_NAP",
