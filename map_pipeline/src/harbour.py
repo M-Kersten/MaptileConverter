@@ -15,6 +15,13 @@ the terrain under it is cut down:
   saw them, otherwise at a standard height above the water.
 * **Mooring posts** (``waterinrichtingselement_punt``, plus-type ``meerpaal``)
   are posts from below the water to `POST_ABOVE_M` above it.
+* **Fender works** (``waterinrichtingselement_lijn``, plus-type
+  ``remmingswerk`` or ``geleidewerk``) are the catwalks and dolphin rows at a
+  ferry berth and the fender runs along a quay. The BGT has them only as
+  lines, and the water polygon runs under them. Out in the water a line is a
+  catwalk `CATWALK_WIDTH_M` wide on posts, at the height the surface model saw
+  on it; tight along the waterline it is a fender, a thin strip from below the
+  water to the quay top.
 
 All of it is heights read off the water levels, which `surfaces` reads once
 per connected water from the surface model.
@@ -33,8 +40,20 @@ from .geo import BBox
 
 LOG = logging.getLogger(__name__)
 
-QUAY, JETTY, PONTOON, POST = 0, 1, 2, 3
-KIND_NAMES = {QUAY: "quay", JETTY: "jetty", PONTOON: "pontoon", POST: "mooring_post"}
+QUAY, JETTY, PONTOON, POST, CATWALK, FENDER = 0, 1, 2, 3, 4, 5
+KIND_NAMES = {
+    QUAY: "quay", JETTY: "jetty", PONTOON: "pontoon", POST: "mooring_post",
+    CATWALK: "catwalk", FENDER: "fender",
+}
+# Fender-work lines: the plus-types read, how wide a catwalk is, how far
+# apart its posts stand, and how close to the waterline a line has to run,
+# on average, to be a fender on the quay rather than a catwalk out in the water.
+FENDER_TYPES = ("remmingswerk", "geleidewerk")
+CATWALK_WIDTH_M = 2.0
+CATWALK_ABOVE_M = 2.5
+CATWALK_POST_EVERY_M = 6.0
+FENDER_REACH_M = 2.0
+FENDER_THICKNESS_M = 0.3
 
 # Waterline within this of a BGT quay wall is quay.
 QUAY_REACH_M = 1.5
@@ -46,8 +65,8 @@ MIN_QUAY_M = 2.0
 # A quay top less than this above the water is a bank, not a quay.
 MIN_QUAY_HEIGHT_M = 0.3
 # Decks with no reading of their own: how far above the water, how thick.
-DECK_ABOVE_M = {JETTY: 1.2, PONTOON: 0.5}
-DECK_THICKNESS_M = {JETTY: 0.3, PONTOON: 1.0}
+DECK_ABOVE_M = {JETTY: 1.2, PONTOON: 0.5, CATWALK: CATWALK_ABOVE_M}
+DECK_THICKNESS_M = {JETTY: 0.3, PONTOON: 1.0, CATWALK: 0.3}
 # Surface-model heights more than this above the water are not a deck: a
 # boat moored at it, a crane, a building on it.
 DECK_MAX_ABOVE_M = 6.0
@@ -182,6 +201,61 @@ def build_harbour(
                 tops.append(top)
                 deck_levels.append(level)
                 result.counts[KIND_NAMES[kind]] = result.counts.get(KIND_NAMES[kind], 0) + 1
+
+    # ---- fender works: catwalks and fenders --------------------------------
+    try:
+        features, _ = fetch_current(
+            "waterinrichtingselement_lijn", bbox, class_field="plus_type", **fetch_kwargs
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("could not read BGT fender works: %s", exc)
+        features = []
+    shore = wet.boundary.difference(box.exterior.buffer(0.05))
+    for feature in features:
+        props = feature.get("properties") or {}
+        plus = str(props.get("plus_type") or "").lower()
+        if not any(t in plus for t in FENDER_TYPES):
+            continue
+        try:
+            line = shapely.force_2d(shapely.geometry.shape(feature.get("geometry")))
+        except Exception:  # noqa: BLE001
+            continue
+        for part in shapely.get_parts(line.intersection(box)):
+            if part.geom_type != "LineString" or part.length < 1.0:
+                continue
+            if shapely.distance(wet, part) > 3.0:
+                continue  # a fender on land, or in water this area does not have
+            stations = shapely.get_coordinates(shapely.line_interpolate_point(
+                part, np.linspace(0.0, part.length, max(int(part.length), 2))
+            ))
+            level = float(np.nanmedian(level_at(stations)))
+            gap = float(np.mean(shapely.distance(shore, shapely.points(stations))))
+            if gap <= FENDER_REACH_M:
+                top = _fender_top(stations, wet, surface_at, level)
+                tris = _extrude(
+                    part.buffer(FENDER_THICKNESS_M / 2.0, cap_style="flat"),
+                    level - BELOW_WATER_M, top,
+                )
+                kind = FENDER
+            else:
+                deck = part.buffer(CATWALK_WIDTH_M / 2.0, cap_style="flat", join_style="mitre")
+                top = _deck_top(deck, dsm, level, CATWALK)
+                tris = _extrude(deck, top - DECK_THICKNESS_M[CATWALK], top)
+                posts = shapely.get_coordinates(shapely.line_interpolate_point(
+                    part, np.linspace(0.0, part.length,
+                                      max(int(np.ceil(part.length / CATWALK_POST_EVERY_M)), 1) + 1)
+                ))
+                tris = np.concatenate([tris] + [
+                    _post(x, y, level - BELOW_WATER_M, top - DECK_THICKNESS_M[CATWALK])
+                    for x, y in posts
+                ])
+                tops.append(top)
+                deck_levels.append(level)
+                kind = CATWALK
+            if len(tris):
+                chunks.append((tris, kind))
+                key = f"{KIND_NAMES[kind]}_m"
+                result.counts[key] = round(result.counts.get(key, 0.0) + part.length, 1)
     result.deck_top = np.array(tops)
     result.deck_level = np.array(deck_levels)
 
@@ -252,6 +326,22 @@ def _deck_top(polygon, dsm, level: float, kind: int) -> float:
         return default
     # The lower half of what stands on it: the deck, not the boat beside it.
     return float(np.percentile(values, 25))
+
+
+def _fender_top(stations, wet, surface_at, level: float) -> float:
+    """A fender's top: the quay it hangs on, read a metre in from the water."""
+    import shapely
+
+    lines = shapely.shortest_line(shapely.points(stations), wet.boundary)
+    near = shapely.get_coordinates(shapely.line_interpolate_point(lines, 1.0, normalized=True))
+    # Step a metre past the waterline, away from the fender.
+    step = near - stations
+    step /= np.maximum(np.linalg.norm(step, axis=1), 1e-9)[:, None]
+    away = near + step
+    inland = ~shapely.contains_xy(wet, away[:, 0], away[:, 1])
+    tops = np.asarray(surface_at(away[inland, 0], away[inland, 1]), dtype=np.float64)
+    tops = tops[np.isfinite(tops) & (tops > level + MIN_QUAY_HEIGHT_M)]
+    return float(np.median(tops)) if len(tops) else level + CATWALK_ABOVE_M
 
 
 def _quay_strip(line, wet, level_at, surface_at):

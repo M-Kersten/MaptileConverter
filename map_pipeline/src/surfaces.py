@@ -622,7 +622,9 @@ def build_surfaces(
     if keep_areas:
         result.areas = _ground_areas(bbox, fetch_kwargs, result)
         if result.water:
-            result.quays = _quay_walls(bbox, fetch_kwargs)
+            result.quays = _quay_walls(bbox, fetch_kwargs) + _jetty_shores(
+                bbox, fetch_kwargs, result.water
+            )
 
     # Outside the water block, and guarded: land cover and water are
     # independently switchable, so this ran on a None grid whenever water was
@@ -667,6 +669,60 @@ def _quay_walls(bbox: BBox, fetch_kwargs: dict) -> list:
                 out.append(geometry)
     if out:
         LOG.info("%d quay walls", len(out))
+    return out
+
+
+# Waterline within this of a jetty deck is the shore the deck stands off.
+JETTY_SHORE_M = 3.0
+
+
+def _jetty_shores(bbox: BBox, fetch_kwargs: dict, water) -> list:
+    """The stretches of waterline a jetty deck stands over, as quay.
+
+    Where a ferry pier or a linkspan leaves the shore there is a wall under
+    it, not a bank: the BGT draws the deck (``kunstwerkdeel_vlak``, type
+    ``steiger``) but no quay wall beneath, so the terrain sloped from the quay
+    down to the harbour floor and showed as a grey wedge poking out of the
+    water beside the deck. Treated as quay, the terrain drops in a hand's
+    breadth there and a quay face hides the drop.
+    """
+    import shapely
+    from shapely.geometry import shape
+
+    rings = []
+    for body in water:
+        parts = [np.asarray(r, dtype=np.float64)[:, :2] for r in body.rings]
+        parts = [r for r in parts if len(r) >= 4]
+        if parts:
+            rings.append(shapely.make_valid(shapely.Polygon(parts[0], parts[1:])))
+    if not rings:
+        return []
+    box = shapely.box(bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+    shore = shapely.union_all(np.array(rings, dtype=object)).boundary.difference(
+        box.exterior.buffer(0.05)
+    )
+    try:
+        features, _ = fetch_current("kunstwerkdeel_vlak", bbox, **fetch_kwargs)
+    except Exception as exc:  # noqa: BLE001 - a refinement
+        LOG.warning("could not read BGT jetties for their shores: %s", exc)
+        return []
+    out = []
+    for feature in features:
+        props = feature.get("properties") or {}
+        if str(props.get("type") or "").lower() != "steiger":
+            continue
+        try:
+            deck = shapely.make_valid(shapely.force_2d(shape(feature.get("geometry"))))
+        except Exception:  # noqa: BLE001
+            continue
+        # The deck's outline stops short of the waterline as often as it
+        # crosses it: at the Hoek van Holland ferry pier it runs a metre or two
+        # off the quay. Close is enough.
+        under = shore.intersection(deck.buffer(JETTY_SHORE_M))
+        if not under.is_empty and under.length >= 1.0:
+            out.append(under)
+    if out:
+        LOG.info("%d jetties stand over the waterline; their shore is quay", len(out))
     return out
 
 

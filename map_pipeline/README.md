@@ -754,10 +754,26 @@ How it is built (`src/layered.py`):
   height the surface model saw on them (the lower quarter of its readings, so
   a moored boat does not count), else 1.2 m (jetty) or 0.5 m (pontoon) above
   the water. Mooring posts (`meerpaal`) are posts from 1.5 m under to 2.5 m
-  above the water, `<Prefix>_Meerpalen`. Ships, cranes and fender works are
-  not in the open data as 3D objects and are left to the modellers. Over
-  Rotterdam Rijnhaven–Maashaven: 2.78 km of quay, 12 jetties, 17 pontoons and
-  43 mooring posts.
+  above the water, `<Prefix>_Meerpalen`. Where a jetty deck stands over or
+  within 3 m of the waterline, that waterline is quay too: the BGT draws the
+  pier but no wall under it, and the bank otherwise sloped from the quay top
+  down to the bed beside the deck, a grey wedge out of the water. Fender works
+  (`waterinrichtingselement_lijn`, plus-type `remmingswerk` or `geleidewerk`)
+  are the catwalks and dolphin rows at a ferry berth and the fender runs along
+  a quay, which the BGT keeps only as lines with the water polygon under them.
+  More than 2 m out from the waterline on average, a line is a 2 m catwalk on
+  posts every 6 m, `<Prefix>_Loopbruggen`, at the surface model's height or
+  2.5 m above the water; closer in, a 30 cm fender from under the water to the
+  quay top, `<Prefix>_Remmingswerk`. Ships and cranes are not in the open data
+  as 3D objects and are left to the modellers. Over Rotterdam
+  Rijnhaven–Maashaven: 2.78 km of quay, 12 jetties, 17 pontoons and 43 mooring
+  posts; at the Hoek van Holland ferry terminal 82 m of catwalk and 175 m of
+  fender.
+* **Thin strips.** A ground polygon thinner than 0.5 m (twice its area over
+  its perimeter) is folded into the neighbour it shares most outline with
+  before meshing, land into land where it can. Three BGT borders 35–40 cm
+  wide side by side along a Hoek van Holland quay were narrower than any row
+  the mesher lays, and the rows beside them missed their outlines: 21 cracks.
 * **Objects.** Every layer is grouped as the modellers group theirs: the
   motorway is one object, `<Prefix>_Snelweg`; within `focus_m` (250 m) of the
   centre each layer is split east and west, `<Prefix>_Centrum_Oost_Wegen`;
@@ -827,7 +843,7 @@ The layered style's settings, all optional:
 | `layered.ditch_depth_m` | 0.6 | how far below its water level a ditch is cut |
 | `layered.water_surface` | true | the flat water object over every BGT water |
 | `layered.water_level_offset_m` | 0 | added to every water level: a tide (the survey's is whatever the tide was when it was flown) |
-| `layered.harbour` | true | quay faces, jetties, pontoons and mooring posts |
+| `layered.harbour` | true | quay faces, jetties, pontoons, mooring posts, catwalks and fenders |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.focus_m` | 250 | half the side of the middle square split east and west |
 | `layered.road_lift_m`, `grass_lift_m` | 0.05, 0.02 | how far the layers lie above the terrain |

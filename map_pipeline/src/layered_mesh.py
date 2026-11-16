@@ -555,6 +555,8 @@ QUAY_REACH_M = 1.5
 # ... if this much of its outline is, and its row there is this wide.
 QUAY_MIN_M = 5.0
 QUAY_ROW_M = 0.3
+# Ground strips thinner than this are folded into a neighbour before meshing.
+THIN_M = 0.5
 
 # The steepest a ditch bank is cut: one metre down per metre across, 45°.
 BANK_SLOPE = 1.0
@@ -955,6 +957,68 @@ def _without_overlaps(pieces):
     return out, count
 
 
+def _without_thin(pieces, thin_m: float, wet_code=None):
+    """Strips thinner than `thin_m` folded into the neighbour they share most
+    outline with. Returns the pieces and how many were folded.
+
+    Thinness is twice the area over the perimeter: a strip's width. The BGT
+    has borders of shrubs, paving and lawn 35 to 40 cm wide side by side along
+    a quay at Hoek van Holland, narrower than any row the mesher lays, and the
+    rows either side of them did not land on their outlines: 21 cracks. A
+    strip that narrow is not something a modeller draws as its own surface.
+    Land strips go to land where they can, so a hedge along the water does not
+    become water.
+    """
+    import shapely
+
+    from .terrain_mesh import GRID_SIZE
+
+    polygons = [p for p, _ in pieces]
+    codes = [c for _, c in pieces]
+
+    def thickness(p):
+        return 2.0 * p.area / p.length if p.length > 0 else 0.0
+
+    order = sorted(
+        (i for i, p in enumerate(polygons) if not p.is_empty and thickness(p) < thin_m),
+        key=lambda i: thickness(polygons[i]),
+    )
+    if not order:
+        return pieces, 0
+    strips = set(order)
+    tree = shapely.STRtree(np.array(polygons, dtype=object))
+    folded = 0
+    for i in order:
+        strip = polygons[i]
+        if strip.is_empty or thickness(strip) >= thin_m:
+            continue
+        best, best_len = None, 0.0
+        for j in tree.query(strip.buffer(0.01)):
+            j = int(j)
+            if j == i or polygons[j].is_empty:
+                continue
+            if j in strips and thickness(polygons[j]) < thin_m:
+                continue  # never into another strip, or two would swap
+            shared = strip.boundary.intersection(polygons[j].buffer(0.01)).length
+            # Land into land before land into water.
+            if wet_code is not None and codes[i] != wet_code and codes[j] == wet_code:
+                shared *= 0.01
+            if shared > best_len:
+                best, best_len = j, shared
+        if best is None or best_len <= 0.0:
+            continue
+        merged = shapely.set_precision(shapely.union(polygons[best], strip), GRID_SIZE)
+        polygons[best] = _polygonal_only(merged)
+        polygons[i] = shapely.Polygon()
+        folded += 1
+    out = []
+    for polygon, code in zip(polygons, codes):
+        for part in _parts(polygon):
+            if part.area > 1e-4:
+                out.append((shapely.orient_polygons(part), code))
+    return out, folded
+
+
 def _polygonal_only(geometry):
     import shapely
 
@@ -1133,6 +1197,7 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     # was ground drawn twice, its edges matching neither neighbour (fourteen
     # over Rotterdam's Rijnhaven).
     pieces, overlaps = _without_overlaps(pieces)
+    pieces, thin = _without_thin(pieces, THIN_M, wet_code=codes_wet)
     parts, codes = [], []
     for polygon, code in pieces:
         polygon = _with_stations(polygon, spacing, centre, (width, height))
@@ -1367,6 +1432,7 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
         "rungs_divided": int(divided),
         "regions_filled_whole": int(refilled),
         "pieces_overlapping": int(overlaps),
+        "thin_strips_folded": int(thin),
         "t_junctions_mended": int(mended),
         "water_along_quays": int(sum(1 for r in rows if r == QUAY_ROW_M)),
         "loops_cut_to_the_survey": int(cuts),

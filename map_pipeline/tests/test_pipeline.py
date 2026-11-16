@@ -7097,6 +7097,51 @@ class TestQuadTerrain(unittest.TestCase):
         )
         self._assert_closed(mesh)
 
+    def test_strips_narrower_than_a_row_are_folded_into_a_neighbour(self):
+        """Three BGT borders 35-40 cm wide side by side along a quay at Hoek van
+        Holland: narrower than any row, and the rows beside them missed their
+        outlines by 20 cm. 21 crack edges."""
+        import shapely
+
+        from src.layered_mesh import _without_thin, quad_terrain
+        from src.terrain_mesh import TerrainMesh
+
+        west = shapely.Polygon([(0, 0), (80, 0), (80, 160), (0, 160)])
+        a = shapely.Polygon([(80, 0), (80.35, 0), (80.45, 160), (80, 160)])
+        b = shapely.Polygon([(80.35, 0), (80.75, 0), (80.8, 160), (80.45, 160)])
+        east = shapely.Polygon([(80.75, 0), (160, 0), (160, 160), (80.8, 160)])
+        pieces = [(west, 0), (a, 6 * 16 + 6), (b, 6 * 16 + 6), (east, 0)]
+        folded, count = _without_thin(pieces, 0.5)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(folded), 2)
+        self.assertAlmostEqual(sum(p.area for p, _ in folded), 160 * 160, places=3)
+
+        vertices, sizes, loops, codes, part, stats = quad_terrain(
+            self.terrain, pieces, [], codes_wet=15,
+            tolerance_m=0.5, focus_m=250.0, depth_m=0.6, paved_codes=set(),
+        )
+        self.assertEqual(stats["thin_strips_folded"], 2)
+        mesh = TerrainMesh(
+            vertices=vertices, measured_z=vertices[:, 2], face_sizes=sizes,
+            face_loops=loops, face_kind=np.zeros(len(sizes), dtype=np.int8),
+            face_part=part.astype(np.int8), vertex_on=np.zeros(len(vertices), dtype=np.int32),
+            edges=np.zeros((0, 2), dtype=np.int64), edge_on=np.zeros(0, dtype=np.int32),
+        )
+        self._assert_closed(mesh)
+
+    def test_a_thin_land_strip_along_water_stays_land(self):
+        import shapely
+
+        from src.layered_mesh import _without_thin
+
+        water = shapely.Polygon([(0, 0), (50, 0), (50, 100), (0, 100)])
+        hedge = shapely.Polygon([(50, 0), (50.4, 0), (50.4, 100), (50, 100)])
+        lawn = shapely.Polygon([(50.4, 0), (52, 0), (52, 100), (50.4, 100)])
+        folded, count = _without_thin([(water, 15), (hedge, 7), (lawn, 7)], 0.5, wet_code=15)
+        self.assertEqual(count, 1)
+        wet = [p for p, c in folded if c == 15]
+        self.assertAlmostEqual(wet[0].area, 50 * 100, places=3)
+
     def test_a_loose_piece_of_mesh_on_the_sheet_goes(self):
         from src.layered_mesh import _floating
 
@@ -8368,6 +8413,17 @@ class TestHarbour(unittest.TestCase):
                 {"geometry": {"type": "Point", "coordinates": [70, 45]}, "properties": {"plus_type": "meerpaal"}},
                 {"geometry": {"type": "Point", "coordinates": [70, 90]}, "properties": {"plus_type": "meerpaal"}},
             ],
+            "waterinrichtingselement_lijn": [
+                # A catwalk between dolphins, out in the basin.
+                {"geometry": {"type": "LineString", "coordinates": [[60, 20], [90, 20]]},
+                 "properties": {"plus_type": "remmingswerk"}},
+                # A fender run along the quay face.
+                {"geometry": {"type": "LineString", "coordinates": [[15, 49.6], [35, 49.6]]},
+                 "properties": {"plus_type": "remmingswerk"}},
+                # Something else the BGT keeps as a line in the water.
+                {"geometry": {"type": "LineString", "coordinates": [[5, 10], [25, 10]]},
+                 "properties": {"plus_type": "kribbe"}},
+            ],
         }
 
         def fetch(collection, _bbox, **_kwargs):
@@ -8411,6 +8467,56 @@ class TestHarbour(unittest.TestCase):
         posts = built.tris[built.tri_kind == POST].reshape(-1, 3)
         self.assertLess(posts[:, 2].min(), 0.5)
         self.assertGreater(posts[:, 2].max(), 2.5)
+
+    def test_fender_works_out_in_the_water_are_a_catwalk_on_posts(self):
+        """The BGT keeps the catwalks at a ferry berth only as fender-work
+        lines, and the water polygon runs under them."""
+        from src.harbour import CATWALK, CATWALK_ABOVE_M, CATWALK_WIDTH_M
+
+        built = self._build()
+        self.assertAlmostEqual(built.counts["catwalk_m"], 30.0, places=1)
+        walk = built.tris[built.tri_kind == CATWALK].reshape(-1, 3)
+        self.assertAlmostEqual(walk[:, 2].max(), 0.5 + CATWALK_ABOVE_M, places=6)
+        # Posts down into the water under it.
+        self.assertAlmostEqual(walk[:, 2].min(), 0.5 - 1.5, places=6)
+        self.assertAlmostEqual(walk[:, 1].max() - walk[:, 1].min(), CATWALK_WIDTH_M, delta=0.5)
+
+    def test_fender_works_along_the_quay_are_a_fender_up_to_the_quay_top(self):
+        from src.harbour import FENDER
+
+        built = self._build()
+        self.assertAlmostEqual(built.counts["fender_m"], 20.0, places=1)
+        fender = built.tris[built.tri_kind == FENDER].reshape(-1, 3)
+        self.assertAlmostEqual(fender[:, 2].max(), 3.0, places=6)
+        self.assertAlmostEqual(fender[:, 2].min(), 0.5 - 1.5, places=6)
+        self.assertNotIn("kribbe", " ".join(built.counts))
+
+    def test_the_shore_under_a_jetty_is_quay(self):
+        """Where a pier leaves the shore there is a wall under it, not a bank;
+        the BGT draws the deck but no quay wall beneath it."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import src.surfaces as surfaces
+        from src.geo import BBox
+        from src.surfaces import WaterBody
+
+        basin = WaterBody(rings=[np.array([[0, 0], [100, 0], [100, 50], [0, 50], [0, 0]], float)],
+                          level_nap=0.5, area_m2=5000.0, measured=True)
+        # A pier from the land out over the basin, and a jetty wholly in it.
+        pier = {"type": "Polygon", "coordinates": [[[40, 30], [46, 30], [46, 60], [40, 60], [40, 30]]]}
+        afloat = {"type": "Polygon", "coordinates": [[[70, 10], [74, 10], [74, 30], [70, 30], [70, 10]]]}
+
+        def fetch(collection, _bbox, **_kwargs):
+            rows = [{"geometry": pier, "properties": {"type": "steiger"}},
+                    {"geometry": afloat, "properties": {"type": "steiger"}}]
+            return (rows if collection == "kunstwerkdeel_vlak" else []), SimpleNamespace()
+
+        with mock.patch.object(surfaces, "fetch_current", fetch):
+            shores = surfaces._jetty_shores(BBox(0.0, 0.0, 100.0, 100.0), {}, [basin])
+        self.assertEqual(len(shores), 1)
+        # The pier's 6 m, and the reach either side of it.
+        self.assertAlmostEqual(shores[0].length, 6.0 + 2 * surfaces.JETTY_SHORE_M, places=6)
 
     def test_the_checks_read_it(self):
         from src.validate import CheckReport, check_harbour
