@@ -442,6 +442,8 @@ def build_surfaces(
             shapely.make_valid(shapely.Polygon(rings[0][:, :2], [r[:, :2] for r in rings[1:]]))
             for rings in found
         ]
+        polygons, found, piers = _water_under_bridges(polygons, found, bbox, fetch_kwargs)
+        result.counts["bridge_piers_in_water"] = piers
         level_source, level_bounds = raster, raster_bounds
         if level_raster is not None and Path(level_raster).is_file():
             with rasterio.open(level_raster) as dataset:
@@ -680,6 +682,77 @@ def _quay_walls(bbox: BBox, fetch_kwargs: dict) -> list:
     if out:
         LOG.info("%d quay walls", len(out))
     return out
+
+
+# A bridge part on the ground is water when at least this share of its
+# outline borders water.
+PIER_IN_WATER_SHARE = 0.5
+
+
+def _water_under_bridges(polygons, found, bbox: BBox, fetch_kwargs: dict):
+    """Water polygons with the bridge piers standing in them filled in.
+
+    The BGT cuts every pier of a canal bridge (``overbruggingsdeel`` on the
+    ground, ``relatieve_hoogteligging`` 0) out of the water as a hole: 38 holes
+    and 4 notches over Amsterdam's centre. The terrain took each for an island,
+    filled its height in from the quays at about +1 m, and sloped the bed up to
+    it at 45 degrees -- a mound across the canal under every bridge, closing
+    it. Filled in, the water and the cut bed run through under the deck; the
+    piers themselves are still built, by `structures`, down to the bed.
+
+    Returns the polygons, their rings in the same order, and how many piers
+    were filled in.
+    """
+    import shapely
+    from shapely.geometry import shape
+
+    if not polygons:
+        return polygons, found, 0
+    try:
+        features, _ = fetch_current("overbruggingsdeel", bbox, **fetch_kwargs)
+    except Exception as exc:  # noqa: BLE001 - a refinement
+        LOG.warning("could not read BGT bridge parts for the water under them: %s", exc)
+        return polygons, found, 0
+    tree = shapely.STRtree(np.array(polygons, dtype=object))
+    grown = list(polygons)
+    filled = 0
+    for feature in features:
+        props = feature.get("properties") or {}
+        try:
+            if int(props.get("relatieve_hoogteligging") or 0) != 0:
+                continue
+            part = shapely.make_valid(shapely.force_2d(shape(feature.get("geometry"))))
+        except Exception:  # noqa: BLE001 - one broken outline
+            continue
+        if part.is_empty or part.length <= 0:
+            continue
+        near = [int(i) for i in tree.query(part, predicate="dwithin", distance=0.3)]
+        if not near:
+            continue
+        border = [part.boundary.intersection(polygons[i].buffer(0.3)).length for i in near]
+        if sum(border) < PIER_IN_WATER_SHARE * part.length:
+            continue
+        best = near[int(np.argmax(border))]
+        grown[best] = shapely.union(grown[best], part.buffer(0.05, join_style="mitre"))
+        filled += 1
+    if not filled:
+        return polygons, found, 0
+    out_polygons, out_found = [], []
+    for before, after, rings in zip(polygons, grown, found):
+        if after is before:
+            out_polygons.append(before)
+            out_found.append(rings)
+            continue
+        for piece in shapely.get_parts(shapely.make_valid(after)):
+            if piece.geom_type != "Polygon" or piece.area < 0.5:
+                continue
+            out_polygons.append(piece)
+            out_found.append(
+                [np.asarray(piece.exterior.coords)[:, :2]]
+                + [np.asarray(r.coords)[:, :2] for r in piece.interiors]
+            )
+    LOG.info("%d bridge piers stand in the water; the water runs on under them", filled)
+    return out_polygons, out_found, filled
 
 
 # Waterline within this of a jetty deck is the shore the deck stands off.

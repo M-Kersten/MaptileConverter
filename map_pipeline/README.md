@@ -1054,6 +1054,14 @@ A water with too few returns takes its banks' level; one with neither takes
 the median of the others, rather than being dropped and drawn as land (38,800
 m² of the Nieuwe Waterweg was). `one_level_per_water` checks it.
 
+The water runs on under bridges. The BGT cuts every pier of a canal bridge
+(`overbruggingsdeel` on the ground) out of the water polygon, 38 holes and 4
+notches over Amsterdam's centre; taken for islands, they were filled in from
+the quays at about +1 m with the bed sloping up to them, a mound across the
+canal under every bridge. A ground-level bridge part with at least half its
+outline on water is now water itself, so the surface and the cut bed pass
+under the deck; the piers are still built, from the deck down to the bed.
+
 Separate waters keep separate levels: levels across one square kilometre of
 Utrecht run from −0.57 to 1.00 m NAP, so a single bed taken from the median
 would sit above the surface of the lowest canal and poke straight through it.

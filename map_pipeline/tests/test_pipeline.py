@@ -8354,6 +8354,44 @@ class TestWaterLevels(unittest.TestCase):
         level = surface_level(np.concatenate([water, boats, noise]))
         self.assertAlmostEqual(level, -0.40, delta=0.06)
 
+    def test_the_water_runs_on_under_a_bridge(self):
+        """The BGT cuts each pier of a canal bridge out of the water as a hole;
+        taken for an island, it raised a mound across the canal under every
+        bridge in Amsterdam. A pier mostly bordered by water is water; a bridge
+        part on land, or one up on the deck, is not."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import shapely
+
+        import src.surfaces as surfaces
+        from src.geo import BBox
+
+        hole = [(40, 4), (44, 4), (44, 6), (40, 6), (40, 4)]
+        canal = shapely.Polygon([(0, 0), (100, 0), (100, 10), (0, 10)], [hole])
+        rings = [[np.asarray(canal.exterior.coords), np.asarray(hole, float)]]
+        pier = {"type": "Polygon", "coordinates": [hole]}
+        on_land = {"type": "Polygon", "coordinates": [[[40, 30], [44, 30], [44, 34], [40, 34], [40, 30]]]}
+        deck = {"type": "Polygon", "coordinates": [[[38, -2], [46, -2], [46, 12], [38, 12], [38, -2]]]}
+        rows = [
+            {"geometry": pier, "properties": {"relatieve_hoogteligging": 0}},
+            {"geometry": on_land, "properties": {"relatieve_hoogteligging": 0}},
+            {"geometry": deck, "properties": {"relatieve_hoogteligging": 1}},
+        ]
+
+        def fetch(collection, _bbox, **_kwargs):
+            return (rows if collection == "overbruggingsdeel" else []), SimpleNamespace()
+
+        with mock.patch.object(surfaces, "fetch_current", fetch):
+            polygons, found, filled = surfaces._water_under_bridges(
+                [canal], rings, BBox(0.0, 0.0, 100.0, 100.0), {}
+            )
+        self.assertEqual(filled, 1)
+        self.assertEqual(len(polygons), 1)
+        self.assertEqual(len(polygons[0].interiors), 0)
+        self.assertAlmostEqual(polygons[0].area, 1000.0, delta=1.0)
+        self.assertEqual(len(found[0]), 1)
+
     def test_a_water_flown_twice_reads_its_lower_peak(self):
         """A tidal river flown at two tides has two water peaks; the level is
         one of them, not the gap between."""
