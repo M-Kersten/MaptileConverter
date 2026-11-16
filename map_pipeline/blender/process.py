@@ -711,6 +711,8 @@ def _tag_surface_regions(
 
 # How many of the lowest and the highest layer vertices the summary lists.
 EXTREMES = 50
+# A terrain face whose normal points up less than this (cos 65°) is a drop.
+STEEP_UPRIGHT = 0.42
 
 
 def _layered_summary(layered: dict) -> dict:
@@ -752,7 +754,8 @@ def _layered_summary(layered: dict) -> dict:
         ).z
         normal = (standing[b] - standing[a]).cross(standing[c] - standing[a])
         upright = abs(normal.z) / normal.length if normal.length > 0 else 1.0
-        return z, upright
+        top = max(standing[a].z, standing[b].z, standing[c].z)
+        return z, upright, top
 
     raw, evaluated = 0, 0
     heights: dict[str, list] = {}
@@ -805,6 +808,15 @@ def _layered_summary(layered: dict) -> dict:
                     square = gap * ground[1]
                     if abs(square - offset) < abs(gap - offset):
                         gap = square
+                    # Over a quay the ground straight below the road's edge is
+                    # the drop to the bed, a hand's breadth wide and all but
+                    # upright, and the road was wrapped onto the top of it: on
+                    # Amsterdam's canals 50 edge vertices read 10 to 22 cm up.
+                    # On a face steeper than 65 degrees its top counts too.
+                    if ground[1] < STEEP_UPRIGHT:
+                        on_top = z - ground[2]
+                        if abs(on_top - offset) < abs(gap - offset):
+                            gap = on_top
                 heights.setdefault(role, []).append(gap)
         finally:
             holder.to_mesh_clear()

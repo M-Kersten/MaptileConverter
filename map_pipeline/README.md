@@ -1042,8 +1042,14 @@ where its managers' plots meet, lines that mean nothing on the water: read one
 by one, the Nieuwe Waterweg at Hoek van Holland came out at −0.99 to +3.55 m
 NAP, the high one off the ferries moored in it. Now every polygon's returns
 are pooled with those of the polygons it touches (within 1 m), and the level
-is the median of the returns within 1 m of the lowest (`SHIP_CLEARANCE_M`):
-what stands more than a metre above the water is a ship, a pontoon or a jetty.
+is the median of the returns from 10 cm below to 15 cm above the lowest (the
+1st percentile, `SHIP_CLEARANCE_M`): the water's own returns lie within a few
+centimetres of each other, and anything higher is a boat, a pontoon or a
+jetty. The band was a metre at first, which let Rotterdam's barges out but
+kept Amsterdam's canal boats in: they lie 0.7 m above the water and outnumber
+its returns ten to one, and every canal read +0.32 m NAP against a real −0.40.
+Now the main canals read −0.39 and −0.41 m. A tidal water flown at two tides
+has two water peaks, and this reads the lower.
 A water with too few returns takes its banks' level; one with neither takes
 the median of the others, rather than being dropped and drawn as land (38,800
 m² of the Nieuwe Waterweg was). `one_level_per_water` checks it.
@@ -1052,7 +1058,7 @@ Separate waters keep separate levels: levels across one square kilometre of
 Utrecht run from −0.57 to 1.00 m NAP, so a single bed taken from the median
 would sit above the surface of the lowest canal and poke straight through it.
 Waters that meet only outside the area can differ too: Rotterdam's Maashaven
-reads +0.66 m and the Nieuwe Maas +1.42 m, flown on different days at
+reads +0.26 m and the Nieuwe Maas +0.86 m, flown on different days at
 different tides. A lock between two waters whose polygons touch is the one
 place this is wrong: both sides get one level. A check asserts every bed
 clears its own surface.

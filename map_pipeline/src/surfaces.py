@@ -264,10 +264,17 @@ def clip_ring_to_bbox(ring: np.ndarray, bbox: BBox) -> np.ndarray:
 
 
 # Returns more than this above the lowest over a water are not the water: a
-# moored ship, a barge, a pontoon, a jetty. Lidar barely reflects off water --
-# 0 to 3% of a harbour basin has a return at all -- and in a harbour most of
-# the few it has are those.
-SHIP_CLEARANCE_M = 1.0
+# moored boat, a barge, a pontoon, a jetty. Lidar barely reflects off water --
+# 0 to 3% of a harbour basin has a return at all -- and most of the few it has
+# are those. It was a metre, which let the ships in Rotterdam out but kept
+# Amsterdam's canal boats in: they lie 0.7 m above the water, and outnumber
+# its returns ten to one, so every canal read +0.32 m NAP against a real
+# -0.40. The water's own returns lie within a few centimetres of each other;
+# at 0.3 m the boats' still lifted the main canals to -0.28, at 0.15 they read
+# -0.39 and -0.41, and inland ditches moved 5 cm.
+SHIP_CLEARANCE_M = 0.15
+# Returns this far below the anchor still count: the water's own spread.
+WATER_SPREAD_M = 0.1
 # Water polygons this close together are one water, at one level.
 WATER_JOIN_M = 1.0
 
@@ -299,15 +306,18 @@ def surface_level(samples: np.ndarray, min_samples: int = 25) -> float | None:
     """The water surface from the returns over a water, or None with too few.
 
     The lowest returns are the water; anything more than `SHIP_CLEARANCE_M`
-    above them stands on it. The 2nd percentile rather than the minimum, so
-    one stray low return does not set the level.
+    above them stands on it. Anchored on the 1st percentile, or the fifth
+    lowest return where there are few, so one stray low return does not set
+    the level -- not the 2nd: over Amsterdam's canals the boats already pull
+    that 12 cm up. Where the survey flew a tidal water more than once, each
+    flight left its own water peak; this reads the lowest.
     """
     samples = np.asarray(samples, dtype=np.float64)
-    samples = samples[np.isfinite(samples)]
+    samples = np.sort(samples[np.isfinite(samples)])
     if len(samples) < min_samples:
         return None
-    low = float(np.percentile(samples, 2))
-    near = samples[samples <= low + SHIP_CLEARANCE_M]
+    anchor = float(samples[max(int(0.01 * len(samples)), 4)])
+    near = samples[(samples >= anchor - WATER_SPREAD_M) & (samples <= anchor + SHIP_CLEARANCE_M)]
     return float(np.median(near))
 
 

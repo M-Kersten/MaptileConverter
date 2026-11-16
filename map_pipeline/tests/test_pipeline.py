@@ -8340,6 +8340,31 @@ class TestWaterLevels(unittest.TestCase):
         self.assertAlmostEqual(level, 0.5, delta=0.1)
         self.assertIsNone(surface_level(np.array([0.5] * 10)))
 
+    def test_low_canal_boats_do_not_set_the_level(self):
+        """Over Amsterdam's canals the boats lie 0.7 m above the water and
+        outnumber its returns ten to one, rising in a continuum from just above
+        the water up. With a metre's clearance every canal read +0.32 m NAP
+        against a real -0.40."""
+        from src.surfaces import surface_level
+
+        rng = np.random.default_rng(2)
+        water = rng.normal(-0.42, 0.04, 2500)
+        boats = rng.uniform(-0.3, 1.2, 25000)
+        noise = rng.uniform(-0.8, -0.5, 150)
+        level = surface_level(np.concatenate([water, boats, noise]))
+        self.assertAlmostEqual(level, -0.40, delta=0.06)
+
+    def test_a_water_flown_twice_reads_its_lower_peak(self):
+        """A tidal river flown at two tides has two water peaks; the level is
+        one of them, not the gap between."""
+        from src.surfaces import surface_level
+
+        rng = np.random.default_rng(3)
+        low = rng.normal(-0.82, 0.04, 1500)
+        high = rng.normal(-0.05, 0.05, 4000)
+        level = surface_level(np.concatenate([low, high]))
+        self.assertAlmostEqual(level, -0.82, delta=0.06)
+
     def test_one_river_is_one_level(self):
         """The BGT cuts the Nieuwe Waterweg into polygons; ferries moored in
         one gave it +3.55 m NAP beside -0.99 m, and the terrain cut below each
