@@ -887,12 +887,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     barriers = BarrierSet()
     fence_texture = None
+    deck_at = None
     if want_barriers:
         with Stage("walls, fences and hedges (BGT)", next_step(), total):
             # A parapet on a bridge stands on its deck, not on the ground (or
             # canal bed) under it; the decks are read as the bridges stage
             # will build them.
-            deck_at = None
             if want_structures:
                 deck_dsm = ensure_dsm(
                     terrain.bbox,
@@ -1125,7 +1125,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         # Against what they were placed on: the model's own surface, which
         # is the road where there is one and the terrain as drawn elsewhere.
         check_barriers(
-            report, barriers if want_barriers else None, terrain.surface
+            report, barriers if want_barriers else None, terrain.surface,
+            deck_at=deck_at,
         )
         check_vehicles(
             report, vehicles if want_vehicles else None, config.bbox, surfaces

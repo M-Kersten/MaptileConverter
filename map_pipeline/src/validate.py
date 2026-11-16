@@ -582,8 +582,12 @@ def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
     )
 
 
-def check_barriers(report: CheckReport, barriers, sampler=None) -> None:
+def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) -> None:
     """Walls and fences are closed, on the ground, and a believable height.
+
+    `deck_at(x, y)` is the top of a bridge deck, NaN off one: a parapet stands
+    on the deck, so each vertex is measured from whichever of the deck and the
+    ground it is nearer, not from the canal bed four metres down.
 
     Height is the one thing the BGT does not survey for these, so it comes
     from a table of assumptions -- which is exactly the sort of number that
@@ -628,6 +632,11 @@ def check_barriers(report: CheckReport, barriers, sampler=None) -> None:
     if sampler is not None:
         ground = np.asarray(sampler(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
         above = vertices[:, 2] - ground
+        if deck_at is not None:
+            deck = np.asarray(deck_at(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
+            on_deck = vertices[:, 2] - deck
+            nearer = np.isfinite(on_deck) & (np.abs(on_deck) < np.abs(above))
+            above = np.where(nearer, on_deck, above)
         # An awning or a canopy is meant to be up in the air; everything else
         # is meant to be standing on the pavement, and 8 m of garden wall is a
         # mistake. The awnings used to be measured too, and one 8 m up over a

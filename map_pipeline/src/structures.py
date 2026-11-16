@@ -246,6 +246,10 @@ def deck_corner_heights(flat, level: float, terrain, lift: float) -> np.ndarray:
     return np.maximum(np.full((len(flat), 3, 1), float(level)), ground) + float(lift)
 
 
+# A point this close to a deck's outline is on the deck, for what stands on it.
+DECK_EDGE_M = 0.6
+
+
 def deck_surface(bbox: BBox, *, structures_cfg: dict, terrain, dsm_sampler):
     """The top of every bridge deck, as a function of position: `f(x, y)`
     gives the deck's surface where a deck is and NaN everywhere else.
@@ -307,7 +311,11 @@ def deck_surface(bbox: BBox, *, structures_cfg: dict, terrain, dsm_sampler):
         y = np.atleast_1d(np.asarray(y, dtype=np.float64))
         out = np.full(x.shape, np.nan)
         points = shapely.points(x, y)
-        hit_point, hit_deck = tree.query(points, predicate="intersects")
+        # A parapet runs along the deck's very edge, and a wall is swept on
+        # both its faces: read only inside the outline, one face stood on the
+        # deck and the other on the canal bed, a comb of teeth down to the
+        # water. Close to the edge is on it.
+        hit_point, hit_deck = tree.query(points, predicate="dwithin", distance=DECK_EDGE_M)
         if len(hit_point):
             out[hit_point] = np.fmax(out[hit_point], levels[hit_deck])
             # Held up where the ground rises through the deck, as the deck is.

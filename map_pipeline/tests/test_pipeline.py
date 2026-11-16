@@ -9062,6 +9062,36 @@ class TestCollisionLayer(unittest.TestCase):
         self.assertGreaterEqual(parapet[:, 2].min(), 2.5 - 0.3)
         self.assertLess(ground_wall[:, 2].min(), 0.0)
 
+    def test_the_deck_surface_reaches_the_parapet_on_its_edge(self):
+        """A wall is swept on both faces, and a parapet runs along the deck's
+        very edge: read only inside the outline, one face stood on the deck
+        and the other on the canal bed, a comb of teeth down to the water."""
+        from unittest import mock
+
+        import src.structures as structures
+        from src.geo import BBox
+
+        deck = {"type": "Polygon", "coordinates": [[[30, 20], [50, 20], [50, 80], [30, 80], [30, 20]]]}
+        rows = [{"geometry": deck, "properties": {"type_overbruggingsdeel": "dek",
+                                                   "relatieve_hoogteligging": 1}}]
+
+        class Terrain:
+            def sample(self, x, y):
+                return np.full(np.shape(np.atleast_1d(x)), -1.0)
+
+        def dsm(x, y):
+            return np.full(np.shape(np.atleast_1d(x)), 2.5)
+
+        with mock.patch.object(structures, "fetch_current", lambda *a, **k: (rows, None)):
+            at = structures.deck_surface(
+                BBox(0.0, 0.0, 100.0, 100.0), structures_cfg={}, terrain=Terrain(),
+                dsm_sampler=dsm,
+            )
+        got = at(np.array([40.0, 50.3, 52.0]), np.array([50.0, 50.0, 50.0]))
+        self.assertAlmostEqual(got[0], 2.55, places=6)
+        self.assertAlmostEqual(got[1], 2.55, places=6)
+        self.assertTrue(np.isnan(got[2]))
+
     def test_no_collider_is_swept_when_it_was_not_asked_for(self):
         """Another sweep of every thin run, and another copy in the npz, on a
         run that will never export it."""
