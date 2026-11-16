@@ -1600,6 +1600,19 @@ nothing and cost a great deal — footpath is 305 of the 871 road parts over tha
 square, and in a park every winding path through the lawns is one.
 `trees.detect_off_surfaces` names the classes.
 
+**On a yard, a found tree needs a crown, not a flat top.** Lorry parks, depot
+yards and big car parks are not parking bays in the BGT but *erf* or paving, so
+the road mask misses them, and a parked trailer is 4 m tall and rough at its
+edges. Over the Hazeldonk square 991 found trees stood on yards, 91% of them
+grey in the photo and a median 4.06 m tall: a lorry park full of them. Masking
+yards outright would take the gardens and the woodland the BGT also files as
+*erf*, so on those surfaces a peak is refused only when its top is flat: more
+than 15% of the 4.5 m window around it within 25 cm of the peak. A round crown
+runs about 1% of that window; a trailer, container or van roof 20 to 60%.
+`trees.detect_flat_top_on` names the surfaces (`paved` by default), and
+`detect_flat_top_share`, `detect_flat_top_tolerance_m` and
+`detect_flat_top_window_m` set the test.
+
 **Detected trees arrive under their own parent.** The model gets
 `Trees_registered` and `Trees_detected`, each holding one object per tree
 (`Tree_00001`, `Tree_d00001`), sharing one material. The detector is good rather

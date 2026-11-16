@@ -281,6 +281,20 @@ DEFAULTS: dict[str, Any] = {
             "road_asphalt", "road_brick", "cycle_path", "parking",
             "transit_lane", "footpath",
         ],
+        # Surfaces where a found tree must also have a crown, not a flat top.
+        # Lorry parks and depot yards are not parking bays in the BGT but
+        # "erf" or paving, and the trailers parked on them are 4 m tall and
+        # rough at the edges: over the Hazeldonk square 991 found trees stood
+        # on yards, 91% of them grey in the photo. Masking yards outright would
+        # take the gardens and the woodland the BGT also files as "erf" with
+        # them, so here a tree is only refused when its top is flat: more than
+        # `detect_flat_top_share` of the window around the peak within
+        # `detect_flat_top_tolerance_m` of it. A crown is round and runs about
+        # 1% of that window; a trailer roof runs 20 to 60%.
+        "detect_flat_top_on": ["paved"],
+        "detect_flat_top_share": 0.15,
+        "detect_flat_top_tolerance_m": 0.25,
+        "detect_flat_top_window_m": 4.5,
         "geometry": True,
         "texture_px": 512,
     },

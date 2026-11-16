@@ -401,6 +401,10 @@ def detect_trees(
     building_mask: np.ndarray | None = None,
     water_mask: np.ndarray | None = None,
     road_mask: np.ndarray | None = None,
+    flat_top_mask: np.ndarray | None = None,
+    flat_top_share: float = 0.15,
+    flat_top_tolerance_m: float = 0.25,
+    flat_top_window_m: float = 4.5,
     min_height_m: float = 2.5,
     max_height_m: float = 30.0,
     crown_radius_ratio: float = 0.25,
@@ -477,6 +481,27 @@ def detect_trees(
     seed_rows, seed_cols = np.nonzero(peaks)
     if not len(seed_rows):
         return np.zeros((0, 2)), np.zeros(0)
+    peak_count = len(seed_rows)
+
+    if flat_top_mask is not None and flat_top_share > 0:
+        # On a yard, a crown has to look like one. Done on the seeds rather
+        # than the candidates, so a trailer refused here does not then hold
+        # off the real tree beside it in the spacing pass below.
+        keep = _not_flat_topped(
+            ndsm, seed_rows, seed_cols, flat_top_mask,
+            share=flat_top_share,
+            tolerance_m=flat_top_tolerance_m,
+            half_cells=max(1, int(round(flat_top_window_m / 2.0 / cell))),
+        )
+        if not keep.all():
+            LOG.info(
+                "dropped %d flat-topped canopy peaks on yards and paving "
+                "(parked trailers, containers, vans)",
+                int((~keep).sum()),
+            )
+        seed_rows, seed_cols = seed_rows[keep], seed_cols[keep]
+        if not len(seed_rows):
+            return np.zeros((0, 2)), np.zeros(0)
 
     heights = ndsm[seed_rows, seed_cols]
     xs = left + (seed_cols + 0.5) * cell_x
@@ -554,9 +579,36 @@ def detect_trees(
     LOG.info(
         "detected %d trees the register does not have, from %d canopy peaks",
         len(xy),
-        len(seed_rows),
+        peak_count,
     )
     return xy, found_h
+
+
+def _not_flat_topped(ndsm, rows, cols, mask, *, share, tolerance_m, half_cells):
+    """False for each seed on `mask` whose top is flat rather than a crown.
+
+    Flat means more than `share` of the square window around the peak lies
+    within `tolerance_m` of the peak's height. A tree crown is round, so only
+    the peak itself is that high: about 1% of a 4.5 m window over the
+    Hazeldonk and Hoek van Holland squares. A trailer, a container or a van
+    roof is a plateau: 20% at the median, 56% at the 90th percentile.
+    """
+    keep = np.ones(len(rows), dtype=bool)
+    n_rows, n_cols = ndsm.shape
+    for index, (row, col) in enumerate(zip(rows, cols)):
+        if not mask[row, col]:
+            continue
+        window = ndsm[
+            max(0, row - half_cells) : min(n_rows, row + half_cells + 1),
+            max(0, col - half_cells) : min(n_cols, col + half_cells + 1),
+        ]
+        valid = np.isfinite(window)
+        if not valid.any():
+            continue
+        near_top = np.abs(window[valid] - ndsm[row, col]) < tolerance_m
+        if near_top.mean() > share:
+            keep[index] = False
+    return keep
 
 
 def build_trees(
@@ -690,6 +742,15 @@ def build_trees(
             building_mask=building_mask,
             water_mask=water_mask,
             road_mask=road_mask,
+            flat_top_mask=_class_mask(
+                surfaces, bbox, bounds, ndsm.shape,
+                _road_classes(trees_cfg.get("detect_flat_top_on")),
+            ),
+            flat_top_share=float(trees_cfg.get("detect_flat_top_share", 0.15)),
+            flat_top_tolerance_m=float(
+                trees_cfg.get("detect_flat_top_tolerance_m", 0.25)
+            ),
+            flat_top_window_m=float(trees_cfg.get("detect_flat_top_window_m", 4.5)),
             min_height_m=float(trees_cfg.get("detect_min_height_m", 2.5)),
             max_height_m=float(trees_cfg.get("detect_max_height_m", 30.0)),
             crown_radius_ratio=crown_ratio,
@@ -771,6 +832,37 @@ def _rasterize_rings(rings, bounds, shape) -> np.ndarray:
                 col1 = min(cols - 1, int(np.floor(end - 0.5)))
                 if col1 >= col0:
                     mask[row, col0 : col1 + 1] = True
+    return mask
+
+
+def _class_mask(surfaces, bbox, bounds, shape, classes) -> np.ndarray | None:
+    """Cells of the canopy raster whose land cover is one of `classes`.
+
+    Read off the land-cover grid rather than the BGT polygons, because the
+    terrain-type polygons (yards, paving) are only kept as that grid. The grid
+    spans the bbox with both edges on it and row 0 at the southern edge.
+    """
+    grid = getattr(surfaces, "class_grid", None) if surfaces is not None else None
+    if grid is None or not classes or bbox is None:
+        return None
+    grid = np.asarray(grid)
+    n_rows, n_cols = grid.shape
+    left, bottom, right, top = bounds
+    rows, cols = shape
+    xs = left + (np.arange(cols) + 0.5) * (right - left) / cols
+    ys = top - (np.arange(rows) + 0.5) * (top - bottom) / rows
+    gc = np.rint((xs - bbox.xmin) / (bbox.xmax - bbox.xmin) * (n_cols - 1)).astype(int)
+    gr = np.rint((ys - bbox.ymin) / (bbox.ymax - bbox.ymin) * (n_rows - 1)).astype(int)
+    inside_c = (gc >= 0) & (gc < n_cols)
+    inside_r = (gr >= 0) & (gr < n_rows)
+    picked = grid[np.clip(gr, 0, n_rows - 1)[:, None], np.clip(gc, 0, n_cols - 1)[None, :]]
+    mask = np.isin(picked, list(classes)) & inside_r[:, None] & inside_c[None, :]
+    if not mask.any():
+        return None
+    LOG.info(
+        "%.1f%% of the canopy model is yard or paving, where a found tree "
+        "needs a crown rather than a flat top", 100.0 * mask.mean(),
+    )
     return mask
 
 

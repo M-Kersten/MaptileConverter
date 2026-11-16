@@ -948,6 +948,56 @@ class TestTreeDetection(unittest.TestCase):
             any(y > 60 for _, y in kept), "the verge tree went with it"
         )
 
+    def test_a_trailer_on_a_yard_is_not_a_tree(self):
+        """Lorry parks are "erf" or paving in the BGT, not parking bays, so the
+        road mask misses them -- and a trailer is 4 m tall and rough at its
+        edges. On a yard a found tree has to have a crown, not a flat top.
+        The BGT files gardens and woodland as "erf" too, so a real crown on
+        the same yard stays."""
+        from src.trees import detect_trees
+
+        # A 13 m x 2.6 m trailer, 4 m tall, along RD y = 50, and a crown at
+        # (30, 75); the whole square is yard.
+        grid = self._blank()
+        grid[96:101, 100:126] = 4.0 + np.random.default_rng(1).normal(0, 0.03, (5, 26))
+        grid = self._put(grid, 30, 75, 9.0, radius=2.5, rough=0.9, seed=3)
+        yard = np.ones(grid.shape, dtype=bool)
+
+        loose, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)),
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        kept, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), flat_top_mask=yard,
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        on_trailer = lambda pts: [(x, y) for x, y in pts if 48 < y < 52 and 49 < x < 64]
+        self.assertTrue(on_trailer(loose), "the fixture's trailer was never a tree")
+        self.assertEqual(on_trailer(kept), [], "a tree still stands on the trailer")
+        self.assertTrue(
+            any(np.hypot(x - 30, y - 75) < 2.5 for x, y in kept),
+            "the real crown on the yard went with it",
+        )
+
+    def test_the_yard_mask_is_read_off_the_land_cover_grid(self):
+        """Row 0 of the land-cover grid is the southern edge; row 0 of the
+        canopy raster is the northern one."""
+        from types import SimpleNamespace
+
+        from src.geo import BBox
+        from src.surfaces import CLASS_GREEN, CLASS_PAVED
+        from src.trees import _class_mask
+
+        grid = np.full((51, 51), CLASS_GREEN, dtype=np.uint8)
+        grid[:10, :] = CLASS_PAVED          # the southern 18 m is a yard
+        mask = _class_mask(
+            SimpleNamespace(class_grid=grid), BBox(0.0, 0.0, 100.0, 100.0),
+            self.BOUNDS, (200, 200), {CLASS_PAVED},
+        )
+        self.assertTrue(mask[-1].all(), "the southern row is not yard")
+        self.assertFalse(mask[0].any(), "the northern row is yard")
+        self.assertIsNone(_class_mask(None, None, self.BOUNDS, (200, 200), {CLASS_PAVED}))
+
     def test_the_surfaces_are_named_not_numbered(self):
         """"cycle_path" survives someone reading the config a year later and 7
         does not, and these are the names the road objects already carry."""
