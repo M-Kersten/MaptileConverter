@@ -125,10 +125,13 @@ def build_harbour(
         rings = [r for r in rings if len(r) >= 4]
         if not rings:
             continue
-        polygon = shapely.make_valid(shapely.Polygon(rings[0], rings[1:]))
-        if not polygon.is_empty:
-            polygons.append(polygon)
-            levels.append(float(body.level_nap))
+        valid = shapely.make_valid(shapely.Polygon(rings[0], rings[1:]))
+        # Area only: a repaired outline can carry a stray line, and a
+        # collection has no boundary to find the waterline on.
+        for polygon in shapely.get_parts(valid):
+            if polygon.geom_type == "Polygon" and not polygon.is_empty:
+                polygons.append(polygon)
+                levels.append(float(body.level_nap))
     if not polygons:
         return result
     wet = shapely.union_all(np.array(polygons, dtype=object))

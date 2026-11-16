@@ -694,7 +694,13 @@ def _jetty_shores(bbox: BBox, fetch_kwargs: dict, water) -> list:
         parts = [np.asarray(r, dtype=np.float64)[:, :2] for r in body.rings]
         parts = [r for r in parts if len(r) >= 4]
         if parts:
-            rings.append(shapely.make_valid(shapely.Polygon(parts[0], parts[1:])))
+            # A repaired outline can come back as a collection with a stray
+            # line in it, which has no boundary: keep the area only.
+            valid = shapely.make_valid(shapely.Polygon(parts[0], parts[1:]))
+            rings.extend(
+                p for p in shapely.get_parts(valid)
+                if p.geom_type in ("Polygon", "MultiPolygon") and not p.is_empty
+            )
     if not rings:
         return []
     box = shapely.box(bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)

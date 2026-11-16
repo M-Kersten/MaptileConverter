@@ -8512,8 +8512,13 @@ class TestHarbour(unittest.TestCase):
                     {"geometry": afloat, "properties": {"type": "steiger"}}]
             return (rows if collection == "kunstwerkdeel_vlak" else []), SimpleNamespace()
 
+        # An outline that repairs into a polygon plus a stray line: no
+        # boundary on the collection, which crashed Hazeldonk.
+        bowtie = WaterBody(rings=[np.array([[80, 80], [90, 80], [90, 90], [80, 90], [80, 80],
+                                            [80, 95], [80, 80]], float)],
+                           level_nap=0.5, area_m2=100.0, measured=True)
         with mock.patch.object(surfaces, "fetch_current", fetch):
-            shores = surfaces._jetty_shores(BBox(0.0, 0.0, 100.0, 100.0), {}, [basin])
+            shores = surfaces._jetty_shores(BBox(0.0, 0.0, 100.0, 100.0), {}, [basin, bowtie])
         self.assertEqual(len(shores), 1)
         # The pier's 6 m, and the reach either side of it.
         self.assertAlmostEqual(shores[0].length, 6.0 + 2 * surfaces.JETTY_SHORE_M, places=6)
