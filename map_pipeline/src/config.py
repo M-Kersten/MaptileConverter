@@ -34,24 +34,21 @@ DEFAULTS: dict[str, Any] = {
         # What every ground object's name starts with; empty takes the area
         # name ("hazeldonk" gives Hazeldonk_Terrein, Hazeldonk_Snelweg).
         "prefix": "",
-        # How far any surveyed point may be from the terrain. The hand-made
-        # Hazeldonk terrain is within 0.98 m on 95% of the ground; 0.5 m
-        # everywhere costs about 27k faces over a square kilometre.
+        # How far a surveyed point may be from the ground before the checks
+        # warn, and what the "triangles" mesher refines to. The hand-made
+        # Hazeldonk terrain is within 0.98 m on 95% of the ground.
         "tolerance_m": 0.5,
         # How far a simplified outline may stray from the BGT's.
         "outline_m": 0.25,
-        # The middle of the area, grouped into an east and a west object per
-        # layer; outside it, one per quadrant. The modellers' VP_Oost_Wegen
-        # and Wegen_Afstand_NO.
-        "focus_m": 250.0,
-        # How far each layer is lifted off the terrain, as the modellers'
-        # shrinkwrap offsets do: enough to keep it from flickering.
-        "road_lift_m": 0.05,
-        "grass_lift_m": 0.02,
-        # How the terrain is laid out: "quads", rows along the outlines and a
-        # grid that coarsens away from the middle, or "triangles", the
-        # triangulation refined until it is within tolerance_m everywhere.
+        # How the ground is laid out: "quads", rows along the outlines and one
+        # grid of square_m squares everywhere, turned to the way the streets
+        # run, or "triangles", the triangulation refined until it is within
+        # tolerance_m everywhere.
         "mesher": "quads",
+        # The size of the grid squares, the same everywhere, and the spacing
+        # of the points along every outline: rounded to whole survey grid
+        # squares. 8 has about a third of the faces of 4 over open ground.
+        "square_m": 4.0,
         # How far below the water level a ditch is cut.
         "ditch_depth_m": 0.6,
         # A flat water surface over every BGT water, as an object of its own
@@ -517,6 +514,16 @@ RETIRED: dict[str, str] = {
     "surfaces.road_min_angle_deg": "roads are cut across along their centrelines",
     "surfaces.road_snap_m": "roads are cut across along their centrelines",
     "buildings.merge": "every building is its own object, under the Buildings parent",
+    "layered.focus_m": (
+        "the ground is one square size everywhere and one object per layer; "
+        "divide it as the project needs"
+    ),
+    "layered.road_lift_m": (
+        "the roads, walkways and grass are the ground itself, not lifted onto a terrain"
+    ),
+    "layered.grass_lift_m": (
+        "the roads, walkways and grass are the ground itself, not lifted onto a terrain"
+    ),
 }
 
 
@@ -790,7 +797,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     merged["buildings"]["clip_mode"] = clip_mode
 
     layered = merged["layered"]
-    for key in ("tolerance_m", "focus_m"):
+    for key in ("tolerance_m", "square_m"):
         value = float(layered[key])
         if not value > 0:
             raise ValueError(f"layered.{key} must be positive, got {value}")
@@ -802,7 +809,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     layered["water_surface"] = bool(layered.get("water_surface", True))
     layered["harbour"] = bool(layered.get("harbour", True))
     layered["water_level_offset_m"] = float(layered.get("water_level_offset_m", 0.0))
-    for key in ("outline_m", "road_lift_m", "grass_lift_m", "ditch_depth_m"):
+    for key in ("outline_m", "ditch_depth_m"):
         value = float(layered[key])
         if value < 0:
             raise ValueError(f"layered.{key} must not be negative, got {value}")

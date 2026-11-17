@@ -494,8 +494,8 @@ outliner and an empty that everything in it hangs from:
 
 | Collection / parent | What is in it |
 | --- | --- |
-| `<Prefix>_Terrain` | layered style: the terrain `<Prefix>_Terrein`, and the road, motorway and walkway objects lying on it (see [Two styles of ground](#two-styles-of-ground)) |
-| `Terrain Cutout` | layered style: the grass objects |
+| `<Prefix>_Terrain` | layered style: the terrain `<Prefix>_Terrein` and the road, motorway and walkway objects, together one sheet of ground (see [Two styles of ground](#two-styles-of-ground)) |
+| `Terrain Cutout` | layered style: the grass object |
 | `Terrain` | survey style: one object, the ground; its edges follow the outlines (see [Terrain](#terrain)) |
 | `Roads` | survey style: one object per street, junction and paving area (see [Roads](#roads)) |
 | `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
@@ -557,11 +557,11 @@ Blender halts every file that asks to with a security warning. Four buttons:
   time; to get the ground back from under a road you moved away, Reset first
   and Fit after. It works on the terrain whatever its faces, including any you
   have remeshed yourself. Kerb and skirt faces are left out. In the layered
-  style there is normally nothing to fit: the roads, walkways and lawns are
-  wrapped or draped onto the terrain and follow it. Only a layer whose
-  Shrinkwrap or drape was removed or applied is fitted under.
+  style there is nothing to fit: the roads, walkways and lawns are pieces of
+  the ground itself.
 * **Reset terrain to survey.** Puts every terrain vertex back on its measured
-  height (`measured_z`), roads ignored.
+  height (`measured_z`), roads ignored; in the layered style every ground
+  piece, roads included, since they are the ground.
 * **Drop selected onto ground.** Moves each selected object vertically onto the
   road, walkway, lawn or terrain under it — for a lamppost after a road moved,
   or anything you added.
@@ -655,12 +655,20 @@ The modellers sent a hand-made model of Tankstation Hazeldonk to say how they
 want an area built. It is built in layers, each a separate object a person can
 grab: a **terrain** of about 2,100 faces for the square kilometre with the
 aerial on it; **roads, the motorway, walkways and grass** as flat faces lying a
-few centimetres above it (grass at 2 cm, everything paved at 5 cm), each in a
-flat colour of its own; and **no modelled kerbs**: every walkway and traffic
-island is a flat outline carrying their *CurbGenerator* geometry-nodes
-modifier, which raises it and builds the kerb round it, so editing the outline
-edits the kerb. The *layered* style builds that from the open data, and it is
-the default. The *survey* style is what the pipeline built before; the
+few centimetres above it, each in a flat colour of its own; and **no modelled
+kerbs**: every walkway and traffic island is a flat outline carrying their
+*CurbGenerator* geometry-nodes modifier, which raises it and builds the kerb
+round it, so editing the outline edits the kerb. The *layered* style builds
+that from the open data, and it is the default.
+
+With the Hoek van Holland model in hand they asked for three changes, which
+are how it is built now. **The ground once**: a terrain under every road is
+the ground drawn twice, and deleting it left holes wherever no layer was, so
+the ground is one sheet cut into the terrain, road, walkway and grass objects,
+meeting edge to edge. **No split by compass point**: one object per layer;
+they divide the model themselves, for culling. **One resolution**: no
+coarser squares far out and no denser patches where the survey rises, roads
+as ladders, and no fans of slivers. The *survey* style is what the pipeline built before; the
 sections from [Terrain](#terrain) to [Street detail](#street-detail) describe
 it.
 
@@ -704,14 +712,16 @@ How it is built (`src/layered.py`):
   walkway too thin for a kerb on each side, or a small one keeping a corner
   under 6°, becomes part of its neighbour. At Hazeldonk that is 0.3% of the
   footpath area.
-* **Terrain, in quads** (`src/layered_mesh.py`). The modellers' feedback on
+* **Ground, in quads** (`src/layered_mesh.py`). The modellers' feedback on
   the first version, a triangulation refined until it fitted the survey, was:
   quads rather than a complete triangulation, with minimal but realistic height
   variation; whole continuous quads along the roads; edge loops that follow
-  the shape; points where outlines meet (round a roundabout); the ditches; and
-  fewer points far away. So each region is meshed the way they lay theirs out:
-  * *Rungs across.* Every outline gets stations 4 m apart (8 m beyond
-    `focus_m`). A road narrower than about 20 m gets rungs straight across from
+  the shape; points where outlines meet (round a roundabout); the ditches; and,
+  on the next version, one resolution everywhere. So each region is meshed the
+  way they lay theirs out:
+  * *Rungs across.* Every outline gets stations 4 m apart, everywhere; only an
+    outline up to 20 m long on the edge of the area is left whole, so a road
+    cut off there ends in one quad. A road narrower than about 20 m gets rungs straight across from
     kerb to kerb — one quad across, one after the other along the road, and
     radial quads round a roundabout. A rung must meet the far kerb within 30°
     of square, and lands on the station across from it where one is within
@@ -722,17 +732,26 @@ How it is built (`src/layered.py`):
     loops running along the strip.
   * *Rows and grid.* Wider ground gets a row of quads along each outline (6 m
     on grass and open ground, 10 m along a road, 2 m along a footpath, a yard
-    or water) and a 4 m grid inside, lined up with the stations so the rows
-    meet it square on. Away from the middle the grid squares merge, two by two,
-    to 8 m within `focus_m` and up to 32 m beyond, wherever the survey under the
-    merged square stays within `tolerance_m`; a 4 m square that misses it by
-    more splits into 2 m ones. A square beside smaller ones takes their corner
-    on its side, as a quad and a triangle, so there is never a crack.
-  * *Loop cuts to the survey.* Where a face is still more than `tolerance_m`
-    off a surveyed grid node inside it — the ballast ridge of a railway, the
-    crest of a dike in a verge — an edge loop is cut through it and carried on
-    through the quads beside it, as Blender's loop cut does, ending in a
-    triangle.
+    or water) and a grid of 4 m squares inside, the same everywhere, land and
+    water bed alike. The squares used to merge up to 32 m in the far fields
+    and split to 2 m, and loops were cut wherever a face missed the survey;
+    the modellers found the patches of dense faces that left more work than
+    detail, and the mix of sizes hard to edit.
+  * *Turned to the streets.* The grid is turned to the direction most of the
+    outline length runs in, counted modulo 90° (a street and the one square to
+    it agree), so a row along a street meets it square on. Across Hoek van
+    Holland the streets run 36° off north, and every row along one met a
+    north–south grid in a band of triangles. Where no direction holds a
+    quarter of the outline length within 4°, the grid stays north–south.
+  * *Junctions through the grid.* What the rows leave of a junction is a big
+    polygon with a station every 4 m round it and nothing inside, and its
+    triangulation was fans of long slivers from the corners. Bigger than two
+    grid squares, it is filled through the grid nodes inside it instead, and
+    the triangles paired back into quads the size of a square.
+  * *A loop down a road on a dike.* A road's rungs run straight from kerb to
+    kerb. Where the survey across their middle is more than `tolerance_m` off
+    them (90th percentile), every rung of that road is cut in two: one loop
+    down its whole length, so it stays a ladder.
   * *A closed sheet.* Regions are meshed one by one, so a gap between two
     pieces of the outline coverage goes to the neighbour sharing most edge
     with it first; afterwards vertices within 1.2 cm of each other are made
@@ -743,10 +762,11 @@ How it is built (`src/layered.py`):
     faces standing nearly upright, on which a draped kerb and the check
     measuring it picked different faces.
 
-  Every outline is an edge of the terrain, so each layer is the terrain's own
-  faces under it — nothing on a layer can dip under the ground or float off
-  it. `layered.mesher: "triangles"` gives the old triangulation back, and is
-  what a quad mesh that fails falls back to.
+  Every outline is an edge of the sheet, so each layer is the faces under it
+  and the terrain object is what is left — the pieces share every vertex
+  along the edges where they meet, and none lies on another.
+  `layered.mesher: "triangles"` gives the old triangulation back, and is what
+  a quad mesh that fails falls back to.
 * **Water.** Water is meshed like the rest, with rungs across a ditch split
   at the middle: the middle line is the bed, `ditch_depth_m` (0.6 m) below the
   water level (one per connected water, see [Ground surfaces](#ground-surfaces)),
@@ -763,8 +783,10 @@ How it is built (`src/layered.py`):
   face running 1.5 m under the water: from the water the quay wall, from above
   its coping. The barrier stage's 1.1 m wall on top of the quay is left out.
   Jetties and pontoons (`kunstwerkdeel_vlak`, `steiger` and plus-type
-  `ponton`) are decks, `<Prefix>_Steigers` and `<Prefix>_Pontons`, at the
-  height the surface model saw on them (the lower quarter of its readings, so
+  `ponton`) are decks, `<Prefix>_Steigers` and `<Prefix>_Pontons`, the BGT's
+  pieces of one jetty joined into one deck (each piece read its own height,
+  and two met in a step with a crack down it), at the height the surface
+  model saw on them (the lower quarter of its readings, so
   a moored boat does not count), else 1.2 m (jetty) or 0.5 m (pontoon) above
   the water. Mooring posts (`meerpaal`) are posts from 1.5 m under to 2.5 m
   above the water, `<Prefix>_Meerpalen`. Where a jetty deck stands over or
@@ -795,41 +817,40 @@ How it is built (`src/layered.py`):
   before meshing, land into land where it can. Three BGT borders 35–40 cm
   wide side by side along a Hoek van Holland quay were narrower than any row
   the mesher lays, and the rows beside them missed their outlines: 21 cracks.
-* **Objects.** Every layer is grouped as the modellers group theirs: the
-  motorway is one object, `<Prefix>_Snelweg`; within `focus_m` (250 m) of the
-  centre each layer is split east and west, `<Prefix>_Centrum_Oost_Wegen`;
-  outside it by quadrant, `<Prefix>_Wegen_Afstand_NO`. The words are
-  `Wegen`, `Voetpaden` and `Gras`. A walkway goes whole to the side its middle
-  is on, because the curb generator kerbs every edge where an object ends.
-  `<Prefix>` is `layered.prefix`, or the area name: `hazeldonk_west` gives
-  `Hazeldonk_West_Terrein`.
+* **Objects.** One object per layer: `<Prefix>_Snelweg`, `<Prefix>_Wegen`,
+  `<Prefix>_Voetpaden` and `<Prefix>_Gras`, and `<Prefix>_Terrein` for the
+  ground none of them covers — bare ground, the ground under buildings, the
+  water beds. The ground used to be split east and west of the middle and by
+  quadrant beyond, as the hand-made file is; the modellers divide it
+  themselves. `<Prefix>` is `layered.prefix`, or the area name:
+  `hazeldonk_west` gives `Hazeldonk_West_Terrein`.
 * **Placing things.** Trees, lamp posts and fences stand on the top of the layer
-  under them: the terrain plus 5 cm on a road, plus the curb generator's raise
-  (13 cm more) on a walkway.
+  under them: the ground on a road or lawn, plus the curb generator's raise
+  (13 cm) on a walkway.
 
-In Blender every layer object carries the modellers' modifier stack, with two
-changes measured to be needed:
+In Blender nothing holds a layer onto anything: it is the ground. The
+modifiers:
 
 | Modifier | On | What it does |
 | --- | --- | --- |
-| *Shrinkwrap* (project along Z, both ways, offset the lift, snap *Outside Surface*) | roads, motorway, grass | keeps it on the terrain: reshape the terrain and the layers follow |
-| *Flatten for kerbs* (`Maptile_Flatten`) | walkways | lays the outline flat for the curb generator |
-| *CurbGenerator* | walkways | raises the walkway and builds the kerb round its outline |
-| *Drape on terrain* (`Maptile_Drape`) | walkways | lifts every vertex by the terrain's height under it, plus the lift: follows the terrain like a Shrinkwrap |
+| *CurbGenerator* (`Maptile_Kerbs_CurbGenerator`) | walkways | lays the walkway flat, runs the modellers' curb generator on it, and puts every point of the result back at the walkway's height straight below it |
 | *WeightedNormal* | walkways, terrain | the modellers' shading |
-| *Triangulate for export* (render only) | every layer, terrain | cuts quads as the terrain is cut, so a road stays parallel to it |
+| *Triangulate for export* (render only) | every layer, terrain | cuts quads the same way in every piece, so they stay matched along their shared edges |
 
-The two changes. The modellers' Shrinkwrap snaps *On Surface*, which offsets
-towards where a vertex was: raise the terrain past a road and the road ends up
-5 cm under it. *Outside Surface* offsets the same way but always up. And the
-curb generator was made for their level outlines: on outlines that follow the
-survey it threw kerb spikes — over Hazeldonk 1.5% of kerb vertices stood up to
-0.65 m off the ground, at slopes and at outline points a few centimetres lower
-than their neighbours — while the same outlines laid flat came out exact. So it
-is handed the outline flat, and the result is draped back onto the terrain:
-every walkway vertex then stands exactly its lift plus its own height in the
-kerb above the ground, on any slope. Editing is unchanged: move the outline
-and the kerb follows; reshape the terrain and the walkway follows.
+The curb generator was made for the modellers' level outlines: on outlines
+that follow the survey it threw kerb spikes — over Hazeldonk 1.5% of kerb
+vertices stood up to 0.65 m off the ground, at slopes and at outline points a
+few centimetres lower than their neighbours — while the same outlines laid
+flat came out exact. So the modifier wraps it: the walkway goes in flat, and
+every point that comes out is raised by the height of the walkway as it came
+in, read straight below it. Every one of the generator's inputs is passed
+through, so the modifier panel shows them as it would show the generator's
+own, and the generator itself is unchanged inside it. Move the outline, or
+raise a vertex of it, and the kerb follows. (It used to read the height off
+the terrain under the walkway; there is none now. Carrying each outline
+point's own height onto the kerb points made from it was tried and missed by
+up to half a metre on steep ground, where a kerb point lands away from the
+outline point it came from.)
 
 One more thing the generator needs: every outline vertex with exactly two
 outline edges. Where two footpaths touch at a single corner — common in a
@@ -838,11 +859,11 @@ flies off: over Utrecht by 800 m, elsewhere a metre into the air. Each
 walkway object is built with such a vertex split, one copy per side in the same
 place, so every outline is a simple loop.
 
-The terrain carries the aerial, a `ground_layer` face attribute (0 terrain,
-1 road, 4 motorway, 5 walkway, 6 grass), seams where the layer changes and a
-vertex group per layer outline (`outline_road`, `outline_motorway`,
+The terrain carries the aerial, seams along its edges where a layer begins
+and a vertex group per layer outline (`outline_road`, `outline_motorway`,
 `outline_walkway`, `outline_grass`), so *Select* on a group picks every
-walkway edge at once.
+walkway edge at once. Every ground piece carries its surveyed heights
+(`measured_z`), which *Reset terrain to survey* puts back.
 
 **Kerbs need Blender 5.** The curb generator is built on the *Bevel* geometry
 node, which only Blender 5 has. `blender/assets/curb_generator.blend` holds it
@@ -859,33 +880,39 @@ The layered style's settings, all optional:
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `layered.prefix` | the area name | what every ground object's name starts with |
-| `layered.tolerance_m` | 0.5 | how far the terrain may miss a surveyed grid node before the grid stays fine or a loop is cut there |
+| `layered.tolerance_m` | 0.5 | how far the survey may be off a road's rungs before a loop goes down its middle, and what the checks warn past |
 | `layered.mesher` | `"quads"` | `"quads"`, or `"triangles"` for the triangulation refined to `tolerance_m` |
+| `layered.square_m` | 4 | the size of the grid squares and the spacing of the points along every outline, the same everywhere, in whole survey grid squares; 8 has about a third of the faces over open ground |
 | `layered.ditch_depth_m` | 0.6 | how far below its water level a ditch is cut |
 | `layered.water_surface` | true | the flat water object over every BGT water |
 | `layered.water_level_offset_m` | 0 | added to every water level: a tide (the survey's is whatever the tide was when it was flown) |
 | `layered.harbour` | true | quay faces, jetties, pontoons, mooring posts, catwalks and fenders |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
-| `layered.focus_m` | 250 | half the side of the middle square split east and west |
-| `layered.road_lift_m`, `grass_lift_m` | 0.05, 0.02 | how far the layers lie above the terrain |
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
 
-Over the Hazeldonk square kilometre the terrain is 61,997 faces, 58% of them
-quads, on 49,224 vertices: 4 m squares in the middle, up to 32 m in the far
-fields, rungs across every road and loops along every verge, 119 ditches cut
-in. 95% of the 0.5 m survey is within 0.24 m of it, and 0.7% further than half
-a metre (it was 26,650 triangles and quads within 0.30 m with the old
-triangulation; the modellers' own terrain has about 2,100 faces and is within
-0.98 m on 95%). There are 19 layer objects, 6 of them walkways whose 3,828
-faces become 24,223 with their kerbs. The ground takes 25 seconds to build; the
-whole run takes about 4 minutes, most of it relighting the aerial, and passes
-all 63 checks.
+Over the Hazeldonk square kilometre the ground is 84,867 faces, 77% of them
+quads, on 75,479 vertices: 4 m squares everywhere, turned 15° to the roads,
+rungs across every road and loops along every verge, ditches cut in. 95% of
+the 0.5 m survey is within 0.28 m of it, and 1.7% further than half a metre.
+The version before, with squares up to 32 m in the far fields and loops cut
+to the survey, was 61,810 faces, 58% quads, within 0.24 m on 95%: the even
+grid costs faces in the open fields, which `square_m: 8` gives back (41,692
+faces, a little further from the survey, and fewer of them quads). The modellers' own terrain has about 2,100
+faces and is within 0.98 m on 95%. There are 4 layer objects; the walkways'
+3,929 faces become 25,619 with their kerbs. The ground takes 23 seconds to
+build; the whole run about 3½ minutes, most of it relighting the aerial, and
+it passes all 65 checks.
 
-Over Utrecht centre — quays, retaining walls, underpasses — the terrain is
-100,657 faces. A handful of layer vertices on faces steeper than 65° stand a
-few centimetres outside their lift band, which `layers_lie_on_the_terrain`
-allows up to 0.05% of the vertices and 10 cm each. And where two footpaths touch at a single point on
+Over the Hoek van Holland square the modellers commented on, the ground is
+82,348 faces, 79% quads (63% before), turned 36° to the streets; 34,542 of
+them are the beds of the harbour and the river, under the water object. With
+`square_m: 8` it is 38,383.
+
+Over Utrecht centre — quays, retaining walls, underpasses — the terrain was
+100,657 faces. A kerb mitred round a sharp corner can stand a few centimetres
+outside its band, which `layers_lie_on_the_terrain` allows up to 0.05% of the
+vertices and 10 cm each. And where two footpaths touch at a single point on
 the edge of the area, the kerb on the cut edge stands its own width outside
 it, which the check also allows: a runaway kerb goes metres.
 
@@ -1397,6 +1424,12 @@ Three details are worth knowing:
   63,000 of them. As bands in a tile repeating along the track they cost
   nothing. The UVs run in metres along the centreline, so the spacing holds
   through curves.
+- **A curve is cut like a straight.** The BGT draws a curve as a vertex every
+  few centimetres, and the track was cut at every one: a comb of hundreds of
+  edges beside straights cut every 4 m. Each line is simplified to within
+  3 cm first and then cut every 4 m at most, and each step of a bed or a
+  rail is one quad, the strip one piece. Over Hoek van Holland the metro's
+  ballast went from 8,078 triangles to 667 quads.
 - **The ribbon is mitred.** Using each segment's own normal would leave a notch
   on the outside of every bend; averaging the two adjacent normals and widening
   by `1/cos` keeps the edge continuous. The widening is capped, so a hairpin

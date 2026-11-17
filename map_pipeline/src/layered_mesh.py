@@ -9,16 +9,17 @@ What the modellers asked for, looking at the triangulated terrain:
 * **Points where the outlines meet**: round a roundabout the rungs run
   across from the island to the outer edge, so both outlines share them.
 * **Ditches**, carved in.
-* **Fewer points far away.**
+* **One resolution everywhere.** Asked again, with the model in hand: a
+  grid that coarsens away from the middle and loops cut wherever the survey
+  rises left patches far denser than the ground there needs, and a mix of
+  sizes is hard to edit. They divide the model themselves.
 
 So the ground is meshed region by region with the survey style's machinery
 (`terrain_mesh`): a row of quads along every outline, rungs straight across
 anything too narrow for two rows -- a road up to `PAVED_ROW_M` across is one
-ladder of quads -- and the terrain grid inside. Away from the middle the grid
-squares are merged into bigger ones, two by two, as far as the distance
-allows and as long as the merged square stays within the tolerance of the
-survey. A merged square beside smaller ones takes their corner on its side
-and is split into a quad and a triangle or two, so there is never a crack.
+ladder of quads -- and one grid of `NEAR_CELL_M` squares inside, the same
+everywhere. The grid is turned to the way the streets run (`_grid_angle`), so
+a row along a street meets it square on and the two stay quads.
 """
 
 from __future__ import annotations
@@ -37,35 +38,28 @@ PAVED_ROW_M = 10.0
 # strip between carriageways or the slope of a dike up to about twice this
 # across is a ladder of quads following its shape, not a grid cut across it.
 LAND_ROW_M = 6.0
-# Grid squares in the middle of the area are at most this big; out to the
-# focus distance twice this, beyond it `FAR_CELLS` times, where the survey
-# is flat enough for it.
+# The grid squares, everywhere; and the spacing of the stations along every
+# outline, so the rows meet the grid square on.
 NEAR_CELL_M = 4.0
-FAR_CELLS = 8
+# An outline along the edge of the area up to this long is left in one piece.
+FRAME_WHOLE_M = 2.0 * PAVED_ROW_M
 # A rung across a road meets the far kerb within this many degrees of square.
 SQUARE_DEG = 30.0
 
 
-def _spacing(focus_m: float, near_m: float):
-    """Station spacing by how far out an edge is: the same on both sides of it.
-
-    The grid's own spacing out to `focus_m`, so the rows meet the grid square
-    on; twice that beyond, where fewer points matter more than tidy rows.
-    """
-    def spacing(mid: np.ndarray, centre: np.ndarray) -> float:
-        d = float(np.max(np.abs(mid - centre)))
-        return near_m if d <= focus_m else 2.0 * near_m
-    return spacing
-
-
-def _with_stations(polygon, spacing, centre, size=None):
+def _with_stations(polygon, spacing, centre, size=None, turn=0.0):
     """A polygon with each edge cut into equal parts, spaced by distance.
 
     As `terrain_mesh._with_stations`: every edge is cut from the same end
     whichever ring runs along it, and its spacing is read at its middle, so
     the two regions sharing it compute the same stations. Edges along the edge
-    of the area (``size`` is its width and height) are left whole: nothing is
-    on the other side, and a road cut off there ends in one quad, not a fan.
+    of the area (``size`` is its width and height) are left whole up to
+    `FRAME_WHOLE_M`: nothing is on the other side, and a road cut off there
+    ends in one quad, not a fan. A longer one -- a field running along the
+    edge -- is cut like any other, or the strip along it has no vertices.
+    With the grid turned (`turn` degrees about `centre`, see `_grid_angle`)
+    the polygon is in the turned frame, and the edge of the area is found by
+    turning its corners back.
     """
     import shapely
 
@@ -74,10 +68,11 @@ def _with_stations(polygon, spacing, centre, size=None):
     rings = []
     for ring in [polygon.exterior, *polygon.interiors]:
         coords = np.asarray(ring.coords)[:, :2]
+        level = _turn(coords, turn, centre) if turn else coords
         out = [coords[0]]
-        for a, b in zip(coords[:-1], coords[1:]):
-            if size is not None and any(
-                abs(a[i] - edge) < 1e-6 and abs(b[i] - edge) < 1e-6
+        for (a, b), (la, lb) in zip(zip(coords[:-1], coords[1:]), zip(level[:-1], level[1:])):
+            if size is not None and float(np.hypot(*(b - a))) <= FRAME_WHOLE_M and any(
+                abs(la[i] - edge) < 1e-6 and abs(lb[i] - edge) < 1e-6
                 for i in (0, 1) for edge in (0.0, size[i])
             ):
                 out.append(b)
@@ -95,7 +90,108 @@ def _with_stations(polygon, spacing, centre, size=None):
     return shapely.Polygon(rings[0], rings[1:])
 
 
-def _divide_rungs(faces, across, step_m: float):
+def _turn(points, degrees: float, centre):
+    """Points turned anticlockwise by `degrees` about `centre`."""
+    points = np.asarray(points, dtype=np.float64)
+    if not degrees:
+        return points.copy()
+    a = np.radians(degrees)
+    c, s = np.cos(a), np.sin(a)
+    d = points[..., :2] - centre
+    out = points.copy()
+    out[..., 0] = centre[0] + c * d[..., 0] - s * d[..., 1]
+    out[..., 1] = centre[1] + s * d[..., 0] + c * d[..., 1]
+    return out
+
+
+# The grid is turned to the outlines only when they agree on a direction:
+# at least this share of their length within `ALIGN_WITHIN_DEG` of it.
+ALIGN_SHARE = 0.25
+ALIGN_WITHIN_DEG = 4.0
+
+
+def _grid_angle(pieces, size) -> float:
+    """The way the streets run, in degrees between -45 and 45; 0 for none.
+
+    Rows follow every outline, and where a row along a street meets a grid
+    square-on the two are one quad wide; where it meets it at 40 degrees, as
+    across most of Hoek van Holland, every cell along the street is cut into
+    triangles. So the grid is turned to the direction most of the outline
+    length runs in, counted modulo 90 degrees -- a street and the side
+    street square to it agree -- leaving out the edge of the area, which
+    runs north-south whatever the streets do.
+    """
+    lengths, angles = [], []
+    for polygon, _ in pieces:
+        for part in _parts(polygon):
+            for ring in [part.exterior, *part.interiors]:
+                c = np.asarray(ring.coords)[:, :2]
+                a, b = c[:-1], c[1:]
+                d = b - a
+                length = np.hypot(d[:, 0], d[:, 1])
+                on_edge = np.zeros(len(a), dtype=bool)
+                for i in (0, 1):
+                    for edge in (0.0, size[i]):
+                        on_edge |= (np.abs(a[:, i] - edge) < 1e-3) & (np.abs(b[:, i] - edge) < 1e-3)
+                keep = (length > 0.5) & ~on_edge
+                lengths.append(length[keep])
+                angles.append(np.degrees(np.arctan2(d[keep, 1], d[keep, 0])) % 90.0)
+    if not lengths:
+        return 0.0
+    length = np.concatenate(lengths)
+    angle = np.concatenate(angles)
+    if not len(length) or length.sum() <= 0:
+        return 0.0
+    hist = np.bincount(np.floor(angle).astype(int) % 90, weights=length, minlength=90)
+    window = int(round(ALIGN_WITHIN_DEG))
+    smooth = sum(np.roll(hist, k) for k in range(-window, window + 1))
+    peak = float(np.argmax(smooth)) + 0.5
+    # Refined to the length-weighted mean near the peak, on the circle of 90.
+    off = (angle - peak + 45.0) % 90.0 - 45.0
+    near = np.abs(off) <= ALIGN_WITHIN_DEG
+    if length[near].sum() < ALIGN_SHARE * length.sum():
+        return 0.0
+    best = peak + float(np.average(off[near], weights=length[near]))
+    best = (best + 45.0) % 90.0 - 45.0
+    return 0.0 if abs(best) < 1.0 else round(best, 3)
+
+
+def _flat_on_frame(xy, sizes, loops, size) -> np.ndarray:
+    """Faces with no area whose corners all lie on one edge of the area."""
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    face_of = np.repeat(np.arange(len(sizes)), sizes)
+    following = np.arange(len(loops)) + 1
+    following[starts + sizes - 1] = starts
+    a, b = xy[loops], xy[loops[following]]
+    area = np.zeros(len(sizes))
+    np.add.at(area, face_of, a[:, 0] * b[:, 1] - b[:, 0] * a[:, 1])
+    flat = np.abs(0.5 * area) < 1e-6
+    on_edge = np.zeros(len(sizes), dtype=bool)
+    for i in (0, 1):
+        for edge in (0.0, size[i]):
+            there = np.abs(xy[loops, i] - edge) < 1e-6
+            on_edge |= np.bincount(face_of, weights=there, minlength=len(sizes)) == sizes
+    return flat & on_edge
+
+
+def _rungs_miss(across, height_at) -> float:
+    """How far the survey is off the straight rungs across a road, at their
+    quarter, middle and three-quarter points: the 90th percentile, so one
+    rung over a ditch does not split a whole street."""
+    if not across:
+        return 0.0
+    ends = np.array([np.asarray(line.coords)[[0, -1], :2] for line in across])
+    a, b = ends[:, 0], ends[:, 1]
+    za, zb = height_at(a), height_at(b)
+    worst = np.zeros(len(across))
+    for t in (0.25, 0.5, 0.75):
+        z = height_at(a + (b - a) * t)
+        worst = np.maximum(worst, np.abs(z - (za + (zb - za) * t)))
+    worst = worst[np.isfinite(worst)]
+    return float(np.percentile(worst, 90)) if len(worst) else 0.0
+
+
+def _divide_rungs(faces, across, step_m: float, count: int | None = None):
     """The rungs across a strip of ground cut into pieces about `step_m` long.
 
     A ladder straight across a verge or the slope of a dike has vertices only
@@ -115,7 +211,8 @@ def _divide_rungs(faces, across, step_m: float):
     lengths = np.array([line.length for line in across])
     if not len(lengths):
         return faces, 0
-    count = int(np.clip(np.round(np.median(lengths) / step_m), 1, 4))
+    if count is None:
+        count = int(np.clip(np.round(np.median(lengths) / step_m), 1, 4))
     if count < 2:
         return faces, 0
     cuts = {}
@@ -173,252 +270,6 @@ def _divide_rungs(faces, across, step_m: float):
     return out, len(used)
 
 
-def _loop_cuts(local_xy, sizes, loops, face_kind, face_part, face_code, *, height_at,
-               nodes_xy, nodes_z, tolerance_m, skip_kind, max_cuts=4000, max_run=400,
-               min_edge_m=1.0):
-    """Edge loops cut through the faces that miss the survey, as a modeller would.
-
-    The faces are laid out from the outlines and the grid; between their
-    corners the ground can still do something they do not -- the ballast
-    ridge of a railway, the crest of a dike in a verge. Where a face is more
-    than `tolerance_m` off a survey grid node inside it, the pair of opposite
-    edges whose middles bring it closest is cut, and the cut is carried on
-    through the quads beside it, edge to opposite edge, as Blender's loop cut
-    does: a new loop along the strip. It ends in a triangle, at a face of
-    `skip_kind` (water, carved on purpose), or after `max_run` quads, with
-    the last face split into a quad and a triangle so there is never a crack.
-
-    Returns the new vertices, sizes, loops, kinds, parts and codes, and how
-    many loops were cut.
-    """
-    import heapq
-
-    import shapely
-
-    xy = [tuple(p) for p in np.asarray(local_xy, dtype=np.float64).tolist()]
-    z = [float(v) for v in height_at(np.asarray(local_xy, dtype=np.float64))]
-    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
-    faces = [list(map(int, loops[s: s + n])) for s, n in zip(starts, sizes)]
-    kind, part, code = list(face_kind), list(face_part), list(face_code)
-    alive = [True] * len(faces)
-    nodes_xy = np.asarray(nodes_xy, dtype=np.float64)
-    nodes_z = np.asarray(nodes_z, dtype=np.float64)
-
-    def ekey(a, b):
-        return (a, b) if a < b else (b, a)
-
-    edge_faces: dict = {}
-
-    def link(f):
-        v = faces[f]
-        for i in range(len(v)):
-            edge_faces.setdefault(ekey(v[i], v[(i + 1) % len(v)]), set()).add(f)
-
-    def unlink(f):
-        v = faces[f]
-        for i in range(len(v)):
-            edge_faces.get(ekey(v[i], v[(i + 1) % len(v)]), set()).discard(f)
-
-    for f in range(len(faces)):
-        link(f)
-
-    # Which survey nodes lie in which face.
-    polygons = np.array([shapely.Polygon([xy[i] for i in v]) for v in faces], dtype=object)
-    node_lists: dict = {}
-    if len(faces) and len(nodes_xy):
-        tree = shapely.STRtree(polygons)
-        ni, fi = tree.query(shapely.points(nodes_xy), predicate="intersects")
-        order = np.argsort(ni, kind="stable")
-        ni, fi = ni[order], fi[order]
-        first = np.ones(len(ni), dtype=bool)
-        first[1:] = ni[1:] != ni[:-1]
-        for n, f in zip(ni[first], fi[first]):
-            node_lists.setdefault(int(f), []).append(int(n))
-    node_lists = {f: np.array(v, dtype=np.int64) for f, v in node_lists.items()}
-
-    def inside(points, ring):
-        """Which points lie in the convex counter-clockwise ring."""
-        ok = np.ones(len(points), dtype=bool)
-        for i in range(len(ring)):
-            ax, ay = ring[i]
-            bx, by = ring[(i + 1) % len(ring)]
-            cross = (bx - ax) * (points[:, 1] - ay) - (by - ay) * (points[:, 0] - ax)
-            ok &= cross >= -1e-7
-        return ok
-
-    def tri_interp(points, a, b, c, za, zb, zc):
-        det = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
-        if abs(det) < 1e-12:
-            return np.full(len(points), np.nan), np.zeros(len(points), dtype=bool)
-        w1 = ((b[1] - c[1]) * (points[:, 0] - c[0]) + (c[0] - b[0]) * (points[:, 1] - c[1])) / det
-        w2 = ((c[1] - a[1]) * (points[:, 0] - c[0]) + (a[0] - c[0]) * (points[:, 1] - c[1])) / det
-        w3 = 1.0 - w1 - w2
-        hit = (w1 >= -1e-7) & (w2 >= -1e-7) & (w3 >= -1e-7)
-        return w1 * za + w2 * zb + w3 * zc, hit
-
-    def error_of(ring_ids, nodes, ring_xy=None, ring_z=None):
-        if nodes is None or not len(nodes):
-            return 0.0
-        pts = nodes_xy[nodes]
-        target = nodes_z[nodes]
-        rx = ring_xy if ring_xy is not None else [xy[i] for i in ring_ids]
-        rz = ring_z if ring_z is not None else [z[i] for i in ring_ids]
-        if len(rx) == 3:
-            value, _ = tri_interp(pts, rx[0], rx[1], rx[2], rz[0], rz[1], rz[2])
-            return float(np.nanmax(np.abs(value - target), initial=0.0))
-        best = np.inf
-        for d in (0, 1):
-            a, b, c, e = d, d + 1, d + 2, (d + 3) % 4
-            v1, h1 = tri_interp(pts, rx[a], rx[b], rx[c], rz[a], rz[b], rz[c])
-            v2, _ = tri_interp(pts, rx[a], rx[c], rx[e], rz[a], rz[c], rz[e])
-            value = np.where(h1, v1, v2)
-            best = min(best, float(np.nanmax(np.abs(value - target), initial=0.0)))
-        return best
-
-    heap: list = []
-
-    def push(f):
-        if kind[f] == skip_kind:
-            return
-        err = error_of(faces[f], node_lists.get(f))
-        if err > tolerance_m:
-            heapq.heappush(heap, (-err, f))
-
-    def new_vertex(a, b):
-        p = (0.5 * (xy[a][0] + xy[b][0]), 0.5 * (xy[a][1] + xy[b][1]))
-        xy.append(p)
-        z.append(float(height_at(np.array([p]))[0]))
-        return len(xy) - 1
-
-    mids: dict = {}
-
-    def mid(a, b):
-        k = ekey(a, b)
-        if k not in mids:
-            mids[k] = new_vertex(a, b)
-        return mids[k]
-
-    def replace(f, children):
-        unlink(f)
-        alive[f] = False
-        nodes = node_lists.pop(f, None)
-        for child in children:
-            faces.append(child)
-            kind.append(kind[f])
-            part.append(part[f])
-            code.append(code[f])
-            alive.append(True)
-            g = len(faces) - 1
-            link(g)
-            if nodes is not None and len(nodes):
-                mine = inside(nodes_xy[nodes], [xy[i] for i in child])
-                if mine.any():
-                    node_lists[g] = nodes[mine]
-                    nodes = nodes[~mine]
-            push(g)
-
-    def at(v, a, b):
-        """Index i with v[i], v[i+1] being a and b in either order."""
-        n = len(v)
-        for i in range(n):
-            if ekey(v[i], v[(i + 1) % n]) == ekey(a, b):
-                return i
-        return None
-
-    def carry(a, b, m):
-        """Carry a cut of edge a-b (middle m) on into the face across it."""
-        steps = 0
-        while True:
-            across = [g for g in edge_faces.get(ekey(a, b), ()) if alive[g]]
-            if not across:
-                return
-            g = across[0]
-            v = faces[g]
-            i = at(v, a, b)
-            if i is None:
-                return
-            n = len(v)
-            x, y = v[i], v[(i + 1) % n]
-            if n == 3:
-                c = v[(i + 2) % 3]
-                replace(g, [[x, m, c], [m, y, c]])
-                return
-            c, d = v[(i + 2) % 4], v[(i + 3) % 4]
-            if kind[g] == skip_kind or steps >= max_run:
-                replace(g, [[x, m, d], [m, y, c, d]])
-                return
-            m2 = mid(c, d)
-            replace(g, [[x, m, m2, d], [m, y, c, m2]])
-            a, b, m = c, d, m2
-            steps += 1
-
-    for f in range(len(faces)):
-        push(f)
-    cuts = 0
-    while heap and cuts < max_cuts:
-        neg, f = heapq.heappop(heap)
-        if not alive[f]:
-            continue
-        v = faces[f]
-        err = -neg
-        nodes = node_lists.get(f)
-        if len(v) == 3:
-            lengths = [np.hypot(xy[v[(i + 1) % 3]][0] - xy[v[i]][0],
-                                xy[v[(i + 1) % 3]][1] - xy[v[i]][1]) for i in range(3)]
-            i = int(np.argmax(lengths))
-            if lengths[i] < 2.0 * min_edge_m:
-                continue
-            x, y, c = v[i], v[(i + 1) % 3], v[(i + 2) % 3]
-            m = mid(x, y)
-            replace(f, [[x, m, c], [m, y, c]])
-            carry(x, y, m)
-            cuts += 1
-            continue
-        best = None
-        for i in (0, 1):
-            x, y, c, d = v[i], v[i + 1], v[(i + 2) % 4], v[(i + 3) % 4]
-            l1 = np.hypot(xy[y][0] - xy[x][0], xy[y][1] - xy[x][1])
-            l2 = np.hypot(xy[d][0] - xy[c][0], xy[d][1] - xy[c][1])
-            if min(l1, l2) < 2.0 * min_edge_m:
-                continue
-            p1 = (0.5 * (xy[x][0] + xy[y][0]), 0.5 * (xy[x][1] + xy[y][1]))
-            p2 = (0.5 * (xy[c][0] + xy[d][0]), 0.5 * (xy[c][1] + xy[d][1]))
-            h = height_at(np.array([p1, p2]))
-            ring_a = [xy[x], p1, p2, xy[d]]
-            ring_b = [p1, xy[y], xy[c], p2]
-            za = [z[x], h[0], h[1], z[d]]
-            zb = [h[0], z[y], z[c], h[1]]
-            if nodes is not None and len(nodes):
-                pts = nodes_xy[nodes]
-                in_a = inside(pts, ring_a)
-                score = max(error_of(None, nodes[in_a], ring_a, za),
-                            error_of(None, nodes[~in_a], ring_b, zb))
-            else:
-                score = 0.0
-            if best is None or score < best[0]:
-                best = (score, i)
-        if best is None or best[0] >= err - 0.05:
-            continue  # no cut here gets it any closer
-        i = best[1]
-        x, y, c, d = v[i], v[i + 1], v[(i + 2) % 4], v[(i + 3) % 4]
-        m1, m2 = mid(x, y), mid(c, d)
-        replace(f, [[x, m1, m2, d], [m1, y, c, m2]])
-        carry(x, y, m1)
-        carry(c, d, m2)
-        cuts += 1
-
-    keep = [f for f in range(len(faces)) if alive[f]]
-    sizes_out = np.array([len(faces[f]) for f in keep], dtype=np.int64)
-    loops_out = np.array([i for f in keep for i in faces[f]], dtype=np.int64)
-    return (
-        np.array(xy, dtype=np.float64), sizes_out, loops_out,
-        np.array([kind[f] for f in keep], dtype=np.int64),
-        np.array([part[f] for f in keep], dtype=np.int64),
-        np.array([code[f] for f in keep], dtype=np.int64),
-        cuts,
-    )
-
-
 # A triangle less than this high over its long edge is a sliver: its normal
 # points anywhere, and whatever is shrinkwrapped onto it is thrown sideways.
 SLIVER_HEIGHT_M = 0.05
@@ -432,7 +283,8 @@ def _merge_slivers(local_xy, sizes, loops, face_kind, face_part, face_code,
     covers both, and is filled again if it is no longer a triangle or a convex
     quad. Nothing moves and no vertex is lost, so no crack opens.
 
-    Returns the faces as `_loop_cuts` does, and how many slivers went.
+    Returns the new vertices, sizes, loops, kinds, parts and codes, and how
+    many slivers went.
     """
     import shapely
 
@@ -1033,109 +885,9 @@ def _area(coords) -> float:
     return 0.5 * abs(float(np.sum(c[:, 0] * np.roll(c[:, 1], -1) - np.roll(c[:, 0], -1) * c[:, 1])))
 
 
-def _cap_levels(nb: int, size: float, centre, focus_m: float, near_m: float, g: float):
-    """Per block of `size`, whether its distance allows a block that big."""
-    mids = (np.arange(nb) + 0.5) * size
-    dx = np.abs(mids[None, :] - centre[0])
-    dy = np.abs(mids[:, None] - centre[1])
-    # The block's nearest point, so a big block never reaches into the middle.
-    d = np.maximum(np.maximum(dx, dy) - 0.5 * size, 0.0)
-    cap = np.where(d <= 0.5 * focus_m, near_m, np.where(d <= focus_m, 2 * near_m, FAR_CELLS * near_m))
-    return size <= cap + 1e-9
-
-
-def _blocks(owner, heights, g, centre, *, focus_m, near_m, base_level, tolerance_m):
-    """The core squares as blocks: a level per survey grid square, balanced.
-
-    `owner` is the region index per square of the survey grid (-1 where no
-    grid face is), `heights` the grid's node heights, `g` its spacing. A
-    block of level ``l`` is ``2**l`` survey squares across; the grid the rows
-    meet is level `base_level`. A block a level up merges four owned by the
-    same region where the distance allows a block that big and every survey
-    node inside lies within `tolerance_m` of the merged square. A base block
-    that misses the survey by more than that is split in four, unless a row
-    or fill face is beside it: those carry a vertex at every base grid node
-    and no more. No block is more than one level bigger than the one beside
-    it, so a side carries at most one extra vertex.
-    """
-    rows, cols = owner.shape
-    top = int(max(0, np.floor(np.log2(max(FAR_CELLS * near_m / g, 1.0)) + 1e-9)))
-    finest = max(0, base_level - 1)
-    free = owner < 0
-    padded = np.pad(free, 1, constant_values=False)
-    beside_free = (
-        free | padded[:-2, 1:-1] | padded[2:, 1:-1] | padded[1:-1, :-2] | padded[1:-1, 2:]
-    )
-    ok = [owner >= 0]
-    for level in range(1, top + 1):
-        m = 2 ** level
-        nb_r, nb_c = rows // m, cols // m
-        if nb_r < 1 or nb_c < 1:
-            break
-        prev = ok[-1]
-        children = (
-            prev[0: 2 * nb_r: 2, 0: 2 * nb_c: 2] & prev[1: 2 * nb_r: 2, 0: 2 * nb_c: 2]
-            & prev[0: 2 * nb_r: 2, 1: 2 * nb_c: 2] & prev[1: 2 * nb_r: 2, 1: 2 * nb_c: 2]
-        )
-        view = owner[: nb_r * m, : nb_c * m].reshape(nb_r, m, nb_c, m)
-        same = (view == view[:, :1, :, :1]).all(axis=(1, 3))
-        if level <= finest:
-            ok.append(children & same)
-            continue
-        # Every survey grid node inside the block, against the merged square.
-        windows = np.lib.stride_tricks.sliding_window_view(heights, (m + 1, m + 1))[::m, ::m]
-        windows = windows[:nb_r, :nb_c]
-        u = np.arange(m + 1) / m
-        z00 = windows[:, :, 0, 0][..., None, None]
-        z10 = windows[:, :, 0, -1][..., None, None]
-        z01 = windows[:, :, -1, 0][..., None, None]
-        z11 = windows[:, :, -1, -1][..., None, None]
-        uu, vv = np.meshgrid(u, u)
-        plane = (1 - vv) * ((1 - uu) * z00 + uu * z10) + vv * ((1 - uu) * z01 + uu * z11)
-        dev = np.nanmax(np.abs(windows - plane), axis=(2, 3))
-        flat = np.isfinite(dev) & (dev <= tolerance_m)
-        if level <= base_level:
-            edge = beside_free[: nb_r * m, : nb_c * m].reshape(nb_r, m, nb_c, m).any(axis=(1, 3))
-            ok.append(children & same & (flat | edge))
-            continue
-        cap = _cap_levels(max(nb_r, nb_c), m * g, centre, focus_m, near_m, g)[:nb_r, :nb_c]
-        ok.append(children & same & cap & flat)
-
-    def levels():
-        out = np.where(owner >= 0, 0, -1)
-        jj, ii = np.indices(owner.shape)
-        for level in range(1, len(ok)):
-            m = 2 ** level
-            nb_r, nb_c = ok[level].shape
-            inside = (jj < nb_r * m) & (ii < nb_c * m)
-            hit = np.zeros(owner.shape, dtype=bool)
-            hit[inside] = ok[level][jj[inside] // m, ii[inside] // m]
-            out[hit] = level
-        return out
-
-    block_level = levels()
-    for _ in range(4 * len(ok) + 4):
-        # Squares with no grid face count as the base level: the faces there
-        # carry a vertex at every base grid node along the edge of the grid.
-        seen = np.where(block_level < 0, base_level, block_level)
-        padded = np.pad(seen, 1, constant_values=10 ** 6)
-        neighbour = np.minimum.reduce([
-            padded[:-2, 1:-1], padded[2:, 1:-1], padded[1:-1, :-2], padded[1:-1, 2:],
-        ])
-        too_big = (block_level > neighbour + 1) & (block_level >= 1)
-        if not too_big.any():
-            break
-        jj, ii = np.nonzero(too_big)
-        for j, i in zip(jj, ii):
-            level = int(block_level[j, i])
-            m = 2 ** level
-            ok[level][j // m, i // m] = False
-        block_level = levels()
-    return block_level
-
-
-def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, depth_m,
-                 paved_codes, narrow_codes=(), near_m: float = NEAR_CELL_M, quays=()):
+def quad_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
+                 paved_codes, narrow_codes=(), near_m: float = NEAR_CELL_M, quays=(),
+                 tolerance_m: float = 0.5):
     """The terrain mesh, quads first, conforming to every piece's outline.
 
     `pieces` are ``(polygon, code)`` in local coordinates from the first grid
@@ -1186,7 +938,8 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     outer = shapely.difference(frame.buffer(4.0 * widest, join_style="mitre"), frame)
 
     timings = {}
-    spacing = _spacing(float(focus_m), near_m)
+    def spacing(mid, centre):
+        return near_m
     # Each region is meshed on its own, so a gap between two of them -- left
     # where a hairpin was trimmed, say -- would be a hole. It goes to the
     # neighbour it shares most outline with.
@@ -1198,9 +951,22 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     # over Rotterdam's Rijnhaven).
     pieces, overlaps = _without_overlaps(pieces)
     pieces, thin = _without_thin(pieces, THIN_M, wet_code=codes_wet)
+    # The grid turned to the streets, by turning everything else the other
+    # way and turning the mesh back once it is assembled.
+    turn = _grid_angle(pieces, (width, height))
+    if turn:
+        pieces = [
+            (shapely.transform(p, lambda c: _turn(c, -turn, centre)), code)
+            for p, code in pieces
+        ]
+        frame = shapely.Polygon(_turn(np.asarray(frame.exterior.coords), -turn, centre))
+        outer = shapely.difference(frame.buffer(4.0 * widest, join_style="mitre"), frame)
+        reach = int(np.ceil((0.5 * np.hypot(width, height) + near_m) / near_m))
+        xs = centre[0] + near_m * np.arange(-reach, reach + 1)
+        ys = centre[1] + near_m * np.arange(-reach, reach + 1)
     parts, codes = [], []
     for polygon, code in pieces:
-        polygon = _with_stations(polygon, spacing, centre, (width, height))
+        polygon = _with_stations(polygon, spacing, centre, (width, height), turn=turn)
         polygon = shapely.orient_polygons(shapely.set_precision(polygon, GRID_SIZE))
         for piece in _parts(polygon):
             if piece.area > 1e-4:
@@ -1221,8 +987,12 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
             [shapely.transform(q, lambda c: c - shift) for q in quays], dtype=object
         )).buffer(QUAY_REACH_M)
         shapely.prepare(quay_zone)
+        turned_quays = (
+            shapely.transform(quay_zone, lambda c: _turn(c, -turn, centre)) if turn
+            else quay_zone
+        )
         for i, (polygon, kind) in enumerate(parts):
-            if kind == WATER and polygon.boundary.intersection(quay_zone).length > QUAY_MIN_M:
+            if kind == WATER and polygon.boundary.intersection(turned_quays).length > QUAY_MIN_M:
                 rows[i] = QUAY_ROW_M
     t = time.time()
     # A rung lands on the station across from it where there is one within
@@ -1240,7 +1010,16 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     faces = []  # (coords local, part, mesher kind, code)
     failed = 0
     divided = 0
+    crowned = 0
     refilled = 0
+
+    def height_local(points):
+        """The survey's height at points in the (turned) frame the mesher works in."""
+        flat = _turn(points, turn, centre) if turn else np.asarray(points, dtype=np.float64)
+        return np.asarray(
+            terrain.sample(flat[:, 0] + shift[0], flat[:, 1] + shift[1]), dtype=np.float64
+        )
+
     t = time.time()
     for index, (region, kind) in enumerate(parts):
         before = taken.copy()
@@ -1248,6 +1027,7 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
             out, cells, _, _ = _mesh_region(
                 region, kind, frame, outer, xs, ys, taken,
                 row_m=rows[index], margin_m=margin_m, across=across.get(index, ()),
+                spaced_fill=True,
             )
         except Exception as exc:  # noqa: BLE001 - one region, not the terrain
             LOG.debug("layered terrain: region %d meshed without rows: %s", index, exc)
@@ -1271,92 +1051,27 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
         if kind == LAND and codes[index] not in paved_codes and across.get(index):
             out, n_divided = _divide_rungs(out, across[index], near_m)
             divided += n_divided
+        elif (kind == LAND and across.get(index)
+              and _rungs_miss(across[index], height_local) > tolerance_m):
+            # A road on a dike or with a crown the survey shows: one loop
+            # down its middle, along the whole road, so it stays a ladder.
+            out, n_divided = _divide_rungs(out, across[index], near_m, count=2)
+            divided += n_divided
+            crowned += 1
         faces.extend((c, p, kind, codes[index]) for c, p in out)
         if len(cells):
             owner[cells[:, 1], cells[:, 0]] = index
     timings["regions_meshed_s"] = round(time.time() - t, 1)
 
-    # ---- the grid squares, merged into blocks away from the middle --------
+    # ---- the grid squares, one size everywhere ----------------------------
     t = time.time()
-    grid_z = np.asarray(
-        terrain.measured if terrain.measured is not None else terrain.heights,
-        dtype=np.float64,
-    )
-    # On the survey grid itself, so a base square can be split where it has
-    # to be. Only for a power of two: otherwise the base grid is the finest.
-    split = k if (k & (k - 1)) == 0 else 1
-    base_level = int(np.log2(split))
-    owner_fine = np.repeat(np.repeat(owner, split, axis=0), split, axis=1)
-    if split == 1:
-        xs_fine, ys_fine, g_fine = xs, ys, near_m
-        z_fine = grid_z[::k, ::k][: len(ys), : len(xs)]
-    else:
-        xs_fine, ys_fine, g_fine = xs_full, ys_full, g
-        z_fine = grid_z
-    block_level = _blocks(
-        owner_fine, z_fine, g_fine, centre, focus_m=float(focus_m), near_m=near_m,
-        base_level=base_level, tolerance_m=float(tolerance_m),
-    )
-    owner = owner_fine
-    blocks = []  # (level, I, J)
-    for level in range(int(block_level.max()) + 1 if block_level.size else 0):
-        m = 2 ** level
-        jj, ii = np.nonzero(block_level == level)
-        first = (jj % m == 0) & (ii % m == 0)
-        blocks.extend((level, int(i // m), int(j // m)) for j, i in zip(jj[first], ii[first]))
-
-    def corner_keys(points):
-        k = np.rint(np.asarray(points) * 1000.0).astype(np.int64)
-        return k[:, 0] * (1 << 31) + k[:, 1]
-
-    region_corners = (
-        np.vstack([c for c, _, _, _ in faces]) if faces else np.zeros((0, 2))
-    )
-    block_arr = np.array(blocks, dtype=np.int64).reshape(-1, 3)
-    m_arr = 2 ** block_arr[:, 0]
-    i0, j0 = block_arr[:, 1] * m_arr, block_arr[:, 2] * m_arr
-    i1, j1 = i0 + m_arr, j0 + m_arr
-    block_corners = np.stack([
-        np.column_stack([xs_fine[i0], ys_fine[j0]]), np.column_stack([xs_fine[i1], ys_fine[j0]]),
-        np.column_stack([xs_fine[i1], ys_fine[j1]]), np.column_stack([xs_fine[i0], ys_fine[j1]]),
-    ], axis=1) if len(block_arr) else np.zeros((0, 4, 2))
-    known = np.unique(np.concatenate([
-        corner_keys(region_corners), corner_keys(block_corners.reshape(-1, 2)),
-    ]))
-    hanging_faces = 0
-    levels_arr = block_arr[:, 0] if len(block_arr) else np.zeros(0, dtype=np.int64)
-    for level in np.unique(levels_arr):
-        chosen = np.flatnonzero(levels_arr == level)
-        m = 2 ** int(level)
-        corners_l = block_corners[chosen]  # (B, 4, 2)
-        owners = owner[j0[chosen], i0[chosen]]
-        if m == 1:
-            faces.extend(
-                (corners_l[b], CORE, parts[o][1], codes[o]) for b, o in enumerate(owners)
-            )
-            continue
-        # Every grid node along each side, and which of them a face beside
-        # the block has as a corner.
-        frac = (np.arange(1, m) / m)[None, None, :, None]
-        a = corners_l[:, :, None, :]
-        c = np.roll(corners_l, -1, axis=1)[:, :, None, :]
-        between = a + (c - a) * frac  # (B, 4, m-1, 2)
-        present = np.isin(corner_keys(between.reshape(-1, 2)), known).reshape(
-            len(chosen), 4, m - 1
-        )
-        for b, o in enumerate(owners):
-            kind, code = parts[o][1], codes[o]
-            if not present[b].any():
-                faces.append((corners_l[b], CORE, kind, code))
-                continue
-            ring = []
-            for side in range(4):
-                ring.append(corners_l[b, side][None, :])
-                ring.append(between[b, side][present[b, side]])
-            hanging_faces += 1
-            faces.extend(
-                (q, CORE, kind, code) for q in _fill(shapely.Polygon(np.vstack(ring)))
-            )
+    jj, ii = np.nonzero(owner >= 0)
+    for j, i in zip(jj.tolist(), ii.tolist()):
+        o = int(owner[j, i])
+        corners = np.array([
+            (xs[i], ys[j]), (xs[i + 1], ys[j]), (xs[i + 1], ys[j + 1]), (xs[i], ys[j + 1]),
+        ])
+        faces.append((corners, CORE, parts[o][1], codes[o]))
     timings["grid_s"] = round(time.time() - t, 1)
 
     # ---- assemble, one vertex per position ----------------------------------
@@ -1370,8 +1085,23 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     face_kind = np.array([k for _, _, k, _ in faces], dtype=np.int64)
     face_part = np.array([p for _, p, _, _ in faces], dtype=np.int64)
     face_code = np.array([c for _, _, _, c in faces], dtype=np.int64)
+    if turn:
+        # Back the way it came, the edge of the area put back exactly on it:
+        # to the centimetre the turned outlines were rounded to, its corners
+        # were off it.
+        local_xy = _turn(local_xy, turn, centre)
+        for i, edge in ((0, 0.0), (0, width), (1, 0.0), (1, height)):
+            near_edge = np.abs(local_xy[:, i] - edge) < 2.0 * GRID_SIZE
+            local_xy[near_edge, i] = edge
+        local_xy[:, 0] = np.clip(local_xy[:, 0], 0.0, width)
+        local_xy[:, 1] = np.clip(local_xy[:, 1], 0.0, height)
     local_xy, sizes, loops, welded = _weld(local_xy, sizes, loops)
     keep = _distinct_corners(loops, sizes) & (sizes >= 3)
+    if turn:
+        # A sliver at a corner of the area whose corners all went back onto
+        # its edge is flat now: nothing, and only the edge of the area is
+        # left open without it.
+        keep &= ~_flat_on_frame(local_xy, sizes, loops, (width, height))
     if not keep.all():
         loops = loops[np.repeat(keep, sizes)]
         sizes, face_kind, face_part, face_code = (
@@ -1390,18 +1120,6 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
         loops = remap[loops]
         local_xy = local_xy[used]
 
-    # ---- loops cut where the faces miss the survey -------------------------
-    t = time.time()
-    gx, gy = np.meshgrid(xs_full, ys_full)
-    local_xy, sizes, loops, face_kind, face_part, face_code, cuts = _loop_cuts(
-        local_xy, sizes, loops, face_kind, face_part, face_code,
-        height_at=lambda p: np.asarray(
-            terrain.sample(p[:, 0] + shift[0], p[:, 1] + shift[1]), dtype=np.float64
-        ),
-        nodes_xy=np.column_stack([gx.ravel(), gy.ravel()]), nodes_z=grid_z.ravel(),
-        tolerance_m=float(tolerance_m), skip_kind=WATER,
-    )
-    timings["loop_cuts_s"] = round(time.time() - t, 1)
     local_xy, sizes, loops, face_kind, face_part, face_code, slivers = _merge_slivers(
         local_xy, sizes, loops, face_kind, face_part, face_code,
     )
@@ -1411,31 +1129,26 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, tolerance_m, focus_m, de
     # survey itself, read at an outline point on a retaining wall, made faces
     # standing nearly upright, slivers seen from above, on which whatever is
     # draped picks one sliver and a check the next. The grid is never steeper
-    # than it is between two of its nodes, and the loop cuts already hold the
-    # faces to the survey.
+    # than it is between two of its nodes.
     heights = np.asarray(terrain.sample(xy[:, 0], xy[:, 1]), dtype=np.float64)
     heights = _water_heights(heights, loops, sizes, face_kind, xy, bodies, shift, depth_m)
     heights = _gentle_banks(heights, loops, sizes, face_kind, local_xy, WATER, steep=quay_zone)
     vertices = np.column_stack([xy, heights])
     sizes, loops = _orient(vertices, sizes, loops, face_part, face_kind, terrain)
 
-    levels_used = {
-        f"{(2 ** level) * g_fine:g} m": int((block_arr[:, 0] == level).sum())
-        for level in np.unique(block_arr[:, 0])
-    } if len(block_arr) else {}
     stats = {
         "mesher": "quads",
-        "grid_blocks": levels_used,
-        "grid_blocks_split_at_a_finer_neighbour": int(hanging_faces),
+        "grid_angle_deg": float(turn),
+        "grid_squares": {f"{near_m:g} m": int(len(jj))},
         "cross_rungs": int(sum(len(v) for v in across.values())),
         "regions_meshed_without_rows": int(failed),
         "rungs_divided": int(divided),
+        "roads_given_a_middle_loop": int(crowned),
         "regions_filled_whole": int(refilled),
         "pieces_overlapping": int(overlaps),
         "thin_strips_folded": int(thin),
         "t_junctions_mended": int(mended),
         "water_along_quays": int(sum(1 for r in rows if r == QUAY_ROW_M)),
-        "loops_cut_to_the_survey": int(cuts),
         "slivers_merged": int(slivers),
         "vertices_welded": int(welded),
         "holes_patched_or_strays_dropped": int(patched),

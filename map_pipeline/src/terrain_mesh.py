@@ -1202,8 +1202,14 @@ def _spokes(rungs, inset, outline, grid_m: float, reach: float) -> list:
     return list(segments[keep])
 
 
-def _mesh_region(region, kind, frame, outer, xs, ys, taken, *, row_m, margin_m, across=()):
-    """The faces of one region, its grid squares, its row outline and bed."""
+def _mesh_region(region, kind, frame, outer, xs, ys, taken, *, row_m, margin_m, across=(),
+                 spaced_fill: bool = False):
+    """The faces of one region, its grid squares, its row outline and bed.
+
+    With `spaced_fill`, a face the rows and the grid leave over that is more
+    than a couple of grid squares big is filled with points on the grid
+    inside it (`_fill_spaced`), not fanned from its corners.
+    """
     import shapely
 
     grid_m = float(xs[1] - xs[0])
@@ -1309,6 +1315,9 @@ def _mesh_region(region, kind, frame, outer, xs, ys, taken, *, row_m, margin_m, 
         if len(face.interiors) == 0 and len(coords) == 4 and _good_quad(_ccw(coords)):
             out.append((_ccw(coords), part))
             continue
+        if spaced_fill and face.area > SPACED_FILL_CELLS * grid_m * grid_m:
+            out.extend((p, part) for p in _fill_spaced(face, xs, ys))
+            continue
         out.extend((p, part) for p in _fill(face))
     if kind == WATER:
         out = _deepen(out, region)
@@ -1404,6 +1413,84 @@ def _fill(face) -> list:
         return []
     quads, rest = _recombine(_ccw_many(coords))
     return quads + rest
+
+
+# A leftover face bigger than this many grid squares gets points inside it.
+SPACED_FILL_CELLS = 2.0
+
+
+def _fill_spaced(face, xs, ys) -> list:
+    """A face filled through points on the grid inside it, paired into quads.
+
+    What the rows and the grid leave of a junction is a big polygon with a
+    station every grid square along its outline and nothing inside, and the
+    triangulation of that is fans of long slivers from its corners: what the
+    modellers pointed at. With a point at every grid node well inside it, the
+    triangles come out the size of half a grid square and pair into quads
+    the size of one. The points' triangulation has to have every edge of the
+    outline as an edge, or a neighbour would not match; where it does not,
+    the face is filled from its corners after all.
+    """
+    import shapely
+
+    g = float(xs[1] - xs[0])
+    x0, y0, x1, y1 = face.bounds
+    i0 = max(0, int(np.ceil((x0 - xs[0]) / g)))
+    i1 = min(len(xs) - 1, int(np.floor((x1 - xs[0]) / g)))
+    j0 = max(0, int(np.ceil((y0 - ys[0]) / g)))
+    j1 = min(len(ys) - 1, int(np.floor((y1 - ys[0]) / g)))
+    if i1 < i0 or j1 < j0:
+        return _fill(face)
+    gx, gy = np.meshgrid(xs[i0: i1 + 1], ys[j0: j1 + 1])
+    inner = np.column_stack([gx.ravel(), gy.ravel()])
+    shapely.prepare(face)
+    keep = shapely.contains_xy(face, inner[:, 0], inner[:, 1])
+    inner = inner[keep]
+    if len(inner):
+        far = shapely.distance(face.boundary, shapely.points(inner)) > 0.45 * g
+        inner = inner[far]
+    if not len(inner):
+        return _fill(face)
+    rings = [np.asarray(face.exterior.coords)[:-1, :2]] + [
+        np.asarray(r.coords)[:-1, :2] for r in face.interiors
+    ]
+    outline = np.vstack(rings)
+    points = np.vstack([outline, inner])
+    triangles = shapely.get_parts(shapely.delaunay_triangles(shapely.multipoints(points)))
+    if not len(triangles):
+        return _fill(face)
+    triangles = triangles[shapely.contains(face, shapely.centroid(triangles))]
+    coords = shapely.get_coordinates(shapely.get_exterior_ring(triangles)).reshape(-1, 4, 2)[:, :3]
+    # Stations on a straight stretch of outline make flat triangles: each is
+    # mended by splitting its neighbour, as in `_fill`.
+    coords = _without_flat_triangles(coords)
+    if not len(coords):
+        return _fill(face)
+    coords = _ccw_many(coords)
+    if (_signed_areas(coords) <= 1e-6).any():
+        return _fill(face)
+    # Every edge of the outline must be an edge of a triangle.
+    have = set()
+    for t in coords:
+        k = [_key(p) for p in t]
+        for a in range(3):
+            have.add(tuple(sorted((k[a], k[(a + 1) % 3]))))
+    for ring in rings:
+        keys = [_key(p) for p in ring]
+        for a in range(len(keys)):
+            if tuple(sorted((keys[a], keys[(a + 1) % len(keys)]))) not in have:
+                return _fill(face)
+    covered = float(np.sum(np.abs(_signed_areas(coords))))
+    if abs(covered - face.area) > 1e-3 * max(face.area, 1.0):
+        return _fill(face)
+    quads, rest = _recombine(coords)
+    return quads + rest
+
+
+def _signed_areas(triangles: np.ndarray) -> np.ndarray:
+    t = np.asarray(triangles)
+    return 0.5 * ((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
+                  - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1]))
 
 
 def _without_flat_triangles(triangles: np.ndarray) -> np.ndarray:

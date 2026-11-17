@@ -13,13 +13,16 @@ Fit terrain under roads
     survives it; to get ground back from under a road you moved away, Reset
     first and Fit after. Works on the terrain whatever its faces: the grid,
     the rows along the outlines, or anything you have remeshed. In the
-    layered style the roads, walkways and grass are wrapped or draped onto
-    the terrain and follow it by themselves; only one whose Shrinkwrap or
-    drape was removed or applied is fitted under.
+    layered style the roads, walkways and grass are the ground itself, so
+    there is nothing to fit (in a model made before that, they follow the
+    terrain by themselves; only one whose Shrinkwrap or drape was removed or
+    applied is fitted under).
 
 Reset terrain to survey
     Put every terrain vertex back at the surveyed height it was built from,
-    undoing every fit and every sculpt. Run Fit afterwards.
+    undoing every fit and every sculpt -- in the layered style the roads,
+    walkways and grass too, which are pieces of the same ground. Run Fit
+    afterwards.
 
 Drop selected onto ground
     Move each selected object straight down (or up) so its origin sits on the
@@ -73,11 +76,16 @@ def _terrain_object():
 
 
 def _follows(obj, terrain) -> bool:
-    """Whether a layer is wrapped or draped onto the terrain, so moves with it.
+    """Whether a layer needs no fitting: it is part of the ground, or kept on it.
 
-    Roads and lawns carry a Shrinkwrap; a kerbed walkway the pipeline's
-    Maptile_Drape geometry nodes, which read the terrain the same way.
+    In the layered style the roads, walkways and grass are the ground itself,
+    each the faces of it under them (`maptile_ground`), so there is nothing
+    to push the terrain under. A layer from an older model is wrapped onto
+    the terrain with a Shrinkwrap, or draped with Maptile_Drape geometry
+    nodes, and moves with it.
     """
+    if obj.get("maptile_ground"):
+        return True
     for m in obj.modifiers:
         if not m.show_viewport:
             continue
@@ -395,19 +403,30 @@ class MAPTILE_OT_reset_terrain(bpy.types.Operator):
 
     def execute(self, context):
         terrain = _terrain_object()
-        measured = terrain and terrain.data.attributes.get("measured_z")
-        if not measured:
+        # The terrain, and in the layered style every piece of the ground.
+        objects = [terrain] if terrain is not None else []
+        objects += [
+            o for o in bpy.data.objects
+            if o.type == "MESH" and o.get("maptile_ground") and o is not terrain
+        ]
+        reset = 0
+        for obj in objects:
+            measured = obj.data.attributes.get("measured_z")
+            if not measured:
+                continue
+            values = np.empty(len(obj.data.vertices))
+            measured.data.foreach_get("value", values)
+            co = np.empty(len(values) * 3)
+            obj.data.vertices.foreach_get("co", co)
+            co = co.reshape(-1, 3)
+            co[:, 2] = values
+            obj.data.vertices.foreach_set("co", co.ravel())
+            obj.data.update()
+            reset += 1
+        if not reset:
             self.report({"ERROR"}, "the terrain carries no surveyed heights")
             return {"CANCELLED"}
-        values = np.empty(len(terrain.data.vertices))
-        measured.data.foreach_get("value", values)
-        co = np.empty(len(values) * 3)
-        terrain.data.vertices.foreach_get("co", co)
-        co = co.reshape(-1, 3)
-        co[:, 2] = values
-        terrain.data.vertices.foreach_set("co", co.ravel())
-        terrain.data.update()
-        self.report({"INFO"}, "terrain back at the surveyed heights")
+        self.report({"INFO"}, f"{reset} ground objects back at the surveyed heights")
         return {"FINISHED"}
 
 

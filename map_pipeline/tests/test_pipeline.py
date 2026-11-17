@@ -4486,6 +4486,47 @@ class TestRailways(unittest.TestCase):
         steps = np.linalg.norm(np.diff(dense, axis=0), axis=1)
         self.assertLessEqual(steps.max(), 4.0 + 1e-9)
 
+    def test_a_curve_drawn_every_few_centimetres_is_spaced_like_a_straight(self):
+        """"Places with a lot of polygons that add no detail": the BGT draws a
+        curve as a vertex every few centimetres, and the track was cut at
+        every one. Simplified first, it is cut every few metres, and stays
+        within a few centimetres of the BGT's line."""
+        from src.rails import SIMPLIFY_M, densify, simplify
+
+        angle = np.linspace(0.0, np.pi / 4, 400)  # a 300 m radius, 236 m of arc
+        arc = np.column_stack([300.0 * np.sin(angle), 300.0 * (1 - np.cos(angle))])
+        drawn = densify(simplify(arc), 4.0)
+        steps = np.linalg.norm(np.diff(drawn, axis=0), axis=1)
+        self.assertLess(len(drawn), 80)
+        self.assertGreater(steps.min(), 1.0)
+        self.assertLessEqual(steps.max(), 4.0 + 1e-9)
+        # Every drawn point on the curve, to the tolerance.
+        off = np.abs(np.hypot(drawn[:, 0], drawn[:, 1] - 300.0) - 300.0)
+        self.assertLessEqual(off.max(), SIMPLIFY_M + 1e-6)
+        np.testing.assert_allclose(drawn[[0, -1]], arc[[0, -1]])
+
+    def test_the_track_strips_are_quads(self):
+        """Each step along a ballast bed or a rail was two loose triangles;
+        it is one quad, and the strip one piece."""
+        from src.rails import _ribbon, offset_normals
+
+        quads = _process_namespace({"_rail_quads"})["_rail_quads"]
+        line = np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 1.0], [12.0, 3.0]])
+        tris, uv = _ribbon(line, np.zeros(4), offset_normals(line), 0.0, 1.5)
+        corners, corner_uv, sizes = quads(tris, uv.reshape(-1, 3, 2))
+        self.assertEqual(sizes.tolist(), [4, 4, 4])
+        self.assertEqual(len(corner_uv), len(corners))
+        # Each quad is the two triangles' four corners, the right way up.
+        for k in range(3):
+            q = corners[4 * k: 4 * k + 4, :2]
+            area = 0.5 * np.sum(q[:, 0] * np.roll(q[:, 1], -1) - np.roll(q[:, 0], -1) * q[:, 1])
+            self.assertGreater(area, 0.0)
+            halves = 0.0
+            for t in tris[2 * k: 2 * k + 2]:
+                u, v = t[1, :2] - t[0, :2], t[2, :2] - t[0, :2]
+                halves += 0.5 * abs(u[0] * v[1] - u[1] * v[0])
+            self.assertAlmostEqual(area, halves, places=9)
+
     def test_densify_leaves_a_short_line_alone(self):
         from src.rails import densify
 
@@ -5214,10 +5255,17 @@ class TestConfig(unittest.TestCase):
         base = {"name": "x", "bbox": self.BBOX}
         with self.assertRaises(ValueError):
             self._load({**base, "style": "handmade"})
-        for bad in ({"tolerance_m": 0}, {"focus_m": -1}, {"road_lift_m": -0.1},
+        for bad in ({"tolerance_m": 0}, {"outline_m": -0.1}, {"square_m": 0},
                     {"curb": {"height_offset_curb_m": 0.2}}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self._load({**base, "layered": bad})
+        # The zones and the lifts went with the terrain under the layers: a
+        # file that still sets them loads, and says so.
+        with self.assertLogs("src.config", level="WARNING") as logs:
+            config = self._load({**base, "layered": {"focus_m": 100.0, "road_lift_m": 0.05}})
+        said = " ".join(logs.output)
+        self.assertIn("layered.focus_m no longer does anything", said)
+        self.assertIn("layered.road_lift_m no longer does anything", said)
         config = self._load({**base, "layered": {"prefix": " Tankstation ",
                                                  "tolerance_m": "0.25"}})
         self.assertEqual(config.layered["prefix"], "Tankstation")
@@ -7083,22 +7131,138 @@ class TestQuadTerrain(unittest.TestCase):
         self.assertGreater(self.ground.stats["water_faces"], 0)
         self.assertEqual(self.ground.stats["water_bodies"], 1)
 
-    def test_the_survey_is_kept_within_the_tolerance(self):
-        """"Height missing": loops are cut where a face misses the survey."""
-        self.assertLessEqual(self.ground.stats["grid_error_max_m"], 0.5 + 1e-6)
-        self.assertGreater(self.ground.stats["loops_cut_to_the_survey"], 0)
-
-    def test_far_away_the_grid_is_coarser(self):
-        """"Simplifying the amount of points for far away terrain"."""
+    def test_one_square_size_everywhere(self):
+        """"The difference in resolution throughout the map": no squares merged
+        away from the middle and no loops cut where the survey rises, so every
+        grid square is the same size, and the ground still follows the survey."""
+        stats = self.ground.stats
+        self.assertEqual(set(stats["grid_squares"]), {"4 m"})
+        self.assertNotIn("grid_blocks", stats)
+        self.assertNotIn("loops_cut_to_the_survey", stats)
+        self.assertLess(stats["grid_error_p95_m"], 0.5)
+        # Its outlines run east-west and north-south: the grid is not turned.
+        self.assertEqual(stats["grid_angle_deg"], 0.0)
+        # Bigger squares, the same everywhere, for fewer faces.
         from src.layered import build_layered_ground
 
-        far = build_layered_ground(self.terrain, self.areas, prefix="T", focus_m=40.0)
-        self.assertEqual(set(self.ground.stats["grid_blocks"]), {"4 m"})
-        self.assertIn("16 m", far.stats["grid_blocks"])
-        self.assertLess(far.stats["faces"], self.ground.stats["faces"])
-        # Bigger squares beside smaller ones share every corner: still one
-        # closed sheet.
-        self._assert_closed(far.mesh)
+        coarse = build_layered_ground(self.terrain, self.areas, prefix="T", square_m=8.0)
+        self.assertEqual(set(coarse.stats["grid_squares"]), {"8 m"})
+        self.assertLess(coarse.stats["faces"], 0.6 * stats["faces"])
+        self._assert_closed(coarse.mesh)
+
+    def test_the_grid_is_turned_to_the_streets(self):
+        """Across Hoek van Holland the streets run 36 degrees off north, and
+        every row along one met the north-south grid in a band of triangles.
+        Turned to the streets, the rows meet it square on."""
+        import shapely
+
+        from src.layered import GRASS, ROAD, build_layered_ground
+        from src.layered import GroundArea
+
+        angle = 30.0
+        centre = shapely.Point(1080.0, 2080.0)
+
+        def turned(x0, y0, x1, y1):
+            box = shapely.affinity.rotate(shapely.box(x0, y0, x1, y1), angle, origin=centre)
+            frame = shapely.box(1000.0, 2000.0, 1160.0, 2160.0)
+            part = box.intersection(frame)
+            return [np.asarray(part.exterior.coords)]
+
+        import shapely.affinity  # noqa: F401
+
+        areas = [
+            GroundArea(turned(960.0, 2070.0, 1200.0, 2082.0), ROAD, "Asfalt"),
+            GroundArea(turned(1074.0, 1960.0, 1086.0, 2070.0), ROAD, "Asfalt"),
+            GroundArea(turned(1000.0, 2100.0, 1060.0, 2150.0), GRASS, "Gras"),
+            GroundArea(turned(1095.0, 2000.0, 1150.0, 2060.0), GRASS, "Gras"),
+        ]
+        ground = build_layered_ground(self.terrain, areas, prefix="T")
+        self.assertAlmostEqual(ground.stats["grid_angle_deg"], angle, delta=0.5)
+        self._assert_closed(ground.mesh)
+        # In 160 m, the edge of the area -- now at 30 degrees to the grid --
+        # is a good part of it, and is cut into triangles.
+        self.assertGreater(ground.stats["quad_share"], 0.7)
+        # The grid squares are square to the streets.
+        mesh = ground.mesh
+        starts = mesh.loop_starts
+        square = 0
+        for f in np.flatnonzero(mesh.face_sizes == 4):
+            ring = mesh.vertices[mesh.face_loops[starts[f]: starts[f] + 4], :2]
+            side = ring[1] - ring[0]
+            if abs(np.hypot(*side) - 4.0) < 1e-3:
+                turn = np.degrees(np.arctan2(side[1], side[0])) % 90.0
+                square += abs(turn - angle) < 0.5
+        self.assertGreater(square, 300)
+
+    def test_the_way_the_streets_run(self):
+        """Measured modulo 90 degrees by outline length, the edge of the area
+        left out; no direction when the outlines agree on none."""
+        import shapely
+
+        from src.layered_mesh import _grid_angle
+
+        def rect(cx, cy, w, h, deg):
+            return shapely.affinity.rotate(
+                shapely.box(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), deg
+            )
+
+        import shapely.affinity  # noqa: F401
+
+        streets = [(rect(50, 50, 60, 8, 37.0), 0), (rect(50, 50, 8, 60, 37.0), 0),
+                   (shapely.box(0, 0, 100, 100), 0)]
+        self.assertAlmostEqual(_grid_angle(streets, (100.0, 100.0)), 37.0, delta=0.2)
+        self.assertAlmostEqual(
+            _grid_angle([(rect(50, 50, 60, 8, -50.0), 0)], (100.0, 100.0)), 40.0, delta=0.2
+        )
+        circle = [(shapely.Point(50, 50).buffer(30, 64), 0)]
+        self.assertEqual(_grid_angle(circle, (100.0, 100.0)), 0.0)
+
+    def test_a_big_leftover_face_is_filled_through_the_grid(self):
+        """"The roads should all be ladders": what the rows leave of a junction
+        was fanned from its corners into slivers; filled through the grid
+        nodes inside it, it is quads the size of a grid square."""
+        import shapely
+
+        from src.terrain_mesh import _fill, _fill_spaced
+
+        xs = ys = np.arange(0.0, 41.0, 4.0)
+        ring = []
+        for (ax, ay), (bx, by) in zip(
+            [(2, 2), (30, 2), (30, 26), (2, 26)], [(30, 2), (30, 26), (2, 26), (2, 2)]
+        ):
+            n = int(round(max(abs(bx - ax), abs(by - ay)) / 4.0))
+            ring.extend((ax + (bx - ax) * k / n, ay + (by - ay) * k / n) for k in range(n))
+        face = shapely.Polygon(ring)
+
+        def worst_angle(faces):
+            worst = 180.0
+            for f in faces:
+                f = np.asarray(f)
+                for i in range(len(f)):
+                    a, b, c = f[i - 1], f[i], f[(i + 1) % len(f)]
+                    u, v = a - b, c - b
+                    cos = np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v))
+                    worst = min(worst, np.degrees(np.arccos(np.clip(cos, -1, 1))))
+            return worst
+
+        spaced = _fill_spaced(face, xs, ys)
+        fanned = _fill(face)
+        area = sum(shapely.Polygon(f).area for f in spaced)
+        self.assertAlmostEqual(area, face.area, places=6)
+        # Every face the right way up and with area: the stations along a
+        # straight edge made flat triangles, upside down in the model.
+        for f in spaced:
+            f = np.asarray(f)
+            signed = 0.5 * np.sum(f[:, 0] * np.roll(f[:, 1], -1) - np.roll(f[:, 0], -1) * f[:, 1])
+            self.assertGreater(signed, 1e-6)
+        # Each outline station is a corner of some face, so no neighbour is
+        # left with a vertex this fill lacks.
+        corners = {tuple(np.round(p, 6)) for f in spaced for p in np.asarray(f)}
+        for p in ring:
+            self.assertIn(tuple(np.round(p, 6)), corners)
+        self.assertGreater(sum(len(f) == 4 for f in spaced) / len(spaced), 0.7)
+        self.assertGreater(worst_angle(spaced), 25.0)
+        self.assertLess(worst_angle(fanned), worst_angle(spaced))
 
     def test_the_quad_terrain_is_one_closed_sheet(self):
         self._assert_closed(self.ground.mesh)
@@ -7127,27 +7291,6 @@ class TestQuadTerrain(unittest.TestCase):
         )
         self.assertTrue(on_frame.all())
 
-    def test_a_loop_is_cut_along_a_ridge(self):
-        """A crest between two edges gets a loop along it, quads either side."""
-        from src.layered_mesh import _loop_cuts
-
-        def ridge(p):
-            return np.maximum(0.0, 1.0 - np.abs(p[:, 0] - 4.0) / 2.0)
-
-        xy = np.array([[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]])
-        gx, gy = np.meshgrid(np.arange(9.0), np.arange(9.0))
-        nodes = np.column_stack([gx.ravel(), gy.ravel()])
-        out = _loop_cuts(
-            xy, np.array([4]), np.arange(4), np.array([0]), np.array([0]), np.array([0]),
-            height_at=ridge, nodes_xy=nodes, nodes_z=ridge(nodes), tolerance_m=0.6,
-            skip_kind=2,
-        )
-        new_xy, sizes, loops, _, _, _, cuts = out
-        self.assertEqual(cuts, 1)
-        self.assertEqual(list(sizes), [4, 4])
-        crest = new_xy[np.unique(loops)]
-        self.assertEqual(int((np.abs(crest[:, 0] - 4.0) < 1e-9).sum()), 2)
-
     def test_a_gap_between_two_pieces_is_not_a_hole(self):
         """Regions are meshed one by one, so a sliver no piece covers -- left
         where a hairpin was trimmed -- went to nobody: at Hazeldonk, 23 crack
@@ -7161,7 +7304,7 @@ class TestQuadTerrain(unittest.TestCase):
         east = shapely.Polygon([(80, 0), (160, 0), (160, 160), (80, 160)])
         vertices, sizes, loops, codes, part, _ = quad_terrain(
             self.terrain, [(west, 0), (east, 6 * 16 + 6)], [], codes_wet=15,
-            tolerance_m=0.5, focus_m=250.0, depth_m=0.6, paved_codes=set(),
+            depth_m=0.6, paved_codes=set(),
         )
         mesh = TerrainMesh(
             vertices=vertices, measured_z=vertices[:, 2], face_sizes=sizes,
@@ -7183,7 +7326,7 @@ class TestQuadTerrain(unittest.TestCase):
         east = shapely.Polygon([(80, 0), (160, 0), (160, 160), (79.4, 160)])
         vertices, sizes, loops, codes, part, stats = quad_terrain(
             self.terrain, [(west, 0), (east, 6 * 16 + 6)], [], codes_wet=15,
-            tolerance_m=0.5, focus_m=250.0, depth_m=0.6, paved_codes=set(),
+            depth_m=0.6, paved_codes=set(),
         )
         self.assertEqual(stats["pieces_overlapping"], 1)
         mesh = TerrainMesh(
@@ -7215,7 +7358,7 @@ class TestQuadTerrain(unittest.TestCase):
 
         vertices, sizes, loops, codes, part, stats = quad_terrain(
             self.terrain, pieces, [], codes_wet=15,
-            tolerance_m=0.5, focus_m=250.0, depth_m=0.6, paved_codes=set(),
+            depth_m=0.6, paved_codes=set(),
         )
         self.assertEqual(stats["thin_strips_folded"], 2)
         mesh = TerrainMesh(
@@ -7311,7 +7454,7 @@ class TestLayeredGround(unittest.TestCase):
 
         cls.terrain, cls.areas = _layered_fixture()
         cls.ground = build_layered_ground(
-            cls.terrain, cls.areas, prefix="T", tolerance_m=cls.TOLERANCE, focus_m=50.0,
+            cls.terrain, cls.areas, prefix="T", tolerance_m=cls.TOLERANCE,
         )
         cls.mesh = cls.ground.mesh
 
@@ -7545,20 +7688,12 @@ class TestLayeredGround(unittest.TestCase):
         self.assertEqual(self.ground.stats["parts_on_bridges_or_tunnels"], 1)
         self.assertEqual(self._at(1035.0, 2040.0), (TERRAIN, None))
 
-    def test_the_objects_are_named_and_grouped_as_the_modellers_do(self):
+    def test_the_objects_are_named_as_the_modellers_do(self):
         from src.layered import TERRAIN
 
+        # One object per layer: the modellers divide the model themselves.
         names = self.ground.object_names
-        pattern = re.compile(
-            r"^T_(Snelweg|Centrum_(Oost|West)_(Wegen|Voetpaden|Gras)"
-            r"|(Wegen|Voetpaden|Gras)_Afstand_[NZ][OW])$"
-        )
-        for name in names:
-            self.assertRegex(name, pattern)
-        self.assertEqual(len(set(names)), len(names))
-        self.assertIn("T_Snelweg", names)
-        self.assertTrue(any("Centrum" in n for n in names))
-        self.assertTrue(any("Afstand" in n for n in names))
+        self.assertEqual(sorted(names), ["T_Gras", "T_Snelweg", "T_Voetpaden", "T_Wegen"])
         self.assertEqual(self.ground.terrain_name, "T_Terrein")
         layer = np.asarray(self.mesh.face_kind)
         owner = self.ground.face_object
@@ -7591,8 +7726,11 @@ class TestLayeredGround(unittest.TestCase):
     def test_things_stand_on_the_layer_under_them(self):
         from src.layered import GRASS, ROAD, TERRAIN, WALKWAY
 
+        # The layers are the ground; only a walkway is raised, by its kerb.
         top = self.ground.top
-        self.assertAlmostEqual(top[WALKWAY], 0.05 + 0.13)
+        self.assertEqual(top[ROAD], 0.0)
+        self.assertEqual(top[GRASS], 0.0)
+        self.assertAlmostEqual(top[WALKWAY], 0.13)
         for (x, y), layer in {
             (1050.0, 2080.0): ROAD, (1050.0, 2073.5): WALKWAY,
             (1125.0, 2125.0): GRASS, (1010.0, 2150.0): TERRAIN,
@@ -7615,17 +7753,13 @@ class TestLayeredGround(unittest.TestCase):
             self.assertEqual(str(data["terrain_name"]), "T_Terrein")
             self.assertEqual(len(data["face_object"]), len(self.mesh))
 
-    def test_zones_and_names(self):
-        from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY, object_name, zone_of
+    def test_names(self):
+        from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY, object_name
 
-        self.assertEqual(zone_of(10.0, -10.0, 250.0), (True, "Centrum_Oost"))
-        self.assertEqual(zone_of(-0.1, 300.0, 250.0), (False, "Afstand_NW"))
-        self.assertEqual(zone_of(300.0, -300.0, 250.0), (False, "Afstand_ZO"))
-        self.assertEqual(object_name("P", ROAD, (True, "Centrum_West")), "P_Centrum_West_Wegen")
-        self.assertEqual(object_name("P", GRASS, (False, "Afstand_NO")), "P_Gras_Afstand_NO")
-        self.assertEqual(object_name("P", WALKWAY, (True, "Centrum_Oost")),
-                         "P_Centrum_Oost_Voetpaden")
-        self.assertEqual(object_name("P", MOTORWAY, (False, "Afstand_ZW")), "P_Snelweg")
+        self.assertEqual(object_name("P", ROAD), "P_Wegen")
+        self.assertEqual(object_name("P", GRASS), "P_Gras")
+        self.assertEqual(object_name("P", WALKWAY), "P_Voetpaden")
+        self.assertEqual(object_name("P", MOTORWAY), "P_Snelweg")
 
 
 def _process_namespace(names, extra=None):
@@ -7744,7 +7878,7 @@ class TestLayeredInBlender(unittest.TestCase):
         from src.layered import build_layered_ground
 
         terrain, areas = _layered_fixture()
-        cls.ground = build_layered_ground(terrain, areas, prefix="T", focus_m=50.0)
+        cls.ground = build_layered_ground(terrain, areas, prefix="T")
         cls.folder = Path(tempfile.mkdtemp())
         cls.ground.save(cls.folder)
 
@@ -7782,18 +7916,21 @@ class TestLayeredInBlender(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
+        def kerb_group(curb):
+            # The wrapper passes every input of the generator through.
+            return types_namespace(name=f"Maptile_Kerbs_{curb.name}", interface=curb.interface,
+                                   inner=curb)
+
         namespace = _process_namespace(
-            {"build_layered", "_layer_objects", "_mark_layer_outlines", "_shrinkwrap",
-             "split_pinches",
+            {"build_layered", "_layer_objects", "_mark_layer_outlines", "_faces_subset",
+             "_GROUND", "split_pinches",
              "_weighted_normals", "_triangulate_on_export", "set_modifier_input",
              "planar_uv", "LAYER_ROAD", "LAYER_MOTORWAY", "LAYER_WALKWAY", "LAYER_GRASS",
              "LAYER_ROLES"},
             {"build_mesh_object": build_mesh_object, "_Layer": _Layer,
              "make_plain_material": lambda name, rgb, rough: f"material {name}",
              "load_curb_generator": lambda: curb_group,
-             "_flatten_group": lambda: self._group("Maptile_Flatten", []),
-             "_drape_group": lambda: self._group(
-                 "Maptile_Drape", [("Terrain", "Socket_1"), ("Lift", "Socket_2")])},
+             "_kerb_group": kerb_group},
         )
         # Unpacked from the tuple assignment above.
         self.assertIn("LAYER_WALKWAY", namespace)
@@ -7809,42 +7946,58 @@ class TestLayeredInBlender(unittest.TestCase):
         summary = namespace["build_layered"](scene, self.folder, "aerial")
         return summary, {obj.name: obj for obj in made}
 
-    def test_one_object_for_the_terrain_and_one_per_layer_name(self):
+    def test_the_ground_once_in_pieces(self):
+        """"Not needed to have it twice": the terrain object holds only the
+        ground no layer covers, every face of the ground is in one object and
+        no more, and the pieces meet along shared vertices."""
+        from src.layered import TERRAIN
+
         summary, made = self._build(self._curb_group())
         self.assertEqual(summary["terrain"], "T_Terrein")
         self.assertEqual(summary["objects"], self.ground.object_names)
         self.assertEqual(set(made), {"T_Terrein", *self.ground.object_names})
         terrain = made["T_Terrein"]
         self.assertEqual(terrain["maptile_role"], "terrain")
-        self.assertEqual(len(terrain.data.polygons), len(self.ground.mesh))
-        np.testing.assert_array_equal(
-            terrain.data.made["ground_layer"]["value"], self.ground.mesh.face_kind
-        )
+        self.assertTrue(terrain["maptile_ground"])
+        bare = int((self.ground.mesh.face_kind == TERRAIN).sum())
+        self.assertEqual(len(terrain.data.polygons), bare)
+        self.assertEqual(sum(len(o.data.polygons) for o in made.values()),
+                         len(self.ground.mesh))
+        self.assertNotIn("ground_layer", terrain.data.made)
         self.assertTrue(terrain.data.made["edge_use_seam"].any())
         self.assertIn("outline_walkway", terrain.groups)
+        # No loose vertices: the terrain carries only what its faces use.
+        self.assertEqual(len(np.unique(terrain.data.loops)), len(terrain.data.co))
         for obj in made.values():
             with self.subTest(obj=obj.name):
                 self.assertEqual(obj.uvs, len(obj.data.loops), "one UV per loop")
                 self.assertLess(int(obj.data.loops.max()), len(obj.data.co))
 
-    def test_each_layer_is_the_terrain_under_it_lifted_and_kept_on_it(self):
-        """A road or lawn is wrapped onto the terrain. A kerbed walkway is
-        laid flat for the curb generator and draped back on after: the
-        generator, made for level outlines, threw spikes up to 0.65 m on
-        ones that follow the survey."""
+    def test_each_layer_is_the_ground_where_it_is(self):
+        """A road or lawn is the ground's own faces at the ground's heights,
+        with nothing holding it onto anything. A kerbed walkway carries the
+        curb generator, wrapped to lay it flat first and put it back after:
+        made for level outlines, it threw spikes up to 0.65 m on ones that
+        follow the survey."""
         from src.layered import WALKWAY
 
         _, made = self._build(self._curb_group())
-        terrain = made["T_Terrein"]
-        ground_z = {tuple(np.round(p[:2], 6)): p[2] for p in terrain.data.co}
+        mesh = self.ground.mesh
+        ground_z = {tuple(np.round(p[:2], 6)): p[2] for p in mesh.vertices}
+        origin = np.array([1080.0, 2080.0])
+        terrain_xy = {tuple(np.round(p[:2] + origin, 6)) for p in made["T_Terrein"].data.co}
+        shared = 0
         for index, name in enumerate(self.ground.object_names):
             obj = made[name]
             layer = self.ground.object_layer[index]
-            lift = self.ground.lift[layer]
             with self.subTest(obj=name):
-                below = np.array([ground_z[tuple(np.round(p[:2], 6))] for p in obj.data.co])
-                np.testing.assert_allclose(obj.data.co[:, 2] - below, lift, atol=1e-9)
+                xy = obj.data.co[:, :2] + origin
+                below = np.array([ground_z[tuple(np.round(p, 6))] for p in xy])
+                np.testing.assert_allclose(obj.data.co[:, 2], below, atol=1e-9)
+                shared += sum(tuple(np.round(p, 6)) in terrain_xy for p in xy)
+                self.assertTrue(obj["maptile_ground"])
                 kinds = [m.type for m in obj.modifiers]
+                self.assertNotIn("SHRINKWRAP", kinds)
                 # The triangulation last, so it cuts what the others made.
                 self.assertEqual(kinds[-1], "TRIANGULATE")
                 self.assertEqual(obj.modifiers[-1].quad_method, "FIXED")
@@ -7852,24 +8005,13 @@ class TestLayeredInBlender(unittest.TestCase):
                 self.assertTrue(obj.modifiers[-1].show_render)
                 if layer == WALKWAY:
                     self.assertEqual(obj["maptile_role"], "walkway")
-                    self.assertEqual(kinds, ["NODES", "NODES", "NODES", "WEIGHTED_NORMAL",
-                                             "TRIANGULATE"])
-                    flatten, curb, drape = obj.modifiers[:3]
-                    self.assertEqual(flatten.node_group.name, "Maptile_Flatten")
-                    self.assertEqual(curb.node_group.name, "CurbGenerator")
-                    self.assertEqual(drape.node_group.name, "Maptile_Drape")
-                    self.assertIs(drape["Socket_1"], terrain)
-                    self.assertAlmostEqual(drape["Socket_2"], lift)
+                    self.assertEqual(kinds, ["NODES", "WEIGHTED_NORMAL", "TRIANGULATE"])
+                    self.assertEqual(obj.modifiers[0].node_group.name,
+                                     "Maptile_Kerbs_CurbGenerator")
                     continue
-                self.assertEqual(kinds, ["SHRINKWRAP", "TRIANGULATE"])
-                wrap = obj.modifiers[0]
-                self.assertIs(wrap.target, terrain)
-                # Not the modellers' "On Surface", which leaves a road under
-                # terrain raised past it.
-                self.assertEqual(wrap.wrap_mode, "OUTSIDE_SURFACE")
-                self.assertTrue(wrap.use_project_z)
-                self.assertTrue(wrap.use_negative_direction and wrap.use_positive_direction)
-                self.assertAlmostEqual(wrap.offset, lift)
+                self.assertEqual(kinds, ["TRIANGULATE"])
+        # The layers meet the terrain edge to edge.
+        self.assertGreater(shared, 0)
 
     def test_the_curb_generator_gets_its_settings(self):
         summary, made = self._build(self._curb_group())
@@ -7879,7 +8021,7 @@ class TestLayeredInBlender(unittest.TestCase):
         self.assertEqual(summary["kerbed_objects"], len(walkways))
         self.assertTrue(summary["curb_generator"])
         for name in walkways:
-            curb = made[name].modifiers[1]
+            curb = made[name].modifiers[0]
             self.assertEqual(curb["Socket_2"], 0.3)
             self.assertEqual(curb["Socket_3"], 0.15)
             self.assertEqual(curb["Socket_4"], 0.02)
@@ -7893,7 +8035,7 @@ class TestLayeredInBlender(unittest.TestCase):
         for obj in made.values():
             self.assertNotIn("NODES", [m.type for m in obj.modifiers])
             if obj.get("maptile_role") == "walkway":
-                self.assertEqual([m.type for m in obj.modifiers], ["SHRINKWRAP", "TRIANGULATE"])
+                self.assertEqual([m.type for m in obj.modifiers], ["TRIANGULATE"])
 
     def test_footpaths_touching_at_a_corner_get_a_vertex_each(self):
         """Two footpaths meeting at one corner share a vertex with four outline
@@ -8012,6 +8154,11 @@ class TestLayeredInBlender(unittest.TestCase):
         # stay under.
         self.assertEqual(namespace["_road_objects"](terrain), [applied])
         self.assertIn("grass", namespace["GROUND_ROLES"])
+        # Now the roads are pieces of the ground itself: none is fitted under.
+        piece = types_namespace(type="MESH", name="T_Wegen", modifiers=[], get=lambda k, d=None: (
+            {"maptile_role": "road", "maptile_ground": True}.get(k, d)))
+        bpy.data.objects.append(piece)
+        self.assertEqual(namespace["_road_objects"](terrain), [applied])
 
 
 class TestIntermediatesNeedNoPickle(unittest.TestCase):
@@ -8311,18 +8458,18 @@ class TestTerrainGrid(unittest.TestCase):
         from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY
         from src.validate import CheckReport, check_layered
 
+        # The layers are the ground: built 0 above it, a walkway up to its kerb.
         ground = types_namespace(
-            object_names=["P_Snelweg", "P_Centrum_Oost_Wegen", "P_Centrum_Oost_Voetpaden",
-                          "P_Gras_Afstand_NO"],
-            lift={ROAD: 0.05, MOTORWAY: 0.05, WALKWAY: 0.05, GRASS: 0.02},
+            object_names=["P_Snelweg", "P_Wegen", "P_Voetpaden", "P_Gras"],
+            lift={ROAD: 0.0, MOTORWAY: 0.0, WALKWAY: 0.0, GRASS: 0.0},
         )
         good = {
             "objects": list(ground.object_names), "kerbed_objects": 1,
             "curb_generator": True, "walkway_faces": 100, "walkway_faces_evaluated": 700,
             "height_above_terrain": {
-                "road": {"min_m": 0.049, "max_m": 0.058},
-                "walkway": {"min_m": 0.05, "max_m": 0.2},
-                "grass": {"min_m": 0.0199, "max_m": 0.021},
+                "road": {"min_m": -0.0004, "max_m": 0.0003},
+                "walkway": {"min_m": 0.0, "max_m": 0.18},
+                "grass": {"min_m": -0.0001, "max_m": 0.0002},
             },
         }
 
@@ -8342,10 +8489,10 @@ class TestTerrainGrid(unittest.TestCase):
         self.assertEqual(set(verdicts), {"ground_layers_built", "layers_lie_on_the_terrain",
                                          "walkways_have_kerbs"})
         floating = json.loads(json.dumps(good))
-        floating["height_above_terrain"]["road"]["max_m"] = 0.11
+        floating["height_above_terrain"]["road"]["max_m"] = 0.05
         self.assertFalse(run(floating)["layers_lie_on_the_terrain"].passed)
         sunk = json.loads(json.dumps(good))
-        sunk["height_above_terrain"]["grass"]["min_m"] = -0.01
+        sunk["height_above_terrain"]["grass"]["min_m"] = -0.02
         self.assertFalse(run(sunk)["layers_lie_on_the_terrain"].passed)
         # What the first Hazeldonk run measured: kerb spikes on outlines that
         # follow the survey.
@@ -8359,34 +8506,33 @@ class TestTerrainGrid(unittest.TestCase):
         verdict = run(runaway)["layers_lie_on_the_terrain"]
         self.assertFalse(verdict.passed)
         self.assertIn("825.00 m past its outline", verdict.detail)
-        # Utrecht: five of 26,000 vertices a few centimetres out, on faces
-        # steeper than 65 degrees. Not a layer gone wrong.
-        steep = json.loads(json.dumps(good))
-        steep["height_above_terrain"]["road"] = {
-            "min_m": 0.014, "max_m": 0.11, "vertices": 120000,
-            "lowest_m": [0.014] + [0.049] * 49, "highest_m": [0.11] + [0.058] * 49,
+        # A kerb mitred round a sharp corner: two of 120,000 vertices a few
+        # centimetres out. Not a layer gone wrong.
+        mitre = json.loads(json.dumps(good))
+        mitre["height_above_terrain"]["walkway"] = {
+            "min_m": -0.03, "max_m": 0.21, "vertices": 120000,
+            "lowest_m": [-0.03] + [0.0] * 49, "highest_m": [0.21] + [0.18] * 49,
         }
-        verdict = run(steep)["layers_lie_on_the_terrain"]
+        verdict = run(mitre)["layers_lie_on_the_terrain"]
         self.assertTrue(verdict.passed, verdict.detail)
         self.assertIn("2 of 120000 vertices outside", verdict.detail)
-        # But a road sunk by more than the slack anywhere still fails ...
-        deep = json.loads(json.dumps(steep))
-        deep["height_above_terrain"]["road"]["min_m"] = -0.2
-        deep["height_above_terrain"]["road"]["lowest_m"][0] = -0.2
+        # But a walkway sunk by more than the slack anywhere still fails ...
+        deep = json.loads(json.dumps(mitre))
+        deep["height_above_terrain"]["walkway"]["min_m"] = -0.2
+        deep["height_above_terrain"]["walkway"]["lowest_m"][0] = -0.2
         self.assertFalse(run(deep)["layers_lie_on_the_terrain"].passed)
         # ... and so does a share of strays, each only a little out.
-        many = json.loads(json.dumps(steep))
-        many["height_above_terrain"]["road"]["lowest_m"] = [0.02] * 50
-        many["height_above_terrain"]["road"]["vertices"] = 20000
+        many = json.loads(json.dumps(mitre))
+        many["height_above_terrain"]["walkway"]["lowest_m"] = [-0.02] * 50
+        many["height_above_terrain"]["walkway"]["vertices"] = 20000
         self.assertFalse(run(many)["layers_lie_on_the_terrain"].passed)
         # A small layer may have its few, as a big one may.
         few = json.loads(json.dumps(good))
         few["height_above_terrain"]["grass"] = {
-            "min_m": 0.0, "max_m": 0.024, "vertices": 2008,
-            "lowest_m": [0.0, 0.001] + [0.015] * 48, "highest_m": [0.024] * 50,
+            "min_m": -0.01, "max_m": 0.012, "vertices": 2008,
+            "lowest_m": [-0.01, -0.008] + [0.0] * 48, "highest_m": [0.012] + [0.0] * 49,
         }
         self.assertTrue(run(few)["layers_lie_on_the_terrain"].passed)
-        self.assertFalse(run(many)["layers_lie_on_the_terrain"].passed)
         # A kerb a kerb's width past its outline, where two footpaths touch
         # on the edge of the area, passes; more does not.
         edge = json.loads(json.dumps(good))
@@ -8412,7 +8558,7 @@ class TestTerrainGrid(unittest.TestCase):
             self.assertTrue({c.name: c for c in report.checks}["water_surface_built"].passed)
         old_blender = dict(good, curb_generator=False, kerbed_objects=0)
         old_blender["height_above_terrain"] = dict(
-            good["height_above_terrain"], walkway={"min_m": 0.05, "max_m": 0.051})
+            good["height_above_terrain"], walkway={"min_m": 0.0, "max_m": 0.001})
         verdicts = run(old_blender)
         self.assertEqual(verdicts["walkways_have_kerbs"].severity, "warning")
         self.assertFalse(verdicts["walkways_have_kerbs"].passed)
@@ -8620,6 +8766,43 @@ class TestHarbour(unittest.TestCase):
         self.assertEqual(built.counts.get("jetty"), 1)
         self.assertNotIn("pontoon", built.counts)
         self.assertAlmostEqual(float(built.deck_top[0]), 0.5 + DECK_ABOVE_M[JETTY], places=6)
+
+    def test_two_pieces_of_one_jetty_are_one_deck(self):
+        """The BGT draws a jetty in pieces; each read its own height off the
+        surface model and the two met in a step with a crack down it."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import src.harbour as harbour
+        from src.geo import BBox
+        from src.harbour import JETTY
+        from src.surfaces import WaterBody
+
+        bbox = BBox(0.0, 0.0, 100.0, 100.0)
+        basin = WaterBody(rings=[np.array([[0, 0], [100, 0], [100, 50], [0, 50], [0, 0]], float)],
+                          level_nap=0.5, area_m2=5000.0, measured=True)
+
+        def piece(y0, y1):
+            return {"geometry": {"type": "Polygon", "coordinates": [
+                [[40, y0], [44, y0], [44, y1], [40, y1], [40, y0]]]},
+                "properties": {"type": "steiger"}}
+
+        features = {"kunstwerkdeel_vlak": [piece(10, 30), piece(30, 49), piece(5, 8)]}
+
+        def fetch(collection, _bbox, **_kwargs):
+            return features.get(collection, []), SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(harbour, "fetch_current", fetch):
+            built = harbour.build_harbour(
+                bbox, Path(tmp), water=[basin], quays=[],
+                surface_at=lambda x, y: np.full(np.shape(x), 3.0),
+            )
+        self.assertEqual(built.counts.get("jetty"), 2)
+        self.assertEqual(built.counts.get("deck_pieces_joined"), 1)
+        deck = built.tris[built.tri_kind == JETTY].reshape(-1, 3)
+        # No wall across the joint at y = 30: one deck, end to end.
+        across = deck[(np.abs(deck[:, 1] - 30.0) < 1e-6)]
+        self.assertEqual(len(across), 0)
 
     def test_only_mooring_posts_in_the_water_are_built(self):
         from src.harbour import POST

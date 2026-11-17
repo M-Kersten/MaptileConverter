@@ -223,6 +223,26 @@ def _clip_segment(start: np.ndarray, end: np.ndarray, bbox: BBox):
     return (t0, t1) if t1 > t0 else None
 
 
+# How far a track's drawn line may stray from the BGT's. The BGT draws a curve
+# as a vertex every few centimetres, which drawn as is made a curve a comb of
+# hundreds of cross-edges beside straights cut every 4 m. Simplified to this
+# first, a 300 m curve keeps a vertex every 8 m or so, and `densify` fills
+# that in to the same spacing as the straights.
+SIMPLIFY_M = 0.03
+
+
+def simplify(points: np.ndarray, tolerance_m: float = SIMPLIFY_M) -> np.ndarray:
+    """The line with every vertex dropped that it can lose within `tolerance_m`."""
+    import shapely
+
+    points = np.asarray(points, dtype=np.float64)[:, :2]
+    if len(points) < 3 or tolerance_m <= 0:
+        return points
+    line = shapely.LineString(points).simplify(tolerance_m, preserve_topology=False)
+    out = np.asarray(line.coords)[:, :2] if not line.is_empty else points
+    return out if len(out) >= 2 else points[[0, -1]]
+
+
 def densify(points: np.ndarray, max_step: float = DEFAULT_STEP_M) -> np.ndarray:
     """Insert points so no gap exceeds ``max_step``, keeping the originals.
 
@@ -339,7 +359,7 @@ def build_track_geometry(
     rail_tris, rail_kind, rail_uv = [], [], []
 
     for line in rails.lines:
-        points = densify(line.points, step_m)
+        points = densify(simplify(line.points), step_m)
         if len(points) < 2:
             continue
 

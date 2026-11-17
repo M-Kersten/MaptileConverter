@@ -50,10 +50,6 @@ from src.elevation import (  # noqa: E402
     raster_sampler,
 )
 from src.terrain_mesh import build_terrain_mesh  # noqa: E402
-from src.layered import GRASS as GRASS_LAYER  # noqa: E402
-from src.layered import MOTORWAY as MOTORWAY_LAYER  # noqa: E402
-from src.layered import ROAD as ROAD_LAYER  # noqa: E402
-from src.layered import WALKWAY as WALKWAY_LAYER  # noqa: E402
 from src.layered import build_layered_ground  # noqa: E402
 from src.nwb import NWB_URL, fetch_centrelines  # noqa: E402
 from src.roads import (  # noqa: E402
@@ -731,13 +727,6 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 prefix=str(settings["prefix"]),
                 tolerance_m=float(settings["tolerance_m"]),
                 outline_m=float(settings["outline_m"]),
-                focus_m=float(settings["focus_m"]),
-                lift={
-                    ROAD_LAYER: float(settings["road_lift_m"]),
-                    MOTORWAY_LAYER: float(settings["road_lift_m"]),
-                    WALKWAY_LAYER: float(settings["road_lift_m"]),
-                    GRASS_LAYER: float(settings["grass_lift_m"]),
-                },
                 walkway_raise_m=(
                     float(curb["height_m"]) - float(curb["height_offset_curb_m"])
                     if settings.get("kerbs", True)
@@ -748,6 +737,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 quays=surfaces.quays,
                 ditch_depth_m=float(settings["ditch_depth_m"]),
                 mesher=str(settings["mesher"]),
+                square_m=float(settings["square_m"]),
             )
             terrain.mesh = ground_layers.mesh
             terrain.layers = ground_layers

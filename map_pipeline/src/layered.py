@@ -1,23 +1,24 @@
-"""The ground the way the modellers build it: a coarse terrain, flat layers on top.
+"""The ground the way the modellers build it: one sheet, in layers they can grab.
 
 The hand-made Hazeldonk model the modellers work from is built in layers,
 each a separate object a person can grab:
 
-* **Terrain.** One sheet, with as few faces as keep it close to the survey --
-  2,115 faces for their square kilometre -- and the aerial on it.
-* **Roads, the motorway, walkways and grass**, each a separate set of faces
-  lying on the terrain a few centimetres up: grass at 2 cm, everything paved
-  at 5 cm. Their own colour, no photo.
+* **Terrain**, with the aerial on it.
+* **Roads, the motorway, walkways and grass**, each a separate set of faces.
+  Their own colour, no photo.
 * **Kerbs** are not modelled at all: every walkway and traffic island is a flat
   outline carrying the modellers' curb generator, which raises the walkway and
   builds the kerb round it. Edit the outline and the kerb follows.
 
-Here the same layers come from the BGT. The terrain is laid out in quads
+Their file lays the layers a few centimetres over a full terrain. With our
+model in hand they asked for the ground once: a terrain under every road is
+ground drawn twice, and deleting it leaves holes wherever no layer is. So
+here the ground is one sheet cut into those objects. It is laid out in quads
 along the outlines of every layer (`layered_mesh`): rungs straight across the
-roads, loops along the verges, a grid inside that coarsens away from the
-middle, and loops cut wherever a face still misses the survey. The outlines
-are edges of it, so each layer is simply the terrain's own faces under it,
-lifted -- no face of a road can dip under the ground or float off it.
+roads, loops along the verges, and one grid of the same squares everywhere
+else, turned to the way the streets run. The outlines are edges of it, so
+each layer is simply the faces under it and the terrain object what is left
+-- they meet edge to edge, sharing every vertex, and none lies on another.
 
 Water is cut into the terrain, with a flat water object over it, and along
 quay walls the ground drops straight down (`harbour` builds the quay faces,
@@ -88,9 +89,12 @@ PRIORITY = (
 ISLAND_SHARE = 0.9
 ISLAND_MAX_M2 = 2500.0
 
-# How far each layer's top is above the terrain, for what stands on it: a
-# lamp post on a footpath stands on the walkway the curb generator raised.
-DEFAULT_OFFSETS = {ROAD: 0.05, MOTORWAY: 0.05, WALKWAY: 0.05, GRASS: 0.02}
+# How far each layer lies above the ground: not at all. The roads, walkways
+# and grass are the ground, each its own object, sharing the vertices along
+# every edge where two meet; nothing is lifted onto a terrain under it. Only
+# a walkway's top is higher, by what the curb generator raises it, and a lamp
+# post on a footpath stands on that.
+DEFAULT_OFFSETS = {ROAD: 0.0, MOTORWAY: 0.0, WALKWAY: 0.0, GRASS: 0.0}
 
 # Ground under water: terrain, carved down to a bed, with no layer on it. A
 # terrain code of its own (material slot 15, which no material uses) only so
@@ -258,7 +262,6 @@ def build_layered_ground(
     prefix: str,
     tolerance_m: float = 0.5,
     outline_m: float = 0.25,
-    focus_m: float = 250.0,
     lift: dict[int, float] | None = None,
     walkway_raise_m: float = 0.13,
     max_rounds: int = 60,
@@ -266,15 +269,19 @@ def build_layered_ground(
     ditch_depth_m: float = DITCH_DEPTH_M,
     mesher: str = "quads",
     quays=(),
+    square_m: float | None = None,
 ) -> LayeredGround:
     """The terrain and its layers, from the survey and the BGT areas.
 
     `tolerance_m` is how far the terrain may be from the survey where it is
     simplified; `outline_m` how far a simplified outline may stray from the
     BGT's. `water` is the WaterBody list: carved into the terrain as ditches
-    and canals `ditch_depth_m` below their level. Faces in the middle
-    `focus_m` of the area are grouped east and west of the centre, the rest by
-    quadrant, as the modellers group theirs.
+    and canals `ditch_depth_m` below their level. Each layer is one object;
+    the modellers divide the model themselves.
+
+    `square_m` is the size of the grid squares and the spacing of the
+    stations along every outline (`layered_mesh.NEAR_CELL_M` if not given),
+    the same everywhere; a whole number of survey grid squares.
 
     `mesher` "quads" lays the terrain out in quads (`layered_mesh`);
     "triangles" is the triangulation refined until every grid node is within
@@ -344,8 +351,7 @@ def build_layered_ground(
         try:
             built = quad_terrain(
                 terrain, pieces, bodies, codes_wet=WATER_CODE,
-                tolerance_m=float(tolerance_m), focus_m=float(focus_m),
-                depth_m=float(ditch_depth_m),
+                depth_m=float(ditch_depth_m), tolerance_m=float(tolerance_m),
                 # Roads get rows wide enough to ladder straight across;
                 # yards, forecourts and footpaths the grid's.
                 paved_codes={
@@ -354,6 +360,7 @@ def build_layered_ground(
                 },
                 narrow_codes={_code(WALKWAY, "Beton_Geel"), _code(ROAD, "Verharding")},
                 quays=quays,
+                **({"near_m": float(square_m)} if square_m else {}),
             )
         except Exception as exc:  # noqa: BLE001 - the triangulation always works
             LOG.warning(
@@ -413,10 +420,7 @@ def build_layered_ground(
     )
 
     # ---- objects, named and grouped as the modellers do --------------------
-    face_object, names, object_layer = _objects(
-        points, loops, sizes, face_layer, prefix=prefix,
-        centre=(0.5 * width, 0.5 * height), focus_m=float(focus_m),
-    )
+    face_object, names, object_layer = _objects(face_layer, prefix=prefix)
     top = dict(lift)
     top[WALKWAY] = lift[WALKWAY] + float(walkway_raise_m)
 
@@ -966,109 +970,30 @@ def _layer_outlines(loops, sizes, face_layer, n_vertices):
     return edges.astype(np.int64), edge_on, vertex_on
 
 
-def zone_of(dx: float, dy: float, focus_m: float) -> tuple[bool, str]:
-    """Which part of the area a point is in, relative to the centre.
+def object_name(prefix: str, layer: int) -> str:
+    """The one object a layer is: Hazeldonk_Wegen, Hazeldonk_Voetpaden."""
+    return f"{prefix}_{LAYER_WORDS[layer]}"
 
-    Inside the middle `focus_m` it is the centre's east or west half; outside
-    it, a quadrant -- the modellers' VP_Oost and Wegen_Afstand_NO.
+
+def _objects(face_layer, *, prefix):
+    """Which object each face belongs to: one per layer.
+
+    The modellers used to have the ground split into an east and a west half
+    round the middle and quadrants beyond, as their hand-made file is. With
+    the model in hand they asked for it whole: they divide it themselves, for
+    their own culling. The terrain's own faces belong to no layer object (-1).
     """
-    if abs(dx) <= focus_m and abs(dy) <= focus_m:
-        return True, "Centrum_" + ("Oost" if dx >= 0 else "West")
-    return False, "Afstand_" + ("N" if dy >= 0 else "Z") + ("O" if dx >= 0 else "W")
-
-
-def object_name(prefix: str, layer: int, zone: tuple[bool, str] | None) -> str:
-    word = LAYER_WORDS[layer]
-    if layer == MOTORWAY or zone is None:
-        return f"{prefix}_{word}"
-    central, name = zone
-    return f"{prefix}_{name}_{word}" if central else f"{prefix}_{word}_{name}"
-
-
-def _objects(points, loops, sizes, face_layer, *, prefix, centre, focus_m):
-    """Which object each face belongs to.
-
-    Roads and grass by where each face is; a walkway by where its whole
-    island is, because the curb generator kerbs every edge where an object
-    ends -- splitting one footpath across two objects would kerb it in half.
-    """
-    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
-    face_of = np.repeat(np.arange(len(sizes)), sizes)
-    xy = points[loops]
-    centroid = np.zeros((len(sizes), 2))
-    np.add.at(centroid, face_of, xy)
-    centroid /= np.maximum(sizes, 1)[:, None]
-    dx, dy = centroid[:, 0] - centre[0], centroid[:, 1] - centre[1]
-
-    # Walkway islands: faces joined across shared edges.
-    walk = np.flatnonzero(face_layer == WALKWAY)
-    island = np.full(len(sizes), -1, dtype=np.int64)
-    if len(walk):
-        parent = {int(f): int(f) for f in walk}
-
-        def find(a):
-            while parent[a] != a:
-                parent[a] = parent[parent[a]]
-                a = parent[a]
-            return a
-
-        following = np.arange(len(loops)) + 1
-        following[starts + sizes - 1] = starts
-        is_walk = face_layer[face_of] == WALKWAY
-        e = np.sort(np.column_stack([loops, loops[following]]), axis=1)[is_walk]
-        owners = face_of[is_walk]
-        key = e[:, 0] * (len(points) + 1) + e[:, 1]
-        order = np.argsort(key, kind="stable")
-        ks = key[order]
-        same = np.flatnonzero(ks[1:] == ks[:-1])
-        for i in same:
-            a, b = find(int(owners[order[i]])), find(int(owners[order[i + 1]]))
-            if a != b:
-                parent[a] = b
-        roots = np.array([find(int(f)) for f in walk])
-        island[walk] = roots
-
     names: list[str] = []
     layers: list[int] = []
-    index: dict[str, int] = {}
-    face_object = np.full(len(sizes), -1, dtype=np.int64)
-
-    def assign(faces, name, layer):
-        if name not in index:
-            index[name] = len(names)
-            names.append(name)
-            layers.append(layer)
-        face_object[faces] = index[name]
-
+    face_object = np.full(len(face_layer), -1, dtype=np.int64)
     for layer in (MOTORWAY, ROAD, WALKWAY, GRASS):
         members = np.flatnonzero(face_layer == layer)
         if not len(members):
             continue
-        if layer == MOTORWAY:
-            assign(members, object_name(prefix, layer, None), layer)
-            continue
-        if layer == WALKWAY:
-            for root in np.unique(island[members]):
-                faces = members[island[members] == root]
-                area = np.abs(_areas(points, loops, starts, sizes, faces))
-                w = area / max(area.sum(), 1e-9)
-                zone = zone_of(float((dx[faces] * w).sum()), float((dy[faces] * w).sum()), focus_m)
-                assign(faces, object_name(prefix, layer, zone), layer)
-            continue
-        zones = [zone_of(float(a), float(b), focus_m) for a, b in zip(dx[members], dy[members])]
-        for zone in sorted(set(zones)):
-            faces = members[[z == zone for z in zones]]
-            assign(faces, object_name(prefix, layer, zone), layer)
+        face_object[members] = len(names)
+        names.append(object_name(prefix, layer))
+        layers.append(layer)
     return face_object, names, layers
-
-
-def _areas(points, loops, starts, sizes, faces):
-    out = np.zeros(len(faces))
-    for i, f in enumerate(faces):
-        ring = points[loops[starts[f]: starts[f] + sizes[f]]]
-        x, y = ring[:, 0], ring[:, 1]
-        out[i] = 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-    return out
 
 
 __all__ = [
@@ -1085,5 +1010,4 @@ __all__ = [
     "build_layered_ground",
     "classify",
     "object_name",
-    "zone_of",
 ]

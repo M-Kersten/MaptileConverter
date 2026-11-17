@@ -1032,9 +1032,9 @@ def check_layered(
 ) -> None:
     """The layered style's ground as Blender built it.
 
-    Every road, walkway and grass object is in the model; each lies on the
-    terrain at its offset, which is what its modifiers are there to keep,
-    and no part of a walkway stands higher than the curb generator builds
+    Every road, walkway and grass object is in the model; each is the ground
+    where it is, not floating over it or sunk under it, and no part of a
+    walkway stands higher than the curb generator builds
     (`kerb_top_m` above the walkway's foot); and the walkways have kerbs,
     which only the curb generator makes. Read back from Blender's own
     summary, as with the terrain: the plan says nothing about what the
@@ -1074,25 +1074,20 @@ def check_layered(
     kerbed = bool(kerbs and built.get("curb_generator"))
     lift = ground.lift
 
-    def wrapped(low, high):
-        # A Shrinkwrap offsets along the terrain's normal, which on a 60
-        # degree bank puts a layer between half and twice its lift above the
-        # ground straight down.
-        return low, high, 0.5 * low, 2.0 * high
+    def exact(low, high=None):
+        # Nothing wraps or drapes a layer onto anything any more: it is the
+        # ground, so it measures what it was built at, to the half centimetre.
+        high = low if high is None else high
+        return low, high, low - 0.005, high + 0.005
 
-    # What each role is built to stand above the terrain under it, and the
+    # What each role is built to stand above the ground under it, and the
     # band it may measure in.
     expect = {
-        "road": wrapped(min(lift[ROAD], lift[MOTORWAY]), max(lift[ROAD], lift[MOTORWAY])),
-        "grass": wrapped(lift[GRASS], lift[GRASS]),
-        # Draped, a kerbed walkway is exact: from its lift to the top of the
-        # kerb, to the half centimetre.
-        "walkway": (
-            (lift[WALKWAY], lift[WALKWAY] + kerb_top_m,
-             lift[WALKWAY] - 0.005, lift[WALKWAY] + kerb_top_m + 0.005)
-            if kerbed
-            else wrapped(lift[WALKWAY], lift[WALKWAY])
-        ),
+        "road": exact(min(lift[ROAD], lift[MOTORWAY]), max(lift[ROAD], lift[MOTORWAY])),
+        "grass": exact(lift[GRASS]),
+        # A kerbed walkway from its foot to the top of the kerb.
+        "walkway": exact(lift[WALKWAY], lift[WALKWAY] + kerb_top_m) if kerbed
+        else exact(lift[WALKWAY]),
     }
     above = built.get("height_above_terrain") or {}
     lines, wrong = [], []
@@ -1107,11 +1102,9 @@ def check_layered(
         past = float(got.get("beyond_outline_m", 0.0))
         reach = kerb_width_m + 0.05 if role == "walkway" else 0.05
         # A layer that floats, sinks or flies off misses its band by far, or
-        # everywhere. A Shrinkwrap on a face steeper than 65 degrees, where no
-        # offset can read as an exact lift straight up, misses it by a few
-        # centimetres at a vertex or two: over Utrecht, five of 26,000. So
-        # nothing may miss it by more than `LAYER_SLACK_M`, and no more than
-        # `LAYER_STRAY_SHARE` of the vertices may miss it at all.
+        # everywhere. Nothing may miss it by more than `LAYER_SLACK_M`, and no
+        # more than `LAYER_STRAY_SHARE` of the vertices may miss it at all: a
+        # kerb mitred round a sharp corner can stand a few centimetres out.
         lowest = got.get("lowest_m")
         highest = got.get("highest_m")
         if lowest is not None and highest is not None:
@@ -1133,7 +1126,7 @@ def check_layered(
             f"(built for {low:.2f}" + (f" to {high:.2f}" if high != low else "") + ")"
             + (f", {outside} of {got.get('vertices', '?')} vertices outside "
                f"{floor:.3f} to {ceiling:.3f} m" if outside else "")
-            + (f", {got['missed']} vertices not over the terrain" if got.get("missed") else "")
+            + (f", {got['missed']} vertices not over the ground" if got.get("missed") else "")
             + (f", reaching {past:.2f} m past its outline" if past > 0.05 else "")
         )
         if not ok:
@@ -1142,7 +1135,7 @@ def check_layered(
         report.add(
             "layers_lie_on_the_terrain",
             not wrong,
-            "height above the terrain: " + "; ".join(lines),
+            "height above the ground: " + "; ".join(lines),
         )
     if kerbs:
         if not built.get("curb_generator"):

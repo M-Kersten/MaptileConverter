@@ -176,6 +176,7 @@ def build_harbour(
         LOG.warning("could not read BGT jetties: %s", exc)
         features = []
     box = shapely.box(bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)
+    by_kind: dict[int, list] = {}
     for feature in features:
         props = feature.get("properties") or {}
         kind_name = str(props.get("type") or "").lower()
@@ -195,15 +196,32 @@ def build_harbour(
                 continue
             if polygon.intersection(wet).area < 0.2 * polygon.area:
                 continue  # on land: a platform, not a jetty
-            c = polygon.representative_point()
-            level = float(level_at(np.array([[c.x, c.y]]))[0])
-            top = _deck_top(polygon, dsm, level, kind)
-            tris = _extrude(polygon, top - DECK_THICKNESS_M[kind], top)
-            if len(tris):
-                chunks.append((tris, kind))
-                tops.append(top)
-                deck_levels.append(level)
-                result.counts[KIND_NAMES[kind]] = result.counts.get(KIND_NAMES[kind], 0) + 1
+            by_kind.setdefault(kind, []).append(polygon)
+    pieces = []
+    for kind, outlines in by_kind.items():
+        # One deck per jetty, however many BGT pieces it is drawn in: each
+        # piece read its own height off the surface model, and two pieces of
+        # one jetty met in a step with a crack down it.
+        merged = shapely.union_all(np.array(outlines, dtype=object))
+        merged = merged.buffer(DECK_JOIN_M, join_style="mitre").buffer(
+            -DECK_JOIN_M, join_style="mitre"
+        )
+        joined = int(len(outlines) - len(shapely.get_parts(merged)))
+        if joined > 0:
+            result.counts["deck_pieces_joined"] = result.counts.get("deck_pieces_joined", 0) + joined
+        pieces.extend((polygon, kind) for polygon in shapely.get_parts(merged))
+    for polygon, kind in pieces:
+        if polygon.geom_type != "Polygon" or polygon.area < 0.5:
+            continue
+        c = polygon.representative_point()
+        level = float(level_at(np.array([[c.x, c.y]]))[0])
+        top = _deck_top(polygon, dsm, level, kind)
+        tris = _extrude(polygon, top - DECK_THICKNESS_M[kind], top)
+        if len(tris):
+            chunks.append((tris, kind))
+            tops.append(top)
+            deck_levels.append(level)
+            result.counts[KIND_NAMES[kind]] = result.counts.get(KIND_NAMES[kind], 0) + 1
 
     # ---- fender works: catwalks and fenders --------------------------------
     try:
@@ -322,6 +340,10 @@ def _raster(path):
 
     with rasterio.open(path) as dataset:
         return dataset.read(1).astype(np.float64), dataset.transform
+
+
+# Pieces of a jetty this close are one jetty.
+DECK_JOIN_M = 0.05
 
 
 def _deck_top(polygon, dsm, level: float, kind: int) -> float:
