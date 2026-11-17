@@ -10183,6 +10183,43 @@ class TestUIServer(unittest.TestCase):
 
         self.server = server
 
+    def test_an_area_carries_the_settings_it_was_built_with(self):
+        """Opnieuw bouwen puts the area back on the map with its style and
+        detail; the page's own runs leave those in work/<name>/ui_config.json,
+        a command-line run only the style in its scene."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "output" / "a").mkdir(parents=True)
+            (root / "work" / "a").mkdir(parents=True)
+            (root / "work" / "a" / "ui_config.json").write_text(json.dumps(
+                {"style": "survey", "detail": "high", "export": {"collision": True}}))
+            (root / "output" / "b").mkdir(parents=True)
+            (root / "work" / "b").mkdir(parents=True)
+            (root / "work" / "b" / "scene.json").write_text(json.dumps({"style": "layered"}))
+            (root / "output" / "c").mkdir(parents=True)
+            with mock.patch.object(self.server, "REPO_ROOT", root):
+                by_name = {a["name"]: a["settings"] for a in self.server.list_areas()}
+        self.assertEqual(by_name["a"], {"style": "survey", "detail": "high", "collision": True})
+        self.assertEqual(by_name["b"], {"style": "layered"})
+        self.assertEqual(by_name["c"], {})
+
+    def test_a_reopened_page_finds_the_running_build(self):
+        job = self.server.Job("j1", "somewhere", {}, 60.0)
+        job.status = "running"
+        job.log("Step 3/15  buildings")
+        self.server.register(job)
+        try:
+            listed = {j["id"]: j for j in self.server.list_jobs()}
+        finally:
+            with self.server.JOBS_LOCK:
+                self.server.JOBS.pop("j1", None)
+                self.server.JOBS_ORDER.remove("j1")
+        self.assertEqual(listed["j1"]["name"], "somewhere")
+        self.assertEqual(listed["j1"]["step"], 3)
+        self.assertNotIn("lines", listed["j1"], "the job list should not carry whole logs")
+
     def test_form_payload_becomes_a_loadable_config(self):
         payload = {
             "name": "somewhere",
@@ -10517,7 +10554,14 @@ class _PanelScan(HTMLParser):
             self._collect = "stepnum" if "stepnum" in classes else "steptitle"
 
         if tag not in self.VOID:
-            controls = [d["for"]] if tag == "label" and "for" in d else []
+            # A label names its control by `for`; a radio group has no single
+            # control to point at, so its heading says which with data-explains.
+            if tag == "label" and "for" in d:
+                controls = [d["for"]]
+            elif "data-explains" in d:
+                controls = [d["data-explains"]]
+            else:
+                controls = []
             self._stack.append({"tag": tag, "controls": controls, "helps": 0})
 
     def handle_data(self, data):
@@ -10577,15 +10621,15 @@ class TestUIPage(unittest.TestCase):
                 control, self.page.explained, f"the control {control} has no help marker"
             )
 
-    def test_the_panel_reads_as_numbered_steps(self):
-        self.assertEqual(
-            self.page.step_titles,
-            ["Choose an area", "Choose the style and detail",
-             "Choose what to include", "Build"],
-        )
-        self.assertEqual(
-            self.page.step_numbers, ["1", "2", "3", "4"], "the steps are misnumbered"
-        )
+    def test_the_page_has_the_models_and_the_build_view(self):
+        """Modellen first, what has been built and what is building; Nieuw
+        gebied on the map. Both views, and the ways between them."""
+        for wanted in ("viewModels", "viewBuild", "newArea", "backToModels", "run",
+                       "runCard", "modelGrid", "map", "buildBar", "layers"):
+            self.assertIn(wanted, self.page.ids, f"the page lost #{wanted}")
+        self.assertRegex(self.html, r'<main id="viewModels"')
+        self.assertRegex(self.html, r'<section id="viewBuild"[^>]*\bhidden\b',
+                         "the map view should start hidden behind Modellen")
 
     def test_advanced_settings_start_folded_away(self):
         """The point of the section is that a newcomer never has to open it."""
@@ -10611,8 +10655,7 @@ class TestUIPage(unittest.TestCase):
             self.assertEqual(shown[name]["facade_px"], preset["facade_px"], name)
         sentences = re.search(r"const DETAIL_PLAIN = \{(.*?)\n\};", self.html, re.S).group(1)
         self.assertEqual(set(re.findall(r"^\s*(\w+):", sentences, re.M)), set(DETAIL_PRESETS))
-        options = set(re.findall(r'<option value="(\w+)"', re.search(
-            r'<select id="detail">(.*?)</select>', self.html, re.S).group(1)))
+        options = set(re.findall(r'name="detail" value="(\w+)"', self.html))
         self.assertEqual(options, set(DETAIL_PRESETS))
 
     def test_there_are_no_sliders_left(self):
@@ -10621,8 +10664,11 @@ class TestUIPage(unittest.TestCase):
         previews."""
         self.assertNotIn('type="range"', self.html)
         controls = set(re.findall(r'<(?:input|select)[^>]*\bid="(\w+)"', self.html))
+        groups = set(re.findall(r'<input type="radio" name="(\w+)"', self.html))
+        # The model list's own search and style filter are not build settings.
         self.assertEqual(
-            controls, {"q", "size", "name", "style", "detail", "preview", "collision"}
+            (controls | groups) - {"modelStyle", "modelFilter"},
+            {"q", "size", "name", "style", "detail", "preview", "collision"},
         )
 
     def test_the_styles_match_the_server(self):
@@ -10642,8 +10688,7 @@ class TestUIPage(unittest.TestCase):
             for name, values in re.findall(r"(\w+):\s*\{([^}]*)\}", body)
         }
         self.assertEqual(set(shown), set(STYLE_PRESETS))
-        options = set(re.findall(r'<option value="(\w+)"', re.search(
-            r'<select id="style">(.*?)</select>', self.html, re.S).group(1)))
+        options = set(re.findall(r'name="style" value="(\w+)"', self.html))
         self.assertEqual(options, set(STYLE_PRESETS))
 
         def value(tree: dict, path) -> object:

@@ -1,472 +1,531 @@
 <!doctype html>
-<html lang="en">
+<html lang="nl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Map pipeline</title>
+<title>Map Pipeline</title>
 <style>
+  /* Virtuele Brigade: deep night-teal grounds, white type, one orange that
+     always means "this moves you forward". Token names as in the design
+     system, so a value changed there can be changed here by name. The
+     Rijksoverheid Sans cuts are used where they are installed; the page does
+     not ship them. */
   :root {
-    --bg: #14161a;
-    --panel: #1c1f25;
-    --panel-2: #23272f;
-    --line: #333944;
-    --text: #e6e9ee;
-    --muted: #9aa3b0;
-    --accent: #4c9be8;
-    --ok: #4caf72;
-    --warn: #d8a339;
-    --bad: #e05c5c;
+    --bg-000: #062028;
+    --bg-100: #0a2c36;
+    --bg-200: #123746;
+    --bg-300: #183743;
+    --glass: rgba(10, 44, 54, 0.88);
+    --glass-deep: rgba(8, 30, 38, 0.94);
+    --text-primary: #ffffff;
+    --text-secondary: #eaf2f5;
+    --text-muted: #8aa7b3;
+    --text-subtle: #5b7a8b;
+    --signal: #ca6302;
+    --signal-bright: #e8871e;
+    --on-signal-bright: #062028;
+    --line: #1e4654;
+    --line-control: #5b7a8b;
+    --focus: #ffffff;
+    --success: #1ca375;
+    --danger: #f26d6d;
+    --radius-xs: 4px;
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --shadow-panel: 0 8px 24px rgba(0, 0, 0, 0.35);
+    --shadow-signal-glow: 0 0 0 1px rgba(232, 135, 30, 0.6), 0 0 18px rgba(202, 99, 2, 0.45);
+    --font-heading: "Rijksoverheid Sans Heading", "Fira Sans", "Segoe UI", system-ui, sans-serif;
+    --font-text: "Rijksoverheid Sans Text", "Fira Sans", "Segoe UI", system-ui, sans-serif;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    background: var(--bg); color: var(--text);
-    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-    display: grid; grid-template-columns: 380px 1fr; height: 100vh; overflow: hidden;
+    background: var(--bg-100); color: var(--text-primary);
+    font: 16px/24px var(--font-text); font-variant-numeric: lining-nums;
   }
-  @media (max-width: 900px) {
-    body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; overflow: auto; }
-    #map { min-height: 55vh; }
-  }
+  [hidden] { display: none !important; }
+  h1, h2, h3 { margin: 0; }
+  p { margin: 0; }
+  a { color: var(--signal-bright); }
+  a:hover { color: var(--text-primary); }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .overline { font-size: 16px; line-height: 20px; font-weight: 700; letter-spacing: .04em;
+              text-transform: uppercase; color: var(--signal-bright); }
+  .muted { color: var(--text-muted); }
+  .small { font-size: 14px; line-height: 20px; }
+  .caption { font-size: 12px; line-height: 16px; }
 
-  /* ---------- panel ---------- */
-  #panel { background: var(--panel); border-right: 1px solid var(--line);
-           overflow-y: auto; padding: 16px; }
-  h1 { font-size: 15px; margin: 0 0 2px; letter-spacing: .3px; }
-  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
-  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 14px;
-             padding: 12px; background: var(--panel-2); }
-  legend { color: var(--muted); font-size: 11px; text-transform: uppercase;
-           letter-spacing: .8px; padding: 0 6px; }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
-  label:first-of-type { margin-top: 0; }
-  input, select, button {
-    font: inherit; color: var(--text); background: #171a1f;
-    border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; width: 100%;
-  }
-  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .inline { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
-  .inline input[type=checkbox] { width: auto; }
-  .inline label { margin: 0; color: var(--text); font-size: 13px; }
-  /* The flex gap already spaces these; the icon's own margin would double it. */
-  .inline .help { margin-left: 0; }
-  button { cursor: pointer; background: #2b303a; }
-  button:hover:not(:disabled) { background: #343a46; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  button.primary { background: var(--accent); border-color: var(--accent);
-                   color: #07121d; font-weight: 600; }
-  button.primary:hover:not(:disabled) { background: #63aaf0; }
-  button.danger { background: #4a2626; border-color: #6b3333; }
-  .hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
-  .derived { float: right; color: var(--text); font-family: var(--mono);
-             font-size: 11px; text-transform: none; letter-spacing: 0; }
-  .derived.over { color: var(--warn); }
-  input[type=range].slider { -webkit-appearance: none; appearance: none;
-    padding: 0; height: 5px; background: #2b303a; border: 0; border-radius: 3px;
-    margin: 8px 0 2px; }
-  input[type=range].slider::-webkit-slider-thumb { -webkit-appearance: none;
-    width: 15px; height: 15px; border-radius: 50%; background: var(--accent);
-    cursor: pointer; border: 0; }
-  input[type=range].slider::-moz-range-thumb { width: 15px; height: 15px;
-    border-radius: 50%; background: var(--accent); cursor: pointer; border: 0; }
-  .ticks { display: flex; justify-content: space-between; color: var(--muted);
-           font-size: 10px; }
+  /* ---------- controls ---------- */
+  button, input, select { font: inherit; color: inherit; }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+         min-height: 40px; padding: 0 16px; border-radius: var(--radius-md);
+         border: 1px solid transparent; background: var(--bg-200); color: var(--text-primary);
+         font-size: 16px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+  .btn:hover:not(:disabled) { background: #1a4556; }
+  .btn:disabled { background: var(--bg-200); color: var(--text-subtle); cursor: not-allowed; box-shadow: none; }
+  .btn.primary { background: var(--signal); font-size: 19px; min-height: 48px; padding: 0 24px; }
+  .btn.primary:hover:not(:disabled) { background: var(--signal); box-shadow: var(--shadow-signal-glow); }
+  .btn.outline { background: transparent; border-color: var(--line-control); }
+  .btn.ghost { background: transparent; }
+  .btn.ghost:hover:not(:disabled) { background: var(--bg-200); }
+  .btn.icon { width: 40px; padding: 0; }
+  .btn svg { width: 20px; height: 20px; flex: none; }
+  .field { height: 40px; padding: 0 12px; background: var(--bg-000); color: var(--text-secondary);
+           border: 1px solid var(--line-control); border-radius: var(--radius-sm); font-size: 15px; width: 100%; }
+  .field::placeholder { color: var(--text-subtle); }
+  .flabel { display: flex; align-items: center; gap: 6px; font-size: 13px; line-height: 16px;
+            color: var(--text-muted); margin-bottom: 4px; }
 
-  /* ---------- steps and help ---------- */
-  .intro { background: var(--panel-2); border: 1px solid var(--line);
-           border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;
-           font-size: 12.5px; color: var(--muted); line-height: 1.45; }
-  .intro b { color: var(--text); font-weight: 600; }
-  /* inline-flex, not flex: a <legend> is laid out specially and several
-     browsers still ignore a block-level display on it. */
-  .step { display: inline-flex; align-items: center; gap: 8px; }
-  .stepnum { display: inline-flex; align-items: center; justify-content: center;
-             width: 19px; height: 19px; border-radius: 50%; flex: 0 0 auto;
-             background: var(--accent); color: #07121d; font-size: 11px;
-             font-weight: 700; }
-  .steptitle { font-size: 12px; color: var(--text); font-weight: 600;
-               text-transform: none; letter-spacing: 0; }
+  /* Segmented choice: radios, so the keyboard and a screen reader get a group. */
+  .seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--bg-000);
+         border: 1px solid var(--line); border-radius: var(--radius-md); }
+  .seg label { position: relative; }
+  .seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+  .seg span { display: block; padding: 6px 14px; border-radius: var(--radius-sm); font-size: 15px;
+              line-height: 22px; font-weight: 700; color: var(--text-muted); white-space: nowrap; }
+  .seg input:checked + span { background: var(--bg-200); color: var(--text-primary); }
+  .seg input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 1px; }
 
-  /* A question mark that explains the control next to it. Hover, keyboard
-     focus and tap all open it, because the people this is for are as likely
-     to be on a laptop trackpad as anywhere else. */
-  .help { display: inline-flex; align-items: center; justify-content: center;
-          width: 14px; height: 14px; border-radius: 50%; margin-left: 5px;
-          background: #39414f; color: var(--text); font-size: 10px;
-          font-weight: 700; cursor: help; user-select: none;
-          vertical-align: 1px; flex: 0 0 auto; }
-  .help:hover, .help:focus, .help.open { background: var(--accent); color: #07121d; }
-  /* One bubble for the whole page, parked on <body> and positioned in script.
-     A bubble parented to the icon would be clipped the moment it opened near
-     an edge, because #panel scrolls and so clips what overflows it. */
-  #tipbox { display: none; position: fixed; z-index: 100; width: 262px;
-            background: #10131a; border: 1px solid var(--line);
-            border-radius: 7px; padding: 9px 11px; font-size: 11.5px;
-            font-weight: 400; line-height: 1.5; color: var(--text);
-            text-align: left; box-shadow: 0 8px 26px rgba(0,0,0,.55); }
-  #tipbox b { color: var(--accent); font-weight: 600; }
+  /* Switch: a checkbox drawn as a toggle; on is the accent orange. */
+  .switch { appearance: none; -webkit-appearance: none; width: 40px; height: 22px; flex: none;
+            border-radius: 999px; background: var(--bg-000); border: 1px solid var(--line-control);
+            position: relative; cursor: pointer; margin: 0; transition: background 140ms; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+                   border-radius: 999px; background: var(--text-muted); transition: transform 140ms; }
+  .switch:checked { background: var(--signal-bright); border-color: var(--signal-bright); }
+  .switch:checked::after { transform: translateX(18px); background: var(--on-signal-bright); }
+  .switch:disabled { opacity: .45; cursor: not-allowed; }
 
-  .plain { color: var(--muted); font-size: 11px; margin-top: 3px;
-           line-height: 1.4; }
-  details.adv { border: 1px solid var(--line); border-radius: 8px;
-                background: var(--panel-2); margin: 0 0 14px; padding: 0; }
-  details.adv > summary { cursor: pointer; padding: 9px 12px; font-size: 12px;
-                          color: var(--muted); list-style: none; }
-  details.adv > summary::-webkit-details-marker { display: none; }
-  details.adv > summary::before { content: "\25B8  "; color: var(--accent); }
-  details.adv[open] > summary::before { content: "\25BE  "; }
-  details.adv > summary:hover { color: var(--text); }
-  details.adv .inner { padding: 0 12px 12px; }
-  details.adv .inner > label:first-child { margin-top: 0; }
-  /* A details nested inside a fieldset closes the group, so it should not
-     carry the spacing that separates two groups. */
-  fieldset > details.adv { margin: 10px 0 0; }
+  .stepper { display: inline-flex; align-items: center; border: 1px solid var(--line-control);
+             border-radius: var(--radius-sm); background: var(--bg-000); }
+  .stepper button { width: 34px; height: 38px; border: 0; background: transparent; color: var(--text-primary);
+                    cursor: pointer; font-size: 18px; }
+  .stepper input { width: 72px; height: 38px; border: 0; background: transparent; text-align: center;
+                   color: var(--text-secondary); font-size: 15px; font-variant-numeric: lining-nums tabular-nums; }
+  .stepper input::-webkit-outer-spin-button, .stepper input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .stepper input { -moz-appearance: textfield; appearance: textfield; }
+  .stepper .unit { padding-right: 10px; color: var(--text-muted); font-size: 14px; }
 
-  .next { font-size: 12px; line-height: 1.55; color: var(--muted); }
-  .next b { color: var(--text); font-weight: 600; }
-  .next code { font-family: var(--mono); font-size: 11.5px; color: var(--text);
-               background: #171a1f; border-radius: 4px; padding: 1px 5px; }
-  .next p { margin: 0 0 8px; }
-  .next p:last-child { margin-bottom: 0; }
+  /* Help markers: hover, tap or Tab to one and its bubble explains. */
+  .help { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 999px;
+          border: 1px solid var(--text-muted); color: var(--text-muted); font-size: 11px; line-height: 1;
+          font-weight: 700; cursor: help; flex: none; }
+  .help:hover, .help.open { border-color: var(--signal-bright); color: var(--signal-bright); }
+  #tipbox { position: fixed; z-index: 50; display: none; max-width: 340px; padding: 12px 14px;
+            background: var(--bg-000); color: var(--text-secondary); border: 1px solid var(--line);
+            border-radius: var(--radius-md); box-shadow: var(--shadow-panel); font-size: 14px; line-height: 20px; }
+  #tipbox b { color: var(--text-primary); }
 
-  /* ---------- sources ---------- */
-  .linkish { width: auto; padding: 1px 7px; font-size: 10px; background: #2b303a;
-             border-radius: 4px; margin-left: 6px; text-transform: none;
-             letter-spacing: 0; vertical-align: 1px; }
-  .srcs { display: flex; flex-direction: column; gap: 1px; }
-  .src { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
-         gap: 8px; padding: 5px 4px; border-radius: 5px; }
-  .src:hover { background: #272c34; }
-  .src input { width: auto; margin: 0; }
-  .src .name { font-size: 12.5px; line-height: 1.25; min-width: 0; }
-  .src .name b { font-weight: 600; }
-  .src .who { color: var(--muted); font-size: 10.5px; }
-  .src .dot { width: 9px; height: 9px; border-radius: 50%; background: #5a6270;
-              flex: 0 0 auto; }
-  .src .dot.up { background: var(--ok); }
-  /* Up, but on the second service. The run works; it is worth seeing anyway. */
-  .src .dot.degraded { background: var(--warn); }
-  .src .dot.down { background: var(--bad); }
-  .src .dot.checking { background: var(--warn); animation: pulse 1s infinite; }
-  @keyframes pulse { 50% { opacity: .35; } }
-  /* A required source that is down blocks the run, so it is marked out rather
-     than left looking like one red dot among several. */
-  .src.blocked { background: #3a2020; }
-  .src.off .name { opacity: .5; }
+  /* ---------- models view ---------- */
+  #viewModels { min-height: 100%; }
+  .wrap { max-width: 1344px; margin: 0 auto; padding: 40px 48px 64px; display: flex; flex-direction: column; gap: 32px; }
+  @media (max-width: 700px) { .wrap { padding: 24px 16px 48px; } }
+  .head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
+  .head h1 { font-family: var(--font-heading); font-size: 48px; line-height: 56px; }
+  .head .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+  #modelFilter { width: 260px; }
 
-  /* ---------- progress ---------- */
-  #progress { margin-top: 12px; }
-  .pbar { height: 7px; background: #2b303a; border-radius: 4px; overflow: hidden; }
-  .pfill { height: 100%; width: 0%; border-radius: 4px; background: var(--accent);
-           transition: width .45s ease; }
-  .pfill.done { background: var(--ok); }
-  .pfill.fail { background: var(--bad); }
-  /* Until a stage boundary lands there is nothing real to report, so the bar
-     shows motion rather than a number it cannot justify. */
-  .pfill.indeterminate {
-    width: 35% !important; transition: none;
-    background: linear-gradient(90deg, transparent, var(--accent), transparent);
-    animation: sweep 1.4s ease-in-out infinite;
-  }
-  @keyframes sweep { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
-  .prow { display: flex; justify-content: space-between; gap: 10px; margin-top: 5px;
-          font-size: 11.5px; color: var(--muted); align-items: baseline; }
-  .prow span { font-family: var(--mono); }
-  /* Stage names are long enough to wrap under the timing and shove it around,
-     so it is clipped instead; the full name is on the title. */
-  .prow #pstage { color: var(--text); white-space: nowrap; overflow: hidden;
-                  text-overflow: ellipsis; min-width: 0; }
-  .prow #ptime { flex: 0 0 auto; white-space: nowrap; }
-  .kv { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
-        white-space: pre-wrap; word-break: break-all; }
-  .kv b { color: var(--text); font-weight: 600; }
+  .run { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; padding: 20px 24px;
+         background: var(--bg-200); border: 1px solid var(--line); border-radius: var(--radius-lg); }
+  .run img, .run .noimg { width: 192px; height: 108px; object-fit: cover; border-radius: var(--radius-md); flex: none; background: var(--bg-000); }
+  .run .body { flex: 1 1 360px; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+  .run .title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; }
+  .run h2 { font-size: 20px; line-height: 26px; }
+  .run .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+  .pbar { height: 8px; border-radius: 999px; background: var(--bg-000); overflow: hidden; }
+  .pfill { height: 100%; width: 0; background: var(--signal); border-radius: 999px; transition: width 360ms cubic-bezier(.4,0,.2,1); }
+  .pfill.done { background: var(--success); }
+  .pfill.fail { background: var(--danger); }
+  .pfill.indeterminate { width: 30% !important; animation: slide 1.4s linear infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  .prow { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; line-height: 20px; color: var(--text-muted); }
+  .prow #pstage { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  /* ---------- search ---------- */
-  #searchWrap { position: relative; }
-  #results { position: absolute; z-index: 40; left: 0; right: 0; top: 100%;
-             background: #171a1f; border: 1px solid var(--line); border-radius: 6px;
-             margin-top: 3px; max-height: 240px; overflow-y: auto; display: none; }
-  #results div { padding: 7px 9px; cursor: pointer; font-size: 12.5px;
-                 border-bottom: 1px solid #23262c; }
-  #results div:last-child { border-bottom: 0; }
-  #results div:hover { background: #232830; }
-  #results .t { color: var(--muted); font-size: 11px; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+  .grid { margin: 0; padding: 0; list-style: none; display: grid; gap: 24px;
+          grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+  .card { display: flex; flex-direction: column; background: var(--bg-300); border-radius: var(--radius-lg); overflow: hidden; }
+  .card .shot { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; background: var(--bg-000); }
+  .card .noimg { display: grid; place-items: center; color: var(--text-muted); font-size: 14px; }
+  .card .body { display: flex; flex-direction: column; gap: 6px; padding: 16px; flex: 1 1 auto; }
+  .card h3 { font-size: 20px; line-height: 26px; overflow-wrap: anywhere; }
+  .card .checks { display: flex; align-items: center; gap: 6px; font-size: 14px; line-height: 20px; }
+  .card .buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 8px; }
+  .empty { padding: 48px 24px; text-align: center; border: 1px dashed var(--line-control); border-radius: var(--radius-lg);
+           display: flex; flex-direction: column; align-items: center; gap: 16px; color: var(--text-muted); }
 
-  /* ---------- map ---------- */
-  #map { position: relative; overflow: hidden; background: #0e1013;
-         cursor: grab; touch-action: none; }
+  /* ---------- build view ---------- */
+  #viewBuild { position: fixed; inset: 0; overflow: hidden; background: var(--bg-000); }
+  #map { position: absolute; inset: 0; overflow: hidden; cursor: crosshair; touch-action: none; }
   #map.dragging { cursor: grabbing; }
-  #tiles { position: absolute; inset: 0; }
-  #tiles img { position: absolute; width: 256px; height: 256px;
-               user-select: none; -webkit-user-drag: none; }
-  #sel { position: absolute; border: 2px solid var(--accent);
-         background: rgba(76,155,232,.14); pointer-events: none;
-         box-shadow: 0 0 0 9999px rgba(10,12,15,.34); }
-  #selLabel { position: absolute; transform: translateY(-100%);
-              background: var(--accent); color: #07121d; font-size: 11px;
-              font-weight: 600; padding: 2px 6px; border-radius: 4px 4px 0 0;
-              white-space: nowrap; }
-  #mapUI { position: absolute; left: 12px; bottom: 12px; z-index: 20;
-           background: rgba(20,22,26,.9); border: 1px solid var(--line);
-           border-radius: 8px; padding: 8px 10px; font-family: var(--mono);
-           font-size: 11.5px; color: var(--muted); }
-  #zoomUI { position: absolute; right: 12px; top: 12px; z-index: 20;
-            display: flex; flex-direction: column; gap: 4px; }
-  #zoomUI button { width: 34px; height: 34px; padding: 0; font-size: 17px;
-                   background: rgba(20,22,26,.9); }
-  .attrib { position: absolute; right: 8px; bottom: 6px; z-index: 20;
-            font-size: 10.5px; color: #7b8493; background: rgba(20,22,26,.75);
-            padding: 2px 6px; border-radius: 4px; }
+  #tiles img { position: absolute; user-select: none; pointer-events: none; }
+  #sel { position: absolute; border: 2px solid var(--signal-bright); box-shadow: 0 0 0 9999px rgba(6, 32, 40, .45);
+         pointer-events: none; }
+  #selLabel { position: absolute; left: -2px; top: -28px; padding: 3px 8px; border-radius: var(--radius-xs);
+              background: var(--signal-bright); color: var(--on-signal-bright); font-size: 12px; line-height: 16px;
+              font-weight: 700; white-space: nowrap; }
+  #zoomUI { position: absolute; left: 16px; bottom: 232px; display: flex; flex-direction: column; gap: 4px; padding: 4px;
+            background: var(--glass); border: 1px solid var(--line); border-radius: var(--radius-md); }
+  #zoomUI button { width: 36px; height: 36px; border: 0; background: transparent; color: var(--text-primary);
+                   font-size: 20px; cursor: pointer; border-radius: var(--radius-sm); }
+  #zoomUI button:hover { background: var(--bg-200); }
+  #mapUI { position: absolute; left: 16px; bottom: 202px; font: 12px/16px var(--mono); color: var(--text-muted);
+           background: rgba(6, 32, 40, .7); padding: 2px 6px; border-radius: var(--radius-xs); }
+  .attrib { position: absolute; left: 16px; bottom: 180px; font-size: 12px; line-height: 16px; color: var(--text-muted);
+            background: rgba(6, 32, 40, .7); padding: 2px 6px; border-radius: var(--radius-xs); }
 
-  /* ---------- log / results ---------- */
-  #log { font-family: var(--mono); font-size: 11px; background: #101216;
-         border: 1px solid var(--line); border-radius: 6px; padding: 9px;
-         height: 230px; overflow-y: auto; white-space: pre-wrap;
-         word-break: break-word; color: #c3c9d3; }
-  #log .e { color: var(--bad); }
-  #log .w { color: var(--warn); }
-  #log .p { color: var(--ok); }
-  .badge { display: inline-block; font-size: 11px; padding: 2px 8px;
-           border-radius: 999px; font-weight: 600; }
-  .badge.run { background: #2b3a4a; color: #8fc4f5; }
-  .badge.done { background: #21402f; color: #8fe0ac; }
-  .badge.fail { background: #4a2626; color: #ffa3a3; }
-  .files a { color: var(--accent); text-decoration: none; font-size: 12.5px; }
-  .files a:hover { text-decoration: underline; }
-  .files div { display: flex; justify-content: space-between; gap: 8px;
-               padding: 3px 0; border-bottom: 1px solid #262a31; }
-  .files span { color: var(--muted); font-size: 11px; font-family: var(--mono); }
-  .shots { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
-  .shots a { display: block; }
-  .shots img { width: 100%; border-radius: 5px; border: 1px solid var(--line);
-               display: block; }
-  .err { background: #3a2020; border: 1px solid #6b3333; color: #ffb3b3;
-         border-radius: 6px; padding: 8px 10px; font-size: 12.5px; margin-bottom: 10px; }
+  .float { position: absolute; background: var(--glass); border: 1px solid var(--line);
+           border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); }
+  #searchCard { top: 16px; left: 16px; width: 420px; max-width: calc(100% - 32px); padding: 16px;
+                display: flex; flex-direction: column; gap: 10px; }
+  #searchCard h1 { font-family: var(--font-heading); font-size: 20px; line-height: 26px; }
+  #searchWrap { position: relative; }
+  #results { position: absolute; left: 0; right: 0; top: 44px; z-index: 10; display: none; max-height: 320px; overflow: auto;
+             background: var(--bg-000); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-panel); }
+  #results div { padding: 8px 12px; cursor: pointer; font-size: 15px; line-height: 20px; }
+  #results div:hover { background: var(--bg-200); }
+  #results .t { color: var(--text-muted); font-size: 12px; line-height: 16px; padding: 0; }
+  #topNav { top: 16px; right: 16px; padding: 8px; display: flex; gap: 8px; }
+
+  #layers { top: 88px; right: 16px; width: 340px; max-width: calc(100% - 32px); max-height: calc(100% - 270px);
+            overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .lhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .lhead .overline { display: flex; align-items: center; gap: 6px; }
+  .linkish { background: none; border: 0; padding: 0; color: var(--signal-bright); cursor: pointer; font-size: 13px; }
+  .linkish:hover { color: var(--text-primary); }
+  .linkish:disabled { color: var(--text-subtle); cursor: default; }
+  .src { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); cursor: pointer; }
+  .src .name { flex: 1 1 auto; min-width: 0; font-size: 15px; line-height: 20px; }
+  .src .who { display: block; font-size: 12px; line-height: 16px; color: var(--text-muted); }
+  .src.off .name { color: var(--text-muted); }
+  .src.blocked .name { color: var(--danger); }
+  .dot { width: 8px; height: 8px; border-radius: 999px; flex: none; background: var(--text-subtle); }
+  .dot.up { background: var(--success); }
+  .dot.degraded { background: var(--signal-bright); }
+  .dot.down { background: var(--danger); }
+  .dot.checking { background: var(--text-subtle); animation: pulse 1s ease-in-out infinite alternate; }
+  @keyframes pulse { to { opacity: .3; } }
+  .optrow { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 15px; line-height: 20px; }
+  .optrow label { flex: 1 1 auto; cursor: pointer; }
+  details.adv summary { cursor: pointer; font-size: 14px; color: var(--text-muted); padding: 4px 0; }
+  .kv { font: 12px/18px var(--mono); color: var(--text-secondary); white-space: pre; overflow-x: auto; margin: 6px 0; }
+  .kv b { color: var(--text-muted); font-weight: 400; }
+
+  #buildBar { left: 50%; bottom: 16px; transform: translateX(-50%); width: 1300px; max-width: calc(100% - 32px);
+              padding: 14px 20px; display: flex; flex-direction: column; gap: 10px; background: var(--glass-deep); }
+  .barrow { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 20px; }
+  .barrow .grow { flex: 1 1 300px; display: flex; align-items: center; justify-content: flex-end; gap: 16px; }
+  .est { display: flex; flex-direction: column; align-items: flex-end; text-align: right; }
+  #name { width: 190px; }
+  #choiceNote, #areaPlain, #qualityNote { font-size: 13px; line-height: 18px; color: var(--text-muted); }
+  .notes { display: flex; flex-wrap: wrap; gap: 2px 20px; }
+  .notes span:empty { display: none; }
+  .warn { color: var(--signal-bright) !important; }
+  .err { padding: 10px 14px; border-radius: var(--radius-md); background: rgba(242, 109, 109, .12);
+         border: 1px solid var(--danger); color: var(--text-primary); font-size: 14px; line-height: 20px; }
+  @media (min-width: 901px) { #toggleLayers { display: none; } }
+  @media (max-width: 900px) {
+    #layers { top: auto; bottom: 16px; max-height: 40%; display: none; }
+    #layers.shown { display: flex; }
+    #zoomUI { bottom: 384px; } #mapUI { bottom: 354px; } .attrib { bottom: 330px; }
+  }
+
+  /* ---------- dialogs ---------- */
+  dialog { width: min(960px, calc(100% - 32px)); max-height: calc(100% - 64px); padding: 0; color: var(--text-primary);
+           background: var(--bg-100); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); }
+  dialog::backdrop { background: rgba(6, 32, 40, .7); }
+  .dhead { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px;
+           border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg-100); z-index: 1; }
+  .dhead h2 { font-family: var(--font-heading); font-size: 24px; line-height: 32px; overflow-wrap: anywhere; }
+  .dbody { padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+  .dbody h3 { font-size: 16px; line-height: 20px; letter-spacing: .04em; text-transform: uppercase; color: var(--signal-bright); }
+  .shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .shots img { width: 100%; border-radius: var(--radius-md); display: block; }
+  .files { display: flex; flex-direction: column; }
+  .files div { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--line);
+               font-size: 15px; line-height: 20px; }
+  .files span { color: var(--text-muted); font-variant-numeric: lining-nums tabular-nums; }
+  .next p { font-size: 15px; line-height: 22px; color: var(--text-secondary); margin-bottom: 10px; }
+  .next code { font-family: var(--mono); font-size: 13px; color: var(--text-primary); }
+  #log { font: 12px/18px var(--mono); color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
+         background: var(--bg-000); border-radius: var(--radius-md); padding: 12px; max-height: 60vh; overflow: auto; }
+  #log .e { color: var(--danger); }
+  #log .w { color: var(--signal-bright); }
+  #log .p { color: var(--success); }
+  .badge { font-size: 13px; line-height: 18px; padding: 2px 8px; border-radius: 999px; font-weight: 700; }
+  .badge.run { background: var(--bg-200); color: var(--text-primary); }
+  .badge.done { background: var(--success); color: var(--on-signal-bright); }
+  .badge.fail { background: var(--danger); color: var(--on-signal-bright); }
 </style>
 </head>
 <body>
 
-<div id="panel">
-  <h1>Map pipeline</h1>
-  <div class="sub">A real Dutch place, as a 3D model you can open in Blender or Unity</div>
-
-  <div id="banner"></div>
-
-  <div class="intro">
-    Pick a square anywhere in the Netherlands. This downloads the official open
-    data for it &mdash; the buildings, the height of the ground, the roads, the
-    aerial photograph &mdash; and builds a <b>model.blend</b> to edit and a
-    <b>model.fbx</b> for Unity. Everything comes out life-size in metres, standing at its real
-    height above sea level.
-    <br><br>
-    You do not need to know anything about maps or 3D modelling to use it:
-    choose a place, press <b>Build model</b>, and leave the rest alone. Every
-    setting has a <span class="help" tabindex="0" role="button"
-      aria-label="Example of a help marker"
-      data-tip="Like this one. Hover it, tap it, or reach it with the Tab key.">?</span>
-    next to it that says what it does.
-  </div>
-
-  <fieldset>
-    <legend>
-      <span class="step"><span class="stepnum">1</span><span class="steptitle">Choose an area</span></span>
-    </legend>
-
-    <label for="q">Find a place
-      <span class="help" tabindex="0" role="button" aria-label="About finding a place"
-        data-tip="Type a town, a street, a postcode or a landmark &mdash; <b>Domtoren Utrecht</b>, <b>Delft</b>, <b>3011 AA</b>. Choose a result and the square jumps there and names itself after it.">?</span>
-    </label>
-    <div id="searchWrap">
-      <input id="q" placeholder="Domtoren Utrecht, Delft, 3011 AA&hellip;" autocomplete="off">
-      <div id="results"></div>
-    </div>
-    <div class="hint">
-      Or work the map directly: click to move the square, drag to pan, scroll to zoom.
-    </div>
-
-    <div class="row" style="margin-top:10px">
-      <div>
-        <label for="size">Size across
-          <span class="help" tabindex="0" role="button" aria-label="About area size"
-            data-tip="How wide the square is, in metres. <b>1000 m</b> is one square kilometre, which is what this tool is tuned for. Larger areas take longer and make heavier files, and not gently: doubling the width is roughly four times the work.">?</span>
-        </label>
-        <input id="size" type="number" value="1000" min="200" max="4000" step="50">
+<!-- ===================================================================== -->
+<!-- Modellen: what has been built, and what is building now.               -->
+<!-- ===================================================================== -->
+<main id="viewModels">
+  <div class="wrap">
+    <header class="head">
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <span class="overline">Map Pipeline</span>
+        <h1>Modellen</h1>
+        <p class="muted" id="modelsCount">Modellen laden&hellip;</p>
       </div>
-      <div>
-        <label for="name">Name
-          <span class="help" tabindex="0" role="button" aria-label="About the name"
-            data-tip="Names the folder the model lands in. Letters, numbers and underscores only. Building the same name twice replaces what was there.">?</span>
-        </label>
-        <input id="name" value="demo_area">
+      <div class="actions">
+        <input id="modelFilter" class="field" type="search" placeholder="Zoek een model" aria-label="Zoek een model">
+        <button class="btn primary" id="newArea">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          Nieuw gebied
+        </button>
       </div>
-    </div>
-    <div class="plain" id="areaPlain"></div>
+    </header>
 
-    <details class="adv">
-      <summary>Exact coordinates</summary>
-      <div class="inner">
-        <div class="kv" id="bboxInfo"></div>
-        <div class="plain" style="margin-top:8px">
-          RD New (EPSG:28992), the Dutch national grid. You only need these if
-          you are lining this model up against other Dutch map data.
+    <section class="run" id="runCard" aria-label="Bouwen" hidden>
+      <img id="runThumb" alt="" hidden>
+      <div class="noimg" id="runNoThumb"></div>
+      <div class="body">
+        <div class="title">
+          <h2 id="runName">&hellip;</h2>
+          <span class="muted small" id="runMeta"></span>
+          <span id="status"></span>
+        </div>
+        <div id="progress">
+          <div class="pbar"><div class="pfill" id="pfill"></div></div>
+          <div class="prow" style="margin-top:6px">
+            <span id="pstage">starten</span>
+            <span id="ptime"></span>
+          </div>
         </div>
       </div>
+      <div class="buttons">
+        <button class="btn" id="showLog">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+          Logboek
+        </button>
+        <button class="btn outline" id="cancel">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          Stoppen
+        </button>
+        <button class="btn" id="openResult" hidden>Bekijken</button>
+        <button class="btn ghost icon" id="dismissRun" aria-label="Melding sluiten" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </section>
+
+    <div class="bar">
+      <div class="seg" role="radiogroup" aria-label="Filter op stijl" id="modelStyleFilter">
+        <label><input type="radio" name="modelStyle" value="all" checked><span>Alle</span></label>
+        <label><input type="radio" name="modelStyle" value="layered"><span>Gelaagd</span></label>
+        <label><input type="radio" name="modelStyle" value="survey"><span>Inmeting</span></label>
+      </div>
+      <span class="muted small">Nieuwste eerst</span>
+    </div>
+
+    <ul class="grid" id="modelGrid" aria-label="Gebouwde modellen"></ul>
+    <div class="empty" id="modelsEmpty" hidden>
+      <p>Nog geen modellen. Kies een plek op de kaart en bouw je eerste model.</p>
+      <button class="btn" id="emptyNew">Gebied kiezen</button>
+    </div>
+  </div>
+</main>
+
+<!-- ===================================================================== -->
+<!-- Nieuw gebied: the map, with everything a build needs floating on it.   -->
+<!-- ===================================================================== -->
+<section id="viewBuild" aria-label="Nieuw gebied" hidden>
+  <div id="map">
+    <div id="tiles"></div>
+    <div id="sel"><div id="selLabel"></div></div>
+    <div id="zoomUI">
+      <button id="zin" aria-label="Inzoomen">+</button>
+      <button id="zout" aria-label="Uitzoomen">&minus;</button>
+    </div>
+    <div id="mapUI"></div>
+    <div class="attrib">Luchtfoto &copy; PDOK / Beeldmateriaal (CC BY 4.0)</div>
+  </div>
+
+  <div class="float" id="searchCard">
+    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+      <h1>Nieuw gebied</h1>
+      <span class="muted caption">Een echte Nederlandse plek als 3D-model</span>
+    </div>
+    <label class="flabel" for="q">Zoek een plaats
+      <span class="help" tabindex="0" role="button" aria-label="Over zoeken"
+        data-tip="Typ een plaats, straat, postcode of bekend gebouw: <b>Domtoren Utrecht</b>, <b>Delft</b>, <b>3011 AA</b>. Kies een resultaat en het vierkant springt erheen en krijgt die naam.">?</span>
+    </label>
+    <div id="searchWrap">
+      <input id="q" class="field" placeholder="Domtoren Utrecht, Delft, 3011 AA&hellip;" autocomplete="off">
+      <div id="results"></div>
+    </div>
+    <p class="muted small">Of werk op de kaart: klik om het vierkant te verplaatsen, sleep om te schuiven, scroll om te zoomen.</p>
+  </div>
+
+  <nav class="float" id="topNav" aria-label="Algemeen">
+    <button class="btn ghost" id="backToModels">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+      Modellen
+    </button>
+    <button class="btn ghost" id="toggleLayers" aria-controls="layers">Lagen</button>
+    <button class="btn ghost icon" id="openAbout" aria-label="Wat je krijgt en hoe je het opent">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg>
+    </button>
+  </nav>
+
+  <aside class="float" id="layers" aria-label="Lagen">
+    <div class="lhead">
+      <span class="overline">Lagen
+        <span class="help" tabindex="0" role="button" aria-label="Over de lagen"
+          data-tip="Elke regel is een openbare Nederlandse dataservice. De stip zegt of hij <b>nu</b> antwoordt: groen is in orde, oranje komt van een reservedienst, rood is onbereikbaar. Zet uit wat je niet nodig hebt en het model is sneller klaar. Wijs een regel aan om te zien wat hij bijdraagt.">?</span>
+      </span>
+      <button id="recheck" class="linkish">Opnieuw controleren</button>
+    </div>
+    <p class="muted caption">Grond, gebouwen en luchtfoto zitten er altijd in. Deze voegen de rest toe.</p>
+    <div id="sources">beschikbaarheid controleren&hellip;</div>
+    <div class="caption" id="sourcesNote"></div>
+
+    <span class="overline" style="margin-top:8px">Uitvoer</span>
+    <div class="optrow">
+      <input type="checkbox" class="switch" id="preview" checked>
+      <label for="preview">Voorbeeldbeelden renderen</label>
+      <span class="help" tabindex="0" role="button" aria-label="Over voorbeeldbeelden"
+        data-tip="Rendert aan het eind een paar beelden van het model, zodat je ziet wat je kreeg zonder iets te openen. Ze verschijnen ook als plaatje bij het model in je overzicht. Kost aan het eind wat extra tijd.">?</span>
+    </div>
+    <div class="optrow">
+      <input type="checkbox" class="switch" id="collision">
+      <label for="collision">Botsvormen voor fysica</label>
+      <span class="help" tabindex="0" role="button" aria-label="Over botsvormen"
+        data-tip="Om er iets doorheen te laten rijden of vliegen in plaats van ernaar te kijken. Voegt onzichtbare <b>Collision_</b>-objecten toe: eenvoudige blokken om de bomen, en hekken dikker gemaakt zodat een snel object niet door een paneel van 6 cm schiet. In Unity: Mesh Collider erop, Mesh Renderer uit. Laat uit als je alleen een beeld wilt; het maakt het bestand groter.">?</span>
+    </div>
+
+    <details class="adv">
+      <summary>Exacte coördinaten</summary>
+      <div class="kv" id="bboxInfo"></div>
+      <p class="muted caption">RD New (EPSG:28992), het Nederlandse rijksdriehoekstelsel. Alleen nodig om dit model op andere Nederlandse kaartdata te leggen.</p>
     </details>
-  </fieldset>
+  </aside>
 
-  <fieldset>
-    <legend>
-      <span class="step"><span class="stepnum">2</span><span class="steptitle">Choose the style and detail</span></span>
-    </legend>
-
-    <label for="style">Style
-      <span class="help" tabindex="0" role="button" aria-label="About the style"
-        data-tip="How the ground is made. <b>Layered</b> is how our 3D modellers build an area by hand: a coarse terrain, with the roads, walkways and lawns as separate objects lying on it, so each can be selected, moved and given its own material. Walkways get kerbs from the curb generator, which needs Blender 5; water lies flat in ditches and harbours cut into the ground, with quay walls and jetties. <b>Survey</b> keeps the ground as measured, with water surfaces, and the roads as meshes of their own.">?</span>
-    </label>
-    <select id="style">
-      <option value="layered" selected>Layered &mdash; as our modellers build it</option>
-      <option value="survey">Survey &mdash; the ground as measured</option>
-    </select>
-    <div class="plain" id="stylePlain"></div>
-
-    <label for="detail">Detail
-      <span class="help" tabindex="0" role="button" aria-label="About detail"
-        data-tip="One choice sets everything that trades detail for time and file size: how sharp the aerial photo is, how closely spaced the ground's grid is, and how large the wall images are. <b>Standard</b> suits a square kilometre. <b>Draft</b> is for checking an area quickly; <b>High</b> for close-up work on a smaller one.">?</span>
-    </label>
-    <select id="detail">
-      <option value="draft">Draft &mdash; quick test</option>
-      <option value="standard" selected>Standard &mdash; recommended</option>
-      <option value="high">High &mdash; close-up work</option>
-    </select>
-    <div class="kv" id="detailNumbers" style="margin-top:8px"></div>
-    <div class="plain" id="detailPlain"></div>
-
-    <div id="qualityNote" class="hint"></div>
-  </fieldset>
-
-  <fieldset>
-    <legend>
-      <span class="step"><span class="stepnum">3</span><span class="steptitle">Choose what to include</span></span>
-    </legend>
-    <div class="hint" style="margin: 0 0 8px">
-      The ground, the buildings and the photo are always in. These add the rest.
-      <span class="help" tabindex="0" role="button" aria-label="About sources"
-        data-tip="Each line is a public Dutch data service. The dot says whether it is answering <b>right now</b>: green is fine, amber means it is being served from a backup, red means it cannot be reached. Switch off anything you do not need and the build finishes sooner. Hover a line to see exactly what it contributes.">?</span>
-    </div>
-    <div id="sources" class="srcs">checking availability&hellip;</div>
-    <div class="hint" id="sourcesNote"></div>
-    <div style="text-align:right; margin-top:6px">
-      <button id="recheck" class="linkish" title="Check availability again">check again</button>
-    </div>
-  </fieldset>
-
-  <fieldset>
-    <legend>
-      <span class="step"><span class="stepnum">4</span><span class="steptitle">Build</span></span>
-    </legend>
-    <div class="inline" style="margin-top:0">
-      <input type="checkbox" id="preview" checked>
-      <label for="preview">Render preview images at the end</label>
-      <span class="help" tabindex="0" role="button" aria-label="About preview images"
-        data-tip="Renders a few pictures of the finished model so you can see what you got without opening anything. Adds a little time at the end.">?</span>
-    </div>
-
-    <div class="inline">
-      <input type="checkbox" id="collision">
-      <label for="collision">Add simplified shapes for physics</label>
-      <span class="help" tabindex="0" role="button" aria-label="About collision shapes"
-        data-tip="For driving or flying something through the model rather than looking at it. Adds invisible <b>Collision_</b> objects: simple blocks around the trees, and fences thickened so a fast-moving object cannot slip through a 6 cm panel between two physics frames. In Unity, select them, add a Mesh Collider and switch off the Mesh Renderer. Everything else &mdash; the ground, the buildings, the roads &mdash; is already simple enough to collide with directly, and <b>metadata.json</b> lists which object to use for each. Leave this off if you only want a picture; it makes the file bigger.">?</span>
-    </div>
-    <button class="primary" id="run" style="margin-top:12px">Build model</button>
-    <div class="hint" id="estimate" style="text-align:center"></div>
-    <button class="danger" id="cancel" style="margin-top:6px; display:none">Cancel</button>
-
-    <div id="progress" style="display:none">
-      <div class="pbar"><div class="pfill" id="pfill"></div></div>
-      <div class="prow">
-        <span id="pstage">starting</span>
-        <span id="ptime"></span>
+  <section class="float" id="buildBar" aria-label="Bouwen">
+    <div id="banner"></div>
+    <div class="barrow">
+      <div>
+        <label class="flabel" for="name">Naam
+          <span class="help" tabindex="0" role="button" aria-label="Over de naam"
+            data-tip="Geeft de map een naam waar het model in komt: <b>output/naam/</b>. Alleen letters, cijfers en lage streepjes. Dezelfde naam opnieuw bouwen vervangt wat er stond.">?</span>
+        </label>
+        <input id="name" class="field" value="gebied">
+      </div>
+      <div>
+        <label class="flabel" for="size">Breedte
+          <span class="help" tabindex="0" role="button" aria-label="Over de breedte"
+            data-tip="Hoe breed het vierkant is, in meters. <b>1000 m</b> is een vierkante kilometer, waar dit gereedschap op is afgesteld. Groter duurt langer en geeft zwaardere bestanden, en niet zachtjes: twee keer zo breed is ongeveer vier keer het werk.">?</span>
+        </label>
+        <div class="stepper">
+          <button id="sizeDown" aria-label="Smaller">&minus;</button>
+          <input id="size" type="number" value="1000" min="200" max="4000" step="50" aria-label="Breedte in meters">
+          <span class="unit">m</span>
+          <button id="sizeUp" aria-label="Breder">+</button>
+        </div>
+      </div>
+      <div>
+        <div class="flabel" data-explains="style">Stijl
+          <span class="help" tabindex="0" role="button" aria-label="Over de stijl"
+            data-tip="Hoe de grond gemaakt wordt. <b>Gelaagd</b> is hoe onze modelleurs een gebied met de hand bouwen: een grof terrein met de wegen, stoepen en gazons als losse objecten erop, elk apart te selecteren en te materialiseren. Stoepen krijgen stoepranden (Blender 5); water ligt vlak in uitgegraven sloten en havens, met kades, steigers en leuningen. <b>Inmeting</b> houdt de grond zoals gemeten, met watervlakken en de wegen als eigen meshes.">?</span>
+        </div>
+        <div class="seg" role="radiogroup" aria-label="Stijl" id="style">
+          <label><input type="radio" name="style" value="layered" checked><span>Gelaagd</span></label>
+          <label><input type="radio" name="style" value="survey"><span>Inmeting</span></label>
+        </div>
+      </div>
+      <div>
+        <div class="flabel" data-explains="detail">Detail
+          <span class="help" tabindex="0" role="button" aria-label="Over het detail"
+            data-tip="Eén keuze die alles zet wat detail ruilt tegen tijd en bestandsgrootte: hoe scherp de luchtfoto is, hoe fijn het grondraster, hoe groot de gevelbeelden. <b>Standaard</b> past bij een vierkante kilometer. <b>Concept</b> is om een gebied snel te bekijken; <b>Hoog</b> voor close-ups op een kleiner gebied.">?</span>
+        </div>
+        <div class="seg" role="radiogroup" aria-label="Detail" id="detail">
+          <label><input type="radio" name="detail" value="draft"><span>Concept</span></label>
+          <label><input type="radio" name="detail" value="standard" checked><span>Standaard</span></label>
+          <label><input type="radio" name="detail" value="high"><span>Hoog</span></label>
+        </div>
+      </div>
+      <div class="grow">
+        <div class="est">
+          <span id="estimate"></span>
+          <span class="muted caption" id="buildSummary"></span>
+        </div>
+        <button class="btn primary" id="run">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7 12 12l8.7-5M12 22V12"/></svg>
+          Model bouwen
+        </button>
       </div>
     </div>
-  </fieldset>
-
-  <fieldset>
-    <legend>What it is doing <span id="status"></span></legend>
-    <div id="log">Nothing yet. Choose an area and press Build model.</div>
-    <div class="plain">
-      Downloading and building takes minutes, not seconds. You can leave this
-      window open and come back to it.
+    <div class="notes">
+      <span id="areaPlain"></span>
+      <span id="choiceNote"></span>
+      <span id="qualityNote"></span>
     </div>
-  </fieldset>
+  </section>
+</section>
 
-  <details class="adv">
-    <summary>What you get, and how to open it</summary>
-    <div class="inner next">
-      <p>A folder <code>output/&lt;name&gt;/</code> holding:</p>
-      <p>
-        <code>model.blend</code> &mdash; the model for editing in Blender: every
-        layer its own collection, one object per building and tree. In the
-        layered style the ground is a coarse terrain with the roads, walkways
-        and lawns as objects of their own lying on it; in the survey style the
-        roads and ground are clean quads, the ground's edges following every
-        waterline, road edge and building.<br>
-        <code>model.fbx</code> &mdash; the same model for Unity.<br>
-        <code>maptile_tools.py</code> &mdash; Blender tools that keep the
-        ground under the roads after you edit them.<br>
-        <code>aerial.png</code> and the wall images &mdash; the textures.<br>
-        <code>metadata.json</code> &mdash; where in the world it sits.<br>
-        <code>ATTRIBUTION.txt</code> &mdash; the credits. Keep it with the model
-        if you pass the model on.
-      </p>
-      <p>
-        <b>Blender:</b> open <code>model.blend</code>. For the tools, install
-        <code>maptile_tools.py</code> once as an add-on (Edit &rarr; Preferences
-        &rarr; Add-ons &rarr; Install from Disk); the <i>Maptile</i> tab is then
-        in the sidebar (N) of every model.
-        In the layered style the roads, walkways and lawns follow the terrain
-        by themselves: reshape the terrain and they move with it. Each
-        walkway's kerb is its <i>CurbGenerator</i> modifier, so edit the
-        walkway's outline and the kerb follows. Use Blender 5 for the kerbs.
-        In the survey style, after moving or widening a road, press
-        <i>Fit terrain under roads</i>.
-      </p>
-      <p>
-        <b>Unity:</b> drag the folder into Assets. On the FBX set
-        <i>Scale Factor</i> to 1, leave <i>Convert Units</i> on, and tick
-        <i>Bake Axis Conversion</i> so nothing arrives rotated.
-      </p>
-      <p>
-        The centre of the square is the origin, so the model straddles 0,0.
-        Height is measured from Dutch sea level (NAP), the same as on any Dutch
-        map.
-      </p>
+<!-- ===================================================================== -->
+<!-- Dialogs                                                                -->
+<!-- ===================================================================== -->
+<dialog id="modelDialog" aria-labelledby="modelTitle">
+  <div class="dhead">
+    <h2 id="modelTitle">Model</h2>
+    <div style="display:flex;gap:8px">
+      <button class="btn" id="rebuildModel">Opnieuw bouwen</button>
+      <button class="btn ghost icon" id="closeModel" aria-label="Sluiten">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
     </div>
-  </details>
-
-  <div id="out"></div>
-</div>
-
-<div id="tipbox"></div>
-
-<div id="map">
-  <div id="tiles"></div>
-  <div id="sel"><div id="selLabel"></div></div>
-  <div id="zoomUI">
-    <button id="zin" title="Zoom in">+</button>
-    <button id="zout" title="Zoom out">&minus;</button>
   </div>
-  <div id="mapUI"></div>
-  <div class="attrib">Aerial &copy; PDOK / Beeldmateriaal (CC BY 4.0)</div>
-</div>
+  <div class="dbody" id="out"></div>
+</dialog>
+
+<dialog id="logDialog" aria-labelledby="logTitle">
+  <div class="dhead">
+    <h2 id="logTitle">Logboek</h2>
+    <button class="btn ghost icon" id="closeLog" aria-label="Sluiten">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <div class="dbody">
+    <div id="log">Nog niets. Kies een gebied en druk op Model bouwen.</div>
+    <p class="muted small">Downloaden en bouwen duurt minuten, geen seconden. Je kunt dit venster open laten en later terugkomen.</p>
+  </div>
+</dialog>
+
+<dialog id="aboutDialog" aria-labelledby="aboutTitle">
+  <div class="dhead">
+    <h2 id="aboutTitle">Wat je krijgt, en hoe je het opent</h2>
+    <button class="btn ghost icon" id="closeAbout" aria-label="Sluiten">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <div class="dbody next">
+    <p>Kies een vierkant ergens in Nederland. Dit haalt de officiële open data ervoor op, de gebouwen, de hoogte van de grond, de wegen en de luchtfoto, en bouwt er een <b>model.blend</b> van om te bewerken en een <b>model.fbx</b> voor Unity. Alles komt op ware grootte in meters, op zijn echte hoogte boven NAP.</p>
+    <p>Een map <code>output/&lt;naam&gt;/</code> met: <code>model.blend</code>, het model voor Blender, elke laag een eigen collectie en één object per gebouw en boom; <code>model.fbx</code>, hetzelfde model voor Unity; <code>maptile_tools.py</code>, Blender-gereedschap dat de grond onder de wegen houdt als je ze bewerkt; <code>aerial.png</code> en de gevelbeelden; <code>metadata.json</code>, waar het in de wereld ligt; en <code>ATTRIBUTION.txt</code>, de bronvermelding. Houd die bij het model als je het doorgeeft.</p>
+    <p><b>Blender:</b> open <code>model.blend</code>. Installeer <code>maptile_tools.py</code> eenmalig als add-on (Edit &rarr; Preferences &rarr; Add-ons &rarr; Install from Disk); het tabblad <i>Maptile</i> staat dan in de zijbalk (N). In de gelaagde stijl volgen wegen, stoepen en gazons het terrein vanzelf, en is de stoeprand van elke stoep zijn <i>CurbGenerator</i>-modifier. Gebruik Blender 5 voor de stoepranden. In de inmetingsstijl druk je na het verplaatsen van een weg op <i>Fit terrain under roads</i>.</p>
+    <p><b>Unity:</b> sleep de map naar Assets. Zet op de FBX <i>Scale Factor</i> op 1, laat <i>Convert Units</i> aan en vink <i>Bake Axis Conversion</i> aan, zodat niets gedraaid binnenkomt.</p>
+    <p>Het midden van het vierkant is de oorsprong, dus het model ligt om 0,0 heen. Hoogte is gemeten vanaf NAP, net als op elke Nederlandse kaart.</p>
+  </div>
+</dialog>
+
+<div id="tipbox" role="tooltip"></div>
 
 <script>
 "use strict";
 
 /* ---------------------------------------------------------------------------
+   Two views: Modellen, what has been built and what is building, and Nieuw
+   gebied, the map with everything a build needs on it. Building from the map
+   goes back to Modellen, where the run is followed to the end.
+
    The map works directly in RD New (EPSG:28992), the same frame the pipeline
-   uses, so the rectangle you drag is literally the bbox that gets built. No
+   uses, so the square on it is literally the bbox that gets built. No
    reprojection anywhere in this page.
 
    PDOK's EPSG:28992 tile matrix set, read from its WMTS capabilities:
@@ -484,23 +543,40 @@ const span = z => TILE * res(z);
 const view = { x: 136500, y: 455500, z: 12 };   // Utrecht centre
 const sel  = { x: 136500, y: 455500, size: 1000 };
 
-const mapEl = document.getElementById("map");
-const tilesEl = document.getElementById("tiles");
-const selEl = document.getElementById("sel");
-const selLabelEl = document.getElementById("selLabel");
-
 const $ = id => document.getElementById(id);
+const mapEl = $("map");
+const tilesEl = $("tiles");
+const selEl = $("sel");
+const selLabelEl = $("selLabel");
+
+/* ---------- views ---------- */
+function showModels() {
+  $("viewBuild").hidden = true;
+  $("viewModels").hidden = false;
+  hideTip();
+  loadAreas();
+}
+
+function showBuild() {
+  $("viewModels").hidden = true;
+  $("viewBuild").hidden = false;
+  hideTip();
+  // The map has no size while hidden; fit once it has one.
+  requestAnimationFrame(() => fitToSelection());
+}
+
+$("newArea").onclick = () => showBuild();
+$("emptyNew").onclick = () => showBuild();
+$("backToModels").onclick = () => showModels();
+$("toggleLayers").onclick = () => $("layers").classList.toggle("shown");
 
 function viewport() { return { w: mapEl.clientWidth, h: mapEl.clientHeight }; }
 
 /* Centre on the selection and pick the zoom where it fills a comfortable part
-   of the view. Without this a 1 km square at the default zoom is wider than the
-   window, so the thing you are about to build is not actually visible. */
-function fitToSelection(fraction = 0.85) {
+   of the view, above the build bar. */
+function fitToSelection(fraction = 0.6) {
   const { w, h } = viewport();
   if (!w || !h) return;
-  // Zoom steps are powers of two, so take the closest zoom in which the square
-  // still fits inside `fraction` of the shorter side.
   const budget = Math.min(w, h) * fraction;
   let best = MIN_Z;
   for (let z = MIN_Z; z <= MAX_Z; z++) {
@@ -508,7 +584,9 @@ function fitToSelection(fraction = 0.85) {
   }
   view.z = best;
   view.x = sel.x;
-  view.y = sel.y;
+  // Shifted down a little, so the square sits in the clear part of the map
+  // rather than behind the bar along the bottom.
+  view.y = sel.y - 70 * res(best);
   render();
 }
 
@@ -525,11 +603,10 @@ function toRD(sx, sy) {
    and the map flickers. */
 const tileCache = new Map();
 
-/* Tiles normally come straight from PDOK. Where the browser cannot reach it —
-   behind a corporate proxy, or on a machine where only the pipeline process has
-   network — they come through our own server instead, which had to reach PDOK
-   anyway. One probe at startup decides which, because a blocked request often
-   hangs rather than failing, and a hang never fires an error event. */
+/* Tiles normally come straight from PDOK. Where the browser cannot reach it,
+   they come through our own server instead, which had to reach PDOK anyway.
+   One probe at startup decides which, because a blocked request often hangs
+   rather than failing, and a hang never fires an error event. */
 let tileSource = "direct";
 
 function tileSrc(z, col, row, zs) {
@@ -545,13 +622,13 @@ function probeTileSource() {
     const timer = setTimeout(() => done("proxy"), 5000);
     img.onload  = () => { clearTimeout(timer); done("direct"); };
     img.onerror = () => { clearTimeout(timer); done("proxy"); };
-    // A tile over Utrecht at zoom 9, only used to test reachability.
     img.src = `${TILE_URL}/09/245/260.jpeg?probe=${Date.now()}`;
   });
 }
 
 function render() {
   const { w, h } = viewport();
+  if (!w || !h) { updateBboxInfo(); return; }
   const s = span(view.z), r = res(view.z);
   const nw = toRD(0, 0), se = toRD(w, h);
 
@@ -582,14 +659,8 @@ function render() {
       img.style.width = img.style.height = Math.ceil(TILE * 1.002) + "px";
     }
   }
-
   for (const [key, img] of tileCache) {
     if (!seen.has(key)) { img.remove(); tileCache.delete(key); }
-  }
-  if (tileCache.size > 900) {
-    for (const [key, img] of tileCache) {
-      if (!seen.has(key)) { img.remove(); tileCache.delete(key); }
-    }
   }
 
   const half = sel.size / 2;
@@ -599,7 +670,7 @@ function render() {
   selEl.style.top = a.sy + "px";
   selEl.style.width = px + "px";
   selEl.style.height = px + "px";
-  selLabelEl.textContent = `${Math.round(sel.size)} × ${Math.round(sel.size)} m`;
+  selLabelEl.textContent = `${$("name").value.trim() || "gebied"} · ${Math.round(sel.size)} m`;
 
   $("mapUI").textContent =
     `RD ${view.x.toFixed(0)}, ${view.y.toFixed(0)}   z${view.z}   ${r.toFixed(2)} m/px`;
@@ -617,27 +688,21 @@ function bbox() {
 function updateBboxInfo() {
   const b = bbox();
   $("bboxInfo").innerHTML =
-    `<b>bbox RD</b>  ${b.xmin}, ${b.ymin}\n          ${b.xmax}, ${b.ymax}\n` +
-    `<b>centre</b>   ${sel.x.toFixed(1)}, ${sel.y.toFixed(1)}`;
+    `<b>bbox RD</b>  ${b.xmin}, ${b.ymin}\n         ${b.xmax}, ${b.ymax}\n` +
+    `<b>midden</b>   ${sel.x.toFixed(1)}, ${sel.y.toFixed(1)}`;
   updateAreaPlain();
 }
 
-/* The same square said in words, because "1000" in a box does not tell you
-   whether you have picked a city block or half a province. The size guidance
-   lives here rather than with the coordinates: the coordinates are folded away
-   by default, and a warning nobody sees is not a warning. */
+/* The same square said in words, with the size warning where it is seen. */
 function updateAreaPlain() {
   const km2 = (sel.size * sel.size) / 1e6;
-  const pretty = km2 >= 10 ? km2.toFixed(0) : km2.toFixed(2).replace(/\.?0+$/, "");
-  const name = $("name").value.trim() || "area";
-  const said =
-    `${Math.round(sel.size)} × ${Math.round(sel.size)} m, ${pretty} km². ` +
-    `Lands in output/${name}/`;
-  const off = sel.size < 900 || sel.size > 1100
-    ? `<br><span style="color:var(--warn)">Outside the 900–1100 m this is tuned ` +
-      `for. It still builds${sel.size > 1100 ? ", it just takes longer" : ""}.</span>`
-    : "";
-  $("areaPlain").innerHTML = escapeHtml(said) + off;
+  const pretty = (km2 >= 10 ? km2.toFixed(0) : km2.toFixed(2).replace(/\.?0+$/, "")).replace(".", ",");
+  const name = $("name").value.trim() || "gebied";
+  const off = sel.size < 900 || sel.size > 1100;
+  $("areaPlain").innerHTML =
+    escapeHtml(`${Math.round(sel.size)} × ${Math.round(sel.size)} m, ${pretty} km² · komt in output/${name}/`) +
+    (off ? ` <span class="warn">Buiten de 900–1100 m waarop dit is afgesteld. Het bouwt wel${
+      sel.size > 1100 ? ", het duurt alleen langer" : ""}.</span>` : "");
 }
 
 /* ---------- interaction ---------- */
@@ -692,10 +757,10 @@ mapEl.addEventListener("wheel", e => {
 $("zin").onclick = () => { view.z = Math.min(MAX_Z, view.z + 1); render(); };
 $("zout").onclick = () => { view.z = Math.max(MIN_Z, view.z - 1); render(); };
 
-$("size").addEventListener("input", () => {
-  const v = parseFloat($("size").value);
+function setSize(v) {
   if (!(v > 0)) return;
-  sel.size = v;
+  sel.size = Math.max(200, Math.min(4000, v));
+  $("size").value = Math.round(sel.size);
   // Detail is per metre, so the derived pixel counts move with the box size.
   updateQuality();
   // Refit only when the square has grown past the window, so a deliberate zoom
@@ -703,7 +768,11 @@ $("size").addEventListener("input", () => {
   const { w, h } = viewport();
   if (sel.size / res(view.z) > Math.min(w, h) * 0.95) fitToSelection();
   else render();
-});
+  refreshEstimate();
+}
+$("size").addEventListener("change", () => setSize(parseFloat($("size").value)));
+$("sizeDown").onclick = () => setSize(sel.size - 250);
+$("sizeUp").onclick = () => setSize(sel.size + 250);
 
 window.addEventListener("resize", render);
 
@@ -733,6 +802,7 @@ $("q").addEventListener("input", () => {
           resultsEl.style.display = "none";
           $("q").value = item.label;
           $("name").value = slug(item.label);
+          updateAreaPlain();
           fitToSelection();
         };
         resultsEl.appendChild(row);
@@ -748,7 +818,7 @@ document.addEventListener("click", e => {
 
 function slug(text) {
   return text.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
-    .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "area";
+    .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "gebied";
 }
 function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g,
@@ -759,13 +829,9 @@ function escapeHtml(text) {
    Help bubbles.
 
    One bubble for the whole page, moved to whichever "?" is active and placed
-   in viewport coordinates. Parenting a bubble to its icon would be simpler,
-   but #panel scrolls and therefore clips, so every tip opened near an edge
-   would come out sliced.
-
-   Hovering explains; clicking pins it open, because a long tip read on a
-   trackpad should not vanish when the pointer drifts a pixel. Tab reaches
-   them, Escape and a click elsewhere dismiss them.
+   in viewport coordinates, so a tip near an edge of a scrolling panel is not
+   sliced. Hovering explains; clicking pins it open. Tab reaches them, Escape
+   and a click elsewhere dismiss them.
 --------------------------------------------------------------------------- */
 const tipbox = $("tipbox");
 let tipOwner = null, tipPinned = false;
@@ -776,15 +842,13 @@ function showTip(el) {
   if (tipOwner && tipOwner !== el) tipOwner.classList.remove("open");
   tipbox.innerHTML = text;          // authored in this file, never user input
   tipbox.style.display = "block";
-  // Measure at a known position: a stale offset would be baked into the height
-  // reading on a bubble that is already wrapping against a window edge.
   tipbox.style.left = tipbox.style.top = "0px";
 
   const anchor = el.getBoundingClientRect();
   const box = tipbox.getBoundingClientRect();
   const M = 8;
   // Below the icon by default, above it when the window has no room left,
-  // which is what happens for the last few controls on a short screen.
+  // which is where the build bar's markers always are.
   let top = anchor.bottom + M;
   if (top + box.height > innerHeight - M) {
     top = anchor.top - box.height - M;
@@ -811,8 +875,6 @@ const helpAt = target => (target && target.closest ? target.closest(".help") : n
 document.addEventListener("pointerover", e => {
   const help = helpAt(e.target);
   if (!help || help === tipOwner) return;
-  // Moving to a different "?" always takes over, pinned or not; otherwise a
-  // pinned tip would make the rest of the page look like it had no help.
   tipPinned = false;
   showTip(help);
 });
@@ -826,7 +888,7 @@ document.addEventListener("click", e => {
   const help = helpAt(e.target);
   if (help) {
     // These sit inside <label>s. Without this the click falls through to the
-    // label and toggles the very checkbox the user was asking about.
+    // label and toggles the very control the user was asking about.
     e.preventDefault();
     if (tipPinned && tipOwner === help) hideTip();
     else { showTip(help); tipPinned = true; }
@@ -835,15 +897,14 @@ document.addEventListener("click", e => {
   if (tipPinned) hideTip();
 });
 
-/* A click focuses the span too. Without knowing that, focusin would pin the
-   tip and the click that follows would read it as "already pinned" and shut
-   it again, so clicking a "?" would look like it did nothing. */
+/* A click focuses the span too; without knowing that, focusin would pin the
+   tip and the click that follows would shut it again. */
 let helpPressed = null;
 document.addEventListener("pointerdown", e => { helpPressed = helpAt(e.target); });
 
 document.addEventListener("focusin", e => {
   const help = helpAt(e.target);
-  if (!help || help === helpPressed) return;   // reached by pointer; click owns it
+  if (!help || help === helpPressed) return;
   showTip(help);
   tipPinned = true;
 });
@@ -855,25 +916,21 @@ document.addEventListener("focusout", e => {
 document.addEventListener("keydown", e => {
   const focused = helpAt(document.activeElement);
   if (e.key === "Escape" && tipOwner) { hideTip(); return; }
-  // Focused by Tab, these are buttons as far as the keyboard is concerned, and
-  // space on a span would otherwise scroll the panel out from under the tip.
   if (focused && (e.key === "Enter" || e.key === " ")) {
     e.preventDefault();
     if (tipPinned && tipOwner === focused) hideTip(); else showTip(focused);
   }
 });
 
-/* The bubble is positioned against the window, so anything that moves the
-   icon underneath it has to take it down. */
-$("panel").addEventListener("scroll", () => { if (tipOwner) hideTip(); });
+$("layers").addEventListener("scroll", () => { if (tipOwner) hideTip(); });
 window.addEventListener("resize", () => { if (tipOwner) hideTip(); });
 
 /* ---------------------------------------------------------------------------
-   Detail.
+   Detail and style.
 
-   Expressed as ground resolution, not as a pixel count, so a setting means the
-   same thing whatever the area size: 25 cm/px is 25 cm/px over a 500 m box and
-   over a 2 km one. Pixel and vertex counts are derived from the box.
+   Detail is expressed as ground resolution, not as a pixel count, so a level
+   means the same thing whatever the area size. Pixel and vertex counts are
+   derived from the box.
 --------------------------------------------------------------------------- */
 const UNITY_MAX_TEXTURE = 16384; // Unity will not import a larger texture at full size
 
@@ -885,73 +942,83 @@ const DETAIL = {
   high:     { aerial_cm: 12, grid_m: 1, facade_px: 1024 }
 };
 const DETAIL_PLAIN = {
-  draft: "Quick to build, to check an area before committing to it. The photo shows blocks and roads; the ground follows the land but not its kerbs.",
-  standard: "Cars and pavements read in the photo; ditches, ramps and embankments come through in the ground, a 2 m grid whose edges follow the waterlines, road edges and buildings.",
-  high: "Road markings read in the photo and the ground carries kerbs and small steps. Heavy over a full square kilometre; best on a smaller area."
+  draft: "Snel gebouwd, om een gebied te bekijken voor je je eraan vastlegt.",
+  standard: "Auto's en stoepen zijn te lezen in de foto; sloten, hellingen en taluds komen door in de grond.",
+  high: "Wegmarkeringen zijn te lezen in de foto. Zwaar over een hele vierkante kilometer; het best op een kleiner gebied."
 };
-/* In the layered style the ground is the same at every level: detail is the
-   photo and the walls. */
-const DETAIL_PLAIN_LAYERED = {
-  draft: "Quick to build, to check an area before committing to it. The photo shows blocks and roads.",
-  standard: "Cars and pavements read in the photo; the walls carry their windows.",
-  high: "Road markings read in the photo. Heavy over a full square kilometre; best on a smaller area."
-};
+const DETAIL_NAME = { draft: "Concept", standard: "Standaard", high: "Hoog" };
 
 /* What each style does to the sources. Must match STYLE_PRESETS and
    STYLE_LOCKED in src/config.py: "locked" sources cannot be used in the
-   style at all, "unticked" ones start off and may be ticked. */
+   style at all, "unticked" ones start off and may be turned on. */
 const STYLE = {
   layered: { locked: [], unticked: ["vehicles"] },
   survey:  { locked: [], unticked: [] }
 };
 const STYLE_PLAIN = {
-  layered: "A terrain of quads whose edge loops follow the roads, verges and ditches, coarser away from the middle, with every road, walkway and lawn an object of its own lying on it, named and grouped as the modellers group theirs. Walkways get kerbs you can edit (Blender 5). Water lies flat in ditches and harbours cut into the ground, with quay walls, jetties, catwalks, fenders and mooring posts.",
-  survey: "The ground as measured: a fine grid whose edges follow every waterline, road edge and building, the roads as meshes of their own with kerbs, and water."
+  layered: "Grof terrein met wegen, stoepen en gazons als losse objecten erop, zoals onze modelleurs bouwen.",
+  survey: "De grond zoals gemeten, met de wegen als eigen meshes en watervlakken."
+};
+const STYLE_NAME = { layered: "Gelaagd", survey: "Inmeting" };
+
+/* The layer names the page shows. The server's own labels are English and
+   stay in the hover text; a source the page does not know keeps its label. */
+const SOURCE_NAME = {
+  terrain: "Hoogte", aerial: "Luchtfoto", buildings: "Gebouwen", usage: "Gebouwfunctie",
+  trees: "Bomen", water: "Water en kades", land_cover: "Bodembedekking",
+  furniture: "Straatmeubilair", barriers: "Muren, hekken en hagen",
+  vehicles: "Auto's en boten", structures: "Bruggen en tunnels", rails: "Spoor"
 };
 
-function currentStyle() { return STYLE[$("style").value] || STYLE.layered; }
+const radioValue = name => (document.querySelector(`input[name="${name}"]:checked`) || {}).value;
+const setRadio = (name, value) => {
+  const box = document.querySelector(`input[name="${name}"][value="${value}"]`);
+  if (box) box.checked = true;
+};
+function styleValue() { return radioValue("style") || "layered"; }
+function detailValue() { return radioValue("detail") || "standard"; }
+function currentStyle() { return STYLE[styleValue()] || STYLE.layered; }
 
 function quality() {
   const side = sel.size;
-  const d = DETAIL[$("detail").value] || DETAIL.standard;
+  const d = DETAIL[detailValue()] || DETAIL.standard;
   // A multiple of 4 px: the mosaic splits the photo into tiles and whole
   // numbers keep every tile boundary on an exact pixel.
   const sizePx = Math.max(256, Math.round(side / (d.aerial_cm / 100) / 4) * 4);
   const perSide = Math.ceil(side / d.grid_m) + 1;
   return {
-    detail: $("detail").value, cm: d.aerial_cm, grid: d.grid_m, sizePx,
-    facadePx: d.facade_px, megapixels: (sizePx * sizePx) / 1e6,
-    vertices: perSide * perSide, perSide
+    detail: detailValue(), cm: d.aerial_cm, grid: d.grid_m, sizePx,
+    facadePx: d.facade_px, vertices: perSide * perSide
   };
 }
 
 function updateQuality() {
   const q = quality();
-  const layered = $("style").value === "layered";
-  $("detailNumbers").innerHTML =
-    `<b>photo</b> ${q.cm} cm/px, ${q.sizePx} px<br>`
-    + (layered
-      ? `<b>ground</b> within 0.5 m of the survey, measured every ${q.grid} m<br>`
-      : `<b>ground</b> every ${q.grid} m, ${(q.vertices / 1000).toFixed(0)}k points<br>`)
-    + `<b>walls</b> ${q.facadePx} px a storey`;
-  $("detailPlain").textContent = (layered ? DETAIL_PLAIN_LAYERED : DETAIL_PLAIN)[q.detail] || "";
-  $("stylePlain").textContent = STYLE_PLAIN[$("style").value] || "";
+  const layered = styleValue() === "layered";
+  $("choiceNote").textContent =
+    `Foto ${q.cm} cm/px (${q.sizePx} px) · ` +
+    (layered ? "grond binnen 0,5 m van de inmeting" : `grond elke ${q.grid} m`) +
+    ` · gevels ${q.facadePx} px`;
+  $("choiceNote").title =
+    `${STYLE_NAME[styleValue()]}: ${STYLE_PLAIN[styleValue()] || ""}\n` +
+    `${DETAIL_NAME[q.detail]}: ${DETAIL_PLAIN[q.detail] || ""}`;
   const notes = [];
   if (q.sizePx > UNITY_MAX_TEXTURE)
-    notes.push(`Using Unity? The photo is bigger than it will import (${UNITY_MAX_TEXTURE} px) and gets shrunk on the way in. A smaller area keeps this detail. Blender takes it as it is.`);
+    notes.push(`Voor Unity? De foto is groter dan Unity importeert (${UNITY_MAX_TEXTURE} px) en wordt verkleind. Een kleiner gebied houdt dit detail.`);
   else if (q.sizePx > 2048)
-    notes.push("Using Unity? It shrinks imported textures to 2048 px until you raise Max Size on the texture. Blender takes it as it is.");
+    notes.push("Voor Unity? Zet Max Size op de luchtfoto hoger dan 2048 px, anders verkleint Unity hem.");
   if (!layered && q.vertices > 1.5e6)
-    notes.push(`That is ${(q.vertices / 1e6).toFixed(1)} million points of ground. It will open, but expect a slow import and a heavy scene.`);
-  $("qualityNote").innerHTML = notes.map(escapeHtml).join("<br>");
-  $("qualityNote").style.color = "var(--muted)";
+    notes.push(`Dat is ${(q.vertices / 1e6).toFixed(1).replace(".", ",")} miljoen grondpunten. Het opent, maar reken op een trage import.`);
+  $("qualityNote").textContent = notes.join(" ");
 }
 
-$("detail").addEventListener("change", updateQuality);
-$("name").addEventListener("input", updateAreaPlain);
+for (const box of document.querySelectorAll('input[name="detail"]')) {
+  box.addEventListener("change", () => { updateQuality(); refreshEstimate(); });
+}
+$("name").addEventListener("input", () => { updateAreaPlain(); render(); });
 
-/* Switching style: a source the style starts without is unticked, once, and
-   ticked again on the way back unless the user has touched it since. */
+/* Switching style: a source the style starts without is turned off, once,
+   and on again on the way back unless the user has touched it since. */
 const styleUnticked = new Set();
 function applyStyle() {
   const style = currentStyle();
@@ -964,19 +1031,21 @@ function applyStyle() {
   renderSources();
   refreshEstimate();
 }
-$("style").addEventListener("change", applyStyle);
+for (const box of document.querySelectorAll('input[name="style"]')) {
+  box.addEventListener("change", applyStyle);
+}
 
 /* ---------- estimate ---------- */
 function humanTime(seconds) {
   if (!isFinite(seconds) || seconds < 0) return "?";
   const s = Math.round(seconds);
-  if (s < 60) return `${s}s`;
+  if (s < 60) return `${s} s`;
   const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
-  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+  if (m < 60) return `${m} min ${String(s % 60).padStart(2, "0")} s`;
+  return `${Math.floor(m / 60)} u ${String(m % 60).padStart(2, "0")} min`;
 }
 
-let estimateTimer = null, lastEstimate = null;
+let estimateTimer = null;
 
 function settingsForEstimate() {
   const b = bbox(), q = quality();
@@ -995,18 +1064,26 @@ function settingsForEstimate() {
   });
 }
 
+function updateBuildSummary() {
+  const optional = sourceList.filter(s => !s.required);
+  const on = optional.filter(sourceOn).length;
+  $("buildSummary").textContent =
+    `${on} van ${optional.length} lagen · voorbeeldbeelden ${$("preview").checked ? "aan" : "uit"}` +
+    ($("collision").checked ? " · botsvormen" : "");
+}
+
 function refreshEstimate() {
+  updateBuildSummary();
   clearTimeout(estimateTimer);
   estimateTimer = setTimeout(async () => {
     try {
       const r = await fetch("/api/estimate?" + settingsForEstimate());
       const d = await r.json();
-      lastEstimate = d.seconds;
       const note = d.calibrated_from_runs
-        ? `, from ${d.calibrated_from_runs} past run${d.calibrated_from_runs > 1 ? "s" : ""}`
+        ? `, uit ${d.calibrated_from_runs} eerdere ${d.calibrated_from_runs > 1 ? "runs" : "run"}`
         : "";
-      $("estimate").textContent = `about ${humanTime(d.seconds)}${note}`;
-      $("estimate").title = Object.entries(d.breakdown || {})
+      $("estimate").textContent = `ca. ${humanTime(d.seconds)}`;
+      $("estimate").title = `Schatting${note}\n` + Object.entries(d.breakdown || {})
         .sort((a, b) => b[1] - a[1])
         .map(([k, v]) => `${k}: ${humanTime(v)}`).join("\n");
     } catch {
@@ -1015,21 +1092,195 @@ function refreshEstimate() {
   }, 200);
 }
 
-/* Anything that changes the cost changes the estimate. */
-for (const id of ["detail", "size"]) {
-  $(id).addEventListener("input", refreshEstimate);
-  $(id).addEventListener("change", refreshEstimate);
-}
 $("preview").addEventListener("change", refreshEstimate);
+$("collision").addEventListener("change", updateBuildSummary);
 
-/* ---------- running ---------- */
+/* ---------------------------------------------------------------------------
+   Modellen: the areas on disk, newest first, as cards.
+--------------------------------------------------------------------------- */
+let areas = [];
+
+function areaStyle(a) { return (a.settings && a.settings.style) || null; }
+
+function areaMeta(a) {
+  const parts = [];
+  const style = areaStyle(a), detail = a.settings && a.settings.detail;
+  if (style) parts.push(STYLE_NAME[style] || style);
+  if (detail) parts.push(DETAIL_NAME[detail] || detail);
+  const size = a.metadata && a.metadata.size_m;
+  if (size) parts.push(`${Math.round(size)} m`);
+  if (a.modified) {
+    const when = new Date(a.modified);
+    if (!isNaN(when)) parts.push(when.toLocaleString("nl-NL", {
+      day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }));
+  }
+  return parts.join(" · ");
+}
+
+function areaShot(a) {
+  const shots = a.previews || [];
+  const best = shots.find(p => /oblique/.test(p.name)) || shots[0];
+  return best ? best.url : null;
+}
+
+function checksLine(v) {
+  if (!v) return { ok: null, text: "Geen controles" };
+  const total = (v.passed || 0) + (v.failed || 0);
+  if (v.failed) return { ok: false, text: `${v.failed} van ${total} controles mislukt` };
+  return { ok: true, text: `${v.passed} van ${total} controles geslaagd` +
+    (v.warned ? `, ${v.warned} ${v.warned > 1 ? "waarschuwingen" : "waarschuwing"}` : "") };
+}
+
+const ICON_OK = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>';
+const ICON_FAIL = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>';
+
+async function loadAreas() {
+  try {
+    const r = await fetch("/api/areas");
+    areas = (await r.json()).areas || [];
+  } catch {
+    $("modelsCount").textContent = "De lokale server is niet bereikbaar.";
+    return;
+  }
+  renderAreas();
+}
+
+function renderAreas() {
+  const term = $("modelFilter").value.trim().toLowerCase();
+  const style = radioValue("modelStyle") || "all";
+  const shown = areas.filter(a =>
+    (!term || a.name.toLowerCase().includes(term)) &&
+    (style === "all" || areaStyle(a) === style));
+
+  const building = job ? 1 : 0;
+  $("modelsCount").textContent =
+    `${areas.length} ${areas.length === 1 ? "gebied" : "gebieden"} gebouwd` +
+    (building ? " · 1 bezig" : "");
+  $("modelsEmpty").hidden = areas.length > 0;
+
+  const grid = $("modelGrid");
+  grid.innerHTML = "";
+  for (const a of shown) {
+    const li = document.createElement("li");
+    li.className = "card";
+    const shot = areaShot(a);
+    const checks = checksLine(a.validation);
+    li.innerHTML =
+      (shot
+        ? `<img class="shot" src="${shot}" alt="Voorbeeldbeeld van ${escapeHtml(a.name)}" loading="lazy">`
+        : `<div class="shot noimg">Geen voorbeeldbeeld</div>`) +
+      `<div class="body">
+         <h3>${escapeHtml(a.name)}</h3>
+         <span class="muted small">${escapeHtml(areaMeta(a))}</span>
+         <span class="checks">${checks.ok === false ? ICON_FAIL : checks.ok ? ICON_OK : ""}${escapeHtml(checks.text)}</span>
+         <div class="buttons">
+           <button class="btn" data-open>Bekijken</button>
+           <button class="btn ghost" data-rebuild>Opnieuw bouwen</button>
+         </div>
+       </div>`;
+    li.querySelector("[data-open]").onclick = () => openModel(a);
+    li.querySelector("[data-rebuild]").onclick = () => rebuild(a);
+    grid.appendChild(li);
+  }
+  if (areas.length && !shown.length) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = "Geen model past bij dit filter.";
+    grid.appendChild(li);
+  }
+}
+
+$("modelFilter").addEventListener("input", renderAreas);
+for (const box of document.querySelectorAll('input[name="modelStyle"]')) {
+  box.addEventListener("change", renderAreas);
+}
+
+/* Opnieuw bouwen: the area's square, name and settings back on the map. */
+let openArea = null;
+
+function rebuild(a) {
+  const m = a.metadata || {};
+  if (Array.isArray(m.bbox_rd) && m.bbox_rd.length === 4) {
+    const [x0, y0, x1, y1] = m.bbox_rd;
+    sel.x = (x0 + x1) / 2;
+    sel.y = (y0 + y1) / 2;
+    sel.size = Math.max(x1 - x0, y1 - y0);
+    $("size").value = Math.round(sel.size);
+  }
+  $("name").value = a.name;
+  const s = a.settings || {};
+  if (s.style) { setRadio("style", s.style); applyStyle(); }
+  if (s.detail) { setRadio("detail", s.detail); updateQuality(); }
+  if (typeof s.collision === "boolean") $("collision").checked = s.collision;
+  refreshEstimate();
+  $("modelDialog").close();
+  showBuild();
+}
+$("rebuildModel").onclick = () => { if (openArea) rebuild(openArea); };
+
+function openModel(a) {
+  openArea = a;
+  $("modelTitle").textContent = a.name;
+  showResult(a);
+  $("modelDialog").showModal();
+}
+$("closeModel").onclick = () => $("modelDialog").close();
+
+function showResult(area) {
+  const parts = [];
+  const v = area.validation;
+  if (v) {
+    const checks = checksLine(v);
+    parts.push(`<section><h3>Controles</h3>
+      <p style="display:flex;gap:8px;align-items:center;margin-top:8px">${
+        checks.ok === false ? ICON_FAIL : ICON_OK}${escapeHtml(checks.text)}</p>`);
+    for (const c of (v.checks || []).filter(c => !c.passed)) {
+      parts.push(`<p class="small" style="color:${c.severity === "error" ? "var(--danger)" : "var(--signal-bright)"}">${
+        escapeHtml(c.name)}: ${escapeHtml(c.detail)}</p>`);
+    }
+    parts.push(`</section>`);
+  }
+  if (area.previews && area.previews.length) {
+    parts.push(`<section><h3>Voorbeeldbeelden</h3><div class="shots" style="margin-top:8px">`);
+    for (const p of area.previews) {
+      parts.push(`<a href="${p.url}" target="_blank" title="${escapeHtml(p.name)}">
+        <img src="${p.url}?t=${Date.now()}" alt="${escapeHtml(p.name)}"></a>`);
+    }
+    parts.push(`</div></section>`);
+  }
+  if (area.files && area.files.length) {
+    parts.push(`<section><h3>Bestanden</h3>
+      <p class="muted small" style="margin:6px 0">In <code>output/${escapeHtml(area.name)}/</code>.</p><div class="files">`);
+    for (const f of area.files) {
+      parts.push(`<div><a href="${f.url}" download>${escapeHtml(f.name)}</a>
+        <span>${f.size_mb < 0.01 ? "&lt; 0,01" : String(f.size_mb).replace(".", ",")} MB</span></div>`);
+    }
+    parts.push(`</div>`);
+    if (area.metadata) {
+      const m = area.metadata;
+      parts.push(
+        `<div class="kv" style="margin-top:12px">` +
+        `<b>oorsprong RD</b>  ${(m.origin_rd || []).join(", ")}\n` +
+        `<b>z-offset</b>      ${m.ground_z_offset_nap} m NAP\n` +
+        `<b>gebouwen</b>      ${m.buildings?.count ?? "?"}\n` +
+        `<b>assen</b>         ${escapeHtml(m.unity_axis || "")}</div>`);
+    }
+    parts.push(`</section>`);
+  }
+  $("out").innerHTML = parts.join("") || `<p class="muted">Nog niets op schijf voor dit model.</p>`;
+}
+
+/* ---------------------------------------------------------------------------
+   Running.
+
+   A build starts from the map and is followed on Modellen. A page opened,
+   or reloaded, while one runs picks it up from /api/jobs.
+--------------------------------------------------------------------------- */
 const logEl = $("log");
-let job = null, offset = 0, poller = null;
+let job = null, jobName = "", offset = 0, poller = null, lastArea = null;
 
 function showProgress(data) {
   const bar = $("pfill");
-  $("progress").style.display = "block";
-
   const running = data.status === "running" || data.status === "starting";
   // With no stage boundary yet there is nothing honest to show as a number.
   const indeterminate = running && !data.total_steps;
@@ -1039,18 +1290,17 @@ function showProgress(data) {
   if (!indeterminate) bar.style.width = `${Math.round((data.fraction || 0) * 100)}%`;
 
   const step = data.total_steps
-    ? `step ${Math.min(data.step, data.total_steps)}/${data.total_steps} · ` : "";
+    ? `Stap ${Math.min(data.step, data.total_steps)} van ${data.total_steps} · ` : "";
   const label = running
-    ? `${step}${data.stage || "working"}`
-    : (data.status === "done" ? "finished" : data.status);
+    ? `${step}${data.stage || "bezig"}`
+    : ({ done: "Klaar", failed: "Mislukt", cancelled: "Gestopt" }[data.status] || data.status);
   $("pstage").textContent = label;
   $("pstage").title = label;
 
   const parts = [humanTime(data.elapsed)];
   if (running && data.remaining != null) {
-    // Counting down to "~0s left" and sitting there says nothing. Once a run
-    // passes its estimate, say so instead of pretending it is about to finish.
-    parts.push(data.remaining > 1 ? `~${humanTime(data.remaining)} left` : "over estimate");
+    // Once a run passes its estimate, say so instead of pretending it is about to finish.
+    parts.push(data.remaining > 1 ? `nog ca. ${humanTime(data.remaining)}` : "langer dan geschat");
   }
   $("ptime").textContent = parts.join(" · ");
 }
@@ -1070,24 +1320,46 @@ function setStatus(state, text) {
     ? `<span class="badge ${state}">${escapeHtml(text)}</span>` : "";
 }
 
+function showRunCard(name, meta) {
+  $("runCard").hidden = false;
+  $("runName").textContent = name;
+  $("runMeta").textContent = meta || "";
+  const known = areas.find(a => a.name === name);
+  const shot = known && areaShot(known);
+  $("runThumb").hidden = !shot;
+  $("runNoThumb").hidden = !!shot;
+  if (shot) $("runThumb").src = shot;
+  $("cancel").hidden = false;
+  $("showLog").hidden = false;
+  $("openResult").hidden = true;
+  $("dismissRun").hidden = true;
+}
+
+function follow(id, name, from = 0) {
+  job = id;
+  jobName = name;
+  offset = from;
+  clearInterval(poller);
+  poller = setInterval(poll, 700);
+  poll();
+  updateSourceStates();
+}
+
 $("run").onclick = async () => {
+  const name = $("name").value.trim();
   const payload = {
-    name: $("name").value.trim(),
+    name,
     bbox: bbox(),
     // Everything else follows from these. See DETAIL_PRESETS and
     // STYLE_PRESETS in src/config.py.
-    style: $("style").value,
-    detail: $("detail").value,
+    style: styleValue(),
+    detail: detailValue(),
     sources: selectedSources(),
     preview: $("preview").checked,
     collision: $("collision").checked
   };
 
   $("banner").innerHTML = "";
-  logEl.innerHTML = "";
-  $("out").innerHTML = "";
-  offset = 0;
-
   let data;
   try {
     const r = await fetch("/api/run", {
@@ -1096,22 +1368,18 @@ $("run").onclick = async () => {
       body: JSON.stringify(payload)
     });
     data = await r.json();
-    if (!r.ok) throw new Error(data.error || "could not start");
+    if (!r.ok) throw new Error(data.error || "kon niet starten");
   } catch (err) {
-    $("banner").innerHTML = `<div class="err">${escapeHtml(err.message)}</div>`;
+    $("banner").innerHTML = `<div class="err" style="margin-bottom:8px">${escapeHtml(err.message)}</div>`;
     return;
   }
 
-  job = data.id;
-  $("run").disabled = true;
-  $("cancel").style.display = "block";
-  setStatus("run", "running");
+  logEl.innerHTML = "";
+  setStatus("run", "bezig");
+  showRunCard(name, `${STYLE_NAME[payload.style]} · ${DETAIL_NAME[payload.detail]} · ${Math.round(sel.size)} m`);
   showProgress({ status: "starting", elapsed: 0, fraction: 0, total_steps: 0 });
-  // The settings panel is taller than most windows, so the progress and log
-  // would otherwise sit below the fold exactly when they matter.
-  $("progress").scrollIntoView({ behavior: "smooth", block: "center" });
-  poller = setInterval(poll, 700);
-  poll();
+  showModels();
+  follow(data.id, name);
 };
 
 $("cancel").onclick = async () => {
@@ -1123,6 +1391,13 @@ $("cancel").onclick = async () => {
   });
 };
 
+$("showLog").onclick = () => $("logDialog").showModal();
+$("closeLog").onclick = () => $("logDialog").close();
+$("openAbout").onclick = () => $("aboutDialog").showModal();
+$("closeAbout").onclick = () => $("aboutDialog").close();
+$("openResult").onclick = () => { if (lastArea) openModel(lastArea); };
+$("dismissRun").onclick = () => { $("runCard").hidden = true; };
+
 async function poll() {
   if (!job) return;
   let data;
@@ -1130,98 +1405,74 @@ async function poll() {
     const r = await fetch(`/api/job?id=${job}&offset=${offset}`);
     data = await r.json();
   } catch { return; }
+  if (data.error) { clearInterval(poller); job = null; return; }
 
   (data.lines || []).forEach(addLog);
   offset = data.offset;
   showProgress(data);
 
   if (data.status === "running" || data.status === "starting") {
-    setStatus("run", `running ${humanTime(data.elapsed)}`);
+    setStatus("run", "bezig");
     return;
   }
 
   clearInterval(poller);
   poller = null;
-  $("cancel").style.display = "none";
   job = null;
+  $("cancel").hidden = true;
+  $("dismissRun").hidden = false;
   // Re-enable through the sources panel, so a required source that went down
   // mid-run keeps the button disabled.
-  renderSources();
+  updateSourceStates();
   // The finished run is a fresh data point for the estimate.
   refreshEstimate();
 
-  if (data.status === "done") {
-    setStatus("done", `done in ${humanTime(data.elapsed)}`);
-    showResult(data.area);
-  } else {
-    setStatus("fail", data.status);
-    if (data.area) showResult(data.area);
+  lastArea = data.area || null;
+  if (data.status === "done") setStatus("done", `klaar in ${humanTime(data.elapsed)}`);
+  else setStatus("fail", { failed: "mislukt", cancelled: "gestopt" }[data.status] || data.status);
+  if (lastArea) {
+    const checks = checksLine(lastArea.validation);
+    $("runMeta").textContent = checks.text;
+    $("openResult").hidden = false;
+    const shot = areaShot(lastArea);
+    if (shot) {
+      $("runThumb").src = shot;
+      $("runThumb").hidden = false;
+      $("runNoThumb").hidden = true;
+    }
   }
+  loadAreas();
 }
 
-function showResult(area) {
-  if (!area) return;
-  const parts = [];
-
-  if (area.validation) {
-    const v = area.validation;
-    const colour = v.ok ? "var(--ok)" : "var(--bad)";
-    parts.push(
-      `<fieldset><legend>Checks</legend>
-       <div style="color:${colour};font-weight:600">
-         ${v.passed} passed, ${v.failed} failed, ${v.warned} warnings
-       </div>`);
-    const notable = (v.checks || []).filter(c => !c.passed);
-    for (const c of notable) {
-      parts.push(`<div class="hint" style="color:${
-        c.severity === "error" ? "var(--bad)" : "var(--warn)"
-      }">${escapeHtml(c.name)}: ${escapeHtml(c.detail)}</div>`);
-    }
-    parts.push(`</fieldset>`);
-  }
-
-  if (area.previews && area.previews.length) {
-    parts.push(`<fieldset><legend>Preview</legend><div class="shots">`);
-    for (const p of area.previews) {
-      parts.push(
-        `<a href="${p.url}" target="_blank" title="${escapeHtml(p.name)}">
-           <img src="${p.url}?t=${Date.now()}" alt="${escapeHtml(p.name)}"></a>`);
-    }
-    parts.push(`</div></fieldset>`);
-  }
-
-  if (area.files && area.files.length) {
-    parts.push(`<fieldset><legend>Files</legend><div class="files">`);
-    for (const f of area.files) {
-      parts.push(
-        `<div><a href="${f.url}" download>${escapeHtml(f.name)}</a>
-         <span>${f.size_mb} MB</span></div>`);
-    }
-    parts.push(`</div>`);
-    if (area.metadata) {
-      const m = area.metadata;
-      parts.push(
-        `<div class="kv" style="margin-top:8px">` +
-        `<b>origin RD</b>  ${m.origin_rd?.join(", ")}\n` +
-        `<b>z offset</b>   ${m.ground_z_offset_nap} m NAP\n` +
-        `<b>buildings</b>  ${m.buildings?.count ?? "?"}\n` +
-        `<b>axes</b>       ${escapeHtml(m.unity_axis || "")}</div>`);
-    }
-    parts.push(`</fieldset>`);
-  }
-
-  $("out").innerHTML = parts.join("");
+/* A run already going when the page opens is picked up where it is. */
+async function resumeRunning() {
+  try {
+    const r = await fetch("/api/jobs");
+    const running = ((await r.json()).jobs || [])
+      .find(j => j.status === "running" || j.status === "starting");
+    if (!running) return;
+    setStatus("run", "bezig");
+    showRunCard(running.name, "");
+    showProgress(running);
+    follow(running.id, running.name, 0);
+  } catch { /* an older server without /api/jobs */ }
 }
 
 /* ---------------------------------------------------------------------------
    Sources.
 
-   The server owns the list; the page renders it with a checkbox and a live
-   status light each. Which sources are selected is what a run is sent, so this
-   panel is both the picker and the availability report.
+   The server owns the list; the page renders each with a switch and a live
+   status light. Which sources are on is what a run is sent, so this panel
+   is both the picker and the availability report.
 --------------------------------------------------------------------------- */
 let sourceList = [];                       // as described by the server
 const sourceOff = new Set();               // ids the user has turned off
+
+/* "Trees (BGT)" names its dataset in brackets; that says more than the host. */
+function datasetOf(s) {
+  const m = /\(([^)]+)\)/.exec(s.label || "");
+  return m ? m[1] : (s.provider || "");
+}
 
 function lockedByStyle(id) { return currentStyle().locked.includes(id); }
 
@@ -1237,39 +1488,42 @@ function renderSources() {
   const host = $("sources");
   host.innerHTML = "";
 
-  for (const s of sourceList) {
+  // Required sources are always in; the panel lists what can be chosen.
+  for (const s of sourceList.filter(s => !s.required)) {
     const row = document.createElement("label");
     row.className = "src";
     row.dataset.id = s.id;
 
+    const dot = document.createElement("span");
+    dot.className = "dot";
+
     const locked = lockedByStyle(s.id);
+    const name = document.createElement("span");
+    name.className = "name";
+    name.innerHTML =
+      `${escapeHtml(SOURCE_NAME[s.id] || s.label)}` +
+      `<span class="who">${escapeHtml(datasetOf(s))}${
+        locked ? " · niet in deze stijl" :
+        s.ok === false ? " · onbereikbaar" :
+        s.degraded ? " · via reserve" : ""}</span>`;
+
     const box = document.createElement("input");
     box.type = "checkbox";
+    box.className = "switch";
     box.checked = sourceOn(s);
-    box.disabled = !!s.required || locked;
+    box.disabled = locked;
+    box.setAttribute("aria-label", SOURCE_NAME[s.id] || s.label);
     box.onchange = () => {
       if (box.checked) sourceOff.delete(s.id); else sourceOff.add(s.id);
       styleUnticked.delete(s.id);
       // Only the state is refreshed, not the markup: rebuilding the list here
-      // would drop focus on the box that was just toggled.
+      // would drop focus on the switch that was just toggled.
       updateSourceStates();
       refreshEstimate();
     };
 
-    const name = document.createElement("div");
-    name.className = "name";
-    name.innerHTML =
-      `<b>${escapeHtml(s.label)}</b>${s.required ? " <span class='who'>· required</span>" : ""}` +
-      `${locked ? " <span class='who'>· not in this style</span>" : ""}` +
-      `<div class="who">${escapeHtml(s.provider)}${
-        s.ok === false ? " · " + escapeHtml(s.detail) :
-        s.degraded ? " · on the backup service" : ""}</div>`;
-
-    const dot = document.createElement("span");
-    dot.className = "dot";
-
-    row.append(box, name, dot);
-    row.title = `${s.contributes}\n${s.host || "?"}: ${s.detail || "not checked"}`;
+    row.append(dot, name, box);
+    row.title = `${s.label}: ${s.contributes}\n${s.host || "?"}: ${s.detail || "niet gecontroleerd"}`;
     host.appendChild(row);
   }
   updateSourceStates();
@@ -1280,32 +1534,29 @@ function updateSourceStates() {
   for (const row of document.querySelectorAll(".src")) {
     const s = byId[row.dataset.id];
     if (!s) continue;
-    const on = sourceOn(s);
-    row.classList.toggle("off", !on);
-    row.classList.toggle("blocked", !!s.required && s.ok === false);
+    row.classList.toggle("off", !sourceOn(s));
     row.querySelector(".dot").className =
       "dot " + (s.ok === true ? (s.degraded ? "degraded" : "up")
                 : s.ok === false ? "down" : "checking");
   }
 
   const blocking = sourceList.filter(s => s.required && s.ok === false);
-  const optionalDown = sourceList.filter(
-    s => !s.required && s.ok === false && sourceOn(s));
+  const optionalDown = sourceList.filter(s => !s.required && s.ok === false && sourceOn(s));
+  const names = list => list.map(s => escapeHtml(SOURCE_NAME[s.id] || s.label)).join(", ");
 
   let note = "";
   if (blocking.length) {
-    note = `<span style="color:var(--bad)">${blocking.map(s => escapeHtml(s.label)).join(", ")}
-            ${blocking.length > 1 ? "are" : "is"} required and unreachable, so a build
-            cannot run. These are national open-data services, so this is normally an
-            outage at their end.</span>`;
+    note = `<span style="color:var(--danger)">${names(blocking)} ${blocking.length > 1 ? "zijn" : "is"}
+            nodig en onbereikbaar, dus er kan niet gebouwd worden. Dit zijn landelijke
+            open-datadiensten; meestal is het een storing aan hun kant.</span>`;
   } else if (optionalDown.length) {
-    note = `<span style="color:var(--warn)">${optionalDown.map(s => escapeHtml(s.label)).join(", ")}
-            ${optionalDown.length > 1 ? "are" : "is"} unreachable. Turn
-            ${optionalDown.length > 1 ? "them" : "it"} off to build without
-            ${optionalDown.length > 1 ? "them" : "it"}.</span>`;
+    note = `<span class="warn">${names(optionalDown)} ${optionalDown.length > 1 ? "zijn" : "is"}
+            onbereikbaar. Zet ${optionalDown.length > 1 ? "ze" : "hem"} uit om zonder te bouwen.</span>`;
   }
   $("sourcesNote").innerHTML = note;
   $("run").disabled = blocking.length > 0 || !!job;
+  $("run").title = job ? "Er loopt al een model; wacht tot het klaar is." : "";
+  updateBuildSummary();
 }
 
 async function checkServices() {
@@ -1319,7 +1570,7 @@ async function checkServices() {
     // to select from, so the first figure was computed against an empty list.
     refreshEstimate();
   } catch {
-    $("sources").textContent = "could not reach the local server";
+    $("sources").textContent = "de lokale server is niet bereikbaar";
   } finally {
     $("recheck").disabled = false;
   }
@@ -1328,10 +1579,10 @@ async function checkServices() {
 $("recheck").onclick = () => { checkServices(); };
 
 /* ---------- start ---------- */
-fitToSelection();
 updateBboxInfo();
 applyStyle();
 checkServices();
+loadAreas().then(resumeRunning);
 
 probeTileSource().then(source => {
   if (source === tileSource) return;

@@ -106,11 +106,24 @@ pip install -r requirements.txt
 python ui/server.py --open
 ```
 
-Open <http://127.0.0.1:8765>. The panel runs top to bottom in four numbered
-steps — **choose an area**, **choose the style and detail**, **choose what to
-include**, **build** — and the defaults in all four are the ones to use. Search
-for a place or click the map, press **Build model**, and watch the log. When it
-finishes you get the check results, the preview renders and download links.
+Open <http://127.0.0.1:8765>. The page is in Dutch and has two views.
+
+- **Modellen** (the start page) shows every area built so far as a card with
+  its preview render, style, size, date and check result. **Bekijken** opens
+  the renders, the check results and the download links; **Opnieuw bouwen**
+  opens the map with that area's square, name, style, detail and collision
+  setting filled in. A build that is running shows on top as a card with a
+  progress bar, the log and a stop button — also after a page reload, as the
+  page asks the server which runs are going (`/api/jobs`).
+- **Nieuw gebied** opens the map full screen: a search field top left, the
+  layers drawer on the right, and a build bar along the bottom with name,
+  width, style, detail, the time estimate and **Model bouwen**. Click the map to
+  move the square, drag to pan, scroll to zoom. The defaults are the ones to
+  use. Building takes you back to Modellen, where the run card follows it.
+
+The page uses the Virtuele Brigade colours. It names Rijksoverheid Sans in its
+font stack but does not ship the font; without it the browser's sans-serif is
+used.
 
 The style is *Layered* (as the modellers build it) or *Survey* (the ground as
 measured). In the layered style water is cut into the ground and covered by a
@@ -127,14 +140,14 @@ size. There used to be a dozen sliders here — ground triangle budget, feature
 straightening, contour spacing, road face size and more — and every one of them
 was a way to make the model worse that a newcomer had to learn to leave alone.
 They are gone; a config file that still sets one loads and says what replaced
-it. A closing **What you get, and how to open it** section names the output
-files and gives the steps for Blender and Unity.
+it. The **?** button opens *Wat je krijgt, en hoe je het opent*, which names the
+output files and gives the steps for Blender and Unity.
 
-Step 3 lists every dataset a model can be built from, each with a checkbox and
-a live status light, so you pick what goes in and see what is answering right
-now. Terrain, aerial imagery and buildings are marked required and cannot be
-unticked — without them there is no model — and if one of those is down the
-Build button is disabled with the reason given. An optional source that is down
+The layers drawer lists every optional dataset with a switch and a live status
+light, so you pick what goes in and see what is answering right now. Terrain,
+aerial imagery and buildings are always in — without them there is no model —
+so the drawer only says so; if one of those is down the build button is
+disabled with the reason given. An optional source that is down
 is only a warning: untick it and the run proceeds without it.
 
 `src/sources.py` is the single registry behind this. The pipeline reads it to
@@ -419,7 +432,7 @@ blender/process.py builds the scene, assigns materials, saves .blend, exports FB
 blender/maptile_tools.py  the Blender add-on shipped beside the model
 blender/preview.py renders preview images of an exported FBX
 ui/server.py       local web UI, standard library only
-ui/index.html      the page: RD map picker, settings, live log, results
+ui/index.html      the page: models gallery, full-screen RD map with build bar, live log, results
 ```
 
 The heavy CityJSON and raster work all happens on the Python side.

@@ -493,7 +493,50 @@ def area_summary(name: str) -> dict | None:
         "validation": validation,
         "files": files,
         "previews": previews,
+        "settings": area_settings(name),
     }
+
+
+def area_settings(name: str) -> dict:
+    """What an area was built with, so the page can build it again.
+
+    The page's own runs leave their config in `work/<name>/ui_config.json`;
+    a run started from the command line leaves only the scene, which still
+    names the style. Whatever is not known is left out.
+    """
+    work = REPO_ROOT / "work" / name
+    settings: dict = {}
+    for source in ("ui_config.json", "scene.json"):
+        path = work / source
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        for key in ("style", "detail"):
+            if isinstance(data.get(key), str):
+                settings.setdefault(key, data[key])
+        export = data.get("export")
+        if isinstance(export, dict) and "collision" in export:
+            settings.setdefault("collision", bool(export["collision"]))
+    return settings
+
+
+def list_jobs() -> list[dict]:
+    """Every run this server knows of, newest first, without their logs.
+
+    For a page opened, or reloaded, while a build is running: it picks the run
+    up from here and follows it with `/api/job`.
+    """
+    with JOBS_LOCK:
+        jobs = [JOBS[i] for i in reversed(JOBS_ORDER) if i in JOBS]
+    out = []
+    for job in jobs:
+        snap = job.snapshot(10**9)
+        snap.pop("lines", None)
+        out.append(snap)
+    return out
 
 
 def list_areas() -> list[dict]:
@@ -689,6 +732,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/areas":
             self.send_json({"areas": list_areas()})
+            return
+
+        if route == "/api/jobs":
+            self.send_json({"jobs": list_jobs()})
             return
 
         if route in ("/api/sources", "/api/health"):
