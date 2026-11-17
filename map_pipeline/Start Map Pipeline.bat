@@ -6,7 +6,7 @@ rem downloads about a gigabyte of dependencies, most of which is Blender.
 rem Later runs skip straight to opening the page.
 setlocal
 cd /d "%~dp0"
-title Map pipeline
+title Zandtafel
 
 set "VENV=.venv"
 set "STAMP=%VENV%\.installed"

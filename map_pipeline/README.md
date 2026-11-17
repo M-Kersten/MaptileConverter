@@ -1,4 +1,8 @@
-# Offline 3D map pipeline (3DBAG + AHN + PDOK aerial → Unity)
+# Zandtafel
+
+*Offline 3D map pipeline (3DBAG + AHN + PDOK aerial → Unity).* A *zandtafel* is
+the sand table a unit gathers round to plan on: a model of the ground. This
+builds one for any square of the Netherlands.
 
 Takes a bounding box in the Netherlands and bakes a textured 3D model you edit
 in Blender and import into Unity. Everything runs locally and the result needs
