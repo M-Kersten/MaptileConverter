@@ -1,8 +1,8 @@
-"""Maptile tools: the edits the model needs after a person has touched it.
+"""TerreinLab tools: the edits the model needs after a person has touched it.
 
 Ships next to every model.blend, and inside it as a text block. Install it once
 as an add-on (Edit > Preferences > Add-ons > Install..., pick this file) or run
-the text block in the Scripting workspace. It adds a "Maptile" tab to the 3D
+the text block in the Scripting workspace. It adds a "TerreinLab" tab to the 3D
 view's sidebar (N) with four buttons:
 
 Fit terrain under roads
@@ -38,11 +38,11 @@ Only bpy and numpy are used, both of which Blender bundles.
 """
 
 bl_info = {
-    "name": "Maptile tools",
-    "author": "MaptileConverter",
+    "name": "TerreinLab tools",
+    "author": "TerreinLab",
     "version": (1, 1, 0),
     "blender": (4, 2, 0),
-    "location": "View3D > Sidebar > Maptile",
+    "location": "View3D > Sidebar > TerreinLab",
     "description": "Keep roads and terrain fitted together while editing",
     "category": "Object",
 }
@@ -541,10 +541,10 @@ class MAPTILE_OT_export_unity(bpy.types.Operator):
 
 
 class MAPTILE_PT_panel(bpy.types.Panel):
-    bl_label = "Maptile"
+    bl_label = "TerreinLab"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Maptile"
+    bl_category = "TerreinLab"
 
     def draw(self, context):
         column = self.layout.column(align=True)

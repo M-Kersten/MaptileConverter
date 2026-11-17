@@ -439,7 +439,7 @@ DEFAULTS: dict[str, Any] = {
     "export": {
         "fbx_name": "model.fbx",
         # The same scene for editing: collections per layer, quads and
-        # n-gons kept, the Maptile tools inside.
+        # n-gons kept, the TerreinLab tools inside.
         "blend_name": "model.blend",
         "aerial_name": "aerial.png",
         "metadata_name": "metadata.json",

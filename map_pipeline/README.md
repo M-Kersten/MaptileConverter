@@ -1,8 +1,14 @@
-# Zandtafel
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="ui/logo-dark.svg">
+  <img src="ui/logo-light.svg" alt="TerreinLab, van locatie naar 3D-demo" width="330">
+</picture>
 
-*Offline 3D map pipeline (3DBAG + AHN + PDOK aerial → Unity).* A *zandtafel* is
-the sand table a unit gathers round to plan on: a model of the ground. This
-builds one for any square of the Netherlands.
+# TerreinLab
+
+*Van locatie naar 3D-demo.* An internal tool for scouting a location and
+working it out as a demo: pick a square of the Netherlands and it builds the
+ground, the buildings and the street detail there from the open data, as a 3D
+model (3DBAG + AHN + PDOK aerial → Blender and Unity).
 
 Takes a bounding box in the Netherlands and bakes a textured 3D model you edit
 in Blender and import into Unity. Everything runs locally and the result needs
@@ -55,9 +61,9 @@ this folder:
 
 | | |
 | --- | --- |
-| Windows | **Start Map Pipeline.bat** |
-| macOS | **Start Map Pipeline.command** |
-| Linux | **start-map-pipeline.sh** |
+| Windows | **Start TerreinLab.bat** |
+| macOS | **Start TerreinLab.command** |
+| Linux | **start-terreinlab.sh** |
 
 It creates a private Python environment beside itself, installs what is
 missing, starts the UI and opens the browser. Nothing is typed and nothing is
@@ -519,7 +525,7 @@ way the pipeline measured heights on. In the viewport you edit the quads.
 Blender's FBX exporter applies only what the viewport shows, whatever its
 render option says — measured on 4.2 and 5.2, a render-only modifier never
 reached the file, so until this was found Unity cut every quad its own way —
-and so the export, and the Maptile tools' re-export, switch every modifier to
+and so the export, and the TerreinLab tools' re-export, switch every modifier to
 its render setting while they write and back after.
 `terrain_exported_as_triangles` checks the result.
 
@@ -543,11 +549,11 @@ edge, 4 building, 8 row, 16 bed, added together where they meet),
 group, then *Select Linked* or *Select Loops* from there; with proportional
 editing on, moving a waterline takes the bank with it.
 
-### The Maptile tools
+### The TerreinLab tools
 
 `maptile_tools.py` is written beside every `model.blend`. **Install it once as
 an add-on** — *Edit → Preferences → Add-ons*, the ⌄ menu at the top right,
-*Install from Disk…*, pick the file, tick it — and the **Maptile** tab is in the
+*Install from Disk…*, pick the file, tick it — and the **TerreinLab** tab is in the
 sidebar (N) of every model from then on. It is also inside each `.blend` as a
 text block: to use the tools without installing, open it in the Text Editor and
 press *Run Script*. The file does not run it by itself on opening, because
@@ -837,7 +843,7 @@ modifiers:
 
 | Modifier | On | What it does |
 | --- | --- | --- |
-| *CurbGenerator* (`Maptile_Kerbs_CurbGenerator`) | walkways | lays the walkway flat, runs the modellers' curb generator on it, and puts every point of the result back at the walkway's height straight below it |
+| *CurbGenerator* (`TerreinLab_Kerbs_CurbGenerator`) | walkways | lays the walkway flat, runs the modellers' curb generator on it, and puts every point of the result back at the walkway's height straight below it |
 | *WeightedNormal* | walkways, terrain | the modellers' shading |
 | *Triangulate for export* (render only) | every layer, terrain | cuts quads the same way in every piece, so they stay matched along their shared edges |
 
@@ -1063,7 +1069,7 @@ Two details decide whether this looks right:
   heights are kept beside it (`terrain_mesh.npz`, and the `measured_z`
   attribute on the Blender terrain), so the fit can be undone and redone after
   someone moves a road. That is what the
-  [Maptile tools](#opening-it-in-blender) do.
+  [TerreinLab tools](#opening-it-in-blender) do.
 
 Big flat surfaces need help too: a car park or a square has no street to cut it
 across and would otherwise be one face tens of metres wide, flat between its

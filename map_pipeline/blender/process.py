@@ -620,7 +620,7 @@ def build_roads(scene: dict, work_dir: Path, make_material):
         obj.location = tuple(origin)
         obj["kind"] = object_kinds[index] if index < len(object_kinds) else "street"
         if face_kind is not None:
-            # 0 surface, 1 kerb, 2 skirt: what the Maptile tools fit the
+            # 0 surface, 1 kerb, 2 skirt: what the TerreinLab tools fit the
             # terrain under, and what they leave out.
             part = obj.data.attributes.new("road_part", "INT", "FACE")
             part.data.foreach_set("value", face_kind[faces].astype(np.int32))
@@ -964,7 +964,7 @@ def build_terrain(scene: dict, work_dir: Path, material) -> object:
         obj, scene, work_dir, vertices, loop_vertex_indices, loop_starts, loop_totals
     )
     # The ground as surveyed, before anything was pushed down under a road, so
-    # the Maptile tools can put it back. Water beds stay sunk: that is not a
+    # the TerreinLab tools can put it back. Water beds stay sunk: that is not a
     # fit to the roads but a fix to the survey.
     if "measured" in data.files:
         measured = _sink_water_bed(
@@ -1004,7 +1004,7 @@ def _build_terrain_mesh(scene: dict, work_dir: Path, material, data) -> object:
     mesh = obj.data
     groups = _tag_surface_regions(obj, scene, work_dir, vertices, loops, starts, sizes)
     # The ground as surveyed, before anything was pushed down under a road, so
-    # the Maptile tools can put it back. Water beds are part of it: they are
+    # the TerreinLab tools can put it back. Water beds are part of it: they are
     # not a fit to the roads but a fix to the survey.
     measured = mesh.attributes.new("measured_z", "FLOAT", "POINT")
     measured.data.foreach_set(
@@ -1120,7 +1120,7 @@ def load_curb_generator():
     return bpy.data.node_groups.get(CURB_GROUP)
 
 
-KERB_GROUP = "Maptile_Kerbs"
+KERB_GROUP = "TerreinLab_Kerbs"
 
 
 def _kerb_group(curb):
@@ -2990,7 +2990,7 @@ def build_collision(scene: dict, work_dir: Path):
 # ---------------------------------------------------------------------------
 
 
-# The FBX settings, in one place. The Maptile tools carry a copy so a
+# The FBX settings, in one place. The TerreinLab tools carry a copy so a
 # re-export from an edited .blend matches; a test keeps the two equal.
 FBX_SETTINGS = dict(
     use_selection=False,
@@ -3070,7 +3070,7 @@ def save_blend(out_dir: Path, name: str = "model.blend") -> Path:
     """Save the scene as a .blend for editing, tools included.
 
     Texture paths are made relative, so the folder can be moved or zipped and
-    the .blend still finds its images beside it. The Maptile tools go in as a
+    the .blend still finds its images beside it. The TerreinLab tools go in as a
     text block to run from the Text Editor, and as a file next to the .blend
     to install once as an add-on. The text block is not marked to register
     itself on load: Blender stops every file that asks that with a security

@@ -1,1 +1,1 @@
-"""Source modules for the offline 3D map pipeline."""
+"""Source modules for TerreinLab, the offline 3D map pipeline."""

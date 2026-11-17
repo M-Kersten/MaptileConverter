@@ -604,6 +604,7 @@ class Handler(BaseHTTPRequestHandler):
             ".txt": "text/plain; charset=utf-8",
             ".pgw": "text/plain; charset=utf-8",
             ".tif": "image/tiff",
+            ".svg": "image/svg+xml",
         }
         content_type = types.get(resolved.suffix.lower(), "application/octet-stream")
         body = resolved.read_bytes()
@@ -626,6 +627,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if route in ("/", "/index.html"):
             self.serve_file(UI_DIR / "index.html", UI_DIR)
+            return
+        if route in ("/icon.svg", "/logo-dark.svg", "/logo-light.svg"):
+            self.serve_file(UI_DIR / route.lstrip("/"), UI_DIR)
             return
 
         if route == "/api/geocode":
@@ -715,7 +719,7 @@ class Handler(BaseHTTPRequestHandler):
             url = f"{TILE_BASE}/{z:02d}/{col}/{row}.jpeg"
             try:
                 request = urllib.request.Request(
-                    url, headers={"User-Agent": "MaptileConverter-UI/1.0"}
+                    url, headers={"User-Agent": "TerreinLab-UI/1.0"}
                 )
                 with urllib.request.urlopen(request, timeout=30) as response:
                     body = response.read()
@@ -927,7 +931,7 @@ def check_environment() -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Local web UI for the map pipeline.")
+    parser = argparse.ArgumentParser(description="TerreinLab: the local web UI.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(
@@ -949,7 +953,7 @@ def main(argv: list[str] | None = None) -> int:
         import webbrowser
 
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    print(f"map pipeline UI on {url}")
+    print(f"TerreinLab on {url}")
     print("press Ctrl+C to stop")
     try:
         server.serve_forever()

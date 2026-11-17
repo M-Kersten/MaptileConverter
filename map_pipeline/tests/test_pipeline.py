@@ -5104,7 +5104,7 @@ class TestDependencies(unittest.TestCase):
         """Python 3.13 is the step colleagues get stuck on, so the launcher
         offers to install it: per user, PATH untouched, and only a file whose
         hash matches the one python.org published."""
-        raw = (REPO_ROOT / "Start Map Pipeline.bat").read_bytes()
+        raw = (REPO_ROOT / "Start TerreinLab.bat").read_bytes()
         # cmd.exe reads a batch file in blocks and can miss a label in an
         # LF-only file, so every line ends CRLF.
         self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))
@@ -5134,8 +5134,8 @@ class TestDependencies(unittest.TestCase):
         )
         self.assertIn(">=5.2", requirement)
         self.assertIn('python_version >= "3.13" and python_version < "3.14"', requirement)
-        for launcher in ("Start Map Pipeline.bat", "start-map-pipeline.sh",
-                         "Start Map Pipeline.command"):
+        for launcher in ("Start TerreinLab.bat", "start-terreinlab.sh",
+                         "Start TerreinLab.command"):
             text = (REPO_ROOT / launcher).read_text()
             with self.subTest(launcher=launcher):
                 self.assertIn("sys.version_info[:2]==(3,13)", text)
@@ -5147,9 +5147,9 @@ class TestDependencies(unittest.TestCase):
         """They used to install once and stamp it done, so an update that
         added shapely never reached a team member's existing environment."""
         for launcher, compare in (
-            ("Start Map Pipeline.bat", 'fc /b requirements.txt "%STAMP%"'),
-            ("start-map-pipeline.sh", 'cmp -s requirements.txt "$STAMP"'),
-            ("Start Map Pipeline.command", 'cmp -s requirements.txt "$STAMP"'),
+            ("Start TerreinLab.bat", 'fc /b requirements.txt "%STAMP%"'),
+            ("start-terreinlab.sh", 'cmp -s requirements.txt "$STAMP"'),
+            ("Start TerreinLab.command", 'cmp -s requirements.txt "$STAMP"'),
         ):
             text = (REPO_ROOT / launcher).read_text()
             self.assertIn(compare, text, launcher)
@@ -7918,7 +7918,7 @@ class TestLayeredInBlender(unittest.TestCase):
 
         def kerb_group(curb):
             # The wrapper passes every input of the generator through.
-            return types_namespace(name=f"Maptile_Kerbs_{curb.name}", interface=curb.interface,
+            return types_namespace(name=f"TerreinLab_Kerbs_{curb.name}", interface=curb.interface,
                                    inner=curb)
 
         namespace = _process_namespace(
@@ -8007,7 +8007,7 @@ class TestLayeredInBlender(unittest.TestCase):
                     self.assertEqual(obj["maptile_role"], "walkway")
                     self.assertEqual(kinds, ["NODES", "WEIGHTED_NORMAL", "TRIANGULATE"])
                     self.assertEqual(obj.modifiers[0].node_group.name,
-                                     "Maptile_Kerbs_CurbGenerator")
+                                     "TerreinLab_Kerbs_CurbGenerator")
                     continue
                 self.assertEqual(kinds, ["TRIANGULATE"])
         # The layers meet the terrain edge to edge.

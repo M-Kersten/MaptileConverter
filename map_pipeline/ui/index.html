@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Zandtafel</title>
+<title>TerreinLab</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
 <style>
   /* Virtuele Brigade: deep night-teal grounds, white type, one orange that
      always means "this moves you forward". Token names as in the design
@@ -53,6 +54,11 @@
   :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .overline { font-size: 16px; line-height: 20px; font-weight: 700; letter-spacing: .04em;
               text-transform: uppercase; color: var(--signal-bright); }
+  .brand { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 18px; line-height: 24px;
+           font-weight: 700; color: var(--text-primary); }
+  .brand img { border-radius: 9px; flex: none; box-shadow: 0 0 0 1px var(--line-control); }
+  .brand b { color: var(--signal-bright); font-weight: 700; margin-left: -10px; }
+  .brand .tagline { font-size: 14px; font-weight: 400; color: var(--text-muted); margin-left: 6px; }
   .muted { color: var(--text-muted); }
   .small { font-size: 14px; line-height: 20px; }
   .caption { font-size: 12px; line-height: 16px; }
@@ -269,7 +275,7 @@
   <div class="wrap">
     <header class="head">
       <div style="display:flex;flex-direction:column;gap:4px">
-        <span class="overline">Zandtafel</span>
+        <span class="brand"><img src="/icon.svg" width="36" height="36" alt="">Terrein<b>Lab</b><span class="tagline">van locatie naar 3D-demo</span></span>
         <h1>Modellen</h1>
         <p class="muted" id="modelsCount">Modellen laden&hellip;</p>
       </div>

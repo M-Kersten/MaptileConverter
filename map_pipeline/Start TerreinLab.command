@@ -1,10 +1,11 @@
 #!/bin/bash
-# Double-click this to start the map pipeline. No terminal knowledge needed.
+# Double-click this to start TerreinLab. No terminal knowledge needed.
 #
 # First run sets up a private Python environment next to this file and
 # downloads about a gigabyte of dependencies, most of which is Blender.
 # Later runs skip straight to opening the page.
 cd "$(dirname "$0")" || exit 1
+printf '\033]0;TerreinLab\007'
 
 VENV=".venv"
 STAMP="$VENV/.installed"

@@ -1,12 +1,12 @@
 @echo off
-rem Double-click this to start the map pipeline. No terminal knowledge needed.
+rem Double-click this to start TerreinLab. No terminal knowledge needed.
 rem
 rem First run sets up a private Python environment next to this file and
 rem downloads about a gigabyte of dependencies, most of which is Blender.
 rem Later runs skip straight to opening the page.
 setlocal
 cd /d "%~dp0"
-title Zandtafel
+title TerreinLab
 
 set "VENV=.venv"
 set "STAMP=%VENV%\.installed"

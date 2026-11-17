@@ -14,7 +14,7 @@ import requests
 
 LOG = logging.getLogger(__name__)
 
-USER_AGENT = "MaptileConverter/1.0 (offline 3D map pipeline)"
+USER_AGENT = "TerreinLab/1.0 (offline 3D map pipeline)"
 
 # Connect and read are bounded separately. A read can legitimately take minutes
 # — a 12000 px aerial mosaic or a 2000x2000 AHN tile is a lot of bytes — but a

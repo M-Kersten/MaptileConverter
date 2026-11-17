@@ -78,7 +78,7 @@ def report_missing(stream=None) -> bool:
         "Install them with:",
         f"  {install_command()}",
         "",
-        "If you start the pipeline with the Start Map Pipeline launcher, close",
+        "If you start the pipeline with the Start TerreinLab launcher, close",
         "it and start it again: it installs whatever requirements.txt has",
         "gained since it last ran.",
     ]
