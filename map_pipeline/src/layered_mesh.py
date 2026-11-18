@@ -809,7 +809,7 @@ def _without_overlaps(pieces):
     return out, count
 
 
-def _without_thin(pieces, thin_m: float, wet_code=None):
+def _without_thin(pieces, thin_m: float, wet_code=None, kerbed_codes=()):
     """Strips thinner than `thin_m` folded into the neighbour they share most
     outline with. Returns the pieces and how many were folded.
 
@@ -820,10 +820,19 @@ def _without_thin(pieces, thin_m: float, wet_code=None):
     strip that narrow is not something a modeller draws as its own surface.
     Land strips go to land where they can, so a hedge along the water does not
     become water.
+
+    And a strip that is not a walkway goes into one, of `kerbed_codes`, only
+    when nothing else is beside it. The curb generator kerbs a walkway's
+    whole outline, the strip's included, and a strip is thin: over Delft a
+    5 degree needle of bare ground went into the footpath beside it, its tip
+    meeting the rest of the footpath at a single point, and the kerb mitred
+    round that tip stood 6.7 m off it, past the edge of the area.
     """
     import shapely
 
     from .terrain_mesh import GRID_SIZE
+
+    kerbed_codes = set(kerbed_codes)
 
     polygons = [p for p, _ in pieces]
     codes = [c for _, c in pieces]
@@ -854,6 +863,9 @@ def _without_thin(pieces, thin_m: float, wet_code=None):
             shared = strip.boundary.intersection(polygons[j].buffer(0.01)).length
             # Land into land before land into water.
             if wet_code is not None and codes[i] != wet_code and codes[j] == wet_code:
+                shared *= 0.01
+            # Anything else into anything but a walkway before into one.
+            if codes[j] in kerbed_codes and codes[i] not in kerbed_codes:
                 shared *= 0.01
             if shared > best_len:
                 best, best_len = j, shared
@@ -887,7 +899,7 @@ def _area(coords) -> float:
 
 def quad_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
                  paved_codes, narrow_codes=(), near_m: float = NEAR_CELL_M, quays=(),
-                 tolerance_m: float = 0.5):
+                 tolerance_m: float = 0.5, kerbed_codes=()):
     """The terrain mesh, quads first, conforming to every piece's outline.
 
     `pieces` are ``(polygon, code)`` in local coordinates from the first grid
@@ -895,7 +907,9 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
     `codes_wet` is the code water pieces carry, `paved_codes` the codes that
     get the road rows, `narrow_codes` the ones that keep rows one grid
     square wide (footpaths, yards); everything else gets `LAND_ROW_M`. Returns RD vertices with heights, face sizes, loops,
-    the code and part of each face, and stats.
+    the code and part of each face, and stats. `kerbed_codes` are the
+    walkways' codes, which a strip of anything else is folded into only when
+    it has no other neighbour.
     """
     import shapely
 
@@ -950,7 +964,8 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
     # was ground drawn twice, its edges matching neither neighbour (fourteen
     # over Rotterdam's Rijnhaven).
     pieces, overlaps = _without_overlaps(pieces)
-    pieces, thin = _without_thin(pieces, THIN_M, wet_code=codes_wet)
+    pieces, thin = _without_thin(pieces, THIN_M, wet_code=codes_wet,
+                                 kerbed_codes=kerbed_codes)
     # The grid turned to the streets, by turning everything else the other
     # way and turning the mesh back once it is assembled.
     turn = _grid_angle(pieces, (width, height))

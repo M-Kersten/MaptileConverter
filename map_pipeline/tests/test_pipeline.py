@@ -7918,6 +7918,28 @@ class TestQuadTerrain(unittest.TestCase):
         wet = [p for p, c in folded if c == 15]
         self.assertAlmostEqual(wet[0].area, 50 * 100, places=3)
 
+    def test_a_thin_strip_goes_to_a_walkway_last(self):
+        """A walkway is kerbed along its outline, so a strip of anything else
+        folded into it gets a kerb, needle tips and all (TestKerbsInBlender);
+        it goes to the street beside it, though it shares less with that."""
+        import shapely
+
+        from src.layered_mesh import _without_thin
+
+        walkway = shapely.Polygon([(0, 0), (50, 0), (50, 100), (0, 100)])
+        strip = shapely.Polygon([(50, 0), (50.4, 0), (50.4, 100), (50, 100)])
+        lawn = shapely.Polygon([(50.4, 0), (52, 0), (52, 40), (50.4, 40)])
+        street = shapely.Polygon([(50.4, 40), (52, 40), (52, 100), (50.4, 100)])
+        pieces = [(walkway, 84), (strip, 0), (lawn, 102), (street, 17)]
+        folded, count = _without_thin(pieces, 0.5, kerbed_codes={84})
+        self.assertEqual(count, 1)
+        self.assertAlmostEqual(next(p for p, c in folded if c == 17).area, 1.6 * 60 + 0.4 * 100, places=3)
+        self.assertAlmostEqual(next(p for p, c in folded if c == 84).area, 50 * 100, places=3)
+        # Beside walkways only, it still goes into one.
+        folded, _ = _without_thin([(walkway, 84), (strip, 0), (lawn.union(street), 84)], 0.5,
+                                  kerbed_codes={84})
+        self.assertAlmostEqual(sum(p.area for p, c in folded if c == 84), 52 * 100, places=3)
+
     def test_a_loose_piece_of_mesh_on_the_sheet_goes(self):
         from src.layered_mesh import _floating
 
@@ -12556,6 +12578,134 @@ class TestWebViewInBlender(unittest.TestCase):
         self.assertEqual(len(translation), 10)
         np.testing.assert_allclose(sorted(translation[:, 0]), [20 + 3 * i for i in range(10)], atol=1e-4)
         np.testing.assert_allclose(translation[:, 2], -40.0, atol=1e-4)
+
+
+# Each walkway given (points, faces) kerbed as process.py kerbs it, and how
+# far the furthest point of the result stands outside the walkway's outline.
+_KERB_RUN = r"""
+import importlib.util
+import json
+import math
+import sys
+
+import bpy
+import numpy as np
+import shapely
+
+source, cases, out = sys.argv[-3:]
+spec = importlib.util.spec_from_file_location("process", source)
+process = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(process)
+curb = process.load_curb_generator()
+settings = {
+    "Width": 0.3, "Height": 0.15, "Height Offset Curb": 0.02, "Curb Slant": 0.6,
+    "Bevel": 0.02, "Bevel Inner": 0.015, "Walkway Height Offset": 0.05,
+    "Bevel Curb Outer": True, "Bevel Curb Inner": True,
+    "Smooth by Angle": math.radians(46.0),
+}
+result = {}
+for name, case in json.loads(open(cases).read()).items():
+    if curb is None:
+        result[name] = None
+        continue
+    points = np.column_stack([case["points"], np.zeros(len(case["points"]))])
+    faces = case["faces"]
+    sizes = np.array([len(f) for f in faces])
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    points, loops = process.split_pinches(points, [i for f in faces for i in f], starts, sizes)
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(points.tolist(), [], [loops[s:s + n].tolist() for s, n in zip(starts, sizes)])
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    modifier = obj.modifiers.new("CurbGenerator", "NODES")
+    modifier.node_group = process._kerb_group(curb)
+    for key, value in settings.items():
+        process.set_modifier_input(modifier, key, value)
+    held = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    built = held.to_mesh()
+    outline = shapely.union_all([shapely.Polygon(points[f, :2]) for f in faces])
+    result[name] = max(outline.distance(shapely.Point(v.co.x, v.co.y)) for v in built.vertices)
+    held.to_mesh_clear()
+open(out, "w").write(json.dumps(result))
+"""
+
+
+@unittest.skipUnless(HAVE_BPY, "needs the pip bpy module")
+class TestKerbsInBlender(unittest.TestCase):
+    """The curb generator on walkways the layered ground hands it."""
+
+    @staticmethod
+    def _faces(polygon):
+        """The polygon as triangles sharing their corners, facing up as the
+        layered ground's faces do: the curb generator kerbs a face turned
+        over on its outside."""
+        import shapely
+
+        triangles = shapely.orient_polygons(shapely.constrained_delaunay_triangles(polygon)).geoms
+        corners = np.round([t.exterior.coords[:3] for t in triangles], 6)
+        points, index = np.unique(corners.reshape(-1, 2), axis=0, return_inverse=True)
+        return {"points": points.tolist(), "faces": index.reshape(-1, 3).tolist()}
+
+    def _kerbed(self, cases):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "run.py").write_text(_KERB_RUN, encoding="utf-8")
+            (folder / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(folder / "run.py"), str(REPO_ROOT / "blender" / "process.py"),
+                 str(folder / "cases.json"), str(folder / "out.json")],
+                capture_output=True, text=True, timeout=600,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            return json.loads((folder / "out.json").read_text(encoding="utf-8"))
+
+    def test_a_thin_strip_of_bare_ground_does_not_become_a_kerbed_needle(self):
+        """Over Delft a needle of bare ground 5 degrees across, thinner than a
+        row, lay along a footpath. Folded into the footpath, the one it shared
+        most outline with, its tip met the rest of the footpath at one point
+        round a lawn, and the curb generator threw the kerb mitred round that
+        tip 6.7 m, past the edge of the area. The strip goes to a neighbour
+        without kerbs instead, and the kerb stays on the path."""
+        import shapely
+
+        from src.layered import GRASS, ROAD, TERRAIN, WALKWAY, _code
+        from src.layered_mesh import THIN_M, _without_thin
+
+        walk = _code(WALKWAY, "Beton_Geel")
+        # A 3 degree needle 4 m long ending on a street, the footpath along
+        # both its sides; a lawn and a patch of bare ground either side of its
+        # tip.
+        needle = shapely.Polygon([(0, 0), (4, 0), (4, 0.21)])
+        lawn = shapely.Polygon([(0, 0), (2, 0.105), (0, 3)])
+        ground = shapely.Polygon([(0, 0), (1, 0), (1, -2), (-4, -2), (-4, 0)])
+        street = shapely.box(4, -6, 10, 6)
+        path = shapely.box(-6, -6, 4, 6).difference(shapely.union_all([needle, lawn, ground]))
+        pieces = [(path, walk), (needle, TERRAIN * 16), (lawn, _code(GRASS, "Gras")),
+                  (ground, TERRAIN * 16), (street, _code(ROAD, "Asfalt"))]
+
+        def walkway(**kw):
+            folded, count = _without_thin(pieces, THIN_M, **kw)
+            self.assertEqual(count, 1)
+            return shapely.union_all([p for p, c in folded if c == walk])
+
+        before = walkway()
+        after = walkway(kerbed_codes={walk})
+        # As it was: the needle went to the footpath, its tip touching the
+        # rest of it at one point.
+        self.assertAlmostEqual(before.area, path.area + needle.area, places=2)
+        # Now the footpath is as the BGT drew it.
+        self.assertTrue(after.equals(path))
+
+        past = self._kerbed({"before": self._faces(before), "after": self._faces(after)})
+        if past["after"] is None:
+            self.skipTest("the curb generator needs Blender 5")
+        # The shape the defect needs: kerbed, the needle throws its kerb
+        # metres (4.9 m when this was written).
+        self.assertGreater(past["before"], 1.0)
+        # Without it nothing stands outside the footpath.
+        self.assertLess(past["after"], 0.01)
 
 
 class TestUIViewer(unittest.TestCase):
