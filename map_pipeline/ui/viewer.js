@@ -1270,8 +1270,12 @@ export class Viewer {
     const size = Math.max(b[3] - b[0], b[4] - b[1], b[5] - b[2]);
     const layer = this.layers[entry[1]];
     if (layer && !layer.visible) this.setLayerVisible(entry[1], true);
+    // Street detail is left out beyond DETAIL_REACH, so a long one, a
+    // guardrail along a whole motorway, is shown in part rather than framed
+    // whole from where it is not drawn.
+    const far = layer && layer.detail ? DETAIL_REACH * 0.6 : this.radius * 6;
     this.flyTo({
-      target: centre, distance: clamp(size * 2.2 + 12, 12, this.radius * 6),
+      target: centre, distance: clamp(size * 2.2 + 12, 12, far),
       yaw: this.camera.yaw, pitch: Math.max(this.camera.pitch, 0.5)
     }, animate);
     this.select(id);
