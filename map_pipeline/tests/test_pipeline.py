@@ -11515,6 +11515,214 @@ class TestUIViewer(unittest.TestCase):
             httpd.server_close()
 
 
+class TestUnityPackage(unittest.TestCase):
+    """The Unity package in unity/ recognises a model by names the pipeline
+    writes, and nothing else ties the two together.
+
+    Unity is not available here, so the C# is not run. What can drift without
+    anyone noticing is the names: rename a texture or a property on this side
+    and every model would import as if the package were not installed. So the
+    names are read out of the C# constants and checked against the code that
+    writes them.
+    """
+
+    PACKAGE = REPO_ROOT / "unity" / "com.terreinlab.importer"
+
+    @classmethod
+    def _constants(cls, relative: str) -> dict[str, str]:
+        text = (cls.PACKAGE / relative).read_text(encoding="utf-8")
+        return dict(re.findall(r'public const string (\w+) = "([^"\\]*)";', text))
+
+    def _json(self, relative: str) -> dict:
+        return json.loads((self.PACKAGE / relative).read_text(encoding="utf-8"))
+
+    def test_the_manifest_is_one_package_manager_accepts(self):
+        manifest = self._json("package.json")
+        self.assertEqual(manifest["name"], "com.terreinlab.importer")
+        # Reverse-domain and lower case, or Package Manager refuses it.
+        self.assertRegex(manifest["name"], r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
+        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
+        # The oldest Unity it is written for: the APIs used are all in 2021.3.
+        self.assertEqual(manifest["unity"], "2021.3")
+        for field in ("displayName", "description"):
+            self.assertIsInstance(manifest[field], str)
+            self.assertTrue(manifest[field].strip(), field)
+        self.assertEqual(manifest.get("dependencies", {}), {})
+        # The README sends people to this file.
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("unity/com.terreinlab.importer/package.json", readme)
+
+    def test_the_editor_assembly_references_the_runtime_one(self):
+        runtime = self._json("Runtime/TerreinLab.Importer.asmdef")
+        editor = self._json("Editor/TerreinLab.Importer.Editor.asmdef")
+        self.assertEqual(runtime["name"], "TerreinLab.Importer")
+        self.assertEqual(editor["name"], "TerreinLab.Importer.Editor")
+        # Editor code in a player build breaks the build.
+        self.assertEqual(editor["includePlatforms"], ["Editor"])
+        self.assertEqual(editor.get("excludePlatforms", []), [])
+        self.assertIn(runtime["name"], editor["references"])
+        # The components ship in builds, so the runtime assembly is for every
+        # platform and depends on nothing of the editor's.
+        self.assertEqual(runtime.get("includePlatforms", []), [])
+        self.assertEqual(runtime.get("excludePlatforms", []), [])
+        self.assertEqual(runtime.get("references", []), [])
+
+        asmdefs = sorted(
+            p.relative_to(self.PACKAGE).as_posix() for p in self.PACKAGE.rglob("*.asmdef")
+        )
+        self.assertEqual(
+            asmdefs,
+            ["Editor/TerreinLab.Importer.Editor.asmdef", "Runtime/TerreinLab.Importer.asmdef"],
+        )
+        scripts = list(self.PACKAGE.rglob("*.cs"))
+        self.assertTrue(scripts)
+        for script in scripts:
+            self.assertIn(script.relative_to(self.PACKAGE).parts[0], ("Editor", "Runtime"), script.name)
+        # Unity only attaches a MonoBehaviour that sits in a file of its own name.
+        for component in ("TerreinLabModel", "TerreinLabProperties"):
+            source = (self.PACKAGE / "Runtime" / f"{component}.cs").read_text(encoding="utf-8")
+            self.assertIn(f"public sealed class {component} : MonoBehaviour", source)
+
+    def test_every_file_has_a_meta_with_a_guid_of_its_own(self):
+        """A package installed from git is read-only, so Unity cannot write the
+        .meta files it lacks and skips those assets. A script's GUID is also
+        how a scene refers to its component, so it must be the same on every
+        machine rather than made up by each one."""
+        guids: dict[str, str] = {}
+        for path in sorted(self.PACKAGE.rglob("*")):
+            name = path.relative_to(self.PACKAGE).as_posix()
+            if path.suffix == ".meta":
+                self.assertTrue(path.with_suffix("").exists(), f"{name} belongs to nothing")
+                continue
+            meta = path.with_name(path.name + ".meta")
+            self.assertTrue(meta.is_file(), f"{name} has no .meta")
+            found = re.search(r"^guid: ([0-9a-f]{32})$", meta.read_text(encoding="utf-8"), re.M)
+            self.assertIsNotNone(found, f"{name}.meta has no GUID")
+            guid = found.group(1)
+            self.assertNotIn(guid, guids, f"{name} has the GUID of {guids.get(guid)}")
+            guids[guid] = name
+
+    def test_the_file_names_are_the_ones_the_pipeline_writes(self):
+        from types import SimpleNamespace
+
+        from src.config import DEFAULTS
+        from src.export import write_attribution
+        from src.facade import generate_facade_textures
+        from src.surfaces import write_land_cover
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        export = DEFAULTS["export"]
+        self.assertEqual(names["MetadataFile"], export["metadata_name"])
+        self.assertEqual(names["AerialFile"], export["aerial_name"])
+        self.assertTrue(export["fbx_name"].endswith(names["ModelExtension"]))
+        # The aerial lands beside the FBX under that export name.
+        process = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        self.assertIn('aerial_dst = out_dir / scene["export"]["aerial_name"]', process)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self.assertEqual(write_attribution(out).name, names["AttributionFile"])
+            land_cover = write_land_cover(
+                SimpleNamespace(class_grid=np.zeros((4, 4), dtype=np.uint8)), BBox(0, 0, 8, 8), out
+            )
+            self.assertEqual(land_cover[0].name, names["LandCoverFile"])
+            cfg = dict(
+                DEFAULTS["facade"], texture_px=32, variants=1, looks_per_era=1,
+                photo_textures=False, normal_map=True, ground_floor=False,
+            )
+            textures = generate_facade_textures(out, facade_cfg=cfg)
+
+        normals = [normal.name for _, normal in textures if normal is not None]
+        self.assertTrue(normals, "no normal maps written to check")
+        for name in normals:
+            self.assertTrue(name.endswith(names["NormalMapSuffix"]), name)
+        # And no colour texture would be imported as one.
+        for colour, _ in textures:
+            self.assertFalse(colour.name.endswith(names["NormalMapSuffix"]), colour.name)
+
+    def test_the_tree_material_is_the_one_blender_hands_the_trees(self):
+        import ast
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        tree = ast.parse((REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8"))
+
+        def makes(node, material):
+            return (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") == "make_textured_material"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == material
+            )
+
+        handed = [
+            arg
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call) and getattr(call.func, "id", "") == "build_trees"
+            for arg in call.args
+        ]
+        self.assertTrue(
+            any(makes(arg, names["TreeMaterial"]) for arg in handed),
+            f"build_trees is no longer given {names['TreeMaterial']}",
+        )
+
+    def test_the_metadata_carries_what_marks_a_model(self):
+        from types import SimpleNamespace
+
+        from src.config import DEFAULTS
+        from src.export import build_metadata
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        metadata = build_metadata(
+            name="area",
+            geo=GeoContext.from_bbox(BBox(136650, 455600, 137150, 456100)),
+            terrain=SimpleNamespace(
+                center_z_nap=5.1864, coverage_id="dtm_05m", resolution_m=0.5,
+                grid_m=2.0, stats=lambda: {},
+            ),
+            aerial=SimpleNamespace(layer_title="Luchtfoto", to_dict=lambda: {"file": "aerial.png"}),
+            buildings=SimpleNamespace(stats=lambda: {}),
+            facade_cfg=DEFAULTS["facade"],
+            lod="2.2",
+            ahn_model="DTM",
+        )
+        # Through JSON, as the importer reads it.
+        metadata = json.loads(json.dumps(metadata))
+        self.assertEqual(metadata[names["JsonName"]], "area")
+        self.assertEqual(metadata[names["JsonCrs"]], names["RdCrs"])
+        self.assertEqual(metadata[names["JsonOriginRd"]], [136900.0, 455850.0])
+        self.assertEqual(metadata[names["JsonGroundZOffsetNap"]], 5.1864)
+        self.assertEqual(metadata[names["JsonBboxRd"]], [136650.0, 455600.0, 137150.0, 456100.0])
+        self.assertEqual(metadata[names["JsonUnityAxis"]], names["UnityAxis"])
+
+        # TerreinLabModel converts with the formulas the metadata documents.
+        self.assertEqual(
+            metadata["unity_import"]["local_to_rd"],
+            "rd_x = local_x + origin_rd[0], rd_y = local_z + origin_rd[1]",
+        )
+        self.assertEqual(metadata["unity_import"]["local_to_nap"], "nap = local_y + ground_z_offset_nap")
+        model = (self.PACKAGE / "Runtime" / "TerreinLabModel.cs").read_text(encoding="utf-8")
+        self.assertIn(
+            "localPosition.x + originRdX,\n"
+            "                localPosition.z + originRdY,\n"
+            "                localPosition.y + groundZOffsetNap",
+            model,
+        )
+
+    def test_the_property_names_are_the_ones_blender_writes(self):
+        keys = self._constants("Runtime/TerreinLabProperties.cs")
+        self.assertEqual(
+            set(keys),
+            {"BagIdKey", "BuildYearKey", "HeightMKey", "KindKey", "DetectedKey",
+             "MaptileRoleKey", "MaptileGroundKey"},
+        )
+        process = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        for key in keys.values():
+            self.assertRegex(
+                process, rf'\w+\["{re.escape(key)}"\] = ', f"process.py no longer sets {key}"
+            )
+
+
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")
 class TestLiveServices(unittest.TestCase):
     """Checks against the real services, for the assumptions that can drift."""
