@@ -727,7 +727,7 @@ outliner and an empty that everything in it hangs from:
 | `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
 | `Water` | water surfaces and beds |
 | `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
-| `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named |
+| `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named; in the layered style `Barriers` also holds the motorway's guardrails, `<Prefix>_Geleiderail` |
 | `Collision` | the physics proxies, hidden; see [Collision shapes](#collision-shapes) |
 
 **Trees are instances.** Ten thousand trees share twelve meshes: three kinds,
@@ -1113,6 +1113,57 @@ How it is built (`src/layered.py`):
   are `Structures_railing`, catwalk railings `<Prefix>_Leuningen`; a stand-in
   for the railing of the place. `structures.railings` turns the bridge ones
   off.
+* **Guardrails** (`src/guardrails.py`). The BGT draws a motorway's
+  carriageways and verges and nothing standing between them, so a steel
+  guardrail is laid wherever a motorway carriageway meets grass, open ground,
+  water or a hard verge in the ground as built: along every verge and down
+  both sides of the central reservation. Not where the carriageway meets
+  another road part, a junction mouth or the lane into a service area: the
+  rail stops 0.3 m short of that road rather than turning the corner into it.
+  Not at a merge, where two motorway parts share an edge and there is none to
+  follow. Not across the end of a carriageway that runs onto a bridge or into
+  a tunnel, whose deck the structures stage builds: an edge with both ends
+  within a metre of a part on a bridge (`relatieve_hoogteligging` not 0) and
+  the carriageway beside it clear of that part is such an end. The metre has
+  room to spare: in the ground as built the ends of the ramps at Princeville
+  (below) stand up to 0.33 m off their bridge parts, and a test 10 cm out
+  missed 11 of their 37 edges and ran a rail across them. A verge passing
+  under a bridge keeps its rail. Not on a green gore the
+  layered style kerbs as an island: its kerb is its edge. And not within
+  0.6 m of a BGT wall, fence or noise barrier, which guards the edge already.
+  The rail's face stands 0.5 m onto the verge and no closer than that to any
+  carriageway, so in a gore the rails of its two sides stop where it narrows;
+  where two would stand back to back closer than 0.4 m, at a gore's tip or in
+  a reservation too narrow for two, the shorter one stops, and a strip under a
+  metre wide has room for none. Nothing shorter than 10 m is kept, and a rail
+  stops 0.23 m inside the edge of the area, so its posts are over the ground.
+  The rail is Rijkswaterstaat's steel guardrail in broad terms: a W-profile
+  beam 0.31 m tall and 8 cm deep, its top 0.75 m above the ground at its face,
+  on 10 cm square posts. The posts stand every 2 m, a common spacing for Dutch
+  steel guardrail (a stiffer stretch has them closer, a softer one further
+  apart), which is also twice to every 4 m square of the ground, so the rail
+  follows the verge as built. Each post goes 10 cm into the ground under the
+  lowest of its corners: on a steep bank a post set by its middle had one
+  corner in the air. The beam is folded once down its middle, which catches
+  the light the way the W does: about 10 triangles a metre, against the
+  railings' 17. Every height is read off the ground the layers are, so a post
+  stands on the verge the model has, not on the survey under it. It is one
+  object, `<Prefix>_Geleiderail`, in the railings' `Staal`, kept with the
+  walls and fences in `Barriers` (the 3D view names that layer already); with
+  collision shapes on, `Collision_Guardrails` is its proxy (see
+  [Collision shapes](#collision-shapes)). `layered.guardrails` turns it off.
+  Over 500 m of the A16 at Tankstation Hazeldonk (RD 109,980 to 110,480 by
+  390,170 to 390,670), with 3.4 km of motorway outline, that is 3,229 m of
+  rail in 10 runs, 2,144 m of it between two carriageways, on 1,630 posts:
+  32,560 triangles, laid out in 0.2 s. Read back from Blender, every corner of
+  every post foot is 0.10 to 0.14 m into the ground as built and the top of
+  the rail's face 0.750 m above it; every post stands on grass. Over the
+  A16/A58 interchange at Princeville (RD 110,200 to 110,700 by 393,050 to
+  393,550), where the A58's ramps cross the A16 and the railway on five
+  bridge parts, it is 5,125 m in 21 runs on 2,593 posts, none across a ramp's
+  end; the A16's verges keep their rails under the ramps. There 274 m of
+  motorway edge borders green gores kerbed as islands and has none, and on
+  the banks up to the bridges a post goes in up to 0.43 m at its uphill corner.
 * **Thin strips.** A ground polygon thinner than 0.5 m (twice its area over
   its perimeter) is folded into the neighbour it shares most outline with
   before meshing, land into land where it can. Three BGT borders 35–40 cm
@@ -1188,6 +1239,7 @@ The layered style's settings, all optional:
 | `layered.water_surface` | true | the flat water object over every BGT water |
 | `layered.water_level_offset_m` | 0 | added to every water level: a tide (the survey's is whatever the tide was when it was flown) |
 | `layered.harbour` | true | quay faces, jetties, pontoons, mooring posts, catwalks and fenders |
+| `layered.guardrails` | true | steel guardrails along the motorway's verges and central reservation, `<Prefix>_Geleiderail` |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
@@ -1217,8 +1269,8 @@ vertices and 10 cm each. And where two footpaths touch at a single point on
 the edge of the area, the kerb on the cut edge stands its own width outside
 it, which the check also allows: a runaway kerb goes metres.
 
-Not in it yet: the motorway's guardrails, and the modellers' hand-made
-buildings — the buildings are 3DBAG's, as in the survey style.
+Not in it yet: the modellers' hand-made buildings. The buildings are
+3DBAG's, as in the survey style.
 
 ## Terrain
 
@@ -2243,12 +2295,14 @@ Off by default (`export.collision`, or "Add simplified shapes for physics" in
 the UI). This is for driving or flying something through the model rather than
 looking at it, and it costs FBX size that most imports do not want.
 
-Two extra objects appear, and **only** two, because only two earn their place:
+Two extra objects appear, and a third in the layered style where the motorway
+has guardrails; only these earn their place:
 
 | Object | What it is | Against the drawn mesh |
 |---|---|---|
 | `Collision_Trees` | a trunk prism and a box round the canopy, per tree | 28 triangles against 52–84, so **2.3×** cheaper over a real height mix — or 16 with `export.collision_tree_crowns` off, **4×** |
 | `Collision_Barriers` | the same walls and fences, fattened | one extra prism per thin run |
+| `Collision_Guardrails` | a block along each guardrail, from the rail's face back over its posts and from below the ground to the rail's top, fattened as a fence is | 8 triangles per post against the drawn 20; 13,000 over the Hazeldonk A16 square |
 
 Everything else in the scene is already the right shape to collide with, and
 `metadata.json` names which object to use for each layer instead of shipping a
@@ -2273,6 +2327,9 @@ generated. `barriers.collision_thickness_m` defaults to 0.30 m, which covers
 15 m/s and is invisible because the drawn fence stays 6 cm. Above that, set the
 moving body's Collision Detection to **Continuous Dynamic** as well — that
 cannot tunnel at any speed, and thickening is a mitigation rather than the cure.
+A guardrail's beam is 8 cm deep, rail and post 18 cm together, so its block is
+fattened to the same 0.30 m, onto the verge behind the rail and never into the
+carriageway in front of it, where a car would meet a wall it cannot see.
 
 Which dimension gets fattened depends on how the barrier was surveyed. A line
 barrier is a swept prism, so its `thickness_m` is the thin direction. An area
@@ -2402,6 +2459,16 @@ from its edge) and `roofs_use_the_atlas` (Blender put as many roof triangles on
 `M_roof` as were planned). `roof_resolution_as_asked` warns when the budget
 made the roofs coarser than `roof_cm`. An atlas that could not be fetched is a
 warning too: the roofs are then on the aerial, as they were before.
+
+The guardrails have three: `guardrails_present` (how many metres, posts and
+triangles, and a warning where a motorway with verges has none),
+`guardrails_on_the_verge` (every post and every point of the rail's face on a
+face of grass, open ground or a hard verge, read off the ground's own faces
+rather than the distances the rails were laid out by) and
+`guardrails_stand_on_the_ground` (read back from Blender: the object has every
+post foot and rail top the layout placed, no corner of any foot is less than
+8 cm into the ground as built, so none is in the air, and the top of the
+rail's face is within 2 cm of 0.75 m above that ground at every post).
 
 `web_view_written` says whether the 3D view was written. It only ever warns:
 the model is whole without it, and the page writes the view from the `.blend`

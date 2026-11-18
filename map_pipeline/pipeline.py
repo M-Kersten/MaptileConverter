@@ -38,8 +38,11 @@ if __name__ == "__main__":
     if report_missing():
         raise SystemExit(2)
 
+from src.bgt import fetch_current  # noqa: E402
 from src.bgt import use_cache as bgt_cache  # noqa: E402
+from src.guardrails import GuardrailSet, build_guardrails  # noqa: E402
 from src.harbour import HarbourSet, build_harbour  # noqa: E402
+from src.railings import guarded_area  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402
 from src.elevation import (  # noqa: E402
@@ -50,7 +53,7 @@ from src.elevation import (  # noqa: E402
     raster_sampler,
 )
 from src.terrain_mesh import build_terrain_mesh  # noqa: E402
-from src.layered import build_layered_ground  # noqa: E402
+from src.layered import MOTORWAY, build_layered_ground  # noqa: E402
 from src.nwb import NWB_URL, fetch_centrelines  # noqa: E402
 from src.roads import (  # noqa: E402
     TERRAIN_CLEARANCE_M,
@@ -132,6 +135,7 @@ from src.validate import (  # noqa: E402
     check_rails,
     check_structures,
     check_vehicles,
+    check_guardrails,
     check_harbour,
     check_surfaces,
     check_terrain,
@@ -496,7 +500,7 @@ def _collision_metadata(work_dir: Path) -> dict:
     return {"collision": collision} if collision.get("objects") else {}
 
 
-def layered_scene(config: PipelineConfig, ground, harbour=None) -> dict:
+def layered_scene(config: PipelineConfig, ground, harbour=None, guardrails=None) -> dict:
     """What the Blender stage needs to build the modellers' ground."""
     settings = config.layered
     curb = settings["curb"]
@@ -519,6 +523,7 @@ def layered_scene(config: PipelineConfig, ground, harbour=None) -> dict:
         },
         "water_surface": bool(settings.get("water_surface", True)),
         "harbour": "harbour.npz" if harbour is not None and len(harbour) else "",
+        "guardrails": "guardrails.npz" if guardrails is not None and len(guardrails) else "",
         "water_level_offset_m": float(settings.get("water_level_offset_m", 0.0)),
         "walkway_material": str(curb.get("walkway_material") or ""),
         "curb_material": str(curb.get("curb_material") or "Beton"),
@@ -742,6 +747,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     ground_layers = None
     harbour = HarbourSet()
+    guardrails = GuardrailSet()
     if layered:
         with Stage("terrain and ground layers", next_step(), total):
             # The modellers' ground: a coarse terrain within tolerance of the
@@ -781,6 +787,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     error["p99_m"],
                 )
             terrain.save(work_dir)
+            bgt_kwargs = {
+                "page_limit": int(config.surfaces["page_limit"]),
+                "timeout": float(config.surfaces["timeout_s"]),
+                "max_retries": int(config.surfaces["max_retries"]),
+                "max_pages": int(config.surfaces["max_pages"]),
+            }
             if surfaces.water and bool(settings.get("harbour", True)):
                 # Quay faces, jetties, pontoons and mooring posts, at the
                 # water levels just read and the ground just built.
@@ -791,12 +803,24 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     quays=surfaces.quays,
                     surface_at=ground_layers.surface_at,
                     dsm_path=level_dsm,
-                    fetch_kwargs={
-                        "page_limit": int(config.surfaces["page_limit"]),
-                        "timeout": float(config.surfaces["timeout_s"]),
-                        "max_retries": int(config.surfaces["max_retries"]),
-                        "max_pages": int(config.surfaces["max_pages"]),
-                    },
+                    fetch_kwargs=bgt_kwargs,
+                )
+            if bool(settings.get("guardrails", True)) and (
+                ground_layers.mesh.face_kind == MOTORWAY
+            ).any():
+                # Steel guardrails along the motorway, standing on the ground
+                # just built, and not where the BGT has a wall or fence.
+                guardrails = build_guardrails(
+                    ground_layers,
+                    surfaces.areas,
+                    bbox=config.bbox,
+                    guarded=guarded_area(config.bbox, fetch_current, bgt_kwargs),
+                    collision_thickness_m=(
+                        float(config.barriers.get("collision_thickness_m", 0.30))
+                        if config.export.get("collision", False)
+                        else None
+                    ),
+                    work_dir=work_dir,
                 )
 
     else:
@@ -1064,7 +1088,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
             ground_variants=ground_variants,
             layered=(
-                layered_scene(config, ground_layers, harbour)
+                layered_scene(config, ground_layers, harbour, guardrails)
                 if ground_layers is not None
                 else None
             ),
@@ -1093,6 +1117,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
                 "barriers": barriers.stats(),
+                **({"guardrails": guardrails.stats()} if len(guardrails) else {}),
                 "vehicles": vehicles.stats(),
                 "railways": rails.stats(),
                 "structures": {
@@ -1157,6 +1182,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_harbour(report, harbour)
+        if ground_layers is not None and bool(config.layered.get("guardrails", True)):
+            check_guardrails(
+                report, guardrails, ground_layers,
+                work_dir=None if args.skip_blender else work_dir,
+            )
         check_furniture(report, furniture if want_furniture else None, config.bbox)
         # Against what they were placed on: the model's own surface, which
         # is the road where there is one and the terrain as drawn elsewhere.

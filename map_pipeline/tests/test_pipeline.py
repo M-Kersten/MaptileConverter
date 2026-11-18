@@ -9428,6 +9428,439 @@ class TestHarbour(unittest.TestCase):
         self.assertTrue(all(v.passed for v in verdicts.values()))
 
 
+def _grid_ground(xs, ys, kind, z=None):
+    """A layered ground of quads on the grid `xs` by `ys`, as built.
+
+    `kind(x, y)` gives the ``(layer, material)`` of the quad whose middle is
+    there (material None for bare terrain); `z(x, y)` the ground's height.
+    Faces run counter-clockwise from above, as `TerrainMesh` has them.
+    """
+    from src.layered import GRASS, MATERIAL_NAMES, MOTORWAY, ROAD, WALKWAY, LayeredGround
+    from src.terrain_mesh import TerrainMesh
+
+    xs, ys = np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+    gx, gy = np.meshgrid(xs, ys)
+    z = z or (lambda x, y: 3.0 + 0.0 * x)
+    vertices = np.column_stack([gx.ravel(), gy.ravel(), z(gx.ravel(), gy.ravel())])
+    nx = len(xs)
+    loops, layers, materials = [], [], []
+    for j in range(len(ys) - 1):
+        for i in range(nx - 1):
+            a = j * nx + i
+            loops += [a, a + 1, a + 1 + nx, a + nx]
+            layer, material = kind(0.5 * (xs[i] + xs[i + 1]), 0.5 * (ys[j] + ys[j + 1]))
+            layers.append(layer)
+            materials.append(MATERIAL_NAMES.index(material) if material else -1)
+    count = len(layers)
+    mesh = TerrainMesh(
+        vertices=vertices, measured_z=vertices[:, 2].copy(),
+        face_sizes=np.full(count, 4, dtype=np.int32), face_loops=np.array(loops, dtype=np.int64),
+        face_kind=np.array(layers, dtype=np.int8), face_part=np.zeros(count, dtype=np.int8),
+        vertex_on=np.zeros(len(vertices), dtype=np.int32), edges=np.zeros((0, 2), dtype=np.int64),
+        edge_on=np.zeros(0, dtype=np.int32), grid_m=2.0, locator_cell=8.0,
+    )
+    flat = {ROAD: 0.0, MOTORWAY: 0.0, WALKWAY: 0.0, GRASS: 0.0}
+    return LayeredGround(
+        mesh=mesh, face_material=np.array(materials, dtype=np.int64),
+        face_object=np.full(count, -1, dtype=np.int64), object_names=[], object_layer=[],
+        terrain_name="T_Terrein", lift=dict(flat), top={**flat, WALKWAY: 0.13},
+    )
+
+
+def _band_rows(*edges):
+    """Grid rows every couple of metres, with a row edge on every band edge."""
+    rows = set(np.arange(0.0, max(edges) + 1e-9, 2.5).round(6).tolist()) | set(edges)
+    return np.array(sorted(rows))
+
+
+class TestGuardrails(unittest.TestCase):
+    """Steel guardrails along the motorway, on synthetic ground.
+
+    A 120 x 60 m square on a slope with a dual carriageway across it: a
+    verge to the south, a 4 m central reservation, a verge to the north with
+    a road leaving it at x 80 to 90, and a BGT fence along the south verge
+    at x 30 to 50.
+    """
+
+    @staticmethod
+    def _z(x, y):
+        return 3.0 + 0.02 * np.asarray(x) + 0.3 * np.sin(np.asarray(y) / 5.0)
+
+    @classmethod
+    def setUpClass(cls):
+        import shapely
+
+        from src.geo import BBox
+        from src.guardrails import build_guardrails
+        from src.layered import GRASS, MOTORWAY, ROAD
+
+        def kind(x, y):
+            if 20.0 < y < 31.0 or 35.0 < y < 46.0:
+                return MOTORWAY, "Asfalt"
+            if y > 46.0 and 80.0 < x < 90.0:
+                return ROAD, "Asfalt"
+            return GRASS, "Gras"
+
+        cls.ground = _grid_ground(np.arange(0.0, 120.1, 2.0),
+                                  _band_rows(0, 20, 31, 35, 46, 60), kind, cls._z)
+        cls.fence = shapely.LineString([(30.0, 19.6), (50.0, 19.6)])
+        cls.bbox = BBox(0.0, 0.0, 120.0, 60.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            cls.built = build_guardrails(
+                cls.ground, [], bbox=cls.bbox, guarded=cls.fence.buffer(0.6),
+                collision_thickness_m=0.3, work_dir=Path(tmp),
+            )
+            data = np.load(Path(tmp) / "guardrails.npz")  # allow_pickle defaults to False
+            cls.saved = {key: data[key] for key in data.files}
+
+    def _rails_at(self, y, within=0.05):
+        """Every rail line point within `within` of the line y = `y`."""
+        points = [p for line in self.built.lines for p in line if abs(p[1] - y) < within]
+        return np.array(points).reshape(-1, 2)
+
+    def test_a_rail_down_each_verge_and_each_side_of_the_reservation(self):
+        from src.guardrails import SETBACK_M
+
+        for y in (20.0 - SETBACK_M, 31.0 + SETBACK_M, 35.0 - SETBACK_M, 46.0 + SETBACK_M):
+            with self.subTest(y=y):
+                self.assertGreater(len(self._rails_at(y)), 1)
+        # Nowhere else: every rail point is its setback from a carriageway.
+        for line in self.built.lines:
+            gaps = np.min(np.abs(line[:, 1][:, None] - np.array([20.0, 31.0, 35.0, 46.0])), axis=1)
+            np.testing.assert_allclose(gaps, SETBACK_M, atol=1e-6)
+        self.assertGreater(self.built.counts["between_carriageways_m"], 150.0)
+
+    def test_the_carriageway_is_on_the_left_of_every_rail(self):
+        """The profile's face, and the posts behind it, are laid out by it."""
+        for line in self.built.lines:
+            step = line[-1] - line[0]
+            left = line[0] + 0.5 * step + 1.0 * np.array([-step[1], step[0]]) / np.hypot(*step)
+            y = left[1]
+            self.assertTrue(20.0 < y < 31.0 or 35.0 < y < 46.0, f"verge on the left at y {y:.2f}")
+
+    def test_no_rail_across_a_junction_mouth(self):
+        """The road leaving the north verge at x 80 to 90: the rail stops
+        `CLEAR_M` short of it either side and does not cross."""
+        from src.guardrails import CLEAR_M, SETBACK_M
+
+        north = self._rails_at(46.0 + SETBACK_M)
+        self.assertFalse(((north[:, 0] > 80.0 - CLEAR_M + 1e-6)
+                          & (north[:, 0] < 90.0 + CLEAR_M - 1e-6)).any())
+        self.assertAlmostEqual(float(north[north[:, 0] < 85, 0].max()), 80.0 - CLEAR_M, places=6)
+        self.assertAlmostEqual(float(north[north[:, 0] > 85, 0].min()), 90.0 + CLEAR_M, places=6)
+        # Nothing runs across the end of the area, or across the mouth.
+        for line in self.built.lines:
+            self.assertLess(float(np.ptp(line[:, 1])), 1e-6)
+
+    def test_no_rail_where_a_barrier_already_stands(self):
+        from src.guardrails import GUARDED_M, SETBACK_M
+
+        south = self._rails_at(20.0 - SETBACK_M)
+        # Where the rail line passes within GUARDED_M of the fence's ends; the
+        # buffer's round ends are drawn a little inside the circle.
+        reach = np.sqrt(GUARDED_M ** 2 - (19.6 - (20.0 - SETBACK_M)) ** 2)
+        self.assertFalse(((south[:, 0] > 30.0 - reach + 0.05)
+                          & (south[:, 0] < 50.0 + reach - 0.05)).any())
+        self.assertTrue((south[:, 0] < 29.0).any() and (south[:, 0] > 51.0).any())
+
+    def test_rails_end_inside_the_area(self):
+        from src.guardrails import FRAME_CLEAR_M
+
+        points = np.vstack(self.built.lines)
+        self.assertAlmostEqual(float(points[:, 0].min()), FRAME_CLEAR_M, places=6)
+        self.assertAlmostEqual(float(points[:, 0].max()), 120.0 - FRAME_CLEAR_M, places=6)
+        feet = self.built.post_foot
+        self.assertTrue(((feet[:, 0] > 0) & (feet[:, 0] < 120)).all())
+
+    def test_posts_stand_on_the_ground_and_the_rail_at_its_height(self):
+        from src.guardrails import (
+            POST_EMBED_M, POST_EVERY_M, RAIL_HEIGHT_M, RAIL_TOP_M, guardrail,
+        )
+
+        # Each foot goes POST_EMBED_M in under the lowest of its corners and
+        # its middle; the others deeper, on the slope.
+        feet, corners = self.built.post_foot, self.built.post_corners
+        self.assertEqual(corners.shape, (len(feet), 4, 3))
+        self.assertLess(float(np.abs(corners[:, :, 2] - feet[:, 2:3]).max()), 1e-12)
+        under = np.column_stack([
+            self.ground.surface_at(feet[:, 0], feet[:, 1]),
+            self.ground.surface_at(corners[:, :, 0].ravel(), corners[:, :, 1].ravel()).reshape(-1, 4),
+        ])
+        depth = under - feet[:, 2:3]
+        np.testing.assert_allclose(depth.min(axis=1), POST_EMBED_M, atol=1e-9)
+        self.assertGreater(float(depth.max()), POST_EMBED_M + 1e-4)
+        line = self.built.lines[0]
+        vertices, _, _, kind, foot, _, top = guardrail(line, self.ground.surface_at)
+        stations = len(top)
+        rail = vertices[: stations * 5].reshape(stations, 5, 3)
+        under = self.ground.surface_at(top[:, 0], top[:, 1])
+        np.testing.assert_allclose(top[:, 2] - under, RAIL_TOP_M, atol=1e-9)
+        np.testing.assert_allclose(rail[:, 0], top, atol=1e-12)
+        np.testing.assert_allclose(rail[:, :, 2].max(axis=1) - under, RAIL_TOP_M, atol=1e-9)
+        np.testing.assert_allclose(rail[:, :, 2].min(axis=1) - under,
+                                   RAIL_TOP_M - RAIL_HEIGHT_M, atol=1e-9)
+        spacing = np.linalg.norm(np.diff(foot[:, :2], axis=0), axis=1)
+        self.assertLessEqual(float(spacing.max()), POST_EVERY_M + 1e-6)
+        self.assertGreater(float(spacing.min()), 0.9 * POST_EVERY_M)
+        # Every post on the verge, behind the rail: never on the carriageway.
+        self.assertTrue(((foot[:, 1] < 20.0) | (foot[:, 1] > 46.0)
+                         | ((foot[:, 1] > 31.0) & (foot[:, 1] < 35.0))).all())
+
+    def test_the_rail_is_a_closed_solid_facing_out(self):
+        """Closed, so it is not a hole from behind; turned out, so an engine
+        culling back faces draws its face. About 10 triangles a metre."""
+        from src.guardrails import RAIL, guardrail
+
+        line = np.array([[0.0, 0.0], [40.0, 0.0]])
+        vertices, triangles, uv, kind, _, _, _ = guardrail(line, lambda x, y: np.zeros(np.shape(x)))
+        self.assertEqual(len(uv), len(vertices))
+        rail = triangles[kind == RAIL]
+        # Closed and consistently wound: every edge once each way round.
+        directed = np.vstack([rail[:, [0, 1]], rail[:, [1, 2]], rail[:, [2, 0]]])
+        _, counts = np.unique(directed, axis=0, return_counts=True)
+        self.assertEqual(set(counts.tolist()), {1})
+        flipped = {tuple(e) for e in directed[:, ::-1].tolist()}
+        self.assertEqual(flipped, {tuple(e) for e in directed.tolist()})
+        # ...and outwards: the volume it encloses comes out positive, and is
+        # the profile's area along the 40 m.
+        corner = vertices[rail]
+        volume = float(np.einsum(
+            "ij,ij->i", corner[:, 0], np.cross(corner[:, 1], corner[:, 2])).sum()) / 6.0
+        self.assertAlmostEqual(volume, 40.0 * (0.08 * 0.31 - 0.5 * 0.04 * 0.31), places=6)
+        # Rail and posts on the verge side, right of the line: south of it.
+        self.assertTrue((vertices[:, 1] <= 1e-9).all())
+        self.assertLess(len(triangles) / 40.0, 11.0)
+
+    def test_the_end_of_a_carriageway_at_a_bridge_has_no_rail_across_it(self):
+        """The carriageway runs onto a bridge at x 60, which the structures
+        stage builds: no rail across the end. A road bridge over the verges
+        at x 20 to 30 leaves their rails where they are."""
+        import shapely
+
+        from src.geo import BBox
+        from src.guardrails import SETBACK_M, build_guardrails
+        from src.layered import GRASS, MOTORWAY, TERRAIN, GroundArea
+
+        def kind(x, y):
+            if 20.0 < y < 31.0:
+                return (MOTORWAY, "Asfalt") if x < 60.0 else (TERRAIN, None)
+            return GRASS, "Gras"
+
+        ground = _grid_ground(np.arange(0.0, 120.1, 2.0), _band_rows(0, 20, 31, 60), kind)
+        bridge = GroundArea([_rect_ring(60.0, 20.0, 120.0, 31.0)], MOTORWAY, "Asfalt", level=1)
+        over = GroundArea([_rect_ring(20.0, 0.0, 30.0, 60.0)], 1, "Asfalt", level=1)
+        bbox = BBox(0.0, 0.0, 120.0, 60.0)
+        built = build_guardrails(ground, [bridge, over], bbox=bbox)
+        points = np.vstack(built.lines)
+        self.assertFalse(((points[:, 0] > 60.0 + 1e-6) & (points[:, 1] > 20.0)
+                          & (points[:, 1] < 31.0)).any())
+        for y in (20.0 - SETBACK_M, 31.0 + SETBACK_M):
+            under = points[(np.abs(points[:, 1] - y) < 1e-6)]
+            self.assertTrue(shapely.LineString(under).length > 55.0)
+            self.assertAlmostEqual(float(under[:, 0].max()), 60.0, places=6)
+        # Without the bridge's part in the BGT, the end is just verge.
+        plain = np.vstack(build_guardrails(ground, [], bbox=bbox).lines)
+        self.assertTrue((np.abs(plain[:, 0] - (60.0 + SETBACK_M)) < 1e-6).any())
+
+    def test_a_strip_too_narrow_for_two_rails_gets_one(self):
+        """Two carriageways with 1.2 m of grass between them: two rails would
+        stand in each other's posts. Under a metre, none fits at all."""
+        from src.geo import BBox
+        from src.guardrails import build_guardrails
+        from src.layered import GRASS, MOTORWAY
+
+        for width, want in ((4.0, 2), (1.2, 1), (0.8, 0)):
+            def kind(x, y, width=width):
+                inside = 20.0 < y < 31.0 or 31.0 + width < y < 42.0 + width
+                return (MOTORWAY, "Asfalt") if inside else (GRASS, "Gras")
+
+            ground = _grid_ground(np.arange(0.0, 60.1, 2.0),
+                                  _band_rows(0, 20, 31, 31 + width, 42 + width, 60), kind)
+            built = build_guardrails(ground, [], bbox=BBox(0.0, 0.0, 60.0, 60.0))
+            between = [line for line in built.lines if 31.0 < line[:, 1].mean() < 31.0 + width]
+            with self.subTest(width=width):
+                self.assertEqual(len(between), want)
+                self.assertEqual(len(built.lines), 2 + want)
+
+    def test_the_two_sides_of_a_gore_stop_before_they_meet(self):
+        """Offset into a gore, the rails of its two sides join at its tip
+        into one line folded back on itself; cut there, the shorter side
+        stops where the two come within `APART_M`."""
+        from src.guardrails import APART_M, _back_to_back, _split_at_turns
+
+        v = np.array([[0.0, 0.0], [40.0, 1.0], [0.0, 2.0]])
+        sides = _split_at_turns(v)
+        self.assertEqual(len(sides), 2)
+        kept = _back_to_back(sides + [np.array([[0.0, -20.0], [40.0, -20.0]])], 5.0)
+        self.assertEqual(len(kept), 3)
+        import shapely
+
+        lines = [shapely.LineString(k) for k in kept]
+        for i, a in enumerate(lines):
+            for b in lines[i + 1:]:
+                self.assertGreaterEqual(a.distance(b), APART_M - 1e-3)
+        # The longer side whole, to the tip; the other stops short of it.
+        self.assertAlmostEqual(max(line.length for line in lines[:2]), np.hypot(40.0, 1.0))
+        self.assertLess(min(line.length for line in lines[:2]), np.hypot(40.0, 1.0) - 5.0)
+
+    def test_the_physics_block_holds_the_rail_and_cannot_be_flown_through(self):
+        from src.guardrails import POST_EMBED_M, POST_SIZE_M, RAIL_DEPTH_M, RAIL_TOP_M
+        from src.guardrails import collision_solid, guardrail
+
+        flat = lambda x, y: np.zeros(np.shape(x))  # noqa: E731
+        line = np.array([[0.0, 0.0], [20.0, 0.0]])
+        drawn = guardrail(line, flat)[0]
+        for asked, deep in ((0.30, 0.30), (0.05, RAIL_DEPTH_M + POST_SIZE_M)):
+            block, triangles = collision_solid(line, flat, asked)
+            with self.subTest(asked=asked):
+                self.assertAlmostEqual(float(-block[:, 1].min()), deep, places=6)
+                self.assertAlmostEqual(float(block[:, 1].max()), 0.0, places=6)
+                self.assertAlmostEqual(float(block[:, 2].max()), RAIL_TOP_M, places=6)
+                self.assertLess(float(block[:, 2].min()), -POST_EMBED_M)
+                self.assertTrue((drawn[:, 1] >= block[:, 1].min() - 1e-9).all())
+                self.assertTrue((drawn[:, 1] <= 1e-9).all())
+                self.assertTrue((drawn[:, 2] >= block[:, 2].min()).all())
+        self.assertGreater(len(self.built.collision_triangles), 0)
+        self.assertEqual(self.built.collision_thickness_m, 0.3)
+
+    def test_the_checks_read_it(self):
+        import copy
+
+        from src.validate import CheckReport, check_guardrails
+
+        report = CheckReport()
+        check_guardrails(report, self.built, self.ground)
+        verdicts = {c.name: c for c in report.checks}
+        self.assertEqual(set(verdicts), {"guardrails_present", "guardrails_on_the_verge",
+                                         "guardrails_stand_on_the_ground"})
+        self.assertTrue(all(v.passed for v in verdicts.values()), [str(v) for v in verdicts.values()])
+
+        # A post on the carriageway is caught by the faces under it.
+        moved = copy.deepcopy(self.built)
+        moved.post_foot[3, 1] = 25.0
+        report = CheckReport()
+        check_guardrails(report, moved, self.ground)
+        self.assertFalse({c.name: c for c in report.checks}["guardrails_on_the_verge"].passed)
+
+        # Read back from Blender's summary where it ran: a foot corner in the
+        # air, a rail too low, a post missing from the object.
+        good = {"object": "T_Geleiderail", "posts": 3, "posts_found": 3,
+                "rail_points": 3, "rail_points_found": 3,
+                "foot_depth_min_m": 0.1, "foot_depth_max_m": 0.3,
+                "rail_top_min_m": 0.749, "rail_top_max_m": 0.751}
+        for change, passed in (({}, True), ({"foot_depth_min_m": 0.03}, False),
+                               ({"rail_top_min_m": 0.6}, False), ({"posts_found": 2}, False)):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                summary = {"layered": {"guardrail": {**good, **change}}}
+                (Path(tmp) / "blender_summary.json").write_text(json.dumps(summary))
+                report = CheckReport()
+                check_guardrails(report, self.built, self.ground, work_dir=Path(tmp))
+                standing = {c.name: c for c in report.checks}["guardrails_stand_on_the_ground"]
+                self.assertEqual(standing.passed, passed, standing.detail)
+                self.assertIn("T_Geleiderail", standing.detail)
+
+    def test_no_motorway_no_guardrails(self):
+        from src.geo import BBox
+        from src.guardrails import build_guardrails
+        from src.layered import GRASS, ROAD
+        from src.validate import CheckReport, check_guardrails
+
+        ground = _grid_ground(np.arange(0.0, 40.1, 2.0), _band_rows(0, 10, 20, 40),
+                              lambda x, y: (ROAD, "Asfalt") if 10 < y < 20 else (GRASS, "Gras"))
+        built = build_guardrails(ground, [], bbox=BBox(0.0, 0.0, 40.0, 40.0))
+        self.assertEqual(len(built), 0)
+        report = CheckReport()
+        check_guardrails(report, built, ground)
+        self.assertEqual([(c.name, c.passed) for c in report.checks], [("guardrails_present", True)])
+        self.assertIn("no motorway", report.checks[0].detail)
+
+    def test_the_file_for_blender(self):
+        """No pickles, and the post feet the summary measures."""
+        for key, value in self.saved.items():
+            self.assertNotEqual(value.dtype, object, key)
+        self.assertEqual(len(self.saved["triangles"]), len(self.built))
+        self.assertEqual([str(n) for n in self.saved["kind_names"]], ["rail", "post"])
+        np.testing.assert_allclose(self.saved["post_foot"], self.built.post_foot)
+        np.testing.assert_allclose(self.saved["post_corners"],
+                                   self.built.post_corners.reshape(-1, 3))
+        np.testing.assert_allclose(self.saved["rail_top"], self.built.rail_top)
+        # Every corner and every rail top is a vertex Blender can find.
+        vertices = {tuple(np.round(v, 9)) for v in self.built.vertices}
+        for point in np.vstack([self.saved["post_corners"], self.saved["rail_top"]]):
+            self.assertIn(tuple(np.round(point, 9)), vertices)
+
+    def test_blender_makes_one_steel_object_of_it(self):
+        made = []
+
+        def build_mesh_object(name, vertices, loops, starts, sizes, uvs, slots, materials, **kw):
+            obj = _FakeMeshObject(name, vertices, loops, starts, sizes, uvs, slots, materials)
+            made.append(obj)
+            return obj
+
+        bpy = types_namespace(data=types_namespace(materials=types_namespace(get=lambda n: None)))
+        namespace = _process_namespace(
+            {"build_guardrails", "_GUARDRAIL_POINTS", "RAILING_MATERIAL"},
+            {"build_mesh_object": build_mesh_object, "bpy": bpy,
+             "make_plain_material": lambda name, rgb, rough: f"material {name}"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.built.save(Path(tmp) / "guardrails.npz")
+            scene = {"origin_rd": [60.0, 30.0], "ground_z_offset_nap": 3.0,
+                     "layered": {"guardrails": "guardrails.npz"}}
+            obj = namespace["build_guardrails"](scene, Path(tmp), "T")
+            # The foot corners and rail tops, local, for the summary to measure.
+            points = namespace["_GUARDRAIL_POINTS"]
+            self.assertEqual(len(points["corners"]), 4 * len(self.built.post_foot))
+            np.testing.assert_allclose(points["tops"] + [60.0, 30.0, 3.0], self.built.rail_top)
+            self.assertIsNone(namespace["build_guardrails"](
+                {**scene, "layered": {"guardrails": ""}}, Path(tmp), "T"))
+            self.assertEqual(namespace["_GUARDRAIL_POINTS"], {})
+        self.assertEqual(obj.name, "T_Geleiderail")
+        self.assertEqual(obj["maptile_role"], "guardrail")
+        self.assertEqual(obj.materials, ["material Staal"])
+        self.assertEqual(obj.uvs, len(obj.data.loops))
+        self.assertEqual(len(obj.data.co), len(self.built.vertices))
+        # In the scene's local frame, centred on the area and its height.
+        self.assertLess(float(np.abs(obj.data.co[:, 0]).max()), 61.0)
+
+    def test_the_physics_proxy_lands_in_local_coordinates(self):
+        seen = {}
+        namespace = TestCollisionLayer._collision_ns(
+            on_build=lambda name, vertices, *a, **k: seen.setdefault(name, np.asarray(vertices))
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.built.save(Path(tmp) / "guardrails.npz")
+            scene = {"origin_rd": [60.0, 30.0], "ground_z_offset_nap": 3.0,
+                     "layered": {"guardrails": "guardrails.npz"},
+                     "export": {"collision": True}}
+            built = namespace["build_collision"](scene, Path(tmp))
+        self.assertEqual(set(built), {"Collision_Guardrails"})
+        self.assertEqual(built["Collision_Guardrails"], len(self.built.collision_triangles))
+        self.assertLess(float(np.abs(seen["Collision_Guardrails"][:, 0]).max()), 61.0)
+
+    def test_the_setting(self):
+        from src.config import DEFAULTS
+
+        self.assertTrue(DEFAULTS["layered"]["guardrails"])
+        raw = {"name": "g", "bbox": {"crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
+                                     "xmax": 137000, "ymax": 456000},
+               "layered": {"guardrails": False}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(raw))
+            self.assertFalse(load_config(path).layered["guardrails"])
+
+    def test_the_scene_names_the_file_only_when_there_is_one(self):
+        import pipeline
+        from src.guardrails import GuardrailSet
+
+        config = load_config(REPO_ROOT / "config.json")
+        self.assertEqual(pipeline.layered_scene(config, self.ground, None, self.built)["guardrails"],
+                         "guardrails.npz")
+        self.assertEqual(pipeline.layered_scene(config, self.ground, None, GuardrailSet())[
+            "guardrails"], "")
+
+
 class TestPathsOverWater(unittest.TestCase):
     """Lidar does not reflect off water, so the bare-earth grid has a hole over
     every body and the filler interpolates across it. The result dips: measured

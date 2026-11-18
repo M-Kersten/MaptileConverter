@@ -1158,6 +1158,122 @@ def check_harbour(report: CheckReport, harbour) -> None:
         )
 
 
+# How far a guardrail may miss what it is built to, measured on the ground
+# as built: a post's foot `POST_EMBED_M` into it at its shallowest corner, the
+# top of the rail's face `RAIL_TOP_M` above it.
+GUARDRAIL_SLACK_M = 0.02
+
+
+def check_guardrails(report: CheckReport, guardrails, ground, work_dir: Path | None = None) -> None:
+    """The motorway's guardrails: there, on the verge, standing on the ground.
+
+    Where the rails are is checked against the ground's own faces: every
+    post on grass, open ground or a hard verge, none on a carriageway or
+    road. That is a different question from the distances they were laid
+    out by. How they stand is read back from Blender where it ran: a post at
+    every foot, no corner of any foot less than `POST_EMBED_M` into the
+    ground the model has (so none is in the air), and the rail's top
+    `RAIL_TOP_M` above it at every post.
+    """
+    from .guardrails import (
+        MIN_RUN_M, POST_EMBED_M, RAIL_TOP_M, motorway_edges, verge_faces,
+    )
+    from .layered import MOTORWAY
+
+    if guardrails is None or ground is None:
+        return
+    mesh = ground.mesh
+    if not (np.asarray(mesh.face_kind) == MOTORWAY).any():
+        report.add("guardrails_present", True, "no motorway here", severity="warning")
+        return
+    if not len(guardrails):
+        edges, _, verge = motorway_edges(
+            mesh.face_sizes, mesh.face_loops, mesh.face_kind, ground.face_material
+        )
+        along = float(np.linalg.norm(
+            mesh.vertices[edges[verge, 1], :2] - mesh.vertices[edges[verge, 0], :2], axis=1
+        ).sum())
+        report.add(
+            "guardrails_present",
+            along < MIN_RUN_M,
+            f"no guardrails, along {along:.0f} m of motorway edge beside a verge",
+            severity="warning",
+        )
+        return
+    counts = guardrails.counts
+    report.add(
+        "guardrails_present",
+        True,
+        f"{counts.get('runs', 0)} runs, {counts.get('length_m', 0.0):.0f} m "
+        f"({counts.get('between_carriageways_m', 0.0):.0f} m between two carriageways), "
+        f"{counts.get('posts', 0)} posts, {len(guardrails)} triangles "
+        f"({counts.get('triangles_per_m', 0.0):.1f} a metre)",
+    )
+
+    # On the verge: every post, and the rail's face at every post, on a face
+    # a guardrail may stand on.
+    verge = verge_faces(mesh.face_kind, ground.face_material)
+    _, owner = mesh.triangles()
+    points = np.vstack([guardrails.post_foot[:, :2], guardrails.rail_top[:, :2]])
+    tri, _ = mesh.locator().locate(points[:, 0], points[:, 1])
+    on = np.zeros(len(points), dtype=bool)
+    found = tri >= 0
+    on[found] = verge[owner[tri[found]]]
+    off = int((~on).sum())
+    where = points[np.argmin(on)] if off else None
+    report.add(
+        "guardrails_on_the_verge",
+        off == 0,
+        f"{len(points) - off} of {len(points)} posts and rail faces on grass, open "
+        f"ground or a hard verge"
+        + (f"; one off it at RD {where[0]:.1f}, {where[1]:.1f}" if off else ""),
+    )
+
+    # Standing on the ground: as Blender built it, else as planned.
+    built = {}
+    if work_dir is not None:
+        try:
+            summary = json.loads((Path(work_dir) / "blender_summary.json").read_text("utf-8"))
+            built = (summary.get("layered") or {}).get("guardrail") or {}
+        except (OSError, ValueError):
+            built = {}
+    if built:
+        posts, seen = int(built.get("posts", 0)), int(built.get("posts_found", 0))
+        rails, rails_seen = int(built.get("rail_points", 0)), int(built.get("rail_points_found", 0))
+        depth = (built.get("foot_depth_min_m"), built.get("foot_depth_max_m"))
+        top = (built.get("rail_top_min_m"), built.get("rail_top_max_m"))
+        source = f"in {built.get('object', 'the model')}"
+    else:
+        posts = seen = len(guardrails.post_foot)
+        rails = rails_seen = len(guardrails.rail_top)
+        corners = guardrails.post_corners.reshape(-1, 3)
+        below = np.asarray(
+            ground.surface_at(corners[:, 0], corners[:, 1]), dtype=np.float64
+        ) - corners[:, 2]
+        tops = guardrails.rail_top
+        above = tops[:, 2] - np.asarray(ground.surface_at(tops[:, 0], tops[:, 1]), dtype=np.float64)
+        depth = (float(np.nanmin(below)), float(np.nanmax(below))) if len(below) else (None, None)
+        top = (float(np.nanmin(above)), float(np.nanmax(above))) if len(above) else (None, None)
+        source = "as planned"
+    known = None not in depth and None not in top
+    ok = (
+        known and seen == posts and rails_seen == rails
+        and depth[0] >= POST_EMBED_M - GUARDRAIL_SLACK_M
+        and abs(top[0] - RAIL_TOP_M) <= GUARDRAIL_SLACK_M
+        and abs(top[1] - RAIL_TOP_M) <= GUARDRAIL_SLACK_M
+    )
+    report.add(
+        "guardrails_stand_on_the_ground",
+        bool(ok),
+        (
+            f"{seen} of {posts} posts {source}, every corner of their feet {depth[0]:.3f} to "
+            f"{depth[1]:.3f} m into the ground (built for at least {POST_EMBED_M:.2f}); "
+            f"the rail's top {top[0]:.3f} to {top[1]:.3f} m above it at {rails_seen} of "
+            f"{rails} posts (built for {RAIL_TOP_M:.2f})"
+        ) if known else f"{seen} of {posts} posts {source}; no ground under them to measure",
+    )
+
+
 def check_layered(
     report: CheckReport, work_dir: Path, ground, *, kerbs: bool, kerb_top_m: float,
     kerb_width_m: float = 0.3, water_expected: bool = False,

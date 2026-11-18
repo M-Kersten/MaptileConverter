@@ -516,6 +516,54 @@ def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
     return made
 
 
+# The corners of every guardrail post's foot and the top of the rail at every
+# post, local coordinates, for the summary to measure against the ground.
+_GUARDRAIL_POINTS = {}  # type: dict
+
+
+def build_guardrails(scene: dict, work_dir: Path, prefix: str):
+    """The steel guardrails along the motorway: one object, `<prefix>_Geleiderail`.
+
+    Rail and posts arrive as one welded triangle mesh from src/guardrails.py,
+    every face already turned outwards, in the painted steel the railings
+    wear. Returns the object, or None where there are none.
+    """
+    _GUARDRAIL_POINTS.clear()
+    name = str(scene["layered"].get("guardrails") or "")
+    path = work_dir / name
+    if not name or not path.is_file():
+        return None
+    data = np.load(path)
+    triangles = data["triangles"].astype(np.int64)
+    if not len(triangles):
+        return None
+    origin = np.array([*scene["origin_rd"], float(scene["ground_z_offset_nap"])])
+    vertices = data["vertices"].astype(np.float64) - origin
+    material = bpy.data.materials.get(RAILING_MATERIAL[0]) or make_plain_material(
+        *RAILING_MATERIAL
+    )
+    n = len(triangles)
+    obj = build_mesh_object(
+        f"{prefix}_Geleiderail",
+        vertices,
+        triangles.reshape(-1),
+        np.arange(0, n * 3, 3),
+        np.full(n, 3),
+        # Metres along the rail and up from the ground, per loop.
+        data["uv"][triangles].reshape(-1, 2),
+        np.zeros(n),
+        [material],
+        shade_smooth=False,
+    )
+    obj["maptile_role"] = "guardrail"
+    if "post_corners" in data.files and "rail_top" in data.files:
+        _GUARDRAIL_POINTS["corners"] = data["post_corners"] - origin
+        _GUARDRAIL_POINTS["tops"] = data["rail_top"] - origin
+    posts = len(_GUARDRAIL_POINTS.get("corners", ())) // 4
+    log(f"guardrails: {obj.name}, {posts} posts, {n} triangles")
+    return obj
+
+
 # The layered style's water: a dark, slightly green harbour blue.
 WATER_RGB = (0.018, 0.045, 0.05)
 
@@ -824,6 +872,10 @@ def _layered_summary(layered: dict) -> dict:
                 heights.setdefault(role, []).append(gap)
         finally:
             holder.to_mesh_clear()
+    guardrail = {}
+    rail = bpy.data.objects.get(str(layered.get("guardrail_object") or ""))
+    if rail is not None and tree is not None:
+        guardrail = _guardrail_summary(rail, (tree, flat, standing, tris), height_on)
     above = {
         role: {
             "min_m": round(float(np.min(values)), 4),
@@ -842,7 +894,66 @@ def _layered_summary(layered: dict) -> dict:
         "walkway_faces": raw,
         "walkway_faces_evaluated": evaluated,
         "height_above_terrain": above,
+        **({"guardrail": guardrail} if guardrail else {}),
     }
+
+
+# How near a vertex of the object has to be to a point src/guardrails.py
+# placed to be that point: it is a vertex, moved only by float32.
+GUARDRAIL_POINT_REACH_M = 0.002
+
+
+def _guardrail_summary(obj, ground, height_on) -> dict:
+    """How the guardrails stand on the ground as built, for the checks.
+
+    For every post src/guardrails.py placed, whether the object has its four
+    foot corners, and how far into the ground each corner is; for every
+    post, whether the object has the top of the rail's face there, and how
+    high above the ground that is.
+    """
+    from mathutils.kdtree import KDTree
+
+    mesh = obj.data
+    co = np.empty(len(mesh.vertices) * 3)
+    mesh.vertices.foreach_get("co", co)
+    matrix = np.asarray(obj.matrix_world)
+    world = co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    lookup = KDTree(len(world))
+    for i, point in enumerate(world.tolist()):
+        lookup.insert(point, i)
+    lookup.balance()
+
+    def measured(points, sign):
+        """Which points the object has, and each one's height against the ground."""
+        have, heights = [], []
+        for x, y, z in np.asarray(points, dtype=np.float64).reshape(-1, 3).tolist():
+            _, _, distance = lookup.find((x, y, z))
+            have.append(distance is not None and distance <= GUARDRAIL_POINT_REACH_M)
+            below = height_on(ground, x, y)
+            if below is not None and np.isfinite(below):
+                heights.append(sign * (z - below))
+        return np.array(have, dtype=bool), heights
+
+    corners, depths = measured(_GUARDRAIL_POINTS.get("corners", ()), -1.0)
+    tops, heights = measured(_GUARDRAIL_POINTS.get("tops", ()), 1.0)
+    out = {
+        "object": obj.name,
+        "posts": int(len(corners) // 4),
+        "posts_found": int(corners.reshape(-1, 4).all(axis=1).sum()) if len(corners) else 0,
+        "rail_points": int(len(tops)),
+        "rail_points_found": int(tops.sum()),
+    }
+    if depths:
+        out.update(
+            foot_depth_min_m=round(float(min(depths)), 4),
+            foot_depth_max_m=round(float(max(depths)), 4),
+        )
+    if heights:
+        out.update(
+            rail_top_min_m=round(float(min(heights)), 4),
+            rail_top_max_m=round(float(max(heights)), 4),
+        )
+    return out
 
 
 def _terrain_summary(names="Terrain") -> dict:
@@ -2960,7 +3071,8 @@ def _collision_tree_mesh(members, fields, origin, crowns: bool):
 def build_collision(scene: dict, work_dir: Path):
     """Physics proxies, named so a designer can set them up in one pass.
 
-    Two objects, and only two, because only two earn their place. Everything
+    Two objects, and a third for the layered style's guardrails, because only
+    those earn their place. Everything
     else in the scene is already the right shape to collide with, and
     `reused_colliders` records which object to use instead -- a copy of a
     mesh that is already minimal is only a bigger file.
@@ -3010,6 +3122,21 @@ def build_collision(scene: dict, work_dir: Path):
                 "Collision_Barriers",
                 data["collision_vertices"]
                 - np.array([origin_x, origin_y, z_offset]),
+                data["collision_triangles"],
+            )
+
+    # The motorway's guardrails, in the layered style. The beam is 8 cm deep,
+    # as easy to pass through between two steps as a fence; the proxy is a
+    # block from the rail's face back over its posts, fattened as a fence is.
+    rail_file = (scene.get("layered") or {}).get("guardrails")
+    if rail_file and (work_dir / rail_file).is_file():
+        data = np.load(work_dir / rail_file)
+        if "collision_triangles" in data.files and len(data["collision_triangles"]):
+            origin_x, origin_y = scene["origin_rd"]
+            z_offset = float(scene["ground_z_offset_nap"])
+            add(
+                "Collision_Guardrails",
+                data["collision_vertices"] - np.array([origin_x, origin_y, z_offset]),
                 data["collision_triangles"],
             )
 
@@ -3373,6 +3500,15 @@ def main() -> int:
                 if "fence" in extra_textures
                 else None,
             )
+
+    if layered is not None and scene["layered"].get("guardrails"):
+        # The motorway's guardrails: a barrier like the walls and fences, so
+        # in their collection and under their parent.
+        prefix = str(scene["layered"].get("prefix") or "Area")
+        with _Layer("Barriers", "Barriers"):
+            rail = build_guardrails(scene, work_dir, prefix)
+            if rail is not None:
+                layered["guardrail_object"] = rail.name
 
     if "vehicle" in extra_textures:
         # Car paint is the one glossy thing out here.
