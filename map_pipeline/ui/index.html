@@ -12,20 +12,20 @@
      Rijksoverheid Sans cuts are used where they are installed; the page does
      not ship them. */
   :root {
-    --bg-000: #062028;
-    --bg-100: #0a2c36;
-    --bg-200: #123746;
-    --bg-300: #183743;
-    --glass: rgba(10, 44, 54, 0.88);
-    --glass-deep: rgba(8, 30, 38, 0.94);
+    --bg-000: #031319;
+    --bg-100: #06202a;
+    --bg-200: #0b2c38;
+    --bg-300: #113542;
+    --glass: rgba(6, 32, 42, 0.9);
+    --glass-deep: rgba(4, 22, 29, 0.95);
     --text-primary: #ffffff;
     --text-secondary: #eaf2f5;
     --text-muted: #8aa7b3;
     --text-subtle: #5b7a8b;
     --signal: #ca6302;
     --signal-bright: #e8871e;
-    --on-signal-bright: #062028;
-    --line: #1e4654;
+    --on-signal-bright: #031319;
+    --line: #173c4a;
     --line-control: #5b7a8b;
     --focus: #ffffff;
     --success: #1ca375;
@@ -54,11 +54,16 @@
   :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .overline { font-size: 16px; line-height: 20px; font-weight: 700; letter-spacing: .04em;
               text-transform: uppercase; color: var(--signal-bright); }
-  .brand { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 18px; line-height: 24px;
-           font-weight: 700; color: var(--text-primary); }
-  .brand img { border-radius: 9px; flex: none; box-shadow: 0 0 0 1px var(--line-control); }
-  .brand b { color: var(--signal-bright); font-weight: 700; margin-left: -10px; }
-  .brand .tagline { font-size: 14px; font-weight: 400; color: var(--text-muted); margin-left: 6px; }
+  /* The identity first, then the page, then what is on it. */
+  .topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px 24px;
+            padding-bottom: 24px; border-bottom: 1px solid var(--line); }
+  .brand { display: inline-flex; align-items: center; gap: 16px; text-decoration: none; color: var(--text-primary); }
+  .brand:hover { color: var(--text-primary); }
+  .brand img { border-radius: 15px; flex: none; box-shadow: 0 0 0 1px var(--line); }
+  .brand .wordmark { display: flex; flex-direction: column; gap: 2px; }
+  .brand .name { font-family: var(--font-heading); font-size: 32px; line-height: 36px; font-weight: 700; letter-spacing: -0.01em; }
+  .brand b { color: var(--signal-bright); font-weight: 700; }
+  .brand .tagline { font-size: 15px; line-height: 20px; color: var(--text-muted); }
   .muted { color: var(--text-muted); }
   .small { font-size: 14px; line-height: 20px; }
   .caption { font-size: 12px; line-height: 16px; }
@@ -69,7 +74,7 @@
          min-height: 40px; padding: 0 16px; border-radius: var(--radius-md);
          border: 1px solid transparent; background: var(--bg-200); color: var(--text-primary);
          font-size: 16px; font-weight: 700; cursor: pointer; white-space: nowrap; }
-  .btn:hover:not(:disabled) { background: #1a4556; }
+  .btn:hover:not(:disabled) { background: #143d4c; }
   .btn:disabled { background: var(--bg-200); color: var(--text-subtle); cursor: not-allowed; box-shadow: none; }
   .btn.primary { background: var(--signal); font-size: 19px; min-height: 48px; padding: 0 24px; }
   .btn.primary:hover:not(:disabled) { background: var(--signal); box-shadow: var(--shadow-signal-glow); }
@@ -127,10 +132,14 @@
   /* ---------- models view ---------- */
   #viewModels { min-height: 100%; }
   .wrap { max-width: 1344px; margin: 0 auto; padding: 40px 48px 64px; display: flex; flex-direction: column; gap: 32px; }
-  @media (max-width: 700px) { .wrap { padding: 24px 16px 48px; } }
-  .head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
-  .head h1 { font-family: var(--font-heading); font-size: 48px; line-height: 56px; }
-  .head .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+  @media (max-width: 700px) {
+    .wrap { padding: 24px 16px 48px; }
+    .brand img { width: 48px; height: 48px; border-radius: 11px; }
+    .brand .name { font-size: 26px; line-height: 30px; }
+  }
+  .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; }
+  .head h1 { font-family: var(--font-heading); font-size: 28px; line-height: 36px; }
+  .topbar .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
   #modelFilter { width: 260px; }
 
   .run { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; padding: 20px 24px;
@@ -167,7 +176,7 @@
   #map { position: absolute; inset: 0; overflow: hidden; cursor: crosshair; touch-action: none; }
   #map.dragging { cursor: grabbing; }
   #tiles img { position: absolute; user-select: none; pointer-events: none; }
-  #sel { position: absolute; border: 2px solid var(--signal-bright); box-shadow: 0 0 0 9999px rgba(6, 32, 40, .45);
+  #sel { position: absolute; border: 2px solid var(--signal-bright); box-shadow: 0 0 0 9999px rgba(3, 19, 25, .45);
          pointer-events: none; }
   #selLabel { position: absolute; left: -2px; top: -28px; padding: 3px 8px; border-radius: var(--radius-xs);
               background: var(--signal-bright); color: var(--on-signal-bright); font-size: 12px; line-height: 16px;
@@ -178,9 +187,9 @@
                    font-size: 20px; cursor: pointer; border-radius: var(--radius-sm); }
   #zoomUI button:hover { background: var(--bg-200); }
   #mapUI { position: absolute; left: 16px; bottom: 202px; font: 12px/16px var(--mono); color: var(--text-muted);
-           background: rgba(6, 32, 40, .7); padding: 2px 6px; border-radius: var(--radius-xs); }
+           background: rgba(3, 19, 25, .7); padding: 2px 6px; border-radius: var(--radius-xs); }
   .attrib { position: absolute; left: 16px; bottom: 180px; font-size: 12px; line-height: 16px; color: var(--text-muted);
-            background: rgba(6, 32, 40, .7); padding: 2px 6px; border-radius: var(--radius-xs); }
+            background: rgba(3, 19, 25, .7); padding: 2px 6px; border-radius: var(--radius-xs); }
 
   .float { position: absolute; background: var(--glass); border: 1px solid var(--line);
            border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); }
@@ -241,7 +250,7 @@
   /* ---------- dialogs ---------- */
   dialog { width: min(960px, calc(100% - 32px)); max-height: calc(100% - 64px); padding: 0; color: var(--text-primary);
            background: var(--bg-100); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); }
-  dialog::backdrop { background: rgba(6, 32, 40, .7); }
+  dialog::backdrop { background: rgba(3, 19, 25, .7); }
   .dhead { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px;
            border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg-100); z-index: 1; }
   .dhead h2 { font-family: var(--font-heading); font-size: 24px; line-height: 32px; overflow-wrap: anywhere; }
@@ -273,12 +282,11 @@
 <!-- ===================================================================== -->
 <main id="viewModels">
   <div class="wrap">
-    <header class="head">
-      <div style="display:flex;flex-direction:column;gap:4px">
-        <span class="brand"><img src="/icon.svg" width="36" height="36" alt="">Terrein<b>Lab</b><span class="tagline">van locatie naar 3D-demo</span></span>
-        <h1>Modellen</h1>
-        <p class="muted" id="modelsCount">Modellen laden&hellip;</p>
-      </div>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="TerreinLab, van locatie naar 3D-demo">
+        <img src="/icon.svg" width="64" height="64" alt="">
+        <span class="wordmark"><span class="name">Terrein<b>Lab</b></span><span class="tagline">van locatie naar 3D-demo</span></span>
+      </a>
       <div class="actions">
         <input id="modelFilter" class="field" type="search" placeholder="Zoek een model" aria-label="Zoek een model">
         <button class="btn primary" id="newArea">
@@ -287,6 +295,10 @@
         </button>
       </div>
     </header>
+    <div class="head">
+      <h1>Modellen</h1>
+      <p class="muted" id="modelsCount">Modellen laden&hellip;</p>
+    </div>
 
     <section class="run" id="runCard" aria-label="Bouwen" hidden>
       <img id="runThumb" alt="" hidden>

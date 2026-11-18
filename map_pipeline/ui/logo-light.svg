@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 330 80" role="img" aria-label="TerreinLab, van locatie naar 3D-demo">
   <title>TerreinLab</title>
   <svg x="6" y="8" width="64" height="64" viewBox="0 0 100 100">
-  <rect width="100" height="100" rx="22" fill="#0a2c36"/>
+  <rect width="100" height="100" rx="22" fill="#06202a"/>
   <g transform="translate(50 50) scale(1.12) translate(-50 -46.8)">
     <polygon points="26.00,42.00 50.00,30.00 74.00,42.00 74.00,66.00 50.00,78.00 26.00,66.00" fill="#3c6070"/>
     <polygon points="26.00,42.00 50.00,54.00 50.00,63.00 26.00,51.00" fill="#8fadb9"/>
@@ -23,7 +23,7 @@
   </g>
   </svg>
   <g font-family="'Rijksoverheid Sans Heading', 'RO Sans', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif">
-    <text x="84" y="45" font-size="34" font-weight="700" letter-spacing="-0.5" fill="#062028">Terrein<tspan fill="#ca6302">Lab</tspan></text>
+    <text x="84" y="45" font-size="34" font-weight="700" letter-spacing="-0.5" fill="#031319">Terrein<tspan fill="#ca6302">Lab</tspan></text>
     <text x="85" y="66" font-size="14" fill="#3d5a66">van locatie naar 3D-demo</text>
   </g>
 </svg>

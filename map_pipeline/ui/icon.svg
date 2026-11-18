@@ -2,7 +2,7 @@
   <title>TerreinLab</title>
   <!-- The square the app cuts out of the map, lifted: its ground in layers,
        one of them orange, and the town on top. -->
-  <rect width="100" height="100" rx="22" fill="#0a2c36"/>
+  <rect width="100" height="100" rx="22" fill="#06202a"/>
   <g transform="translate(50 50) scale(1.12) translate(-50 -46.8)">
     <polygon points="26.00,42.00 50.00,30.00 74.00,42.00 74.00,66.00 50.00,78.00 26.00,66.00" fill="#3c6070"/>
     <polygon points="26.00,42.00 50.00,54.00 50.00,63.00 26.00,51.00" fill="#8fadb9"/>
