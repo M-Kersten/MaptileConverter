@@ -74,7 +74,15 @@ TILE_CACHE_LOCK = threading.Lock()
 STAGE_COSTS: dict[str, dict[str, float]] = {
     #                      constant  per km2  per megapixel
     "terrain":            {"c": 1.0, "a": 8.0,  "m": 0.0},
-    "aerial":             {"c": 1.0, "a": 0.0,  "m": 0.75},
+    # The ground's photo, plus the roofs' own (the "roof textures" stage and
+    # its share of the relighting). Kept on this line because estimate_seconds
+    # only counts the stages it lists as enabled, and the roofs are the same
+    # PDOK imagery. Measured over the Utrecht Dom quarter square kilometre at
+    # Standard: 16 s for a 28.6 Mpx roof page, 6 s to fetch and write it and
+    # 10 s to relight it, most of both writing PNG; over the square kilometre
+    # of config.json, capped at 48 Mpx, 30 s. Draft has no roof page, so this
+    # overestimates Draft by a few per cent.
+    "aerial":             {"c": 4.0, "a": 12.0, "m": 1.5},
     "surfaces":           {"c": 1.0, "a": 30.0, "m": 2.5},
     "usage":              {"c": 0.5, "a": 5.0,  "m": 0.0},
     "buildings":          {"c": 2.0, "a": 75.0, "m": 0.0},

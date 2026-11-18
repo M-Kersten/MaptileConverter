@@ -102,6 +102,7 @@ from src.surfaces import (  # noqa: E402
     write_land_cover,
 )
 from src.relight import remove_cast_shadows  # noqa: E402
+from src.roofs import RoofAtlas, build_roof_atlas, roof_settings  # noqa: E402
 from src.trees import (  # noqa: E402
     TreeSet,
     bake_canopy_shade,
@@ -127,6 +128,7 @@ from src.validate import (  # noqa: E402
     check_barriers,
     check_layered,
     check_furniture,
+    check_roof_atlas,
     check_rails,
     check_structures,
     check_vehicles,
@@ -611,13 +613,16 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_structures = bool(
         config.structures["bridges"] or config.structures["tunnels"]
     )
+    # The roofs' own photo, finer than the ground's; off puts them on the
+    # aerial as before.
+    want_roofs = roof_settings(config.buildings)["metres_per_px"] > 0
 
     # Five fixed stages, plus aerial relighting and the terrain mesh, plus
     # the optional sources, plus Blender.
     total = 7 + sum(
         (
             want_trees, want_surfaces, want_furniture, want_barriers,
-            want_usage,
+            want_usage, want_roofs,
             want_vehicles, want_rails, want_structures,
         )
     ) + (0 if args.skip_blender else 1)
@@ -719,6 +724,21 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             usage=usage if len(usage) else None,
             facade_cfg=config.facade,
         )
+
+    roof_atlas = RoofAtlas(None, note="switched off (buildings.roof_cm is 0)")
+    if want_roofs:
+        with Stage("roof textures (PDOK aerial)", next_step(), total):
+            # Only where the roofs are, finer than the ground. The sun comes
+            # out of it with the ground's, in the relighting stage.
+            roof_atlas = build_roof_atlas(
+                config.bbox,
+                work_dir,
+                roofs=[b.roof_tris for b in buildings.buildings],
+                buildings_cfg=config.buildings,
+                aerial_cfg=config.aerial,
+                ground_m_per_px=aerial.resolution_m,
+                layer_name=aerial.layer_name,
+            )
 
     ground_layers = None
     harbour = HarbourSet()
@@ -846,6 +866,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     #      itself amplified where a shadow used to be.
     #   3. The canopy occlusion goes on last. It is the one shading term that
     #      belongs in a ground texture, because it is true at any hour.
+    #
+    # The roof atlas takes only the first: the same sun, shadow and gains,
+    # read at each roof pixel's own position. The grain is for ground classes
+    # and a roof has none; the canopy occlusion is the ground's, under trees
+    # that mostly stand lower than the roofs beside them.
     with Stage("aerial relighting", next_step(), total):
         shadow_info = remove_cast_shadows(
             aerial.path,
@@ -855,6 +880,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             trees=trees if len(trees) else None,
             class_grid=surfaces.class_grid,
             strength=float(config.aerial.get("deshadow", 1.0)),
+            roofs=roof_atlas if roof_atlas.ok else None,
         )
         if surfaces.class_grid is not None:
             blend_surface_detail(
@@ -1042,6 +1068,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 if ground_layers is not None
                 else None
             ),
+            roof_atlas=roof_atlas if roof_atlas.ok else None,
         )
 
     if not args.skip_blender:
@@ -1061,6 +1088,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             lod=str(config.buildings["lod"]),
             ahn_model=str(config.terrain["ahn_model"]),
             trees=trees,
+            roof_files=roof_atlas.files if roof_atlas.ok else None,
             extra={
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
@@ -1081,6 +1109,13 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # longer carrying its own sun -- and, when it still is, at
                 # what angle, so they can match it.
                 **({"aerial_relighting": shadow_info} if shadow_info else {}),
+                # The roofs' own photo: what was asked, what the budget
+                # allowed, and what fetching it cost. Absent when off.
+                **(
+                    {"roof_atlas": roof_atlas.to_dict()}
+                    if want_roofs and roof_atlas.to_dict()
+                    else {}
+                ),
                 # What to collide with, which is a question about the FBX and
                 # so belongs next to it rather than in work/. Read back from
                 # the Blender stage's own summary: this says what was drawn,
@@ -1137,6 +1172,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             report, structures if want_structures else None, terrain
         )
         check_aerial(report, aerial, config.bbox)
+        if want_roofs:
+            check_roof_atlas(
+                report,
+                roof_atlas,
+                out_dir=None if args.skip_blender else out_dir,
+                work_dir=work_dir,
+                page_cap=int(config.buildings["roof_atlas_px"]),
+            )
 
         if not args.skip_blender:
             check_export(

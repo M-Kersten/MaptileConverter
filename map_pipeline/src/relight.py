@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -443,6 +444,121 @@ def _class_gains(
     }
 
 
+LUMINANCE = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+
+def _lookup_tables(measured: dict, classes: np.ndarray):
+    """The measured gains as arrays indexed by class code.
+
+    A class the statistics never saw keeps a gain of one, a lit luminance of
+    255 and a dark one of 0, which is what leaves it alone.
+    """
+    size = max(256, int(classes.max(initial=0)) + 1)
+    gain = np.ones((size, 3), dtype=np.float32)
+    lit = np.full(size, 255.0, dtype=np.float32)
+    dark = np.zeros(size, dtype=np.float32)
+    for code, (g, bright, shade) in measured.items():
+        gain[code] = np.asarray(g, dtype=np.float32)
+        lit[code] = bright
+        dark[code] = shade
+    return gain, lit, dark
+
+
+def _lift(image, luminance, shadow, gain, lit, dark, strength: float) -> None:
+    """Brighten `image` in place where it is shadowed, by the measured gain.
+
+    Only what actually looks dark. The mask says a shadow was cast here; the
+    confidence says the photo agrees. Where they differ -- a tree the
+    detector missed, a building 3DBAG has a metre out of place, a car parked
+    since the flight -- the photo wins and nothing gets stained.
+    """
+    confidence = np.clip(
+        (lit - luminance) / np.maximum(lit - dark, 1.0), 0.0, 1.0
+    )
+    applied = shadow * float(strength) * confidence
+    image *= 1.0 + applied[..., None] * (gain - 1.0)
+    np.clip(image, 0.0, 255.0, out=image)
+
+
+@dataclass
+class Relighting:
+    """What the de-shadow pass fitted over the ground, to apply elsewhere.
+
+    The roof atlas holds pixels of the same flight at a finer resolution, cut
+    out per building. It has no ground around its roofs to measure anything
+    on, and it does not need any: the sun, the cast shadow and the gain per
+    surface are properties of the flight and the place, not of the
+    resolution, so the roofs get exactly the correction the ground got.
+    """
+
+    bbox: BBox
+    # The cast shadow at SHADOW_PIXEL_M, row 0 to the north, feathered at its
+    # own scale so it can be read at any resolution.
+    shadow: np.ndarray
+    # The land-cover class grid, row 0 to the north; (1, 1) of zeros if none.
+    classes: np.ndarray
+    gain: np.ndarray
+    lit: np.ndarray
+    dark: np.ndarray
+    strength: float
+    pixels: int = 0
+    shadowed: int = 0
+
+    def shadow_at(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        """The feathered shadow at pixel centres `xs` by `ys`, bilinearly.
+
+        Nothing is known outside the area, so a roof hanging over its edge is
+        left as flown there.
+        """
+        rows, cols = self.shadow.shape
+        fc = (np.asarray(xs, dtype=np.float64) - self.bbox.xmin) / (self.bbox.width / cols) - 0.5
+        fr = (self.bbox.ymax - np.asarray(ys, dtype=np.float64)) / (self.bbox.height / rows) - 0.5
+        c0 = np.floor(fc).astype(np.int64)
+        r0 = np.floor(fr).astype(np.int64)
+        wc = (fc - c0).astype(np.float32)
+        wr = (fr - r0).astype(np.float32)
+        ca, cb = np.clip(c0, 0, cols - 1), np.clip(c0 + 1, 0, cols - 1)
+        ra, rb = np.clip(r0, 0, rows - 1), np.clip(r0 + 1, 0, rows - 1)
+        top = self.shadow[ra][:, ca] * (1 - wc) + self.shadow[ra][:, cb] * wc
+        bottom = self.shadow[rb][:, ca] * (1 - wc) + self.shadow[rb][:, cb] * wc
+        out = top * (1 - wr)[:, None] + bottom * wr[:, None]
+        outside_c = (fc < -0.5) | (fc > cols - 0.5)
+        outside_r = (fr < -0.5) | (fr > rows - 0.5)
+        out[outside_r, :] = 0.0
+        out[:, outside_c] = 0.0
+        return out.astype(np.float32)
+
+    def classes_at(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        """The land-cover class under each pixel centre, nearest cell."""
+        rows, cols = self.classes.shape
+        c = np.floor(
+            (np.asarray(xs, dtype=np.float64) - self.bbox.xmin) / self.bbox.width * cols
+        ).astype(np.int64).clip(0, cols - 1)
+        r = np.floor(
+            (self.bbox.ymax - np.asarray(ys, dtype=np.float64)) / self.bbox.height * rows
+        ).astype(np.int64).clip(0, rows - 1)
+        return self.classes[r][:, c]
+
+    def apply(self, block: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        """`block`, rows north first, with pixel centres at `xs` and `ys` in
+        RD, corrected as the ground under it was. Returns uint8."""
+        image = np.asarray(block, dtype=np.float32).copy()
+        shadow = self.shadow_at(xs, ys)
+        classes = self.classes_at(xs, ys)
+        _lift(
+            image,
+            image @ LUMINANCE,
+            shadow,
+            self.gain[classes],
+            self.lit[classes],
+            self.dark[classes],
+            self.strength,
+        )
+        self.pixels += shadow.size
+        self.shadowed += int((shadow > 0.5).sum())
+        return image.astype(np.uint8)
+
+
 def remove_cast_shadows(
     aerial_path,
     bbox: BBox,
@@ -453,11 +569,17 @@ def remove_cast_shadows(
     class_grid=None,
     strength: float = 1.0,
     max_gain: float = MAX_GAIN,
+    roofs=None,
 ) -> dict:
     """Fit the flown sun and take its shadows back out of the aerial, in place.
 
     Returns what it did, for the log and the metadata: an empty dict when
     there was nothing to work with or nothing worth changing.
+
+    `roofs`, the roof atlas when there is one, gets the same correction: the
+    sun, the shadow and the gains fitted here, read at each roof pixel's own
+    position (`Relighting`). Fitting again on the atlas would be worse as well
+    as slower, since it holds no ground to compare a shadow against.
     """
     from PIL import Image
 
@@ -520,35 +642,62 @@ def remove_cast_shadows(
         max_gain,
     )
 
-    gain_image = np.ones((height, width, 3), dtype=np.float32)
-    lit_lum = np.full((height, width), 255.0, dtype=np.float32)
-    dark_lum = np.zeros((height, width), dtype=np.float32)
-    for code, (gain, bright, dark) in measured.items():
-        here = classes == code
-        gain_image[here] = gain.astype(np.float32)
-        lit_lum[here] = bright
-        dark_lum[here] = dark
-
-    # Only brighten what actually looks dark. The mask says a shadow was cast
-    # here; this says the photo agrees. Where they differ -- a tree the
-    # detector missed, a building 3DBAG has a metre out of place, a car parked
-    # since the flight -- the photo wins and nothing gets stained.
-    confidence = np.clip(
-        (lit_lum - luminance) / np.maximum(lit_lum - dark_lum, 1.0), 0.0, 1.0
-    )
-    applied = shadow * float(strength) * confidence
+    gain_lut, lit_lut, dark_lut = _lookup_tables(measured, classes)
 
     shadowed = shadow > 0.5
     before = float(luminance[shadowed].mean()) if shadowed.any() else 0.0
 
-    image *= 1.0 + applied[:, :, None] * (gain_image - 1.0)
-    np.clip(image, 0.0, 255.0, out=image)
+    _lift(
+        image, luminance, shadow,
+        gain_lut[classes], lit_lut[classes], dark_lut[classes], strength,
+    )
 
     after_lum = image @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
     after = float(after_lum[shadowed].mean()) if shadowed.any() else 0.0
     lit_mean = float(after_lum[shadow < 0.05].mean()) if (shadow < 0.05).any() else 0.0
 
     Image.fromarray(image.astype(np.uint8), mode="RGB").save(aerial_path)
+    del image, after_lum, shadow, classes
+    LOG.info(
+        "de-shadowed %s: sun at %.0f deg azimuth, %.0f deg up (r=%.2f), "
+        "%.0f%% of the photo in shadow, lifted from %.0f to %.0f against "
+        "%.0f in the sun",
+        getattr(aerial_path, "name", aerial_path),
+        azimuth, elevation, score,
+        float(shadowed.mean()) * 100, before, after, lit_mean,
+    )
+
+    roof_info = {}
+    if roofs is not None:
+        relighting = Relighting(
+            bbox=bbox,
+            shadow=_box_blur(
+                shadow_small, max(1, int(round(1.0 / SHADOW_PIXEL_M)))
+            ),
+            classes=(
+                np.flipud(np.asarray(class_grid))
+                if class_grid is not None
+                else np.zeros((1, 1), dtype=np.int32)
+            ),
+            gain=gain_lut,
+            lit=lit_lut,
+            dark=dark_lut,
+            strength=float(strength),
+        )
+        roofs.map_rects(relighting.apply)
+        roof_info = {
+            "roofs": {
+                "pages": len(getattr(roofs, "paths", []) or []),
+                "shadow_fraction": round(
+                    relighting.shadowed / max(relighting.pixels, 1), 4
+                ),
+            }
+        }
+        LOG.info(
+            "de-shadowed the roof atlas with the same sun: %.0f%% of its "
+            "pixels in shadow",
+            100.0 * relighting.shadowed / max(relighting.pixels, 1),
+        )
     result = {
         "sun_azimuth_deg": round(azimuth, 1),
         "sun_elevation_deg": round(elevation, 1),
@@ -560,21 +709,15 @@ def remove_cast_shadows(
         "shadow_luminance_before": round(before, 1),
         "shadow_luminance_after": round(after, 1),
         "lit_luminance": round(lit_mean, 1),
+        **roof_info,
     }
-    LOG.info(
-        "de-shadowed %s: sun at %.0f deg azimuth, %.0f deg up (r=%.2f), "
-        "%.0f%% of the photo in shadow, lifted from %.0f to %.0f against "
-        "%.0f in the sun",
-        getattr(aerial_path, "name", aerial_path),
-        azimuth, elevation, score,
-        result["shadow_fraction"] * 100, before, after, lit_mean,
-    )
     return result
 
 
 __all__ = [
     "ELEVATION_RANGE",
     "MAX_GAIN",
+    "Relighting",
     "SHADOW_PIXEL_M",
     "burn_canopies",
     "burn_triangles",

@@ -339,8 +339,8 @@ class _Layer:
 def planar_uv(points_xy: np.ndarray, aerial_bbox_local: list[float]) -> np.ndarray:
     """Top-down UV from local XY, normalised to the aerial footprint.
 
-    Both the terrain and the roofs use this, which is what lets roofs pick up
-    real photo texture and blend into the ground around them.
+    The terrain uses this, and so do the roofs when they have no atlas of
+    their own (`roof_atlas_uvs`): the same photo as the ground around them.
     """
     xmin, ymin, xmax, ymax = aerial_bbox_local
     u = (points_xy[:, 0] - xmin) / (xmax - xmin)
@@ -1531,14 +1531,44 @@ def wall_uvs(
     return np.column_stack([u, v])
 
 
+def roof_atlas_uvs(scene: dict, work_dir: Path, n_roofs: int, n_pages: int):
+    """The roof atlas UVs and pages from roofs.npz, or None to use the aerial.
+
+    Per roof triangle in buildings.npz order: three UVs, and the page, -1 for
+    a roof left on the aerial. Anything that does not line up with the
+    buildings -- a stale file, a page this scene has no material for -- puts
+    every roof back on the aerial rather than on the wrong photo.
+    """
+    name = (scene.get("roofs") or {}).get("file")
+    if not name or not n_pages or not (work_dir / name).is_file():
+        return None
+    data = np.load(work_dir / name)
+    uv = np.asarray(data["roof_uv"], dtype=np.float64).reshape(-1, 2)
+    page = np.asarray(data["roof_page"], dtype=np.int64)
+    if len(page) != n_roofs or len(uv) != 3 * n_roofs or page.max(initial=-1) >= n_pages:
+        log(
+            f"WARNING: {name} does not match buildings.npz ({len(page)} roof "
+            f"triangles against {n_roofs}); the roofs stay on the aerial"
+        )
+        return None
+    return uv, page
+
+
 def build_buildings(
     scene: dict,
     work_dir: Path,
     facade_materials: list,
     aerial_material,
     ground_materials: list | None = None,
+    roof_materials: list | None = None,
+    report: dict | None = None,
 ):
-    """One object per building, with facade and aerial material slots."""
+    """One object per building, with facade and roof material slots.
+
+    A roof is on its page of the roof atlas when there is one, each triangle
+    mapped into its building's rectangle; otherwise on the aerial, as the
+    ground is. `report`, when given, is filled with how many went where.
+    """
     data = np.load(work_dir / scene["buildings"]["file"])
     wall_tris = data["wall_tris"]
     roof_tris = data["roof_tris"]
@@ -1636,8 +1666,13 @@ def build_buildings(
         bays = np.maximum(1.0, np.round(wall_height_m / bay_height))
         effective_floor = np.where(special, wall_height_m / bays, effective_floor)
 
+    roof_materials = list(roof_materials or [])
+    atlas = roof_atlas_uvs(scene, work_dir, n_roofs, len(roof_materials))
     materials = list(facade_materials) + [aerial_material]
     aerial_slot = len(facade_materials)
+    roof_slot_base = len(materials)
+    if atlas is not None:
+        materials.extend(roof_materials)
     ground_slot_base = len(materials)
     if has_ground:
         materials.extend(ground_materials)
@@ -1657,9 +1692,11 @@ def build_buildings(
             )
         )
     if n_roofs:
-        uv_chunks.append(
-            planar_uv(roofs.reshape(-1, 3)[:, :2], scene["aerial"]["bbox_local"])
-        )
+        roof_uv = planar_uv(roofs.reshape(-1, 3)[:, :2], scene["aerial"]["bbox_local"])
+        if atlas is not None:
+            on_atlas = np.repeat(atlas[1] >= 0, 3)
+            roof_uv[on_atlas] = atlas[0][on_atlas]
+        uv_chunks.append(roof_uv)
     if n_grounds:
         # The ground storey gets exactly one tile vertically, so the shopfront
         # spans it instead of repeating inside it.
@@ -1684,6 +1721,19 @@ def build_buildings(
         else:
             material_indices[:n_walls] = 0
     material_indices[n_walls : n_walls + n_roofs] = aerial_slot
+    if atlas is not None:
+        material_indices[n_walls : n_walls + n_roofs] = np.where(
+            atlas[1] >= 0, roof_slot_base + atlas[1], aerial_slot
+        )
+    if report is not None:
+        on_atlas = int((atlas[1] >= 0).sum()) if atlas is not None else 0
+        report.update({
+            "atlas_triangles": on_atlas,
+            "aerial_triangles": int(n_roofs - on_atlas),
+            "materials": [
+                getattr(m, "name", str(m)) for m in roof_materials
+            ] if atlas is not None else [],
+        })
     if n_grounds:
         material_indices[n_walls + n_roofs :] = ground_slot_base + np.clip(
             ground_style[ground_owner], 0, max(0, len(ground_materials) - 1)
@@ -1749,6 +1799,12 @@ def build_buildings(
     log(
         f"buildings: {len(objects)} objects, {n_walls} wall triangles, "
         f"{n_roofs} roof triangles, {n_grounds} ground-storey triangles"
+        + (
+            f"; {int((atlas[1] >= 0).sum())} roof triangles on "
+            f"{len(roof_materials)} roof atlas page(s)"
+            if atlas is not None
+            else ""
+        )
     )
     return objects
 
@@ -3158,6 +3214,11 @@ def copy_textures(
         name = scene.get(section, {}).get("texture")
         if name and (work_dir / name).is_file():
             extras[key] = copy(name)
+    # The roof atlas pages, kept in order: a page's number is its material's.
+    roof_names = (scene.get("roofs") or {}).get("textures") or []
+    if roof_names and all((work_dir / name).is_file() for name in roof_names):
+        for index, name in enumerate(roof_names):
+            extras[f"roof_{index:02d}"] = copy(name)
     return aerial_dst, facades, extras
 
 
@@ -3191,6 +3252,18 @@ def main() -> int:
     ground_textures = facade_textures[len(facade_textures) - n_ground :] if n_ground else []
 
     aerial_material = make_textured_material("M_aerial", aerial_texture, roughness=0.9)
+    # The roofs' own photo, one material per atlas page, named as
+    # src/export.py names them in the metadata.
+    roof_pages = sorted(k for k in extra_textures if k.startswith("roof_"))
+    roof_names = (scene.get("roofs") or {}).get("materials") or []
+    roof_materials = [
+        make_textured_material(
+            roof_names[i] if i < len(roof_names) else f"M_roof_{i:02d}",
+            extra_textures[key],
+            roughness=0.9,
+        )
+        for i, key in enumerate(roof_pages)
+    ]
     facade_materials = [
         make_textured_material(
             # Named after the texture, so the slot says which era and which
@@ -3236,9 +3309,11 @@ def main() -> int:
                 work_dir,
                 lambda name: make_textured_material(name, aerial_texture, roughness=0.85),
             )
+    roof_report: dict = {}
     with _Layer("Buildings", "Buildings"):
         build_buildings(
-            scene, work_dir, facade_materials, aerial_material, ground_materials
+            scene, work_dir, facade_materials, aerial_material, ground_materials,
+            roof_materials=roof_materials, report=roof_report,
         )
 
     if layered is not None and scene["layered"].get("water_surface", True):
@@ -3373,6 +3448,9 @@ def main() -> int:
         },
         "objects": [obj.name for obj in bpy.context.scene.objects],
         "materials": [m.name for m in bpy.data.materials],
+        # Where the roofs ended up: on the atlas or on the aerial. Read back
+        # by the checks, which otherwise only know what was planned.
+        "roofs": roof_report,
         "collision": {
             "objects": collision,
             # The layers with no proxy, and which object to collide with

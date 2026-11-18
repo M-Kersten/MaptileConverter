@@ -126,6 +126,59 @@ def _allow_large_images() -> None:
     Image.MAX_IMAGE_PIXELS = None
 
 
+def wms_image(
+    window: BBox,
+    width_px: int,
+    height_px: int,
+    *,
+    layer_name: str,
+    wms_url: str,
+    request_format: str = "image/jpeg",
+    timeout: float = 180.0,
+    max_retries: int = 4,
+    session: requests.Session | None = None,
+    description: str = "WMS GetMap",
+):
+    """One GetMap request: `window` as a `width_px` by `height_px` image.
+
+    The caller keeps both sides under the service's 2500 px cap. Row 0 of the
+    image is the north edge.
+    """
+    from PIL import Image
+
+    params = {
+        "service": "WMS",
+        "version": WMS_VERSION,
+        "request": "GetMap",
+        "layers": layer_name,
+        "styles": "",
+        "crs": "EPSG:28992",
+        "bbox": (
+            f"{window.xmin:.4f},{window.ymin:.4f},{window.xmax:.4f},{window.ymax:.4f}"
+        ),
+        "width": int(width_px),
+        "height": int(height_px),
+        "format": request_format,
+        "transparent": "false",
+    }
+    response = get_with_retry(
+        wms_url,
+        params=params,
+        timeout=timeout,
+        max_retries=max_retries,
+        session=session,
+        expect_binary=True,
+        description=description,
+    )
+    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    if image.size != (int(width_px), int(height_px)):
+        raise ServiceError(
+            f"WMS returned a {image.size} tile where {(width_px, height_px)} "
+            f"was requested"
+        )
+    return image
+
+
 def fetch_aerial_wms(
     bbox: BBox,
     out_path: Path,
@@ -162,45 +215,24 @@ def fetch_aerial_wms(
 
     for row_start, row_end in rows:
         for col_start, col_end in cols:
-            tile_w = col_end - col_start
-            tile_h = row_end - row_start
-
             # Pixel column 0 is the west edge; pixel row 0 is the north edge.
-            tile_xmin = bbox.xmin + bbox.width * col_start / size_px
-            tile_xmax = bbox.xmin + bbox.width * col_end / size_px
-            tile_ymax = bbox.ymax - bbox.height * row_start / size_px
-            tile_ymin = bbox.ymax - bbox.height * row_end / size_px
-
-            params = {
-                "service": "WMS",
-                "version": WMS_VERSION,
-                "request": "GetMap",
-                "layers": layer_name,
-                "styles": "",
-                "crs": "EPSG:28992",
-                "bbox": f"{tile_xmin:.4f},{tile_ymin:.4f},{tile_xmax:.4f},{tile_ymax:.4f}",
-                "width": tile_w,
-                "height": tile_h,
-                "format": request_format,
-                "transparent": "false",
-            }
-
-            response = get_with_retry(
-                wms_url,
-                params=params,
+            tile = wms_image(
+                BBox(
+                    bbox.xmin + bbox.width * col_start / size_px,
+                    bbox.ymax - bbox.height * row_end / size_px,
+                    bbox.xmin + bbox.width * col_end / size_px,
+                    bbox.ymax - bbox.height * row_start / size_px,
+                ),
+                col_end - col_start,
+                row_end - row_start,
+                layer_name=layer_name,
+                wms_url=wms_url,
+                request_format=request_format,
                 timeout=timeout,
                 max_retries=max_retries,
                 session=session,
-                expect_binary=True,
                 description=f"WMS GetMap tile ({col_start},{row_start})",
             )
-
-            tile = Image.open(io.BytesIO(response.content)).convert("RGB")
-            if tile.size != (tile_w, tile_h):
-                raise ServiceError(
-                    f"WMS returned a {tile.size} tile where {(tile_w, tile_h)} "
-                    f"was requested"
-                )
             canvas.paste(tile, (col_start, row_start))
 
             done += 1
@@ -288,12 +320,49 @@ def fetch_aerial_wmts(
     exactly `size_px`.
     """
     _allow_large_images()
+    cropped = wmts_image(
+        bbox,
+        size_px,
+        size_px,
+        layer_name=layer_name,
+        wmts_url=wmts_url,
+        tile_matrix_set=tile_matrix_set,
+        timeout=timeout,
+        max_retries=max_retries,
+    )
+    _assert_not_blank(cropped, bbox)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cropped.save(out_path, format="PNG")
+    LOG.info("wrote %s (%dx%d) from WMTS", out_path, size_px, size_px)
+    return out_path
+
+
+def wmts_image(
+    bbox: BBox,
+    width_px: int,
+    height_px: int,
+    *,
+    layer_name: str,
+    wmts_url: str,
+    tile_matrix_set: str = "EPSG:28992",
+    timeout: float = 180.0,
+    max_retries: int = 4,
+    capabilities: str | None = None,
+    session: requests.Session | None = None,
+):
+    """`bbox` as a `width_px` by `height_px` image, mosaicked from WMTS tiles.
+
+    `capabilities` is the service's capabilities document, when the caller
+    already has it: the roof atlas asks for many small windows, and reading
+    the document once per window would double the requests.
+    """
+    _allow_large_images()
     from PIL import Image
 
-    xml = _fetch_capabilities(wmts_url, "WMTS", timeout)
+    xml = capabilities or _fetch_capabilities(wmts_url, "WMTS", timeout)
     matrices = _parse_wmts_matrices(xml, tile_matrix_set)
 
-    target_res = bbox.width / size_px
+    target_res = min(bbox.width / width_px, bbox.height / height_px)
     usable = [
         m
         for m in matrices
@@ -339,7 +408,7 @@ def fetch_aerial_wmts(
     )
 
     template = re.search(r'<ResourceURL[^>]*template="([^"]+)"', xml)
-    session = requests.Session()
+    session = session or requests.Session()
     mosaic = Image.new(
         "RGB", (n_cols * matrix["tile_width"], n_rows * matrix["tile_height"])
     )
@@ -401,15 +470,9 @@ def fetch_aerial_wmts(
     top = (mosaic_ymax - bbox.ymax) / pixel_size
     bottom = (mosaic_ymax - bbox.ymin) / pixel_size
 
-    cropped = mosaic.resize(
-        (size_px, size_px), Image.LANCZOS, box=(left, top, right, bottom)
+    return mosaic.resize(
+        (int(width_px), int(height_px)), Image.LANCZOS, box=(left, top, right, bottom)
     )
-
-    _assert_not_blank(cropped, bbox)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cropped.save(out_path, format="PNG")
-    LOG.info("wrote %s (%dx%d) from WMTS", out_path, size_px, size_px)
-    return out_path
 
 
 def write_world_file(path: Path, bbox: BBox, size_px: int) -> Path:
@@ -492,5 +555,7 @@ __all__ = [
     "fetch_aerial_wms",
     "fetch_aerial_wmts",
     "resolve_layer_name",
+    "wms_image",
+    "wmts_image",
     "write_world_file",
 ]

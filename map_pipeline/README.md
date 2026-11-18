@@ -22,6 +22,8 @@ output/<area_name>/
 │                    tunnels, water, buildings, trees, furniture, cars, boats
 ├── maptile_tools.py Blender add-on: fit the ground under edited roads, re-export
 ├── aerial.png       aerial ortho of the same area
+├── roofs_00.png …   the roofs from the same ortho at a finer resolution, packed
+│                    per building into one or a few pages (see Roofs below)
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
 ├── vehicles.json    car and boat positions and headings, same idea
@@ -420,11 +422,11 @@ One choice, three levels. Detail is set as ground resolution rather than pixel
 count, so a level means the same thing whatever the area size, and the pixel
 counts are derived from the box.
 
-| Detail | Aerial | Ground grid | Facade | Normal map | Buildings per wall look |
-| --- | --- | --- | --- | --- | --- |
-| Draft | 50 cm/px | 4 m | 256 px | off | 160 |
-| Standard | 25 cm/px | 2 m | 512 px | on | 80 |
-| High | 12 cm/px | 1 m | 1024 px | on | 40 |
+| Detail | Aerial | Roofs | Ground grid | Facade | Normal map | Buildings per wall look |
+| --- | --- | --- | --- | --- | --- | --- |
+| Draft | 50 cm/px | on the aerial | 4 m | 256 px | off | 160 |
+| Standard | 25 cm/px | 10 cm/px, up to 48 Mpx | 2 m | 512 px | on | 80 |
+| High | 12 cm/px | 8 cm/px, up to 128 Mpx | 1 m | 1024 px | on | 40 |
 
 **Both dials hit a source-data ceiling**, and going past it costs time without
 adding information. The aerial layer is an 8 cm ortho, so a 1 km area is fully
@@ -435,7 +437,9 @@ past what the data holds.
 **The aerial jump from 25 to 12 cm/px is large; from 12 cm to native 8 cm it is
 small.** At 25 cm/px cars are blobs. At 12 cm/px you can see individual cars,
 kerb lines and bare branches. Native 8 cm adds little over that for double the
-file (92 MB against 174 MB for 1 km²).
+file (92 MB against 174 MB for 1 km²). The roofs are the exception to the
+column: at Standard and High they have a photo of their own, finer than the
+ground's (see [Roofs](#roofs)).
 
 **The ground grid is a trade between faithful and editable.** How far the
 drawn ground strays from every surveyed AHN pixel under it, measured over the
@@ -536,10 +540,90 @@ Other knobs worth knowing:
 | `buildings.sources` | `["api", "tiles"]` | Which of 3DBAG's two services to try, in order. `["tiles"]` skips the flaky API entirely. See [When 3DBAG is down](#when-3dbag-is-down). |
 | `buildings.tiles_version` | `v20250903` | Which dated 3DBAG release the static tiles come from. Bumped by hand; releases are listed at 3dbag.nl/en/download. |
 | `buildings.probe_timeout_s` | `8.0` | How long to knock on the API before giving up and using the tiles. |
+| `buildings.roof_cm` | `10` | Resolution of the roofs' own photo, set by `detail`. `0` puts the roofs on the aerial as before. Finer than the 8 cm source is clamped to 8; no finer than the aerial is the same as `0`. See [Roofs](#roofs). |
+| `buildings.roof_max_mpx` | `48` | The most pixels all roof pages may hold together, set by `detail`. Where the roofs need more at `roof_cm`, they are fetched coarser, the log warns and `roof_resolution_as_asked` says by how much. |
+| `buildings.roof_atlas_px` | `8192` | The largest side of a page. WebGL and many GPUs stop at 8192; Unity imports up to 16384, and anything above 8192 is warned about. |
+| `buildings.roof_padding_px` | `4` | Photo kept round each roof inside its rectangle, so the first mipmaps do not blend it with the rectangle packed next to it. |
 | `terrain.grid_m` | `2.0` | Ground grid spacing; set by `detail`. See [Terrain](#terrain). |
 | `terrain.feature_edges` | `["water", "roads", "buildings"]` | Which outlines the terrain's edges follow, each with a row of quads alongside. `[]` gives the plain grid. |
 | `aerial.deshadow` | `1.0` | How much of the flown sun to take back out of the photo, 0 to 1. See [The flown sun](#the-flown-sun-and-taking-it-back-out). `0` leaves it as flown. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
+
+### Roofs
+
+A roof is most of what a drone sees, and at Standard's 25 cm a pixel is a
+quarter of a metre of tiles: a dormer is a few pixels and a skylight is none.
+The ortho is 8 cm. Fetching the whole area at that is nearly what High does,
+and it spends most of the pixels on ground that is not the problem. So the
+roofs get a photo of their own, fetched only where they are (`src/roofs.py`):
+
+* **Rectangles on one grid.** Each building's roof extent, plus
+  `roof_padding_px` (4) of photo round it, becomes a rectangle of pixels on
+  one grid anchored at the area's north-west corner. Where two overlap and one
+  rectangle round both holds no more pixels than the two apart, they become
+  one: a terrace is one strip rather than a row of slivers each carrying its
+  neighbours' party walls.
+* **Packed into pages.** Tallest first, bottom-left along a skyline, into pages
+  of at most `roof_atlas_px` (8192) a side. A page is sized to what it holds,
+  in multiples of 4 for block compression, and there is one page when one will
+  do.
+* **A budget.** When the pages would hold more than `roof_max_mpx`, the
+  resolution is coarsened in whole millimetres until they fit; the log warns
+  and `roof_resolution_as_asked` says by how much. If not even the ground's
+  own resolution would fit, the roofs stay on the aerial.
+* **Few requests.** The grid is cut into tiles of `aerial.max_request_px`
+  (2000 px), and each tile a rectangle reaches is one GetMap for the part of it
+  the rectangles need, four at a time. Every pixel lands on the same grid, so a
+  rectangle split between two requests joins without a seam and nothing is
+  resampled. A window the WMS refuses is mosaicked from WMTS tiles; if neither
+  answers, the roofs stay on the aerial and the run warns.
+* **Mapped and relit.** Each roof triangle's UV points into its rectangle
+  (`work/<area>/roofs.npz`, read by the Blender stage), and the relighting
+  stage takes the flown sun out of the pages exactly as it does out of the
+  ground (see [The flown sun](#the-flown-sun-and-taking-it-back-out)).
+
+Measured over a 500 m square of Utrecht centre round the Dom, at Standard, the
+same area built with `roof_cm: 0` against the default:
+
+| | `roof_cm: 0` | `roof_cm: 10` |
+| --- | --- | --- |
+| roofs | on the 2000 px aerial, 25 cm/px | one 5504 x 5204 page, 10 cm/px |
+| fetched for the roofs | nothing | 27.2 Mpx in 16 requests, 3.6 s |
+| run time | 137 s | 18 s more: 5.9 s roof stage, 10 s relighting, 2 s checks |
+| output folder | 51 MB | 89 MB, of which `roofs_00.png` 38 MB |
+| detail on the roofs | 4.1 | 12.2 |
+
+The last row is the mean absolute Laplacian of luminance over the roof pixels,
+both read at 10 cm: the finest detail in the picture, three times what the
+upsampled aerial has. Most of the time is writing PNG, not the network: a
+29 Mpx page takes 7.8 s to compress and arrives in under 4.
+
+The centre of Utrecht is the hard case for this. Roofs cover 53% of the square
+there, and with streets running every way their rectangles, merged, add up to
+more than the square itself: 241,000 m² against 133,000 m² of roof. So the page
+holds about as many pixels as the whole square would at 10 cm. Where roofs
+cover less of the ground the page shrinks with them, while the ground's photo
+does not.
+
+**At a square kilometre the budget decides.** The square kilometre of the
+default `config.json`, which overlaps most of the 500 m square above, holds
+2,557 roofs: at 10 cm they would need more than the 48 Mpx Standard allows. They come out at 13.6 cm/px instead, on
+one 7164 x 6700 page: 54 Mpx fetched in 23 requests in 8.4 s, 30 s added to the
+fetch and relighting stages of a 400 s run, and a 71 MB page beside a 30 MB
+aerial. The log and `roof_resolution_as_asked` both say so. That is still
+nearly twice as sharp as the ground in each direction; for 10 cm over a square
+kilometre of city centre, raise `roof_max_mpx` and expect a second page.
+
+Two things were weighed and left out. Rectangles turned to each building would
+pack tighter where the streets run every way, but every roof pixel would then
+be resampled off the service's grid, which costs some of the sharpness this is
+for. And the pages are PNG like every other texture here: the photo has been
+relit, so a JPEG would be a second lossy generation. As JPEG at quality 92 the
+page above would be 7.6 MB rather than 38; on the graphics card the two are the
+same size.
+
+`roof_cm: 0`, and Draft, give the previous model: no stage, no page, and the
+roofs on `M_aerial` with the aerial's planar UV.
 
 ## How it fits together
 
@@ -549,6 +633,7 @@ src/elevation.py   AHN WCS -> GeoTIFF -> regular height grid; the fit under road
 src/terrain_mesh.py the terrain mesh: outlines as edges, rows, grid, fill
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
+src/roofs.py       the roofs at a finer resolution: rectangles, packing, roofs_00.png
 src/facade.py      generated facade, tree, water and furniture textures
 src/facade_uv.py   fitting whole window bays across each wall face
 src/textures.py    photographed CC0 wall surfaces, fetched once and cached
@@ -796,7 +881,10 @@ wrong.
 4. **Model → Index Format: Auto.** The ground has more than 65k vertices and
    needs 32-bit indices; Auto handles it.
 5. **`aerial.png` → Max Size: 8192** (or 16384). Unity caps imported textures at
-   2048 by default, and the whole aerial is shrunk to that otherwise.
+   2048 by default, and the whole aerial is shrunk to that otherwise. The same
+   for each `roofs_*.png`, and set its **Non-Power of 2** to *None*: a page is
+   sized to what it holds (5504 x 5204 over Utrecht centre), and the default
+   *To nearest* would scale that down to 4096 x 4096.
 6. **Tree materials → Enable GPU Instancing.** Ten thousand trees share twelve
    meshes; instancing draws each shape in one batch. Marking the `Buildings` and
    `Roads` hierarchies *Static* lets Unity batch those too.
@@ -1829,6 +1917,26 @@ Measured over Bronbeek with buildings and trees, 41.6 s:
 It is a mitigation, not a cure, and the limit is information rather than
 effort. `aerial.deshadow: 0` leaves the photo as flown.
 
+**The roofs get the ground's correction, not a fit of their own.** The roof
+atlas (see [Roofs](#roofs)) is the same flight cut into rectangles, with no
+ground round its roofs to measure a shadow against. So nothing is fitted on it:
+the sun, the cast shadow and the gains per class and channel are the ones
+fitted on the ground, read at each roof pixel's own RD position, with the same
+veto from the photo. The shadow is feathered at its own 0.5 m scale and read
+bilinearly, which comes to the same metre or so of ramp the ground gets. Over
+Utrecht centre a roof's mean luminance in the atlas and the same roof's in the
+aerial differ by 0.3 levels at the median and 2.1 at the 90th percentile, over
+338 roofs and terraces. Fetching the whole area at the roofs' resolution and
+relighting that instead would have cost the ground the same pixels again,
+which is what the atlas is there to avoid.
+
+The atlas does not get the ground's other two passes. The grain is per ground
+surface, and a roof has none. The canopy occlusion is drawn under trees, which
+in a street mostly stand lower than the roof next to them, so on a roof it
+would darken the wrong side of the crown. One limit carries over: the shadow is
+known at 0.5 m, so at 10 cm a thin dark rim can stay along a hard shadow edge
+on a roof, as it can at 25 cm on the ground.
+
 ### The leaf-off photo, under the leafy trees
 
 That same decision leaves the model disagreeing with itself. The ground under a
@@ -1985,11 +2093,18 @@ Set `trees.enabled` to `false` to skip them entirely.
 
 ## Materials
 
-Two materials, by default.
+Three materials, by default.
 
 **`M_aerial`** carries `aerial.png` with a top-down planar UV taken from world XY
-normalised to the aerial bbox. It goes on the terrain *and* on the roof surfaces,
-so roofs pick up real photo texture for free and buildings blend into the ground.
+normalised to the aerial bbox. It goes on the terrain.
+
+**`M_roof`** carries `roofs_00.png`, the same flight over the roofs only, at a
+finer resolution (see [Roofs](#roofs)). Each roof triangle's UV is top-down too,
+into its building's rectangle on the page, so a roof still lines up with the
+ground beside it. With more than one page the materials are `M_roof_00`,
+`M_roof_01` and so on, one per page, and a building's roof is always on one
+page. `buildings.roof_cm: 0`, and the Draft level, put the roofs back on
+`M_aerial` as before, with the planar UV the terrain has.
 
 **`M_facade`** carries a generated facade. V counts storeys from the base of the
 wall, at a storey height of `wall_height / storeys`, so the top row of windows
@@ -2276,6 +2391,16 @@ kerb), `walkways_have_kerbs` (the curb generator ran),
 holds the coarse terrain to its own tolerance rather than to the survey
 style's 25 cm. In both styles `terrain_exported_as_triangles` checks the FBX
 holds the terrain cut as the pipeline cut it.
+
+When the roofs have their own photo, four checks read it back:
+`roof_atlas_written` (every page on disk at its planned size, with content in
+it), `roof_atlas_within_size_cap` (no page over `roof_atlas_px`, and all of them
+within `roof_max_mpx`), `roof_uvs_inside_their_rectangles` (every corner of
+every roof triangle inside its own building's rectangle, at least the padding
+from its edge) and `roofs_use_the_atlas` (Blender put as many roof triangles on
+`M_roof` as were planned). `roof_resolution_as_asked` warns when the budget
+made the roofs coarser than `roof_cm`. An atlas that could not be fetched is a
+warning too: the roofs are then on the aerial, as they were before.
 
 `web_view_written` says whether the 3D view was written. It only ever warns:
 the model is whole without it, and the page writes the view from the `.blend`
