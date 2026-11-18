@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -2158,6 +2159,514 @@ class TestDeShadowing(unittest.TestCase):
         self.assertIn(
             'config.aerial.get("deshadow"', inspect.getsource(pipeline.run)
         )
+
+    def test_the_roof_atlas_gets_the_grounds_correction(self):
+        """The atlas holds the same flight finer, cut up per building, with
+        no ground of its own to measure a shadow against. It gets the sun,
+        the shadow and the gains fitted on the ground, read at its own
+        pixels' positions, so a roof comes out in the tone of the ground."""
+        from PIL import Image
+
+        from src.relight import remove_cast_shadows
+
+        # A window of the photo at twice its resolution, as the atlas holds
+        # a rectangle: rows north first, with the RD centre of every pixel.
+        r0, r1, c0, c1 = 120, 360, 96, 384
+        metres = self.SPAN / self.PX
+
+        class Atlas:
+            paths = ["roofs_00.png"]
+
+            def map_rects(inner, fn):
+                inner.result = fn(inner.block, inner.xs, inner.ys)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = np.asarray(Image.open(path), dtype=np.float64)
+            atlas = Atlas()
+            atlas.block = before[r0:r1, c0:c1].repeat(2, 0).repeat(2, 1).astype(np.uint8)
+            atlas.xs = c0 * metres + (np.arange(2 * (c1 - c0)) + 0.5) * metres / 2
+            atlas.ys = self.SPAN - r0 * metres - (np.arange(2 * (r1 - r0)) + 0.5) * metres / 2
+            info = remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings, roofs=atlas
+            )
+            after = np.asarray(Image.open(path), dtype=np.float64)
+
+        ground = after[r0:r1, c0:c1] @ self.WEIGHTS
+        roof = atlas.result.astype(np.float64).reshape(
+            r1 - r0, 2, c1 - c0, 2, 3
+        ).mean(axis=(1, 3)) @ self.WEIGHTS
+        window = shadow[r0:r1, c0:c1]
+        # The two feathers are drawn at different scales, so compare where
+        # neither reaches: seven pixels, about three metres, from any edge.
+        stable = np.ones_like(window)
+        for dr in range(-7, 8):
+            for dc in range(-7, 8):
+                stable &= np.roll(np.roll(window, dr, 0), dc, 1) == window
+        stable[:7], stable[-7:], stable[:, :7], stable[:, -7:] = False, False, False, False
+        self.assertGreater(int(stable.sum()), 1000)
+        difference = np.abs(ground - roof)[stable]
+        self.assertLess(float(np.median(difference)), 2.0)
+        self.assertLess(float(np.percentile(difference, 95)), 6.0)
+
+        lifted = window & stable
+        was = float((before[r0:r1, c0:c1] @ self.WEIGHTS)[lifted].mean())
+        self.assertGreater(float(roof[lifted].mean()), was * 1.3,
+                           "the atlas's shadows were not lifted")
+        self.assertIn("roofs", info)
+        self.assertGreater(info["roofs"]["shadow_fraction"], 0.05)
+
+    def test_the_roof_atlas_is_left_alone_when_the_ground_is(self):
+        """Switched off, or no sun found: the roofs stay as flown, like the
+        ground, or the two would disagree."""
+        from src.relight import remove_cast_shadows
+
+        class Atlas:
+            paths = ["roofs_00.png"]
+            touched = False
+
+            def map_rects(inner, fn):
+                inner.touched = True
+
+        for overcast, strength in ((False, 0.0), (True, 1.0)):
+            atlas = Atlas()
+            with tempfile.TemporaryDirectory() as tmp:
+                path, _, _, buildings, bbox = self._scene(tmp, overcast=overcast)
+                remove_cast_shadows(
+                    path, bbox, terrain=self._Flat(), buildings=buildings,
+                    strength=strength, roofs=atlas,
+                )
+            self.assertFalse(atlas.touched, (overcast, strength))
+
+    def test_the_pipeline_relights_the_roofs_with_the_ground(self):
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        call = source[source.index("remove_cast_shadows("):]
+        self.assertIn("roofs=roof_atlas", call[: call.index("\n        )")])
+
+
+def _box_roof(x0, y0, x1, y1, z=10.0):
+    """Two triangles over a rectangle: a flat roof."""
+    return np.array([
+        [[x0, y0, z], [x1, y0, z], [x1, y1, z]],
+        [[x0, y0, z], [x1, y1, z], [x0, y1, z]],
+    ], dtype=float)
+
+
+class TestRoofAtlas(unittest.TestCase):
+    """Roofs from the 8 cm ortho, only where the roofs are, in a few atlases.
+
+    Everything here is offline: the photo is a stand-in that writes into each
+    pixel which grid pixel it is, so a roof that comes out on the wrong pixel
+    shows up as a wrong number rather than as a slightly wrong colour.
+    """
+
+    ORIGIN = (1000.0, 2200.0)
+    BBOX = (1000.0, 2000.0, 1200.0, 2200.0)
+
+    def _roofs(self):
+        """A terrace, a few detached houses, a rotated one, one hanging over
+        the area's west edge, and a building with no roof at all."""
+        roofs = []
+        # A terrace of six houses sharing party walls.
+        for i in range(6):
+            roofs.append(_box_roof(1020.013 + 5.5 * i, 2150.07, 1025.513 + 5.5 * i, 2160.07))
+        # Detached houses, spread out.
+        for i, (x, y) in enumerate([(1100.31, 2100.17), (1150.53, 2030.29), (1060.77, 2040.41)]):
+            roofs.append(_box_roof(x, y, x + 9.3 + i, y + 7.1))
+        # Rotated 30 degrees.
+        angle = math.radians(30.0)
+        corners = np.array([[0, 0], [14, 0], [14, 6], [0, 6]], dtype=float)
+        turned = corners @ np.array([[math.cos(angle), math.sin(angle)],
+                                     [-math.sin(angle), math.cos(angle)]])
+        turned += (1120.21, 2160.33)
+        roofs.append(np.array([
+            [[*turned[0], 12.0], [*turned[1], 12.0], [*turned[2], 12.0]],
+            [[*turned[0], 12.0], [*turned[2], 12.0], [*turned[3], 12.0]],
+        ]))
+        # Over the west edge: columns left of the grid's origin.
+        roofs.append(_box_roof(995.17, 2080.23, 1004.61, 2090.37))
+        roofs.append(np.zeros((0, 3, 3)))
+        return roofs
+
+    @staticmethod
+    def _coded_fetch(origin, calls):
+        """A stand-in ortho: each pixel says which grid column and row it is."""
+
+        def fetch(window, width, height):
+            metres = window.width / width
+            self_cols = int(round((window.xmin - origin[0]) / metres)) + np.arange(width)
+            self_rows = int(round((origin[1] - window.ymax) / metres)) + np.arange(height)
+            out = np.zeros((height, width, 3), dtype=np.uint8)
+            out[..., 0] = (self_cols % 251)[None, :]
+            out[..., 1] = (self_rows % 251)[:, None]
+            out[..., 2] = 200
+            calls.append((width, height))
+            return out
+
+        return fetch
+
+    def _atlas(self, folder, *, roof_cm=10, budget_mpx=48, page_px=8192,
+               padding=4, request_px=300):
+        from src.geo import BBox
+        from src.roofs import build_roof_atlas
+
+        calls: list = []
+        atlas = build_roof_atlas(
+            BBox(*self.BBOX),
+            Path(folder),
+            roofs=self._roofs(),
+            buildings_cfg={"roof_cm": roof_cm, "roof_max_mpx": budget_mpx,
+                           "roof_atlas_px": page_px, "roof_padding_px": padding},
+            aerial_cfg={"max_request_px": request_px},
+            ground_m_per_px=0.25,
+            layer_name="test",
+            fetch=self._coded_fetch(self.ORIGIN, calls),
+        )
+        return atlas, calls
+
+    def test_rectangles_are_padded_and_on_one_grid(self):
+        from src.roofs import grid_rects
+
+        rects = grid_rects(
+            np.array([[1.0625, 50.0, 3.0, 52.0], [np.nan] * 4]),
+            (0.0, 100.0), 0.125, 4,
+        )
+        # Column 8.5 rounds out to 8, then four of padding; row 0 is north.
+        np.testing.assert_array_equal(rects[0], [4, 380, 28, 404])
+        np.testing.assert_array_equal(rects[1], [0, 0, 0, 0])
+
+    def test_overlapping_rectangles_merge_only_when_it_saves_space(self):
+        from src.roofs import merge_rects
+
+        # Two houses side by side, their padding overlapping: one strip.
+        merged, members = merge_rects(np.array([[0, 0, 60, 40], [52, 0, 112, 40]]), 8192)
+        np.testing.assert_array_equal(merged, [[0, 0, 112, 40]])
+        self.assertEqual(members, [[0, 1]])
+        # Corners just touching diagonally: the joint box would hold far
+        # more than the two, so they stay apart.
+        merged, members = merge_rects(np.array([[0, 0, 50, 50], [45, 45, 95, 95]]), 8192)
+        self.assertEqual(len(merged), 2)
+        # And never past a page, however much it would save.
+        merged, _ = merge_rects(np.array([[0, 0, 60, 40], [52, 0, 112, 40]]), 100)
+        self.assertEqual(len(merged), 2)
+
+    def test_packing_never_overlaps_and_stays_on_its_page(self):
+        from src.roofs import PAGE_ALIGN, pack_rects
+
+        rng = np.random.default_rng(3)
+        for page_px, count in ((512, 300), (2048, 40)):
+            sizes = np.column_stack([rng.integers(8, 120, count), rng.integers(8, 90, count)])
+            placement, pages = pack_rects(sizes, page_px)
+            self.assertTrue((placement[:, 0] >= 0).all(), "a rectangle was not placed")
+            for width, height in pages:
+                self.assertLessEqual(max(width, height), page_px)
+                self.assertEqual((width % PAGE_ALIGN, height % PAGE_ALIGN), (0, 0))
+            painted = [np.zeros((h, w), dtype=np.int32) for w, h in pages]
+            for (page, x, y), (w, h) in zip(placement, sizes):
+                self.assertLessEqual(x + w, pages[page][0])
+                self.assertLessEqual(y + h, pages[page][1])
+                painted[page][y : y + h, x : x + w] += 1
+            self.assertEqual(max(int(p.max()) for p in painted), 1, "two rectangles overlap")
+        # 300 rectangles of up to 120 x 90 cannot share one 512 px page.
+        self.assertGreater(len(pack_rects(
+            np.column_stack([rng.integers(8, 120, 300), rng.integers(8, 90, 300)]), 512
+        )[1]), 1)
+
+    def test_one_page_is_sized_to_what_it_holds(self):
+        from src.roofs import pack_rects
+
+        sizes = np.full((20, 2), 100)
+        placement, pages = pack_rects(sizes, 8192)
+        self.assertEqual(len(pages), 1)
+        width, height = pages[0]
+        self.assertLess(width * height, 1.5 * 20 * 100 * 100)
+
+    def test_the_budget_coarsens_the_roofs_and_says_so(self):
+        from src.roofs import plan_roof_atlas, roof_extents
+
+        extents = roof_extents(self._roofs())
+        full = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                               ground_m_per_px=0.25, budget_px=10**9)
+        self.assertFalse(full.capped)
+        self.assertAlmostEqual(full.metres_per_px, 0.10)
+        budget = full.total_px // 3
+        capped = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                                 ground_m_per_px=0.25, budget_px=budget)
+        self.assertTrue(capped.capped)
+        self.assertLessEqual(capped.total_px, budget)
+        self.assertGreater(capped.metres_per_px, 0.10)
+        # Whole millimetres, so request bounds stay exact.
+        self.assertAlmostEqual(capped.metres_per_px * 1000, round(capped.metres_per_px * 1000))
+        # A budget only the ground's resolution would fit: no atlas at all.
+        self.assertIsNone(plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                                          ground_m_per_px=0.25, budget_px=2000))
+        # Finer than the 8 cm source is the source.
+        fine = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.03,
+                               ground_m_per_px=0.25, budget_px=10**9)
+        self.assertAlmostEqual(fine.metres_per_px, 0.08)
+
+    def test_every_roof_corner_lands_on_the_pixel_it_was_photographed_in(self):
+        """The whole chain at once: rectangles, requests split across tiles,
+        the copy into the pages, and the UVs. A wrong offset anywhere moves
+        a roof by whole pixels, and the stand-in photo says by how many."""
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, calls = self._atlas(tmp)
+            from PIL import Image
+
+            pages = [np.asarray(Image.open(p)) for p in atlas.paths]
+        plan = atlas.plan
+        self.assertTrue(atlas.ok)
+        self.assertGreater(len(calls), 3, "the 300 px requests should split this area")
+        self.assertTrue(all(max(w, h) <= 300 for w, h in calls))
+
+        roofs = [r for r in self._roofs() if len(r)]
+        corners = np.concatenate(roofs).reshape(-1, 3)[:, :2]
+        uv = atlas.roof_uv.reshape(-1, 2).astype(np.float64)
+        page = np.repeat(atlas.roof_page, 3)
+        self.assertTrue((page >= 0).all())
+        r = plan.metres_per_px
+        for (x, y), (u, v), p in zip(corners, uv, page):
+            width, height = plan.pages[p]
+            pixel = pages[p][int((1.0 - v) * height), int(u * width)]
+            want_col = math.floor((x - self.ORIGIN[0]) / r) % 251
+            want_row = math.floor((self.ORIGIN[1] - y) / r) % 251
+            self.assertEqual((int(pixel[0]), int(pixel[1])), (want_col, want_row),
+                             f"corner {x:.2f}, {y:.2f}")
+
+    def test_a_terrace_shares_one_rectangle_and_a_building_without_a_roof_has_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp)
+        plan = atlas.plan
+        terrace = {int(plan.building_rect[i]) for i in range(6)}
+        self.assertEqual(len(terrace), 1)
+        self.assertEqual(int(plan.building_rect[-1]), -1)
+        self.assertEqual(len(atlas.roof_page), 2 * (len(self._roofs()) - 1))
+
+    def test_the_checks_pass_and_catch_a_stray_uv(self):
+        from src.validate import CheckReport, check_roof_atlas
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp)
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=8192)
+            self.assertEqual([c.name for c in report.checks if not c.passed], [])
+            names = {c.name for c in report.checks}
+            self.assertLessEqual(
+                {"roof_atlas_written", "roof_atlas_within_size_cap",
+                 "roof_uvs_inside_their_rectangles", "roof_resolution_as_asked"},
+                names,
+            )
+
+            # One corner moved into the middle of another building's
+            # rectangle: still on the page, on the wrong roof.
+            plan = atlas.plan
+            other = next(k for k in range(len(plan.rects)) if k != atlas.roof_rect[0])
+            page, x, y = plan.placement[other]
+            w, h = plan.size(other)
+            width, height = plan.pages[page]
+            atlas.roof_uv[0, 0] = ((x + w / 2) / width, 1 - (y + h / 2) / height)
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=8192)
+            failed = {c.name for c in report.checks if not c.passed}
+            self.assertIn("roof_uvs_inside_their_rectangles", failed)
+
+            # A page over the cap.
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=256)
+            self.assertIn("roof_atlas_within_size_cap",
+                          {c.name for c in report.checks if not c.passed})
+
+    def test_the_cap_shows_as_a_warning(self):
+        from src.roofs import plan_roof_atlas, roof_extents
+        from src.validate import CheckReport, check_roof_atlas
+
+        extents = roof_extents(self._roofs())
+        full = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                               ground_m_per_px=0.25, budget_px=10**9)
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp, budget_mpx=full.total_px / 3 / 1e6)
+            self.assertTrue(atlas.plan.capped)
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=8192)
+        capped = next(c for c in report.checks if c.name == "roof_resolution_as_asked")
+        self.assertFalse(capped.passed)
+        self.assertEqual(capped.severity, "warning")
+        self.assertTrue(report.ok)
+
+    def test_a_service_that_does_not_answer_leaves_the_roofs_on_the_aerial(self):
+        from src.geo import BBox
+        from src.http_util import ServiceError
+        from src.roofs import build_roof_atlas
+        from src.validate import CheckReport, check_roof_atlas
+
+        def refuse(window, width, height):
+            raise ServiceError("down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas = build_roof_atlas(
+                BBox(*self.BBOX), Path(tmp), roofs=self._roofs(),
+                buildings_cfg={"roof_cm": 10}, aerial_cfg={},
+                ground_m_per_px=0.25, layer_name="test", fetch=refuse,
+            )
+            self.assertFalse(atlas.ok)
+            self.assertIn("down", atlas.note)
+            self.assertEqual(list(Path(tmp).glob("roofs_*.png")), [])
+        report = CheckReport()
+        check_roof_atlas(report, atlas, out_dir=None, work_dir=Path("."), page_cap=8192)
+        self.assertTrue(report.ok, "a missing atlas is a warning, not a failure")
+        self.assertEqual(report.warnings[0].name, "roof_atlas_written")
+
+    def test_off_is_the_old_behaviour(self):
+        from src.geo import BBox
+        from src.roofs import build_roof_atlas, roof_settings
+
+        self.assertEqual(roof_settings({"roof_cm": 0})["metres_per_px"], 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas = build_roof_atlas(
+                BBox(*self.BBOX), Path(tmp), roofs=self._roofs(),
+                buildings_cfg={"roof_cm": 0}, aerial_cfg={},
+                ground_m_per_px=0.25, layer_name="test",
+                fetch=lambda *a: self.fail("fetched with the roofs switched off"),
+            )
+        self.assertFalse(atlas.ok)
+
+    def test_the_relighting_pass_rewrites_each_rectangle_in_place(self):
+        """`map_rects` hands each rectangle over with the RD centres of its
+        pixels, and writes back what it gets."""
+        from PIL import Image
+
+        seen = []
+
+        def darken(block, xs, ys):
+            seen.append((block.shape, len(xs), len(ys), xs[0], ys[0]))
+            return (block // 2).astype(np.uint8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp)
+            before = np.asarray(Image.open(atlas.paths[0])).copy()
+            atlas.map_rects(darken)
+            after = np.asarray(Image.open(atlas.paths[0]))
+        plan = atlas.plan
+        self.assertEqual(len(seen), len(plan.rects))
+        for (shape, nx, ny, x0, y0) in seen:
+            self.assertEqual(shape[:2], (ny, nx))
+        k = 0
+        _, x, y = plan.placement[k]
+        w, h = plan.size(k)
+        np.testing.assert_array_equal(after[y : y + h, x : x + w], before[y : y + h, x : x + w] // 2)
+        xs, ys = plan.pixel_centres(k)
+        self.assertAlmostEqual(xs[1] - xs[0], plan.metres_per_px)
+        self.assertLess(ys[1], ys[0], "rows run north to south")
+
+    def test_blender_puts_the_roofs_on_their_pages(self):
+        """process.py, exec'd against stubs: every roof triangle that has a
+        rectangle gets its page's material and the UVs from roofs.npz, and a
+        mismatched file puts them all back on the aerial."""
+        from src.buildings import Building, BuildingSet, save_buildings
+
+        calls = []
+
+        def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
+            calls.append({"uvs": np.asarray(uvs), "mats": np.asarray(mats),
+                          "materials": list(materials)})
+
+        namespace = _stubbed_process(record)
+        roofs = self._roofs()
+        buildings = BuildingSet(buildings=[
+            Building(
+                identifier=f"NL.IMBAG.Pand.{i}",
+                wall_tris=np.array([[[r[0, 0, 0] if len(r) else 1010.0, 2100.0, 0.0],
+                                     [1011.0, 2100.0, 0.0], [1011.0, 2100.0, 8.0]]]),
+                roof_tris=r, ground_z_nap=0.0, roof_max_nap=10.0, floors=3,
+                wall_top_nap=8.0,
+            )
+            for i, r in enumerate(roofs)
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            save_buildings(buildings, folder / "buildings.npz")
+            atlas, _ = self._atlas(tmp)
+            scene = {
+                "buildings": {"file": "buildings.npz"},
+                "roofs": {"file": "roofs.npz", "textures": atlas.files,
+                          "materials": ["M_roof"]},
+                "origin_rd": [1100.0, 2100.0],
+                "ground_z_offset_nap": 0.0,
+                "aerial": {"bbox_local": [-100.0, -100.0, 100.0, 100.0]},
+                "facade": {"floor_height_m": 3.0, "ground_floor_height_m": 3.6},
+            }
+            report = {}
+            namespace["build_buildings"](
+                scene, folder, ["F"], "A", None, roof_materials=["R"], report=report
+            )
+            on_roof = []
+            for call in calls:
+                for p, slot in enumerate(call["mats"]):
+                    if call["materials"][slot] == "R":
+                        on_roof.append(call["uvs"][3 * p : 3 * p + 3].ravel())
+            self.assertEqual(report["atlas_triangles"], len(atlas.roof_page))
+            self.assertEqual(report["aerial_triangles"], 0)
+            self.assertEqual(len(on_roof), len(atlas.roof_page))
+            got = np.array(sorted(map(tuple, np.round(on_roof, 5))))
+            want = np.array(sorted(map(tuple, np.round(atlas.roof_uv.reshape(-1, 6), 5))))
+            np.testing.assert_allclose(got, want, atol=1e-5)
+
+            # A roofs.npz that does not match the buildings: all on the aerial.
+            np.savez(folder / "roofs.npz", roof_uv=np.zeros((3, 2), np.float32),
+                     roof_page=np.zeros(1, np.int16))
+            calls.clear()
+            report = {}
+            namespace["build_buildings"](
+                scene, folder, ["F"], "A", None, roof_materials=["R"], report=report
+            )
+            self.assertEqual(report["atlas_triangles"], 0)
+            self.assertFalse(any("R" in call["materials"] for call in calls))
+
+    def test_the_detail_levels_decide_the_roofs(self):
+        from src.config import DETAIL_PRESETS
+
+        for level, preset in DETAIL_PRESETS.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({
+                    "name": "lvl", "detail": level,
+                    "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                }))
+                loaded = load_config(path)
+            self.assertEqual(loaded.buildings["roof_cm"], preset["roof_cm"], level)
+            self.assertEqual(loaded.buildings["roof_max_mpx"], preset["roof_mpx"], level)
+            # Never coarser than the ground, or there would be no point.
+            if preset["roof_cm"]:
+                self.assertLess(preset["roof_cm"], preset["aerial_cm"], level)
+        self.assertEqual(DETAIL_PRESETS["draft"]["roof_cm"], 0)
+
+    def test_roof_settings_are_cleaned_up_on_load(self):
+        def load(**buildings):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({
+                    "name": "r", "detail": "standard", "buildings": buildings,
+                    "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                }))
+                return load_config(path).buildings
+
+        with self.assertLogs("src.config", level="WARNING") as captured:
+            self.assertEqual(load(roof_cm=4)["roof_cm"], 8.0)
+        self.assertIn("finer than the 8 cm source", " ".join(captured.output))
+        # No finer than the 25 cm ground is the same as off.
+        self.assertEqual(load(roof_cm=30)["roof_cm"], 0.0)
+        self.assertEqual(load(roof_cm=0)["roof_cm"], 0.0)
+        self.assertEqual(load(roof_cm=None)["roof_cm"], 0.0)
+        with self.assertRaises(ValueError):
+            load(roof_cm=-1)
+        with self.assertRaises(ValueError):
+            load(roof_atlas_px=20000)
+        with self.assertRaises(ValueError):
+            load(roof_max_mpx=0)
 
 
 class TestCanopyShade(unittest.TestCase):
@@ -5400,11 +5909,43 @@ def _blender_mesh_calls():
     Blender loop indices for the unwelded buffer, which killed a real run with
     "Array length mismatch (got 210, expected more)".
     """
-    import re
     import tempfile
 
-    source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
     calls: list[dict] = []
+
+    def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
+        extra = kw.get("extra_uvs") or {}
+        calls.append({
+            "object": name,
+            "vertices": len(vertices),
+            "loops": len(loops),
+            "uvs": len(uvs),
+            # Every extra UV map is per loop too.
+            "extra_uvs": [len(values) for values in extra.values()],
+            "polygons": len(starts),
+            "totals": len(totals),
+            "loop_total_sum": int(np.sum(totals)),
+            "material_indices": len(mats),
+            "materials": len(materials),
+            "max_index": int(np.max(loops)) if len(loops) else -1,
+        })
+
+    namespace = _stubbed_process(record)
+
+    rng = np.random.default_rng(11)
+    folder = Path(tempfile.mkdtemp())
+    yield from _run_blender_builders(namespace, calls, rng, folder)
+
+
+def _stubbed_process(record):
+    """blender/process.py's functions, exec'd against stubs instead of bpy.
+
+    `record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw)`
+    stands in for `build_mesh_object` and sees what each builder hands it.
+    """
+    import re
+
+    source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
 
     class FakeAttributes:
         """Mesh attributes: created and filled, never read back here."""
@@ -5432,22 +5973,8 @@ def _blender_mesh_calls():
         def __getitem__(self, key):
             return self.__dict__[key]
 
-    def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
-        extra = kw.get("extra_uvs") or {}
-        calls.append({
-            "object": name,
-            "vertices": len(vertices),
-            "loops": len(loops),
-            "uvs": len(uvs),
-            # Every extra UV map is per loop too.
-            "extra_uvs": [len(values) for values in extra.values()],
-            "polygons": len(starts),
-            "totals": len(totals),
-            "loop_total_sum": int(np.sum(totals)),
-            "material_indices": len(mats),
-            "materials": len(materials),
-            "max_index": int(np.max(loops)) if len(loops) else -1,
-        })
+    def stub(name, *args, **kw):
+        record(name, *args, **kw)
         return Stub(name)
 
     class FakeObject(dict):
@@ -5483,7 +6010,7 @@ def _blender_mesh_calls():
 
     namespace = {
         "np": np, "Path": Path, "log": lambda *a: None, "bpy": FakeBpy,
-        "build_mesh_object": record,
+        "build_mesh_object": stub,
         "make_material": lambda *a, **k: "M",
         "make_textured_material": lambda *a, **k: "M",
         "make_plain_material": lambda *a, **k: "M",
@@ -5497,9 +6024,11 @@ def _blender_mesh_calls():
             exec(match.group(0), namespace)  # noqa: S102 - our own source
         except Exception:  # noqa: BLE001 - helpers needing bpy are not our target
             pass
+    return namespace
 
-    rng = np.random.default_rng(11)
-    folder = Path(tempfile.mkdtemp())
+
+def _run_blender_builders(namespace, calls, rng, folder):
+    """Feed each builder in `namespace` synthetic input; see _blender_mesh_calls."""
     n = 12
     xy = np.column_stack([rng.uniform(0, 200, n), rng.uniform(0, 200, n)])
     # A strip sharing corners along its length, so a weld has something to
@@ -10625,10 +11154,14 @@ class TestUIServer(unittest.TestCase):
         # The Utrecht runs predate the terrain mesh stage, so its own measured
         # cost -- 48 s a square kilometre over Bronbeek -- is added to them.
         mesh = 48.0
+        # And the roof page, fetched and relit: 16 s measured over the Utrecht
+        # Dom quarter square kilometre, 30 s over the square kilometre of
+        # config.json, where the 48 Mpx budget caps it.
+        roofs_km, roofs_quarter = 30.0, 16.0
         measured = [
-            (seconds(1000, 4096, preview=True), 468 + mesh),
-            (seconds(1000, 4096, preview=False), 218 + mesh),
-            (seconds(500, 2048, preview=False), 75 + mesh / 4),
+            (seconds(1000, 4096, preview=True), 468 + mesh + roofs_km),
+            (seconds(1000, 4096, preview=False), 218 + mesh + roofs_km),
+            (seconds(500, 2048, preview=False), 75 + mesh / 4 + roofs_quarter),
         ]
         for predicted, actual in measured:
             self.assertLess(

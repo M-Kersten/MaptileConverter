@@ -939,6 +939,138 @@ def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
         )
 
 
+def check_roof_atlas(
+    report: CheckReport,
+    atlas,
+    *,
+    out_dir: Path | None,
+    work_dir: Path,
+    page_cap: int,
+) -> None:
+    """The roofs' own photo: written, within the page cap, mapped correctly.
+
+    Only called when the roofs were meant to have one. If it could not be
+    made, the roofs are on the aerial as they always were, which is a model
+    without the improvement rather than a broken one: a warning.
+    """
+    from PIL import Image
+
+    from .imagery import _allow_large_images
+
+    if not atlas.ok:
+        report.add(
+            "roof_atlas_written",
+            False,
+            f"no roof atlas: {atlas.note or 'nothing was built'}; the roofs use "
+            f"the aerial",
+            severity="warning",
+        )
+        return
+
+    plan = atlas.plan
+    folder = out_dir if out_dir is not None else work_dir
+    _allow_large_images()
+    sizes, flat, missing = [], [], []
+    for path, want in zip(atlas.paths, plan.pages):
+        path = Path(folder) / path.name
+        if not path.is_file():
+            missing.append(path.name)
+            continue
+        with Image.open(path) as image:
+            sizes.append(image.size)
+            sample = np.asarray(image.convert("RGB").resize((256, 256)), dtype=np.float64)
+        if image.size != tuple(want) or float(sample.std()) <= 5.0:
+            flat.append(f"{path.name} {image.size[0]}x{image.size[1]}")
+    megabytes = sum(
+        (Path(folder) / p.name).stat().st_size for p in atlas.paths
+        if (Path(folder) / p.name).is_file()
+    ) / 1e6
+    report.add(
+        "roof_atlas_written",
+        not missing and not flat,
+        (
+            f"missing {', '.join(missing)}" if missing
+            else f"wrong size or no content: {', '.join(flat)}" if flat
+            else f"{len(sizes)} page(s), "
+            + ", ".join(f"{w}x{h}" for w, h in sizes)
+            + f", {megabytes:.1f} MB, {plan.metres_per_px * 100:.1f} cm/px over "
+            f"{int((plan.building_rect >= 0).sum())} roofs"
+        ),
+    )
+
+    largest = max(max(w, h) for w, h in plan.pages)
+    report.add(
+        "roof_atlas_within_size_cap",
+        largest <= page_cap and plan.total_px <= plan.budget_px,
+        f"largest page {largest} px against the {page_cap} px cap; "
+        f"{plan.total_px / 1e6:.1f} of {plan.budget_px / 1e6:.0f} Mpx",
+    )
+
+    # Every roof corner inside its own rectangle, by at least the padding,
+    # so neither bilinear filtering nor the first mipmaps read a neighbour.
+    on = np.flatnonzero(atlas.roof_page >= 0)
+    outside = 0
+    if len(on):
+        uv = atlas.roof_uv[on].astype(np.float64)
+        rect = atlas.roof_rect[on]
+        page = plan.placement[rect, 0]
+        width = np.array([plan.pages[p][0] for p in page], dtype=np.float64)
+        height = np.array([plan.pages[p][1] for p in page], dtype=np.float64)
+        px = uv[:, :, 0] * width[:, None]
+        py = (1.0 - uv[:, :, 1]) * height[:, None]
+        x0 = plan.placement[rect, 1].astype(np.float64)[:, None]
+        y0 = plan.placement[rect, 2].astype(np.float64)[:, None]
+        w = (plan.rects[rect, 2] - plan.rects[rect, 0]).astype(np.float64)[:, None]
+        h = (plan.rects[rect, 3] - plan.rects[rect, 1]).astype(np.float64)[:, None]
+        # Stored as float32: a few thousandths of a pixel on an 8192 page.
+        margin = float(plan.padding_px) - 0.01
+        inside = (
+            (uv >= 0.0).all(axis=2) & (uv <= 1.0).all(axis=2)
+            & (px >= x0 + margin) & (px <= x0 + w - margin)
+            & (py >= y0 + margin) & (py <= y0 + h - margin)
+        )
+        outside = int((~inside.all(axis=1)).sum())
+    report.add(
+        "roof_uvs_inside_their_rectangles",
+        outside == 0 and len(on) > 0,
+        f"{len(on)} roof triangles on the atlas, {outside} with a corner "
+        f"outside its building's rectangle; "
+        f"{int((atlas.roof_page < 0).sum())} left on the aerial",
+    )
+
+    report.add(
+        "roof_resolution_as_asked",
+        not plan.capped,
+        f"roofs at {plan.metres_per_px * 100:.1f} cm/px"
+        + (
+            f", coarser than the {plan.requested_m_per_px * 100:.1f} cm asked: "
+            f"at that resolution this area's roofs need more than the "
+            f"{plan.budget_px / 1e6:.0f} Mpx budget (buildings.roof_max_mpx)"
+            if plan.capped
+            else " as asked"
+        ),
+        severity="warning",
+    )
+
+    summary_path = work_dir / "blender_summary.json"
+    if out_dir is None or not summary_path.is_file():
+        return
+    try:
+        built = (json.loads(summary_path.read_text(encoding="utf-8")) or {}).get("roofs")
+    except (OSError, ValueError):
+        built = None
+    if built is None:
+        return
+    report.add(
+        "roofs_use_the_atlas",
+        int(built.get("atlas_triangles", 0)) == len(on),
+        f"the model has {int(built.get('atlas_triangles', 0))} roof triangles on "
+        f"{', '.join(built.get('materials') or []) or 'no roof material'} and "
+        f"{int(built.get('aerial_triangles', 0))} on the aerial, against {len(on)} "
+        f"planned on the atlas",
+    )
+
+
 def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
     """The terrain in the model is the grid the pipeline meant to build.
 
@@ -1466,6 +1598,7 @@ __all__ = [
     "check_harbour",
     "check_layered",
     "check_roads",
+    "check_roof_atlas",
     "check_terrain",
     "check_terrain_mesh",
     "write_report",
