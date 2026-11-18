@@ -716,10 +716,13 @@ model imports with the right settings by itself. It needs Unity 2021.3 or
 later. In *Window → Package Manager*, click **+** at the top left, choose *Add
 package from disk…* and pick `unity/com.terreinlab.importer/package.json` from
 this folder. Unity uses the package where it lies rather than copying it, so
-put the folder somewhere it will stay before you add it.
+put the folder somewhere it will stay before you add it. On a machine without
+this folder, the **?** dialog of the UI offers the package as a zip: unpack it
+and pick its `package.json` the same way.
 
-Then copy the whole output folder into `Assets/`. The FBX finds its textures by
-name beside it.
+Then copy the output folder into `Assets/`, all but `model.blend`. The FBX
+finds its textures by name beside it. Unity imports a `.blend` itself when
+Blender is installed on the machine, and the model would come in twice.
 
 The package treats an `.fbx` as a TerreinLab model when the same folder holds
 `metadata.json` and `ATTRIBUTION.txt` and the metadata gives the RD origin

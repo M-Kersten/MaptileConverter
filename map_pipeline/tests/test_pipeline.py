@@ -11442,6 +11442,27 @@ class TestBuildQueue(unittest.TestCase):
             self.assertEqual(info["zipped/model.fbx"].compress_type, zipfile.ZIP_DEFLATED)
             self.assertEqual(archive.read("zipped/model.fbx"), b"FBX " * 1000)
 
+    def test_the_unity_package_downloads_whole(self):
+        """The ? dialog hands out the package as a zip: every script with its
+        .meta, or Unity gives the components new ids on each machine."""
+        import io
+        import zipfile
+
+        folder = REPO_ROOT / "unity" / self.server.UNITY_PACKAGE
+        on_disk = {p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()}
+        buffer = io.BytesIO()
+        self.assertEqual(self.server.write_zip(folder, self.server.UNITY_PACKAGE, buffer), len(on_disk))
+        with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+            names = archive.namelist()
+        self.assertTrue(all(n.startswith(f"{self.server.UNITY_PACKAGE}/") for n in names))
+        inside = {n.split("/", 1)[1] for n in names}
+        self.assertEqual(inside, on_disk)
+        self.assertIn("package.json", inside)
+        self.assertIn("Editor.meta", inside)
+        for name in inside:
+            if name.endswith(".cs"):
+                self.assertIn(f"{name}.meta", inside)
+
     def test_a_name_of_dots_or_slashes_builds_nowhere(self):
         """".." passed the old character check and put a build in the project
         folder itself."""
