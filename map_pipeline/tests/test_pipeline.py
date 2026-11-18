@@ -12418,6 +12418,18 @@ class TestUnityPackage(unittest.TestCase):
         for colour, _ in textures:
             self.assertFalse(colour.name.endswith(names["NormalMapSuffix"]), colour.name)
 
+    def test_the_roof_pages_are_known_by_the_name_they_get(self):
+        """A page is sized to what it holds; imported as a colour texture it
+        would be scaled to a power of two and the roofs blurred again."""
+        from src import roofs
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        self.assertEqual(names["RoofPagePrefix"], f"{roofs.FILE_STEM}_")
+        settings = (self.PACKAGE / "Editor" / "TerreinLabImportSettings.cs").read_text(encoding="utf-8")
+        case = settings.split("case TextureRole.RoofPage:", 1)[1].split("break;", 1)[0]
+        self.assertIn("TextureImporterNPOTScale.None", case)
+        self.assertIn("SetLargeMaxSize", case)
+
     def test_the_tree_material_is_the_one_blender_hands_the_trees(self):
         import ast
 

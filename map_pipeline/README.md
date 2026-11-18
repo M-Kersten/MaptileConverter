@@ -820,7 +820,8 @@ the project alone. For a TerreinLab model it:
   it, and no rig or animation, since the model has none;
 - **sets up the textures beside it**: `aerial.png` at Max Size 8192, or 16384
   when the aerial is larger than 8192 px (Android, iOS, tvOS and WebGL stay at
-  8192); every `*_normal.png` as a normal map; `landcover.png` as data, which
+  8192); every `roofs_*.png` the same way, and kept at its own size rather than
+  scaled to a power of two; every `*_normal.png` as a normal map; `landcover.png` as data, which
   means no filtering, mipmaps or compression, and readable from scripts; and
   the rest with mipmaps and repeat wrapping. `fence.png` keeps its alpha
   coverage in every mipmap, so fences do not thin out with distance;

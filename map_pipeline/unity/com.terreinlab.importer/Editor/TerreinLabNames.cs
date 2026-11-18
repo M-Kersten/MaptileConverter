@@ -24,6 +24,12 @@ namespace TerreinLab.Importing
         /// <summary>The aerial photo the terrain and roofs carry (<c>export.aerial_name</c>).</summary>
         public const string AerialFile = "aerial.png";
 
+        /// <summary>
+        /// The start of every roof page, <c>roofs_00.png</c> and up (<c>FILE_STEM</c> in
+        /// <c>src/roofs.py</c>): the roofs at a finer resolution than the aerial, packed.
+        /// </summary>
+        public const string RoofPagePrefix = "roofs_";
+
         /// <summary>The surface class map, one class per pixel (<c>write_land_cover</c> in <c>src/surfaces.py</c>).</summary>
         public const string LandCoverFile = "landcover.png";
 

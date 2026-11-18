@@ -29,6 +29,9 @@ namespace TerreinLab.Importing
             /// <summary><c>aerial.png</c>: the photo over the whole area, on the terrain and the roofs.</summary>
             Aerial,
 
+            /// <summary><c>roofs_*.png</c>: a page of roofs from the same flight, finer than the aerial.</summary>
+            RoofPage,
+
             /// <summary><c>*_normal.png</c>: a facade normal map.</summary>
             NormalMap,
 
@@ -86,6 +89,9 @@ namespace TerreinLab.Importing
                 return TextureRole.Aerial;
             if (string.Equals(file, TerreinLabNames.LandCoverFile, StringComparison.OrdinalIgnoreCase))
                 return TextureRole.LandCover;
+            if (file.StartsWith(TerreinLabNames.RoofPagePrefix, StringComparison.OrdinalIgnoreCase)
+                && file.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                return TextureRole.RoofPage;
             if (file.EndsWith(TerreinLabNames.NormalMapSuffix, StringComparison.OrdinalIgnoreCase))
                 return TextureRole.NormalMap;
             return TextureRole.Colour;
@@ -111,6 +117,19 @@ namespace TerreinLab.Importing
                     // The photo covers the area exactly. Repeat would bleed the far edge into
                     // this one, and a roof overhanging the area would pick up the other side.
                     importer.wrapMode = TextureWrapMode.Clamp;
+                    SetLargeMaxSize(importer, png.LargestSide);
+                    break;
+
+                case TextureRole.RoofPage:
+                    importer.textureType = TextureImporterType.Default;
+                    importer.sRGBTexture = true;
+                    importer.mipmapEnabled = true;
+                    // Each roof keeps to its own rectangle on the page; repeat would only bring
+                    // the far edge of the page in.
+                    importer.wrapMode = TextureWrapMode.Clamp;
+                    // A page is sized to what it holds, 5504 x 5204 over Utrecht centre. The
+                    // default To nearest would scale it to 4096 x 4096 and blur every roof.
+                    importer.npotScale = TextureImporterNPOTScale.None;
                     SetLargeMaxSize(importer, png.LargestSide);
                     break;
 
