@@ -572,17 +572,17 @@
   <nav class="float" id="viewerTools" aria-label="Weergave">
     <button class="btn ghost" id="viewOverview" title="Het hele gebied, schuin van boven (Home)">Overzicht</button>
     <button class="btn ghost" id="viewTop" title="Recht van boven, met het noorden boven">Boven</button>
-    <button class="btn ghost" id="viewWire" aria-pressed="false" aria-label="Draadmodel"
-      title="De randen van de vlakken zoals Blender ze toont: quads als quads (Z)">
+    <button class="btn ghost" id="viewWire" aria-pressed="false" aria-label="Wireframe"
+      title="Wireframe: de edges zoals Blender ze toont, quads als quads, zonder textures (Z)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16v16H4zM4 12h16M12 4v16"/></svg>
-      <span class="label">Draadmodel</span>
+      <span class="label">Wireframe</span>
     </button>
     <button class="btn ghost icon" id="viewNorth" aria-label="Draai met het noorden boven" title="Noorden boven">
       <svg id="compass" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.5" fill="none" stroke="var(--line-control)" stroke-width="1.5"/><path d="M12 3.5 15.2 12H8.8z" fill="var(--signal-bright)"/><path d="M8.8 12h6.4L12 20.5z" fill="var(--text-muted)"/></svg>
     </button>
     <button class="btn ghost" id="toggleViewerLayers" aria-controls="viewerLayers">Lagen</button>
     <span class="help" tabindex="0" role="button" aria-label="Over de bediening"
-      data-tip="<b>Muis:</b> slepen verschuift, rechts slepen of Shift + slepen draait en kantelt, scrollen zoomt naar de cursor, dubbelklik vliegt erheen. Klik op iets om te zien wat het is en waar het ligt. <b>Draadmodel</b> (of Z) tekent de randen van de vlakken zoals Blender ze toont, quads als quads; die van het aangeklikte object in oranje. <b>Touch:</b> één vinger verschuift, twee vingers zoomen, draaien en kantelen. <b>Toetsen:</b> pijltjes verschuiven, Shift + pijltjes draaien en kantelen, + en − zoomen, Home toont het hele gebied.">?</span>
+      data-tip="<b>Muis:</b> slepen verschuift, rechts slepen of Shift + slepen draait en kantelt, scrollen zoomt naar de cursor, dubbelklik vliegt erheen. Klik op iets om te zien wat het is en waar het ligt. <b>Wireframe</b> (of Z) toont de edges zoals Blender ze toont, quads als quads, op een model zonder textures; die van het aangeklikte object in oranje. <b>Touch:</b> één vinger verschuift, twee vingers zoomen, draaien en kantelen. <b>Toetsen:</b> pijltjes verschuiven, Shift + pijltjes draaien en kantelen, + en − zoomen, Home toont het hele gebied.">?</span>
   </nav>
 
   <aside class="float" id="viewerLayers" aria-label="Lagen in het model">
@@ -1967,7 +1967,7 @@ function progress3d(stage, done, total) {
 }
 
 function statsLine(summary) {
-  return `${nl(summary.triangles)} driehoeken, ${nl(summary.objects)} objecten`;
+  return `${nl(summary.triangles)} triangles, ${nl(summary.objects)} objecten`;
 }
 
 function showLayers(summary) {
@@ -2033,9 +2033,9 @@ function showObject(info) {
     // export cuts them in two.
     const m = info.mesh, faces = [];
     if (m.quads) faces.push(`${nl(m.quads)} quads`);
-    if (m.triangles) faces.push(`${nl(m.triangles)} driehoeken`);
-    if (m.ngons) faces.push(`${nl(m.ngons)} n-hoeken`);
-    rows.push(["vlakken", faces.join(", ") || "geen"], ["hoekpunten", nl(m.vertices)]);
+    if (m.triangles) faces.push(`${nl(m.triangles)} triangles`);
+    if (m.ngons) faces.push(`${nl(m.ngons)} n-gons`);
+    rows.push(["faces", faces.join(", ") || "geen"], ["vertices", nl(m.vertices)]);
   }
   rows.push(...pointRows(info));
   $("infoProps").innerHTML = rows

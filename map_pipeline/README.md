@@ -210,7 +210,7 @@ Blender or Unity, and for showing it to someone who has neither.
 | Scroll | zoom towards the cursor |
 | Double-click | fly to that point |
 | Click | what it is and where: name, layer, properties, faces, RD and NAP |
-| Z, or **Draadmodel** | the wireframe on and off |
+| Z, or **Wireframe** | the wireframe on and off |
 | Touch | one finger moves, two fingers zoom, turn and tilt |
 | Keys | arrows move, Shift + arrows turn and tilt, + and − zoom, Home shows the whole area |
 
@@ -223,12 +223,12 @@ whether it came from the BGT register or was found in the height model. Under
 the cursor the page reads out RD and NAP all the time, so the view also measures
 a model against the map.
 
-**The wireframe is the mesh as Blender shows it.** **Draadmodel** draws the
-edges of every face over the model: quads as quads, n-gons whole, without the
+**The wireframe is the mesh as Blender shows it.** **Wireframe** draws the
+edges of every face over the model, with the textures off and the faces plain grey: quads as quads, n-gons whole, without the
 diagonals the export triangulation adds, so the 4 m squares, the rungs across a
 road and the rows along a verge can be checked in the browser as in Blender's
-edit mode. Lines are dark on a light surface and light on a dark one; the
-clicked object's are orange. Far off, where an edge of a few metres shrinks to
+edit mode. The lines are dark on the grey faces; the clicked object's are
+orange. Far off, where an edge of a few metres shrinks to
 a pixel or two, the lines fade, or the whole model would turn black: zoom in
 to read them. Switch layers off to look at one alone: the
 ground with the buildings and trees off is the layout the modellers asked for.

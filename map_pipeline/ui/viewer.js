@@ -229,6 +229,7 @@ uniform float u_shadowBias;
 uniform float u_shadows;
 uniform float u_selected;
 uniform vec3 u_highlight;
+uniform float u_plain;
 out vec4 o_color;
 ${COMMON}
 float sunlight(vec3 n) {
@@ -248,6 +249,8 @@ void main() {
   vec4 base = u_color;
   if (u_hasTexture > 0.5) base *= texture(u_texture, v_uv);
   if (base.a < u_cutoff) discard;
+  // Wireframe mode: plain faces, so only the edges catch the eye.
+  if (u_plain > 0.5) base.rgb = vec3(0.6);
   vec3 n = normalize(v_normal);
   if (!gl_FrontFacing) n = -n;
   vec3 toEye = normalize(u_eye - v_world);
@@ -256,7 +259,7 @@ void main() {
   vec3 ambient = mix(u_groundLight, u_skyLight, n.y * 0.5 + 0.5);
   vec3 color = base.rgb * (ambient + u_sunColor * max(facing, 0.0) * lit);
   // Water and anything else this smooth mirrors the sky at a low angle.
-  float gloss = clamp(1.0 - u_roughness / 0.3, 0.0, 1.0);
+  float gloss = u_plain > 0.5 ? 0.0 : clamp(1.0 - u_roughness / 0.3, 0.0, 1.0);
   if (gloss > 0.0) {
     float fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(n, toEye), 0.0), 5.0);
     color = mix(color, skyColor(reflect(-toEye, n), u_horizon, u_zenith, u_below), fresnel * gloss);
@@ -330,12 +333,14 @@ uniform float u_fogRange;
 uniform float u_selected;
 uniform vec3 u_highlight;
 uniform float u_focal;
+uniform float u_plain;
 out vec4 o_color;
 ${COMMON}
 void main() {
   vec4 base = u_color;
   if (u_hasTexture > 0.5) base *= texture(u_texture, v_uv);
   float light = dot(base.rgb, vec3(0.2126, 0.7152, 0.0722));
+  if (u_plain > 0.5) light = 1.0;
   vec3 color = light > 0.12 ? vec3(0.0) : vec3(1.0);
   float alpha = light > 0.12 ? 0.55 : 0.45;
   // Full where a metre is a few pixels or more, faint where edges a few
@@ -1117,6 +1122,7 @@ export class Viewer {
     gl.uniform1f(u.u_fogRange, this.radius * 2.2);
     // Far from any object number, -1 included: that is "no object".
     gl.uniform1f(u.u_selected, this.selected >= 0 ? this.selected : -1e9);
+    gl.uniform1f(u.u_plain, this.wireframe ? 1 : 0);
     const shadow = this.shadow && this.shadow.viewProj ? this.shadow : null;
     gl.uniform1f(u.u_shadows, shadow ? 1 : 0);
     if (shadow) {
@@ -1166,6 +1172,7 @@ export class Viewer {
     gl.uniform3fv(u.u_highlight, SELECTED);
     // Pixels per metre at a metre away, on the drawing buffer.
     gl.uniform1f(u.u_focal, this.canvas.height / (2 * Math.tan(FOV / 2)));
+    gl.uniform1f(u.u_plain, 1);
     gl.uniform1i(u.u_texture, 0);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
