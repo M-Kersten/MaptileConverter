@@ -46,6 +46,11 @@ const BELOW = [0.14, 0.15, 0.13];
 const PLACEHOLDER = [150, 150, 140, 255];
 const SELECTED = [1.0, 0.36, 0.02];
 
+// The physics proxies, drawn see-through over the model.
+const COLLISION_TINT = [0.95, 0.2, 0.8, 0.38];
+// Street detail further off than this is a pixel or less: left out.
+const DETAIL_REACH = 450;
+
 const MIN_PITCH = (4 * Math.PI) / 180;
 const MAX_PITCH = Math.PI / 2;
 const MIN_DISTANCE = 2;
@@ -230,6 +235,7 @@ uniform float u_shadows;
 uniform float u_selected;
 uniform vec3 u_highlight;
 uniform float u_plain;
+uniform vec4 u_overlay;
 out vec4 o_color;
 ${COMMON}
 float sunlight(vec3 n) {
@@ -269,6 +275,10 @@ void main() {
   if (abs(v_object - u_selected) < 0.5) color = mix(color, u_highlight, 0.45);
   float fog = clamp((length(u_eye - v_world) - u_fogStart) / u_fogRange, 0.0, 1.0);
   color = mix(color, u_horizon, fog * fog * 0.9);
+  if (u_overlay.a > 0.0) {
+    o_color = vec4(srgb(mix(color, u_overlay.rgb, 0.65)), u_overlay.a);
+    return;
+  }
   o_color = vec4(srgb(color), 1.0);
 }`;
 
@@ -583,7 +593,7 @@ export class Viewer {
      the area its ground covers, in the model's own X and Z
      ({ minX, maxX, minZ, maxZ }). Without it the ground layer's bounds
      stand in, which reach past the edge wherever a building does. */
-  async load(url, { textureBase = "", origin = null, extent = null } = {}) {
+  async load(url, { textureBase = "", origin = null, extent = null, camera = null } = {}) {
     const progress = this.on.progress || (() => {});
     this.origin = origin;
     this.extent = extent;
@@ -592,7 +602,12 @@ export class Viewer {
     progress("build", 0, 1);
     const { json, bin } = parseGlb(buffer);
     this.build(json, bin);
-    this.overview(false);
+    if (camera && Array.isArray(camera.target) && camera.target.length === 3 &&
+        [...camera.target, camera.distance, camera.yaw, camera.pitch].every(Number.isFinite)) {
+      this.flyTo(camera, false);
+    } else {
+      this.overview(false);
+    }
     progress("build", 1, 1);
     this.redraw();
     // Geometry first, so the model is there to look at while the photos
@@ -614,7 +629,11 @@ export class Viewer {
         name: described.name || gltf.nodes[nodeIndex].name || `Laag ${i + 1}`,
         objects: described.objects || 0,
         triangles: described.triangles || 0,
-        visible: true
+        // The physics proxies start switched off, and draw see-through.
+        visible: !described.hidden,
+        collision: !!described.collision,
+        // Street detail, left out far off where it would be a pixel.
+        detail: !!described.detail
       };
     });
 
@@ -692,14 +711,21 @@ export class Viewer {
           growingGround = layer === 0;
           if (position.min && position.max) {
             const box = corners(position.min, position.max);
+            // The draw's own box, to leave it out when it is out of view.
+            const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+            const add = p => {
+              grow(p);
+              for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[k]); hi[k] = Math.max(hi[k], p[k]); }
+            };
             if (instances) {
               for (let i = 0; i < draw.instances; i++) {
                 const m = instances.subarray(i * 16, i * 16 + 16);
-                box.forEach(c => grow(transformPoint(m, c)));
+                box.forEach(c => add(transformPoint(m, c)));
               }
             } else {
-              box.forEach(c => grow(transformPoint(matrix, c)));
+              box.forEach(c => add(transformPoint(matrix, c)));
             }
+            draw.box = { min: lo, max: hi };
           }
           if (layer === 0 && !instances && this.groundSample.length < 4000) {
             // A sample of the first layer's heights, the ground in every
@@ -813,14 +839,18 @@ export class Viewer {
     return vao;
   }
 
-  /* The wireframe of a draw: a line for every side of a triangle that is an
-     edge of the mesh, so a quad shows as a quad, as in Blender. A file with
-     no record of that shows every side. Made once, the first time. */
-  wireOf(d) {
-    if (d.wireLines !== undefined) return d.wireLines;
-    d.wireLines = null;
+  /* The wireframe of a draw. "quads": a line for every side of a triangle
+     that is an edge of the mesh, so a quad shows as a quad, as in Blender;
+     a file with no record of that shows every side. "triangles": every
+     side, as the export cuts the mesh and Unity receives it. Made once per
+     way, the first time it is asked for. */
+  wireOf(d, mode) {
+    d.wireLines = d.wireLines || {};
+    if (d.wireLines[mode] !== undefined) return d.wireLines[mode];
+    d.wireLines[mode] = null;
     if (!d.wire) return null;
-    const { indices, mask } = d.wire, triangles = Math.floor(indices.length / 3);
+    const { indices } = d.wire, mask = mode === "triangles" ? null : d.wire.mask;
+    const triangles = Math.floor(indices.length / 3);
     const lines = new Uint32Array(triangles * 6);
     let n = 0;
     for (let t = 0; t < triangles; t++) {
@@ -829,15 +859,14 @@ export class Viewer {
       if (sides & 2) { lines[n++] = indices[i + 1]; lines[n++] = indices[i + 2]; }
       if (sides & 4) { lines[n++] = indices[i + 2]; lines[n++] = indices[i]; }
     }
-    d.wire = null;
     if (!n) return null;
     const gl = this.gl, elements = gl.createBuffer();
     this.buffers.push(elements);
     gl.bindVertexArray(null);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, elements);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lines.subarray(0, n), gl.STATIC_DRAW);
-    d.wireLines = { vao: this.vertexArray(d.bindings, elements), count: n };
-    return d.wireLines;
+    d.wireLines[mode] = { vao: this.vertexArray(d.bindings, elements), count: n };
+    return d.wireLines[mode];
   }
 
   /* The ground's usual height: low, but not the bed of a canal. */
@@ -1123,6 +1152,8 @@ export class Viewer {
     // Far from any object number, -1 included: that is "no object".
     gl.uniform1f(u.u_selected, this.selected >= 0 ? this.selected : -1e9);
     gl.uniform1f(u.u_plain, this.wireframe ? 1 : 0);
+    gl.uniform4fv(u.u_overlay, [0, 0, 0, 0]);
+    this.cull(m);
     const shadow = this.shadow && this.shadow.viewProj ? this.shadow : null;
     gl.uniform1f(u.u_shadows, shadow ? 1 : 0);
     if (shadow) {
@@ -1150,8 +1181,19 @@ export class Viewer {
       gl.enable(gl.POLYGON_OFFSET_FILL);
       gl.polygonOffset(1, 1);
     }
-    this.drawAll(u, true);
+    this.drawAll(u, true, true, "solid");
     gl.disable(gl.POLYGON_OFFSET_FILL);
+    if (this.layers.some(l => l.collision && l.visible)) {
+      // See-through, after everything solid, writing no depth of its own.
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.depthMask(false);
+      gl.uniform4fv(u.u_overlay, COLLISION_TINT);
+      this.drawAll(u, true, true, "collision");
+      gl.uniform4fv(u.u_overlay, [0, 0, 0, 0]);
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+    }
     if (this.wireframe) this.drawWires(m);
     gl.bindVertexArray(null);
     if (this.on.view) this.on.view({ ...this.camera });
@@ -1181,8 +1223,8 @@ export class Viewer {
     gl.activeTexture(gl.TEXTURE0);
     let bound = null;
     for (const d of this.draws) {
-      if (!this.layers[d.layer] || !this.layers[d.layer].visible) continue;
-      const lines = this.wireOf(d);
+      if (!this.shown(d, true)) continue;
+      const lines = this.wireOf(d, this.wireframe);
       if (!lines) continue;
       const material = this.materials[d.material] || this.materials[0];
       const texture = this.textureFor(material);
@@ -1199,18 +1241,96 @@ export class Viewer {
     gl.disable(gl.BLEND);
   }
 
-  setWireframe(on) {
-    this.wireframe = !!on;
+  /* false, "quads" (the mesh as Blender shows it) or "triangles" (as the
+     export cuts it); true means quads. */
+  setWireframe(mode) {
+    this.wireframe = mode === true ? "quads" : mode === "triangles" || mode === "quads" ? mode : false;
     this.redraw();
   }
 
-  /* Every visible draw, with the program whose uniforms are `u` in use.
-     Unit 0 holds the placeholder when this starts. */
-  drawAll(u, withTextures) {
+  /* Where a point of the model is on the canvas, in CSS pixels, and whether
+     it is in front of the eye at all. */
+  project(point) {
+    const m = this.lastMatrices || this.matrices(), v = m.viewProj;
+    const [x, y, z] = point;
+    const cx = v[0] * x + v[4] * y + v[8] * z + v[12];
+    const cy = v[1] * x + v[5] * y + v[9] * z + v[13];
+    const cw = v[3] * x + v[7] * y + v[11] * z + v[15];
+    const rect = this.canvas.getBoundingClientRect();
+    if (cw <= 1e-6) return { x: 0, y: 0, front: false };
+    return { x: (cx / cw * 0.5 + 0.5) * rect.width, y: (0.5 - cy / cw * 0.5) * rect.height, front: true };
+  }
+
+  /* Fly to an object by its number, switch its layer on if it was off, and
+     select it. Returns what describe() says of its middle, or null. */
+  focusObject(id, animate = true) {
+    const entry = this.objects[id], b = entry && entry[4];
+    if (!Array.isArray(b) || b.length !== 6) return null;
+    const centre = [(b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2];
+    const size = Math.max(b[3] - b[0], b[4] - b[1], b[5] - b[2]);
+    const layer = this.layers[entry[1]];
+    if (layer && !layer.visible) this.setLayerVisible(entry[1], true);
+    this.flyTo({
+      target: centre, distance: clamp(size * 2.2 + 12, 12, this.radius * 6),
+      yaw: this.camera.yaw, pitch: Math.max(this.camera.pitch, 0.5)
+    }, animate);
+    this.select(id);
+    return this.describe({ id, point: centre });
+  }
+
+  getCamera() {
+    return { ...this.camera, target: this.camera.target.slice() };
+  }
+
+  /* Whether a draw is drawn: its layer on, and, when `culled`, in view as
+     the last cull() found it. */
+  shown(d, culled) {
+    const layer = this.layers[d.layer];
+    return !!layer && layer.visible && (!culled || d.inView !== false);
+  }
+
+  /* Leave out what the view cannot see: draws whose box is outside the view,
+     and street detail too far off to be more than a pixel. The geometry
+     comes in tiles, so on a big area most of it goes at street level. */
+  cull(m) {
+    const v = m.viewProj;
+    const row = i => [v[i], v[4 + i], v[8 + i], v[12 + i]];
+    const r = [row(0), row(1), row(2), row(3)];
+    const planes = [];
+    for (let k = 0; k < 3; k++) {
+      planes.push(r[3].map((x, i) => x + r[k][i]), r[3].map((x, i) => x - r[k][i]));
+    }
+    let drawn = 0;
+    for (const d of this.draws) {
+      let inside = true;
+      if (d.box) {
+        const { min, max } = d.box;
+        for (const [a, b, c, w] of planes) {
+          if (a * (a > 0 ? max[0] : min[0]) + b * (b > 0 ? max[1] : min[1]) +
+              c * (c > 0 ? max[2] : min[2]) + w < 0) { inside = false; break; }
+        }
+        if (inside && this.layers[d.layer] && this.layers[d.layer].detail) {
+          const e = m.eye;
+          const gap = [0, 1, 2].map(k => Math.max(min[k] - e[k], 0, e[k] - max[k]));
+          inside = Math.hypot(gap[0], gap[1], gap[2]) <= DETAIL_REACH;
+        }
+      }
+      d.inView = inside;
+      if (inside) drawn++;
+    }
+    this.drawn = drawn;
+  }
+
+  /* Every shown draw, with the program whose uniforms are `u` in use: the
+     solid layers, the collision layer, or "all". Unit 0 holds the
+     placeholder when this starts. */
+  drawAll(u, withTextures, culled = false, which = "all") {
     const gl = this.gl;
     let bound = this.placeholder;
     for (const d of this.draws) {
-      if (!this.layers[d.layer] || !this.layers[d.layer].visible) continue;
+      if (!this.shown(d, culled)) continue;
+      const collision = !!this.layers[d.layer].collision;
+      if ((which === "solid" && collision) || (which === "collision" && !collision)) continue;
       const material = this.materials[d.material] || this.materials[0];
       if (withTextures || material.cutoff > 0) {
         const texture = this.textureFor(material);
@@ -1324,7 +1444,7 @@ export class Viewer {
     gl.useProgram(program.program);
     gl.uniformMatrix4fv(program.uniforms.u_viewProj, false, s.viewProj);
     gl.uniform1i(program.uniforms.u_texture, 0);
-    this.drawAll(program.uniforms, false);
+    this.drawAll(program.uniforms, false, false, "solid");
     gl.disable(gl.POLYGON_OFFSET_FILL);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
@@ -1382,7 +1502,8 @@ export class Viewer {
     gl.uniform3fv(u.u_eye, m.eye);
     gl.uniform1f(u.u_far, m.far);
     gl.uniform1i(u.u_texture, 0);
-    this.drawAll(u, false);
+    this.cull(m);
+    this.drawAll(u, false, true, "all");
     gl.bindVertexArray(null);
 
     const object = new Uint8Array(4), distance = new Uint8Array(4);
@@ -1536,10 +1657,14 @@ export class Viewer {
         const [x, y] = local(e);
         pointers.delete(e.pointerId);
         if (gesture && gesture.kind !== "touch" && gesture.moved < 5 && gesture.button === 0) {
-          // A click, not a drag: what is this?
+          // A click, not a drag: what is this? Or, while measuring, where?
           const info = this.describe(this.pick(x, y));
-          this.select(info ? info.id : null);
-          (this.on.select || (() => {}))(info);
+          if (this.clickMode === "point") {
+            (this.on.point || (() => {}))(info);
+          } else {
+            this.select(info ? info.id : null);
+            (this.on.select || (() => {}))(info);
+          }
         }
         gesture = null;
         if (pointers.size) {

@@ -126,14 +126,28 @@ Open <http://127.0.0.1:8765>. The page is in Dutch and has three views.
   [The 3D view](#the-3d-view)); **Bekijken** opens
   the renders, the check results and the download links; **Opnieuw bouwen**
   opens the map with that area's square, name, style, detail and collision
-  setting filled in. A build that is running shows on top as a card with a
-  progress bar, the log and a stop button — also after a page reload, as the
-  page asks the server which runs are going (`/api/jobs`).
+  setting filled in, and **Verwijderen** deletes the model, its renders and its
+  intermediates after asking. **Alles downloaden als zip** in the dialog packs
+  `output/<area>/` into one file. A build that is running shows on top as a
+  card with a progress bar, the log and a stop button, also after a page
+  reload, as the page asks the server which runs are going (`/api/jobs`).
 - **Nieuw gebied** opens the map full screen: a search field top left, the
   layers drawer on the right, and a build bar along the bottom with name,
   width, style, detail, the time estimate and **Model bouwen**. Click the map to
   move the square, drag to pan, scroll to zoom. The defaults are the ones to
   use. Building takes you back to Modellen, where the run card follows it.
+
+**Builds queue.** One model is built at a time, as two Blender runs side by side
+only slow each other down. While one runs, the button reads **In de wachtrij
+zetten** and the next area waits under **Wachtrij** on Modellen, where **Uit de
+wachtrij** takes it off again. The queue lives on disk: every run keeps its
+settings and log in `work/<area>/run.json` and `run.log`, so a server that is
+stopped and started again picks the waiting runs back up. Stopping the server,
+with Ctrl+C or a plain `kill`, stops the run that is building, Blender
+included, and the next server shows it as *onderbroken*, with **Opnieuw
+starten** to build it again from its own settings. The stop button on a run
+card stops Blender too, so the next run in the queue has the machine to
+itself.
 
 The page uses the Virtuele Brigade colours. It names Rijksoverheid Sans in its
 font stack but does not ship the font; without it the browser's sans-serif is
@@ -155,7 +169,8 @@ straightening, contour spacing, road face size and more — and every one of the
 was a way to make the model worse that a newcomer had to learn to leave alone.
 They are gone; a config file that still sets one loads and says what replaced
 it. The **?** button opens *Wat je krijgt, en hoe je het opent*, which names the
-output files and gives the steps for Blender and Unity.
+output files, gives the steps for Blender and Unity and has the Unity importer
+package to download (see [Importing into Unity](#importing-into-unity)).
 
 The layers drawer lists every optional dataset with a switch and a live status
 light, so you pick what goes in and see what is answering right now. Terrain,
@@ -210,14 +225,22 @@ Blender or Unity, and for showing it to someone who has neither.
 | Scroll | zoom towards the cursor |
 | Double-click | fly to that point |
 | Click | what it is and where: name, layer, properties, faces, RD and NAP |
-| Z, or **Wireframe** | the wireframe on and off |
+| Z, or **Wireframe** | the wireframe on and off; **Quads** or **Triangles** beside it |
+| Shift + Z | the wireframe as triangles, the way the FBX and the graphics card see it |
+| M, or **Meten** | measure: click two points for the distance, the level distance and the height difference |
+| Search field | find an object by name or by a property, a BAG id say, and fly to it |
+| **Link** | copy the address of this view, camera included |
+| Esc | stop measuring, close the search |
 | Touch | one finger moves, two fingers zoom, turn and tilt |
 | Keys | arrows move, Shift + arrows turn and tilt, + and − zoom, Home shows the whole area |
 
 **Overzicht** and **Boven** frame the whole area, at an angle or straight from
 above with north up, and the compass turns the view back to north. **Lagen**
 lists every collection of the `.blend` with a switch: the trees off to see the
-street, the buildings off to see the ground. A click on a building gives its
+street, the buildings off to see the ground. The collision shapes are a layer
+too, off at first; switched on they lie over the model in translucent magenta,
+so a wall proxy that misses its wall or a barrier without one shows at a
+glance. A click on a building gives its
 BAG id, construction year and height from 3DBAG; on a tree its height and
 whether it came from the BGT register or was found in the height model. Under
 the cursor the page reads out RD and NAP all the time, so the view also measures
@@ -234,20 +257,35 @@ to read them. Switch layers off to look at one alone: the
 ground with the buildings and trees off is the layout the modellers asked for.
 A click also counts the object's faces and vertices as Blender does, with its
 modifiers and before the triangulation: the kerbed walkways of Utrecht centre
-are 44,166 quads, 2,504 triangles and 6 n-gons.
+are 44,166 quads, 2,504 triangles and 6 n-gons. **Triangles** beside the
+switch, or Shift + Z, draws the same mesh as the FBX carries it, every quad cut
+in two: the diagonals Unity will see.
 
-The address carries the model: `http://<your-machine>:8765/#3d/utrecht_dom`
-opens it straight away, and the browser's back button leaves it.
+**Meten** turns a click into a point: the first click sets one end, the second
+the other, and the card gives the straight distance, the distance over the
+ground plan and the height difference, in metres to the centimetre, with RD and
+NAP of both ends. A third click starts again. The search field top left finds
+objects by name or by a text property, so a BAG id taken from the BAG viewer
+finds its building, and a click on a result flies there and selects it.
+
+The address carries the model and the camera:
+`http://<your-machine>:8765/#3d/utrecht_dom/c=12.4,3.1,-40.2,180.0,0.785,0.611`
+opens that model from that spot (the point looked at in the model's own metres,
+the distance to it, then turn and tilt in radians), as the page keeps the
+address up to date while you look round. **Link** copies it, so a colleague sees the same corner. The
+browser's back button leaves the 3D view.
 
 **What it reads.** The Blender stage writes the view as its last step, to
 `work/<area>/viewer.glb`: a binary glTF of the scene with every modifier as the
 render has it, so the kerbs and the export triangulation are in, as in the FBX.
-The objects of a layer are merged per material, so a thousand buildings are a
-few dozen draws. The trees, ten thousand objects sharing a dozen meshes, stay
+The objects of a layer are merged per material and per tile, a grid of six by
+six over the area, so a thousand buildings are a few hundred draws and the page
+skips the tiles outside the view. Street furniture, barriers and vehicles are
+also left out beyond 450 m, where they would be a pixel each. The trees, ten thousand objects sharing a dozen meshes, stay
 instances (`EXT_mesh_gpu_instancing`), and normals are bytes
 (`KHR_mesh_quantization`). Every vertex carries the number of its object and
-the file lists the objects with their custom properties and face counts, which
-is what a click reads back. The wireframe costs a byte per triangle: which of
+the file lists the objects with their custom properties, face counts and
+bounds, which is what a click reads back and the search flies to. The wireframe costs a byte per triangle: which of
 its three sides are edges of the mesh. The triangulation is render-only and
 keeps every vertex and its number, so the edges are read from the scene as the
 viewport has it and looked up among the triangles' sides; the page makes the

@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
@@ -10854,9 +10855,10 @@ class TestUIPage(unittest.TestCase):
         self.assertNotIn('type="range"', self.html)
         controls = set(re.findall(r'<(?:input|select)[^>]*\bid="(\w+)"', self.html))
         groups = set(re.findall(r'<input type="radio" name="(\w+)"', self.html))
-        # The model list's own search and style filter are not build settings.
+        # The model list's own search and style filter are not build
+        # settings, and neither are the 3D view's search and wireframe choice.
         self.assertEqual(
-            (controls | groups) - {"modelStyle", "modelFilter"},
+            (controls | groups) - {"modelStyle", "modelFilter", "viewerSearch", "wireMode"},
             {"q", "size", "name", "style", "detail", "preview", "collision"},
         )
 
@@ -10925,17 +10927,16 @@ class TestUIPage(unittest.TestCase):
         """The layers list says "Bomen", not "Trees". A collection added in
         process.py without a name here would show up in English."""
         source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
-        exporter = (REPO_ROOT / "blender" / "web_export.py").read_text(encoding="utf-8")
         made = set(re.findall(r'_Layer\("([^"]+)"', source))
         prefixed = set(re.findall(r'_Layer\(f"\{prefix\}(_\w+)"', source))
         self.assertTrue(made and prefixed, "found no collections; the pattern moved")
-        skipped = set(re.findall(r'"([^"]+)"', re.search(
-            r"SKIPPED_COLLECTIONS = frozenset\(\{(.*?)\}\)", exporter).group(1)))
+        # The physics proxies too: they come in switched off, to be checked.
+        self.assertIn("Collision", made)
         named = set(re.findall(r'"([^"]+)":', re.search(
             r"const LAYER_NAME = \{(.*?)\n\};", self.html, re.S).group(1)))
         suffixes = set(re.findall(r'"(_\w+)":', re.search(
             r"const LAYER_SUFFIX = \{(.*?)\n\};", self.html, re.S).group(1)))
-        self.assertEqual(made - skipped - named, set())
+        self.assertEqual(made - named, set())
         self.assertEqual(prefixed - suffixes, set())
 
     def test_every_property_a_model_carries_has_a_label(self):
@@ -11170,11 +11171,14 @@ class TestWebView(unittest.TestCase):
             [[0, 1, 2], [0, 2, 3], [0, 1, 4]], slots=[0, 0, 1])
         box["materials"] = ["brick", "roof"]
         merged = {}
-        for object_id, offset in ((0, 0.0), (1, 30.0)):
+        # Two buildings side by side and one 900 m east: that one is in
+        # another tile, so the page can leave it out when it is not in view.
+        for object_id, offset in ((0, 0.0), (1, 30.0), (5, 900.0)):
             matrix = np.eye(4)
             matrix[0, 3] = offset
             for slot, part in web.split_by_slot(web.triangles_as_vertices(box, matrix), box["slots"]):
                 part["object"] = object_id
+                part["centre"] = (offset + 5.0, -3.0)
                 merged.setdefault((0, slot), []).append(part)
         tree = web.triangles_as_vertices(self._triangles([[0, 0, 0], [1, 0, 0], [0, 0, 1]], [[0, 1, 2]]), None)
         tree_parts = [(2, part) for _, part in web.split_by_slot(tree, np.zeros(1))]
@@ -11186,10 +11190,10 @@ class TestWebView(unittest.TestCase):
         material = {"name": "", "color": [0.5, 0.5, 0.5, 1.0], "texture": None,
                     "normal_texture": None, "roughness": 0.8, "metallic": 0.0, "cutout": False}
         data = {
-            "layers": [{"name": "Buildings", "objects": 2, "triangles": 6},
+            "layers": [{"name": "Buildings", "objects": 3, "triangles": 9},
                        {"name": "Trees", "objects": 3, "triangles": 3}],
             "objects": [["Pand_1", 0, {"bag_id": "NL.IMBAG.Pand.1"}], ["Pand_2", 0, {}],
-                        ["Tree_1", 1, {}], ["Tree_2", 1, {}], ["Tree_3", 1, {}]],
+                        ["Tree_1", 1, {}], ["Tree_2", 1, {}], ["Tree_3", 1, {}], ["Pand_3", 0, {}]],
             "materials": [dict(material, name="brick", texture="facade.png"),
                           dict(material, name="roof"),
                           dict(material, name="fence", texture="fence.png", cutout=True)],
@@ -11229,6 +11233,10 @@ class TestWebView(unittest.TestCase):
                 self.assertEqual(len(edges), len(indices) // 3)
                 self.assertTrue((edges <= 7).all())
 
+        # The far building drawn apart from the near two, per material.
+        brick = [m["name"] for m in document["meshes"] if m["name"].startswith("Buildings / brick")]
+        self.assertEqual(len(brick), 2, brick)
+
         instanced = [n for n in document["nodes"] if "extensions" in n]
         self.assertEqual(len(instanced), 1)
         parts = instanced[0]["extensions"]["EXT_mesh_gpu_instancing"]["attributes"]
@@ -11236,6 +11244,215 @@ class TestWebView(unittest.TestCase):
         self.assertEqual(set(counts.values()), {3})
         np.testing.assert_allclose(_accessor(document, binary, parts["TRANSLATION"])[0], [50.0, 0.0, -7.0])
         np.testing.assert_array_equal(_accessor(document, binary, parts["_OBJECT"]).ravel(), [2, 3, 4])
+
+
+class TestBuildQueue(unittest.TestCase):
+    """Runs wait their turn, survive the server stopping, and models can be
+    removed and handed over whole. The pipeline itself is stood in for."""
+
+    def setUp(self):
+        import threading
+        from unittest import mock
+
+        sys.path.insert(0, str(REPO_ROOT / "ui"))
+        import server
+
+        self.server = server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ran: list[str] = []
+        self.busy = 0
+        self.most = 0
+        self.gate = threading.Event()
+        self.gate.set()
+        lock = threading.Lock()
+
+        def fake_run(job, preview):
+            with lock:
+                self.busy += 1
+                self.most = max(self.most, self.busy)
+            job.status = "running"
+            self.gate.wait(10)
+            time.sleep(0.05)
+            with lock:
+                self.ran.append(job.name)
+                self.busy -= 1
+            job.status = "done"
+            job.finished = time.time()
+            job.save()
+
+        self.patches = [mock.patch.object(server, "REPO_ROOT", self.root),
+                        mock.patch.object(server, "run_job", fake_run)]
+        for patch in self.patches:
+            patch.start()
+        self.before = set(server.JOBS)
+
+    def tearDown(self):
+        self.gate.set()
+        for job_id in set(self.server.JOBS) - self.before:
+            job = self.server.JOBS[job_id]
+            self._wait(lambda j=job: j.status in self.server.FINISHED)
+        for patch in self.patches:
+            patch.stop()
+        with self.server.JOBS_LOCK:
+            for job_id in set(self.server.JOBS) - self.before:
+                self.server.JOBS.pop(job_id, None)
+                if job_id in self.server.JOBS_ORDER:
+                    self.server.JOBS_ORDER.remove(job_id)
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _wait(condition, seconds=10.0):
+        end = time.time() + seconds
+        while time.time() < end:
+            if condition():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _job(self, name):
+        bbox = {"xmin": 136000, "ymin": 455000, "xmax": 136500, "ymax": 455500}
+        return self.server.Job(f"q-{name}", name, {"name": name, "bbox": bbox}, 60.0)
+
+    def test_runs_wait_their_turn_one_at_a_time(self):
+        jobs = [self._job(n) for n in ("first", "second", "third")]
+        for job in jobs:
+            self.server.submit(job)
+        self.assertTrue(self._wait(lambda: len(self.ran) == 3))
+        self.assertEqual(self.ran, ["first", "second", "third"])
+        self.assertEqual(self.most, 1, "two builds ran at once")
+        # Each kept its record beside its work files.
+        record = json.loads((self.root / "work" / "second" / "run.json").read_text())
+        self.assertEqual(record["status"], "done")
+
+    def test_a_waiting_run_can_be_taken_out(self):
+        self.gate.clear()
+        running, waiting = self._job("running"), self._job("waiting")
+        self.server.submit(running)
+        self.assertTrue(self._wait(lambda: running.status == "running"))
+        self.server.submit(waiting)
+        self.assertEqual(self.server.active_job("waiting"), waiting)
+        self.server.cancel(waiting)
+        self.gate.set()
+        self.assertTrue(self._wait(lambda: running.status == "done"))
+        time.sleep(0.2)
+        self.assertEqual(self.ran, ["running"])
+        self.assertEqual(waiting.status, "cancelled")
+
+    def test_a_restarted_server_finds_its_runs(self):
+        """What was running is shown as interrupted, with its log; what was
+        waiting is built."""
+        for name, status in (("cut_off", "running"), ("next_up", "queued")):
+            folder = self.root / "work" / name
+            folder.mkdir(parents=True)
+            (folder / "ui_config.json").write_text(json.dumps({"name": name, "bbox": {"xmin": 1}}))
+            (folder / "run.json").write_text(json.dumps({
+                "id": f"r-{name}", "name": name, "status": status, "queued_at": time.time(),
+                "estimate": 60, "preview": False, "step": 4, "total_steps": 15}))
+        (self.root / "work" / "cut_off" / "run.log").write_text("Step 4/15  buildings\n")
+        self.assertEqual(self.server.restore_jobs(), 1)
+        cut = self.server.JOBS["r-cut_off"]
+        self.assertEqual(cut.status, "interrupted")
+        self.assertIn("Step 4/15  buildings", cut.lines)
+        self.assertEqual(cut.snapshot(0)["fraction"], 1.0)
+        self.assertTrue(self._wait(lambda: self.ran == ["next_up"]))
+        saved = json.loads((self.root / "work" / "cut_off" / "run.json").read_text())
+        self.assertEqual(saved["status"], "interrupted")
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    def test_stopping_a_run_stops_what_it_started(self):
+        """Blender runs as the pipeline's child: stopping the pipeline alone
+        left Blender building on."""
+        import subprocess
+
+        pid_file = self.root / "grandchild.pid"
+        script = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(60)\n"
+        )
+        process = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
+        self.assertTrue(self._wait(lambda: pid_file.is_file() and pid_file.read_text().strip()))
+        grandchild = int(pid_file.read_text())
+        self.server.stop_process(process)
+        self.assertIsNotNone(process.poll())
+
+        def gone():
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                return True
+            # Still a zombie until init reaps it: dead all the same.
+            try:
+                with open(f"/proc/{grandchild}/stat") as stat:
+                    return stat.read().split(") ")[1].startswith("Z")
+            except OSError:
+                return True
+            return False
+
+        self.assertTrue(self._wait(gone, 5), "the grandchild outlived the stop")
+
+    def test_a_server_that_stops_marks_its_run_interrupted(self):
+        self.gate.clear()
+        job = self._job("cut_short")
+        self.server.submit(job)
+        self.assertTrue(self._wait(lambda: job.status == "running"))
+        self.server.stop_running()
+        self.assertEqual(job.status, "interrupted")
+        record = json.loads((self.root / "work" / "cut_short" / "run.json").read_text())
+        self.assertEqual(record["status"], "interrupted")
+        # The stand-in finishes by itself; give the record back its end.
+        self.gate.set()
+
+    def test_a_model_is_removed_with_its_work_files(self):
+        for root in ("output", "work"):
+            (self.root / root / "old_area").mkdir(parents=True)
+            (self.root / root / "old_area" / "file.txt").write_text("x")
+        self.assertIsNone(self.server.delete_area("old_area"))
+        self.assertFalse((self.root / "output" / "old_area").exists())
+        self.assertFalse((self.root / "work" / "old_area").exists())
+        self.assertEqual(self.server.delete_area("old_area")[0], 404)
+        self.assertEqual(self.server.delete_area("..")[0], 400)
+
+    def test_a_model_being_built_is_not_removed(self):
+        self.gate.clear()
+        job = self._job("busy_area")
+        (self.root / "output" / "busy_area").mkdir(parents=True)
+        self.server.submit(job)
+        self.assertEqual(self.server.delete_area("busy_area")[0], 409)
+        self.assertTrue((self.root / "output" / "busy_area").is_dir())
+
+    def test_a_model_zips_whole_with_pictures_stored(self):
+        import io
+        import zipfile
+
+        folder = self.root / "output" / "zipped"
+        (folder / "preview").mkdir(parents=True)
+        (folder / "model.fbx").write_bytes(b"FBX " * 1000)
+        (folder / "aerial.png").write_bytes(b"\x89PNG" + bytes(500))
+        (folder / "preview" / "preview_top.png").write_bytes(b"\x89PNG")
+        buffer = io.BytesIO()
+        self.assertEqual(self.server.write_zip(folder, "zipped", buffer), 3)
+        with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+            info = {i.filename: i for i in archive.infolist()}
+            self.assertEqual(set(info), {"zipped/model.fbx", "zipped/aerial.png",
+                                         "zipped/preview/preview_top.png"})
+            self.assertEqual(info["zipped/aerial.png"].compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(info["zipped/model.fbx"].compress_type, zipfile.ZIP_DEFLATED)
+            self.assertEqual(archive.read("zipped/model.fbx"), b"FBX " * 1000)
+
+    def test_a_name_of_dots_or_slashes_builds_nowhere(self):
+        """".." passed the old character check and put a build in the project
+        folder itself."""
+        for name in ("..", ".", "a/b"):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({"name": name, "bbox": {
+                    "crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
+                    "xmax": 137000, "ymax": 456000}}))
+                with self.assertRaises(ValueError, msg=name):
+                    load_config(path)
 
 
 # A small model, saved by Blender itself: a building with a render-only
@@ -11281,6 +11498,8 @@ for i in range(10):
     trees.objects.link(tree)
 
 layer("Collision").objects.link(bpy.data.objects.new("Collision_box", box.copy()))
+# Hidden in the viewport, as process.py leaves it.
+bpy.context.view_layer.layer_collection.children["Collision"].hide_viewport = True
 bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1])
 """
 
@@ -11314,16 +11533,21 @@ class TestWebViewInBlender(unittest.TestCase):
         # Stamped with the save it shows, which is how the page knows it.
         self.assertEqual(stamp["source"], "model.blend")
         self.assertEqual((stamp["source_size"], stamp["source_mtime_ns"]), (saved.st_size, saved.st_mtime_ns))
-        self.assertEqual(stamp["triangles"], 12 + 10 * 4)
+        # The building, ten trees, and the collision proxy of the building.
+        self.assertEqual(stamp["triangles"], 12 + 10 * 4 + 12)
         tables = document["extras"]["terreinlab"]
-        # The physics proxies are never drawn, so they are not in the view.
-        self.assertEqual([layer["name"] for layer in tables["layers"]], ["Buildings", "Trees"])
-        self.assertEqual(len(tables["objects"]), 11)
+        # The physics proxies are in, switched off until asked for.
+        self.assertEqual([layer["name"] for layer in tables["layers"]], ["Buildings", "Trees", "Collision"])
+        self.assertTrue(tables["layers"][2]["hidden"] and tables["layers"][2]["collision"])
+        self.assertNotIn("hidden", tables["layers"][0])
+        self.assertEqual(len(tables["objects"]), 12)
         building = next(o for o in tables["objects"] if o[0] == "Pand_1")
         self.assertEqual(building[2], {"bag_id": "NL.IMBAG.Pand.1", "build_year": 1900})
         # Counted as Blender shows it: six quads, before the render-only
         # triangulation cuts them.
         self.assertEqual(building[3], [8, 0, 6, 0])
+        # Its box, in glTF axes, for the page's search to fly to.
+        np.testing.assert_allclose(building[4], [0, 0, -6, 10, 9, 0], atol=0.01)
 
         # The building, merged, in glTF axes: north is -Z.
         merged = [n for n in document["nodes"] if "mesh" in n and "extensions" not in n]

@@ -693,6 +693,11 @@ def load_config(path: str | Path) -> PipelineConfig:
     name = str(merged["name"]).strip()
     if not name:
         raise ValueError("config 'name' must not be empty")
+    # The name is a folder in work/ and in output/: one folder, inside them.
+    if set(name) <= {"."} or any(sep in name for sep in ("/", "\\")):
+        raise ValueError(
+            f"config 'name' {name!r} must be a plain folder name: no slashes, not only dots"
+        )
 
     ahn_model = str(merged["terrain"]["ahn_model"]).strip().upper()
     if ahn_model not in ("DTM", "DSM"):
