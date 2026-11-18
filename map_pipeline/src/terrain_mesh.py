@@ -449,11 +449,18 @@ def _feature_mesh(terrain, layers, bodies, *, row_m: float, water_depth_m: float
 
     xs_rd, ys_rd = terrain.xs, terrain.ys
     grid_m = float(terrain.grid_m)
-    # Local coordinates from the first grid node: the grid nodes then sit
-    # exactly on the snapping grid, and the numbers stay small.
+    # Local coordinates from the first grid node, so the numbers stay small,
+    # and every grid node rounded to the centimetre everything else meets on.
+    # The grid spacing is the bbox divided into whole squares, so it is a
+    # whole number of centimetres only by luck: 250 m at draft detail is 63
+    # squares of 3.968254 m. A grid square kept its exact corners while the
+    # faces beside it, noded on the centimetre grid, had theirs at 3.97, and
+    # every edge between the two was a crack (2,818 over Utrecht Vismarkt).
     ox, oy = float(xs_rd[0]), float(ys_rd[0])
-    xs = np.round(xs_rd - ox, 6)
-    ys = np.round(ys_rd - oy, 6)
+    exact_xs = np.round(xs_rd - ox, 6)
+    exact_ys = np.round(ys_rd - oy, 6)
+    xs = _snap(exact_xs)
+    ys = _snap(exact_ys)
     shift = np.array([ox, oy])
     layers = [(k, shapely.transform(g, lambda c: c - shift)) for k, g in layers]
     bodies = [(shapely.transform(g, lambda c: c - shift), level) for g, level in bodies]
@@ -557,11 +564,19 @@ def _feature_mesh(terrain, layers, bodies, *, row_m: float, water_depth_m: float
         unique = unique[used]
 
     xy = local_xy + shift
-    heights = np.asarray(terrain.sample(xy[:, 0], xy[:, 1]), dtype=np.float64)
+    # A grid node takes the height of the node itself, read where it really
+    # is rather than at the centimetre it was rounded to.
+    column = _node_index(local_xy[:, 0], xs)
+    row = _node_index(local_xy[:, 1], ys)
+    on_grid = (column >= 0) & (row >= 0)
+    at = xy.copy()
+    at[on_grid, 0] = exact_xs[column[on_grid]] + ox
+    at[on_grid, 1] = exact_ys[row[on_grid]] + oy
+    heights = np.asarray(terrain.sample(at[:, 0], at[:, 1]), dtype=np.float64)
     # Off the grid nodes, read the survey itself: a vertex on an outline or in
     # a row sits on the bank or the edge it follows, and the grid between its
     # nodes is a blur of exactly that.
-    off_grid = ~_on_grid_nodes(local_xy, grid_m)
+    off_grid = ~on_grid
     surveyed = _survey_heights(terrain, xy[off_grid])
     if surveyed is not None:
         heights[off_grid] = np.where(np.isfinite(surveyed), surveyed, heights[off_grid])
@@ -605,10 +620,12 @@ def _feature_mesh(terrain, layers, bodies, *, row_m: float, water_depth_m: float
     )
 
 
-def _on_grid_nodes(local_xy: np.ndarray, grid_m: float) -> np.ndarray:
-    """Whether each local point is a node of the regular grid."""
-    f = local_xy / grid_m
-    return (np.abs(f - np.rint(f)) < 1e-6).all(axis=1)
+def _node_index(values: np.ndarray, nodes: np.ndarray, tol: float = 1e-6) -> np.ndarray:
+    """Per value, the index of the grid line it lies on, or -1."""
+    values = np.asarray(values, dtype=np.float64)
+    i = np.clip(np.searchsorted(nodes, values), 1, len(nodes) - 1)
+    i = np.where(np.abs(nodes[i - 1] - values) <= np.abs(nodes[i] - values), i - 1, i)
+    return np.where(np.abs(nodes[i] - values) < tol, i, -1)
 
 
 def _survey_heights(terrain, xy: np.ndarray, half_m: float = 0.75):
@@ -1107,16 +1124,25 @@ def _core_cells(area, xs, ys, taken):
     if area.is_empty:
         return np.zeros((0, 2), dtype=np.int64)
     x0, y0, x1, y1 = area.bounds
-    g = float(xs[1] - xs[0])
-    i0 = max(0, int(np.floor((x0 - xs[0]) / g)))
-    i1 = min(len(xs) - 1, int(np.ceil((x1 - xs[0]) / g)))
-    j0 = max(0, int(np.floor((y0 - ys[0]) / g)))
-    j1 = min(len(ys) - 1, int(np.ceil((y1 - ys[0]) / g)))
+    # The grid lines as they are: rounded to the centimetre, the squares are
+    # not all quite the same size, and stepping from the first by one size
+    # drifts off them.
+    i0 = max(0, int(np.searchsorted(xs, x0, side="right")) - 1)
+    i1 = min(len(xs) - 1, int(np.searchsorted(xs, x1, side="left")))
+    j0 = max(0, int(np.searchsorted(ys, y0, side="right")) - 1)
+    j1 = min(len(ys) - 1, int(np.searchsorted(ys, y1, side="left")))
     if i1 <= i0 or j1 <= j0:
         return np.zeros((0, 2), dtype=np.int64)
     shapely.prepare(area)
-    hx = xs[0] + 0.5 * g * np.arange(2 * i0, 2 * i1 + 1)
-    hy = ys[0] + 0.5 * g * np.arange(2 * j0, 2 * j1 + 1)
+
+    def halves(nodes):
+        out = np.empty(2 * len(nodes) - 1)
+        out[0::2] = nodes
+        out[1::2] = 0.5 * (nodes[:-1] + nodes[1:])
+        return out
+
+    hx = halves(np.asarray(xs[i0: i1 + 1], dtype=np.float64))
+    hy = halves(np.asarray(ys[j0: j1 + 1], dtype=np.float64))
     X, Y = np.meshgrid(hx, hy)
     # On the outline counts as in, so squares reach the edge of the area.
     inside = shapely.intersects_xy(area, X, Y)
@@ -1274,7 +1300,8 @@ def _mesh_region(region, kind, frame, outer, xs, ys, taken, *, row_m, margin_m, 
     in_core = np.zeros(len(faces), dtype=bool)
     if len(cells):
         centres = shapely.points(np.column_stack(
-            [xs[cells[:, 0]] + 0.5 * grid_m, ys[cells[:, 1]] + 0.5 * grid_m]
+            [0.5 * (xs[cells[:, 0]] + xs[cells[:, 0] + 1]),
+             0.5 * (ys[cells[:, 1]] + ys[cells[:, 1] + 1])]
         ))
         hit = shapely.STRtree(faces).query(centres, predicate="within")
         in_core[np.unique(hit[1])] = True

@@ -7481,6 +7481,45 @@ class TestTerrainMeshAwkwardShapes(unittest.TestCase):
         ditch = [(10.0, 40.0), (40.0, 41.75), (40.0, 42.25), (10.0, 44.0)]
         self._closed(water=self._water(ditch))
 
+    def test_a_grid_spacing_that_is_not_whole_centimetres(self):
+        """100 m in 33 squares of 3.0303 m, as 250 m at draft detail is 63 of
+        3.968254 m. The grid squares kept their exact corners while the faces
+        beside them, noded on the centimetre grid, had theirs rounded: every
+        edge between the two was a crack (2,818 over Utrecht Vismarkt)."""
+        import types
+
+        from src.elevation import TerrainResult
+        from src.geo import BBox
+        from src.terrain_mesh import CORE
+
+        bbox = BBox(1000.0, 2000.0, 1100.0, 2100.0)
+        axis = np.linspace(0.0, 100.0, 34)
+        gx, gy = np.meshgrid(1000.0 + axis, 2000.0 + axis)
+        heights = (2.0 + 0.3 * np.sin(gx / 7.0) * np.cos(gy / 9.0)).astype(np.float32)
+        terrain = TerrainResult(
+            heights=heights.copy(), xs=1000.0 + axis, ys=2000.0 + axis, bbox=bbox,
+            center_z_nap=2.0, nodata_fraction_raw=0.0, filled_fraction=0.0,
+            geotiff_path=None, coverage_id="t", resolution_m=0.5, measured=heights.copy(),
+        )
+        corners = np.array([[1030.0, 2030.0], [1055.0, 2032.0], [1052.0, 2061.0], [1028.0, 2058.0]])
+        roof = np.concatenate([corners, np.full((4, 1), 8.0)], axis=1)
+        house = types.SimpleNamespace(roof_tris=roof[[[0, 1, 2], [0, 2, 3]]])
+        pond = [(1070.0, 2070.0), (1090.0, 2072.0), (1088.0, 2090.0), (1072.0, 2088.0)]
+        saved, self.terrain = self.terrain, terrain
+        try:
+            mesh = self._closed(
+                buildings=types.SimpleNamespace(buildings=[house]),
+                water=self._water([(x + 0.0, y + 0.0) for x, y in pond]),
+            )
+        finally:
+            self.terrain = saved
+        self.assertTrue((mesh.face_part == CORE).any())
+        # A grid node, rounded to the centimetre, still has the node's height.
+        node = np.argmin(np.hypot(mesh.vertices[:, 0] - 1000.0 - axis[11],
+                                  mesh.vertices[:, 1] - 2000.0 - axis[5]))
+        self.assertLess(abs(mesh.vertices[node, 0] - 1000.0 - axis[11]), 0.006)
+        self.assertAlmostEqual(float(mesh.measured_z[node]), float(heights[5, 11]), places=5)
+
 
 def types_namespace(**kwargs):
     import types
