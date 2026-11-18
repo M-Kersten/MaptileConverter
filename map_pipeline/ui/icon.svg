@@ -1,21 +1,26 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="TerreinLab">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="TerreinLab">
   <title>TerreinLab</title>
-  <!-- A tile of ground in four squares; the one picked on the map rises
-       out of it as a model. -->
-  <defs>
-    <clipPath id="tl-slab"><path d="M6 36 L32 22 L58 36 L58 42 L32 56 L6 42 Z"/></clipPath>
-  </defs>
-  <rect width="64" height="64" rx="14" fill="#0a2c36"/>
-  <g clip-path="url(#tl-slab)">
-    <path d="M6 36 L32 50 L32 56 L6 42 Z" fill="#1e4654"/>
-    <path d="M32 50 L58 36 L58 42 L32 56 Z" fill="#163d4a"/>
-    <path d="M6 36 L32 22 L58 36 L32 50 Z" fill="#3d6676"/>
-    <g fill="#0a2c36">
-      <path d="M17.6 29.8 L20.4 28.2 L46.4 42.2 L46.4 50 L43.6 50 L43.6 43.8 Z"/>
-      <path d="M17.6 42.2 L43.6 28.2 L46.4 29.8 L20.4 43.8 L20.4 50 L17.6 50 Z"/>
-    </g>
+  <!-- The square the app cuts out of the map, lifted: its soil in layers, the
+       orange seam where it was cut, and the town on top. -->
+  <rect width="100" height="100" rx="22" fill="#0a2c36"/>
+  <g transform="translate(50 50) scale(1.12) translate(-50 -46.8)">
+  <path d="M26.00 42.00 Q38.00 48.00 50.00 54.00 L50.00 62.16 Q38.00 58.36 26.00 50.16 Z" fill="#a6c1cc"/>
+  <path d="M50.00 54.00 Q62.00 48.00 74.00 42.00 L74.00 50.16 Q62.00 54.76 50.00 62.16 Z" fill="#6f93a2"/>
+  <path d="M26.00 50.16 Q38.00 58.36 50.00 62.16 L50.00 70.08 Q38.00 65.68 26.00 58.08 Z" fill="#7f9fad"/>
+  <path d="M50.00 62.16 Q62.00 54.76 74.00 50.16 L74.00 58.08 Q62.00 65.88 50.00 70.08 Z" fill="#4d7282"/>
+  <path d="M26.00 58.08 Q38.00 65.68 50.00 70.08 L50.00 78.00 Q38.00 72.00 26.00 66.00 Z" fill="#628797"/>
+  <path d="M50.00 70.08 Q62.00 65.88 74.00 58.08 L74.00 66.00 Q62.00 72.00 50.00 78.00 Z" fill="#365b6a"/>
+  <path d="M26.00 50.16 Q38.00 58.36 50.00 62.16 M50.00 62.16 Q62.00 54.76 74.00 50.16" fill="none" stroke="#e8871e" stroke-width="2.3" stroke-linejoin="round"/>
+  <polygon points="26.00,42.00 50.00,30.00 74.00,42.00 50.00,54.00" fill="#a9c1cb"/>
+  <polygon points="46.88,42.00 50.00,43.56 50.00,28.56 46.88,27.00" fill="#e3ebee"/>
+  <polygon points="50.00,43.56 53.12,42.00 53.12,27.00 50.00,28.56" fill="#b3c6cd"/>
+  <polygon points="46.88,27.00 50.00,28.56 50.00,15.60" fill="#e3ebee"/>
+  <polygon points="50.00,28.56 53.12,27.00 50.00,15.60" fill="#b3c6cd"/>
+  <polygon points="33.20,42.60 38.00,45.00 38.00,39.96 33.20,37.56" fill="#e3ebee"/>
+  <polygon points="38.00,45.00 42.80,42.60 42.80,37.56 38.00,39.96" fill="#b3c6cd"/>
+  <polygon points="33.20,37.56 38.00,35.16 42.80,37.56 38.00,39.96" fill="#ffffff"/>
+  <polygon points="57.20,42.60 62.00,45.00 62.00,39.00 57.20,36.60" fill="#e3ebee"/>
+  <polygon points="62.00,45.00 66.80,42.60 66.80,36.60 62.00,39.00" fill="#b3c6cd"/>
+  <polygon points="57.20,36.60 62.00,34.20 66.80,36.60 62.00,39.00" fill="#ffffff"/>
   </g>
-  <path d="M19 29 L32 36 L32 21 L19 14 Z" fill="#ca6302"/>
-  <path d="M32 36 L45 29 L45 14 L32 21 Z" fill="#9c4c02"/>
-  <path d="M19 14 L32 7 L45 14 L32 21 Z" fill="#e8871e"/>
 </svg>
