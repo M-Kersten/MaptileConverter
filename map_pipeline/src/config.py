@@ -61,6 +61,9 @@ DEFAULTS: dict[str, Any] = {
         # Quay faces along the BGT quay walls, jetties and pontoons as decks,
         # mooring posts as posts (src/harbour.py).
         "harbour": True,
+        # Steel guardrails along the motorway's verges and down its central
+        # reservation, as one object (<prefix>_Geleiderail; src/guardrails.py).
+        "guardrails": True,
         # The curb generator on every walkway and traffic island. Needs
         # Blender 5; with an older one the walkways stay flat.
         "kerbs": True,
@@ -808,6 +811,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     layered["mesher"] = mesher
     layered["water_surface"] = bool(layered.get("water_surface", True))
     layered["harbour"] = bool(layered.get("harbour", True))
+    layered["guardrails"] = bool(layered.get("guardrails", True))
     layered["water_level_offset_m"] = float(layered.get("water_level_offset_m", 0.0))
     for key in ("outline_m", "ditch_depth_m"):
         value = float(layered[key])
