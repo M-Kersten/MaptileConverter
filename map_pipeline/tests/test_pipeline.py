@@ -11,6 +11,7 @@ Run only the offline tests:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -47,6 +48,8 @@ from src.http_util import extract_service_exception, looks_like_xml  # noqa: E40
 from src.geo import tile_edges  # noqa: E402
 
 RUN_NETWORK = "--offline" not in sys.argv
+# Found, not imported: importing it loads the whole of Blender.
+HAVE_BPY = importlib.util.find_spec("bpy") is not None
 
 
 
@@ -5355,9 +5358,12 @@ class TestBlenderStageIsolation(unittest.TestCase):
         return modules
 
     def test_blender_scripts_import_nothing_extra(self):
-        allowed = self.BUNDLED | set(sys.stdlib_module_names)
         scripts = sorted((REPO_ROOT / "blender").glob("*.py"))
         self.assertTrue(scripts, "no Blender scripts found")
+        # A script may import another one beside it -- process.py writes the
+        # 3D view with web_export.py -- because that one is held to this
+        # same rule here.
+        allowed = self.BUNDLED | set(sys.stdlib_module_names) | {s.stem for s in scripts}
 
         for script in scripts:
             extra = self._imported_modules(script) - allowed
@@ -10896,6 +10902,580 @@ class TestUIPage(unittest.TestCase):
             self.assertEqual(shown[style]["unticked"], unticked, style)
         sentences = re.search(r"const STYLE_PLAIN = \{(.*?)\n\};", self.html, re.S).group(1)
         self.assertEqual(set(re.findall(r"^\s*(\w+):", sentences, re.M)), set(STYLE_PRESETS))
+
+
+    def test_the_3d_view_is_there_and_starts_hidden(self):
+        """Opened from a model's card, its dialog and a finished run."""
+        for wanted in ("view3d", "viewerCanvas", "viewerLayers", "viewerInfo",
+                       "viewerStatus", "viewerBack", "open3dModel", "open3dResult"):
+            self.assertIn(wanted, self.page.ids, f"the page lost #{wanted}")
+        self.assertRegex(self.html, r'<section id="view3d"[^>]*\bhidden\b',
+                         "the 3D view should start hidden behind Modellen")
+        self.assertIn('import("/viewer.js")', self.html)
+
+    def test_the_viewer_needs_nothing_from_outside(self):
+        """Like the rest of the page: no library, nothing fetched from
+        another host, so it works where only this server can be reached."""
+        script = (REPO_ROOT / "ui" / "viewer.js").read_text(encoding="utf-8")
+        self.assertNotRegex(script, r"(?m)^\s*import\s", "viewer.js imports a module")
+        self.assertNotRegex(script, r"https?://", "viewer.js reaches for another host")
+        self.assertIn("export class Viewer", script)
+
+    def test_every_layer_the_blender_stage_makes_has_a_name_on_the_page(self):
+        """The layers list says "Bomen", not "Trees". A collection added in
+        process.py without a name here would show up in English."""
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        exporter = (REPO_ROOT / "blender" / "web_export.py").read_text(encoding="utf-8")
+        made = set(re.findall(r'_Layer\("([^"]+)"', source))
+        prefixed = set(re.findall(r'_Layer\(f"\{prefix\}(_\w+)"', source))
+        self.assertTrue(made and prefixed, "found no collections; the pattern moved")
+        skipped = set(re.findall(r'"([^"]+)"', re.search(
+            r"SKIPPED_COLLECTIONS = frozenset\(\{(.*?)\}\)", exporter).group(1)))
+        named = set(re.findall(r'"([^"]+)":', re.search(
+            r"const LAYER_NAME = \{(.*?)\n\};", self.html, re.S).group(1)))
+        suffixes = set(re.findall(r'"(_\w+)":', re.search(
+            r"const LAYER_SUFFIX = \{(.*?)\n\};", self.html, re.S).group(1)))
+        self.assertEqual(made - skipped - named, set())
+        self.assertEqual(prefixed - suffixes, set())
+
+    def test_every_property_a_model_carries_has_a_label(self):
+        """What a click shows of a building or a tree. maptile_* are the
+        pipeline's own bookkeeping and stay out of it."""
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        carried = {
+            key for key in re.findall(r'\b(?:obj|tree|terrain|water)\["(\w+)"\]\s*=', source)
+            if not key.startswith("maptile_")
+        }
+        self.assertTrue(carried, "found no object properties; the pattern moved")
+        labelled = set(re.findall(r"^\s*(\w+): \[", re.search(
+            r"const PROPERTY = \{(.*?)\n\};", self.html, re.S).group(1), re.M))
+        self.assertEqual(carried - labelled, set())
+
+
+def _web_export():
+    """blender/web_export.py, imported against a stand-in for bpy.
+
+    Its geometry and its file layout are plain NumPy; only reading the scene
+    needs Blender, and TestWebViewInBlender runs that part for real wherever
+    the pip module is installed.
+    """
+    import importlib.util
+    import types
+    from unittest import mock
+
+    stub = types.ModuleType("bpy")
+    stub.app = types.SimpleNamespace(version_string="stub")
+    stub.path = types.SimpleNamespace(abspath=lambda path: path)
+    spec = importlib.util.spec_from_file_location(
+        "web_export_under_test", REPO_ROOT / "blender" / "web_export.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(sys.modules, {"bpy": stub}):
+        spec.loader.exec_module(module)
+    return module
+
+
+def _read_glb(blob: bytes) -> tuple[dict, bytes]:
+    """A binary glTF back into its document and its binary chunk, checking
+    the container on the way."""
+    import struct
+
+    magic, version, length = struct.unpack_from("<III", blob, 0)
+    assert (magic, version, length) == (0x46546C67, 2, len(blob)), "bad GLB header"
+    json_length, json_type = struct.unpack_from("<II", blob, 12)
+    assert json_type == 0x4E4F534A and json_length % 4 == 0, "bad JSON chunk"
+    document = json.loads(blob[20:20 + json_length])
+    binary = b""
+    if 20 + json_length < len(blob):
+        bin_length, bin_type = struct.unpack_from("<II", blob, 20 + json_length)
+        assert bin_type == 0x004E4942 and bin_length % 4 == 0, "bad binary chunk"
+        binary = blob[28 + json_length:28 + json_length + bin_length]
+    return document, binary
+
+
+def _accessor(document: dict, binary: bytes, index: int) -> np.ndarray:
+    """An accessor's values, one row per element, honouring its stride."""
+    accessor = document["accessors"][index]
+    view = document["bufferViews"][accessor["bufferView"]]
+    dtype = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16,
+             5125: np.uint32, 5126: np.float32}[accessor["componentType"]]
+    width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[accessor["type"]]
+    element = np.dtype(dtype).itemsize * width
+    stride = view.get("byteStride", element)
+    start = view["byteOffset"] + accessor.get("byteOffset", 0)
+    assert start % np.dtype(dtype).itemsize == 0, "misaligned accessor"
+    assert accessor.get("byteOffset", 0) + stride * (accessor["count"] - 1) + element <= view["byteLength"]
+    raw = np.frombuffer(binary, dtype=np.uint8)[start:start + stride * accessor["count"]]
+    raw = np.concatenate([raw, np.zeros(stride * accessor["count"] - len(raw), np.uint8)])
+    return raw.reshape(accessor["count"], stride)[:, :element].copy().view(dtype).reshape(-1, width)
+
+
+class TestWebView(unittest.TestCase):
+    """The 3D view's file: what blender/web_export.py writes and the page
+    reads. A mistake here shows as a model turned on its side, inside out,
+    with its trees in the wrong place, or as a page that cannot read it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.web = _web_export()
+
+    @staticmethod
+    def _triangles(points, faces, normals=None, uvs=None, slots=None):
+        """What object_triangles hands on, from triangles given as indices."""
+        points = np.asarray(points, dtype=np.float32)
+        corners = np.asarray(faces, dtype=np.int32).reshape(-1)
+        if normals is None:
+            normals = np.tile([0.0, 0.0, 1.0], (len(corners), 1))
+        if uvs is None:
+            uvs = points[corners][:, :2] / 10.0
+        return {
+            "points": points,
+            "corner_vertex": corners,
+            "corner_normal": np.asarray(normals, dtype=np.float32),
+            "corner_uv": np.asarray(uvs, dtype=np.float32),
+            "slots": np.asarray(slots if slots is not None else [0] * (len(corners) // 3)),
+            "materials": [None],
+        }
+
+    def test_the_server_reads_the_layout_this_writes(self):
+        """Held equal, so a change in one is a cached view written again
+        rather than a view the page misreads."""
+        sys.path.insert(0, str(REPO_ROOT / "ui"))
+        import server
+
+        self.assertEqual(self.web.FORMAT, server.VIEWER_FORMAT)
+        self.assertEqual(self.web.FILE_NAME, server.VIEWER_FILE)
+        self.assertEqual(self.web.STAMP_NAME, server.VIEWER_STAMP)
+
+    def test_a_build_without_a_view_only_warns(self):
+        """The model is whole without its view, and the page writes one
+        when it finds none; the check is there to show the exporter broke."""
+        from src.validate import CheckReport, check_web_view
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            report = CheckReport()
+            check_web_view(report, work, {}, "model.blend")
+            self.assertTrue(report.ok)
+            self.assertEqual([c.name for c in report.warnings], ["web_view_written"])
+
+            (work / "viewer.glb").write_bytes(b"glTF" * 100)
+            report = CheckReport()
+            check_web_view(report, work, {"file": "viewer.glb", "triangles": 9,
+                                          "objects": 2, "layers": 1}, "model.blend")
+            self.assertEqual(report.warnings, [])
+            self.assertIn("9 triangles", report.checks[0].detail)
+
+    def test_a_glb_is_aligned_and_reads_back(self):
+        blob = self.web.pack_glb({"asset": {"version": "2.0"}, "é": 1}, b"\x01\x02\x03\x04\x05")
+        self.assertEqual(len(blob) % 4, 0)
+        document, binary = _read_glb(blob)
+        self.assertEqual(document["é"], 1)
+        self.assertEqual(binary[:5], b"\x01\x02\x03\x04\x05")
+
+    def test_blender_axes_become_gltf_axes(self):
+        """East stays X, up becomes Y, north becomes -Z, and the picture is
+        read top row first, as glTF has it."""
+        tris = self._triangles(
+            [[0, 0, 0], [10, 0, 0], [0, 20, 5]], [[0, 1, 2]],
+            normals=[[0.0, 0.0, 1.0]] * 3, uvs=[[0.0, 0.0], [1.0, 0.0], [0.0, 0.25]],
+        )
+        moved = np.eye(4)
+        moved[:3, 3] = (100.0, 200.0, 3.0)
+        out = self.web.triangles_as_vertices(tris, moved)
+        np.testing.assert_allclose(sorted(map(tuple, out["points"])), sorted([
+            (100.0, 3.0, -200.0), (110.0, 3.0, -200.0), (100.0, 8.0, -220.0)]), atol=1e-4)
+        np.testing.assert_array_equal(out["normals"], [[0, 127, 0]] * 3)
+        np.testing.assert_allclose(sorted(out["uv"][:, 1]), [0.75, 1.0, 1.0])
+
+    def test_a_shared_corner_is_one_vertex_only_where_it_looks_the_same(self):
+        """The export triangulation gives every triangle corners of its own.
+        A smooth corner is welded back into one vertex; a crease is not."""
+        square = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]
+        smooth = self.web.triangles_as_vertices(self._triangles(square, [[0, 1, 2], [0, 2, 3]]), None)
+        self.assertEqual(len(smooth["points"]), 4)
+        creased = self._triangles(square, [[0, 1, 2], [0, 2, 3]],
+                                  normals=[[0, 0, 1]] * 3 + [[0, 1, 0]] * 3)
+        self.assertEqual(len(self.web.triangles_as_vertices(creased, None)["points"]), 6)
+
+    def test_a_mirrored_object_stays_right_side_out(self):
+        """Mirroring turns a triangle's winding round; written as it came, the
+        page would light it from behind."""
+        mirror = np.diag([-1.0, 1.0, 1.0, 1.0])
+        out = self.web.triangles_as_vertices(
+            self._triangles([[0, 0, 0], [1, 0, 0], [0, 1, 0]], [[0, 1, 2]]), mirror)
+        a, b, c = out["points"][out["triangles"][0]]
+        face = np.cross(b - a, c - a)
+        self.assertGreater(float(np.dot(face, out["normals"][0].astype(float))), 0.0)
+
+    def test_instances_come_apart_into_translation_rotation_and_scale(self):
+        """What EXT_mesh_gpu_instancing stores, and what the page puts back
+        together: every tree where Blender has it."""
+        rng = np.random.default_rng(3)
+        convert = np.eye(4)
+        convert[:3, :3] = self.web.TO_GLTF
+        matrices = []
+        for _ in range(20):
+            angle = rng.uniform(-np.pi, np.pi)
+            rotation = np.array([[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]])
+            m = np.eye(4)
+            m[:3, :3] = rotation @ np.diag(rng.uniform(0.5, 15.0, 3))
+            m[:3, 3] = rng.uniform(-500, 500, 3)
+            matrices.append(m)
+        translation, rotation, scale = self.web.instance_transforms(matrices)
+        for m, t, q, s in zip(matrices, translation, rotation, scale):
+            x, y, z, w = q
+            r = np.array([
+                [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+            ])
+            rebuilt = np.eye(4)
+            rebuilt[:3, :3] = r @ np.diag(s)
+            rebuilt[:3, 3] = t
+            np.testing.assert_allclose(rebuilt, convert @ m @ np.linalg.inv(convert), atol=1e-6)
+
+    def test_a_scene_becomes_a_file_the_page_can_read(self):
+        """Merged buildings, instanced trees, a texture and a cut-out: every
+        accessor inside its view, bounds that are true, indices inside their
+        vertices, object numbers inside the object table, no empty lists."""
+        web = self.web
+        box = self._triangles(
+            [[0, 0, 0], [10, 0, 0], [10, 6, 0], [0, 6, 0], [0, 0, 9]],
+            [[0, 1, 2], [0, 2, 3], [0, 1, 4]], slots=[0, 0, 1])
+        box["materials"] = ["brick", "roof"]
+        merged = {}
+        for object_id, offset in ((0, 0.0), (1, 30.0)):
+            matrix = np.eye(4)
+            matrix[0, 3] = offset
+            for slot, part in web.split_by_slot(web.triangles_as_vertices(box, matrix), box["slots"]):
+                part["object"] = object_id
+                merged.setdefault((0, slot), []).append(part)
+        tree = web.triangles_as_vertices(self._triangles([[0, 0, 0], [1, 0, 0], [0, 0, 1]], [[0, 1, 2]]), None)
+        tree_parts = [(2, part) for _, part in web.split_by_slot(tree, np.zeros(1))]
+        members = []
+        for k in range(3):
+            m = np.eye(4)
+            m[:3, 3] = (50.0 + k, 7.0, 0.0)
+            members.append((2 + k, m))
+        material = {"name": "", "color": [0.5, 0.5, 0.5, 1.0], "texture": None,
+                    "normal_texture": None, "roughness": 0.8, "metallic": 0.0, "cutout": False}
+        data = {
+            "layers": [{"name": "Buildings", "objects": 2, "triangles": 6},
+                       {"name": "Trees", "objects": 3, "triangles": 3}],
+            "objects": [["Pand_1", 0, {"bag_id": "NL.IMBAG.Pand.1"}], ["Pand_2", 0, {}],
+                        ["Tree_1", 1, {}], ["Tree_2", 1, {}], ["Tree_3", 1, {}]],
+            "materials": [dict(material, name="brick", texture="facade.png"),
+                          dict(material, name="roof"),
+                          dict(material, name="fence", texture="fence.png", cutout=True)],
+            "merged": merged,
+            "instanced": [{"layer": 1, "mesh": "TreeShape", "parts": tree_parts, "members": members}],
+        }
+        document, binary = _read_glb(web.pack_glb(*web.assemble(data)))
+
+        for key, value in document.items():
+            if isinstance(value, list):
+                self.assertTrue(value, f"empty list {key}")
+        self.assertEqual(document["extensionsRequired"], ["KHR_mesh_quantization"])
+        self.assertEqual([n["name"] for n in document["nodes"][:2]], ["Buildings", "Trees"])
+        self.assertEqual(document["extras"]["terreinlab"]["objects"][0][0], "Pand_1")
+        self.assertEqual([i["uri"] for i in document["images"]], ["facade.png", "fence.png"])
+        self.assertEqual(document["materials"][2]["alphaMode"], "MASK")
+
+        objects = len(document["extras"]["terreinlab"]["objects"])
+        for mesh in document["meshes"]:
+            for primitive in mesh["primitives"]:
+                attributes = primitive["attributes"]
+                points = _accessor(document, binary, attributes["POSITION"])
+                accessor = document["accessors"][attributes["POSITION"]]
+                np.testing.assert_allclose(accessor["min"], points.min(axis=0))
+                np.testing.assert_allclose(accessor["max"], points.max(axis=0))
+                normals = _accessor(document, binary, attributes["NORMAL"]).astype(float) / 127
+                np.testing.assert_allclose(np.linalg.norm(normals, axis=1), 1.0, atol=0.02)
+                indices = _accessor(document, binary, primitive["indices"])
+                self.assertLess(int(indices.max()), len(points))
+                textured = "baseColorTexture" in document["materials"][primitive["material"]]["pbrMetallicRoughness"]
+                self.assertEqual("TEXCOORD_0" in attributes, textured)
+                if "_OBJECT" in attributes:
+                    ids = _accessor(document, binary, attributes["_OBJECT"])
+                    self.assertTrue(((ids >= 0) & (ids < objects)).all())
+
+        instanced = [n for n in document["nodes"] if "extensions" in n]
+        self.assertEqual(len(instanced), 1)
+        parts = instanced[0]["extensions"]["EXT_mesh_gpu_instancing"]["attributes"]
+        counts = {k: document["accessors"][v]["count"] for k, v in parts.items()}
+        self.assertEqual(set(counts.values()), {3})
+        np.testing.assert_allclose(_accessor(document, binary, parts["TRANSLATION"])[0], [50.0, 0.0, -7.0])
+        np.testing.assert_array_equal(_accessor(document, binary, parts["_OBJECT"]).ravel(), [2, 3, 4])
+
+
+# A small model, saved by Blender itself: a building with a render-only
+# triangulation, ten trees sharing one mesh, and a physics proxy.
+_SMALL_MODEL = """
+import sys
+import bpy
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+
+
+def layer(name):
+    collection = bpy.data.collections.new(name)
+    scene.collection.children.link(collection)
+    return collection
+
+
+box = bpy.data.meshes.new("Box")
+box.from_pydata(
+    [(x, y, z) for x in (0, 10) for y in (0, 6) for z in (0, 9)], [],
+    [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)],
+)
+box.materials.append(bpy.data.materials.new("Brick"))
+building = bpy.data.objects.new("Pand_1", box)
+building["bag_id"] = "NL.IMBAG.Pand.1"
+building["build_year"] = 1900
+layer("Buildings").objects.link(building)
+modifier = building.modifiers.new("Triangulate for export", "TRIANGULATE")
+modifier.show_viewport = False
+modifier.show_render = True
+
+shape = bpy.data.meshes.new("TreeShape")
+shape.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)], [],
+                  [(0, 2, 1), (0, 1, 3), (1, 2, 3), (0, 3, 2)])
+trees = layer("Trees")
+for i in range(10):
+    tree = bpy.data.objects.new(f"Tree_{i}", shape)
+    tree.location = (20 + 3 * i, 40, 0)
+    tree.rotation_euler[2] = 0.3 * i
+    tree.scale = (1.0, 1.5, 6.0)
+    tree["height_m"] = 6.0
+    trees.objects.link(tree)
+
+layer("Collision").objects.link(bpy.data.objects.new("Collision_box", box.copy()))
+bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1])
+"""
+
+
+@unittest.skipUnless(HAVE_BPY, "needs the pip bpy module")
+class TestWebViewInBlender(unittest.TestCase):
+    """web_export.py run the way the page runs it, on a .blend Blender saved:
+    the part the stand-in above cannot reach."""
+
+    def test_a_saved_model_becomes_a_view(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            maker = folder / "make.py"
+            maker.write_text(_SMALL_MODEL, encoding="utf-8")
+            blend = folder / "model.blend"
+            subprocess.run([sys.executable, str(maker), str(blend)], check=True,
+                           capture_output=True, timeout=600)
+            glb = folder / "work" / "viewer.glb"
+            result = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "blender" / "web_export.py"),
+                 "--blend", str(blend), "--out", str(glb)],
+                capture_output=True, text=True, timeout=600,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            stamp = json.loads((glb.parent / "viewer.json").read_text(encoding="utf-8"))
+            document, binary = _read_glb(glb.read_bytes())
+            saved = blend.stat()
+
+        # Stamped with the save it shows, which is how the page knows it.
+        self.assertEqual(stamp["source"], "model.blend")
+        self.assertEqual((stamp["source_size"], stamp["source_mtime_ns"]), (saved.st_size, saved.st_mtime_ns))
+        self.assertEqual(stamp["triangles"], 12 + 10 * 4)
+        tables = document["extras"]["terreinlab"]
+        # The physics proxies are never drawn, so they are not in the view.
+        self.assertEqual([layer["name"] for layer in tables["layers"]], ["Buildings", "Trees"])
+        self.assertEqual(len(tables["objects"]), 11)
+        building = next(o for o in tables["objects"] if o[0] == "Pand_1")
+        self.assertEqual(building[2], {"bag_id": "NL.IMBAG.Pand.1", "build_year": 1900})
+
+        # The building, merged, in glTF axes: north is -Z.
+        merged = [n for n in document["nodes"] if "mesh" in n and "extensions" not in n]
+        position = document["accessors"][
+            document["meshes"][merged[0]["mesh"]]["primitives"][0]["attributes"]["POSITION"]]
+        np.testing.assert_allclose(position["min"], [0, 0, -6], atol=1e-5)
+        np.testing.assert_allclose(position["max"], [10, 9, 0], atol=1e-5)
+
+        # The trees, one mesh drawn ten times, each where Blender put it.
+        instanced = [n for n in document["nodes"] if "extensions" in n]
+        self.assertEqual(len(instanced), 1)
+        parts = instanced[0]["extensions"]["EXT_mesh_gpu_instancing"]["attributes"]
+        translation = _accessor(document, binary, parts["TRANSLATION"])
+        self.assertEqual(len(translation), 10)
+        np.testing.assert_allclose(sorted(translation[:, 0]), [20 + 3 * i for i in range(10)], atol=1e-4)
+        np.testing.assert_allclose(translation[:, 2], -40.0, atol=1e-4)
+
+
+class TestUIViewer(unittest.TestCase):
+    """The server's side of the 3D view: when a view shows the saved model,
+    when it is written again, and the routes that hand it to the page."""
+
+    def setUp(self):
+        from unittest import mock
+
+        sys.path.insert(0, str(REPO_ROOT / "ui"))
+        import server
+
+        self.server = server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patches = [mock.patch.object(server, "REPO_ROOT", self.root),
+                        mock.patch.object(server, "prepare_view")]
+        for patch in self.patches:
+            patch.start()
+        self.prepare = server.prepare_view
+        with server.VIEWER_LOCK:
+            server.VIEWER_PREP.clear()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+        with self.server.VIEWER_LOCK:
+            self.server.VIEWER_PREP.clear()
+        self.tmp.cleanup()
+
+    def _area(self, name="area", *, blend=b"model", view=True, stamp=None):
+        out = self.root / "output" / name
+        out.mkdir(parents=True)
+        if blend is not None:
+            (out / "model.blend").write_bytes(blend)
+        if view:
+            work = self.root / "work" / name
+            work.mkdir(parents=True)
+            (work / "viewer.glb").write_bytes(b"glTF")
+            st = (out / "model.blend").stat() if blend is not None else None
+            record = {"format": self.server.VIEWER_FORMAT, "triangles": 12, "objects": 1, "layers": 1}
+            if st is not None:
+                record.update(source="model.blend", source_size=st.st_size, source_mtime_ns=st.st_mtime_ns)
+            record.update(stamp or {})
+            (work / "viewer.json").write_text(json.dumps(record))
+        return out
+
+    def test_a_view_of_the_saved_model_is_ready(self):
+        self._area()
+        state = self.server.viewer_state("area")
+        self.assertEqual(state["state"], "ready")
+        self.assertTrue(state["url"].startswith("/viewer/area/viewer.glb?v="))
+        self.assertEqual(state["textures"], "/output/area/")
+        self.assertFalse(state["stale"])
+        self.prepare.assert_not_called()
+
+    def test_saving_the_model_again_writes_the_view_again(self):
+        """An edit saved in Blender is what the next view shows."""
+        out = self._area()
+        (out / "model.blend").write_bytes(b"edited and saved")
+        self.assertEqual(self.server.viewer_state("area", start=False)["state"], "absent")
+        self.assertEqual(self.server.viewer_state("area")["state"], "preparing")
+        self.assertEqual(self.server.viewer_state("area")["state"], "preparing")
+
+    def test_a_view_in_an_older_layout_is_written_again(self):
+        self._area(stamp={"format": self.server.VIEWER_FORMAT - 1})
+        self.assertEqual(self.server.viewer_state("area")["state"], "preparing")
+
+    def test_a_model_never_viewed_gets_its_view_written(self):
+        self._area(view=False)
+        self.assertEqual(self.server.viewer_state("area")["state"], "preparing")
+
+    def test_a_model_without_a_blend_has_no_view(self):
+        self._area(blend=None, view=False)
+        self.assertEqual(self.server.viewer_state("area")["state"], "unavailable")
+        self.assertEqual(self.server.viewer_state("no_such_area")["state"], "unavailable")
+        self.prepare.assert_not_called()
+
+    def test_a_failure_stands_until_a_retry(self):
+        """Not tried again on every poll: a .blend Blender cannot open would
+        start Blender once a second for as long as the page stays open."""
+        out = self._area(view=False)
+        st = (out / "model.blend").stat()
+        with self.server.VIEWER_LOCK:
+            self.server.VIEWER_PREP["area"] = {"status": "failed", "error": "RuntimeError: no",
+                                               "key": (st.st_size, st.st_mtime_ns)}
+        self.assertEqual(self.server.viewer_state("area"), {"state": "failed", "error": "RuntimeError: no"})
+        self.assertEqual(self.server.viewer_state("area", retry=True)["state"], "preparing")
+
+    def test_an_area_being_built_waits_for_its_build(self):
+        """The build writes the view itself; until then the old one will do."""
+        job = self.server.Job("view-test", "area", {}, 60.0)
+        job.status = "running"
+        self.server.register(job)
+        try:
+            self._area(view=False)
+            self.assertEqual(self.server.viewer_state("area")["state"], "building")
+            # A view of an earlier save, which the stamp does not match.
+            work = self.root / "work" / "area"
+            work.mkdir(parents=True)
+            (work / "viewer.glb").write_bytes(b"glTF")
+            (work / "viewer.json").write_text(json.dumps({"format": self.server.VIEWER_FORMAT}))
+            state = self.server.viewer_state("area")
+            self.assertEqual(state["state"], "ready")
+            self.assertTrue(state["stale"])
+        finally:
+            with self.server.JOBS_LOCK:
+                self.server.JOBS.pop("view-test", None)
+                self.server.JOBS_ORDER.remove("view-test")
+        self.prepare.assert_not_called()
+
+    def test_a_name_is_one_folder_and_no_more(self):
+        ok = self.server.area_name_ok
+        for good in ("utrecht_dom", "a.b-c", "Hoek_van_Holland"):
+            self.assertTrue(ok(good), good)
+        for bad in ("", ".", "..", "a/b", "../output", "a b", "a\\b"):
+            self.assertFalse(ok(bad), bad)
+
+    def test_the_line_shown_is_the_one_saying_what_failed(self):
+        stderr = ("[viewer] FAILED\nTraceback (most recent call last):\n  File \"x.py\", line 3\n"
+                  "RuntimeError: Error: File format is not supported\n")
+        self.assertEqual(self.server._error_line(stderr), "RuntimeError: Error: File format is not supported")
+        self.assertEqual(self.server._error_line(""), "")
+
+    def test_the_routes_hand_over_the_view_and_nothing_else(self):
+        """The view comes from work/, which holds much more than the view:
+        only the one file is served from there."""
+        import threading
+        import urllib.error
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+
+        self._area()
+        (self.root / "work" / "area" / "ui_config.json").write_text("{}")
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.server.Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def get(path, headers=None):
+            request = urllib.request.Request(base + path, headers=headers or {})
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status, response.headers, response.read()
+            except urllib.error.HTTPError as error:
+                return error.code, error.headers, error.read()
+
+        try:
+            status, headers, body = get("/viewer.js")
+            self.assertEqual(status, 200)
+            self.assertTrue(headers["Content-Type"].startswith("text/javascript"))
+            self.assertIn(b"export class Viewer", body)
+
+            status, headers, body = get("/viewer/area/viewer.glb")
+            self.assertEqual((status, body), (200, b"glTF"))
+            self.assertEqual(headers["Content-Type"], "model/gltf-binary")
+            # Opened again: "not modified" instead of the whole file.
+            status, _, _ = get("/viewer/area/viewer.glb", {"If-Modified-Since": headers["Last-Modified"]})
+            self.assertEqual(status, 304)
+
+            for path in ("/viewer/area/ui_config.json", "/viewer/area/viewer.json",
+                         "/viewer/..%2Foutput%2Farea/viewer.glb", "/viewer/area"):
+                self.assertEqual(get(path)[0], 404, path)
+            self.assertEqual(get("/api/viewer?name=..")[0], 400)
+            status, _, body = get("/api/viewer?name=area")
+            self.assertEqual(json.loads(body)["state"], "ready")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

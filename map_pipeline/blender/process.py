@@ -3092,6 +3092,33 @@ def save_blend(out_dir: Path, name: str = "model.blend") -> Path:
     return path
 
 
+def write_web_view(work_dir: Path, out_dir: Path, blend: Path) -> dict:
+    """The model for the page's 3D view, from the scene still open here.
+
+    Written after the .blend is saved, and stamped with it, so the page knows
+    this view shows that file. Best effort: the model is finished whatever
+    happens here, and the page writes the view from the .blend itself when it
+    finds none.
+    """
+    try:
+        # Blender does not put a script's folder on the path; the pip module
+        # does. A script beside this one is held to the same import rule.
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import web_export
+
+        return web_export.write(
+            work_dir / web_export.FILE_NAME, out_dir, source=blend
+        )
+    except Exception as exc:  # noqa: BLE001 - the model itself is done
+        log(
+            f"WARNING: no 3D view written ({type(exc).__name__}: {exc}); the page "
+            f"writes one from {blend.name} when the model is opened"
+        )
+        return {}
+
+
 def copy_textures(
     scene: dict, work_dir: Path, out_dir: Path
 ) -> tuple[Path, list[tuple[Path, Path | None]], dict[str, Path]]:
@@ -3328,10 +3355,13 @@ def main() -> int:
     written = export_fbx(out_dir / scene["export"]["fbx_name"], terrain_name)
     ground_names = [terrain_name] + (list(layered["objects"]) if layered else [])
     blend = save_blend(out_dir, scene["export"].get("blend_name", "model.blend"))
+    web_view = write_web_view(work_dir, out_dir, blend)
 
     summary = {
         "fbx": scene["export"]["fbx_name"],
         "blend": blend.name,
+        # The page's 3D view: what was written, or nothing if it failed.
+        "web_view": web_view,
         "layers": {
             collection.name: len(collection.all_objects)
             for collection in bpy.context.scene.collection.children

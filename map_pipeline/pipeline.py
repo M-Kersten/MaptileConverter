@@ -372,15 +372,18 @@ def find_blender(explicit: str | None) -> tuple[str, list[str]]:
     )
 
 
-def run_blender_script(
+def blender_command(
     script_name: str, script_args: list[str], blender: str | None
-) -> subprocess.CompletedProcess:
-    """Run a script in blender/, through whichever Blender is available."""
+) -> tuple[str, list[str]]:
+    """How to run a script in blender/: the mode, and the command line.
+
+    Also what the UI uses to write a 3D view from a saved model.
+    """
     script = REPO_ROOT / "blender" / script_name
     mode, prefix = find_blender(blender)
 
     if mode == "executable":
-        command = prefix + [
+        return mode, prefix + [
             "--background",
             "--factory-startup",
             "--python",
@@ -388,10 +391,16 @@ def run_blender_script(
             "--",
             *script_args,
         ]
-    else:
-        # The pip module runs the same script directly. A subprocess keeps
-        # Blender's global state out of this process.
-        command = prefix + [str(script), *script_args]
+    # The pip module runs the same script directly. A subprocess keeps
+    # Blender's global state out of this process.
+    return mode, prefix + [str(script), *script_args]
+
+
+def run_blender_script(
+    script_name: str, script_args: list[str], blender: str | None
+) -> subprocess.CompletedProcess:
+    """Run a script in blender/, through whichever Blender is available."""
+    mode, command = blender_command(script_name, script_args, blender)
 
     LOG.info("running %s via %s", script_name, mode)
     LOG.debug("command: %s", " ".join(command))

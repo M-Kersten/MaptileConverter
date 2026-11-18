@@ -14,6 +14,7 @@ writes a config file and calls ``pipeline.py --config``.
 from __future__ import annotations
 
 import argparse
+import email.utils
 import json
 import re
 import shutil
@@ -40,6 +41,16 @@ TILE_BASE = (
 
 # Keep finished jobs around so a page reload can still show the result.
 MAX_JOBS = 24
+
+# The 3D view. Its file is written by blender/web_export.py into the area's
+# work folder; FORMAT there and this number are held equal by a test, so a
+# view written for an older page is written again rather than misread.
+VIEWER_FORMAT = 1
+VIEWER_FILE = "viewer.glb"
+VIEWER_STAMP = "viewer.json"
+# Writing a view from a saved model takes seconds; this only stops a Blender
+# that hangs from holding the queue for ever.
+VIEWER_TIMEOUT_S = 30 * 60
 
 # Small in-memory tile cache for the fallback route, so panning back over
 # somewhere you have already been costs nothing.
@@ -494,6 +505,9 @@ def area_summary(name: str) -> dict | None:
         "files": files,
         "previews": previews,
         "settings": area_settings(name),
+        # Whether the 3D view can be opened, asked without starting anything:
+        # "unavailable" is the one state where it cannot.
+        "view": viewer_state(name, start=False)["state"],
     }
 
 
@@ -552,6 +566,185 @@ def list_areas() -> list[dict]:
     return areas
 
 
+# ---------------------------------------------------------------------------
+# The 3D view.
+#
+# A build writes it as it finishes. A model built before there was a view, or
+# edited and saved in Blender since, gets one written from its .blend the
+# first time it is opened: the stamp beside the view says which save of the
+# .blend it shows, so an edit is noticed without anyone having to say so.
+# ---------------------------------------------------------------------------
+
+# Per area: a view being written, or the last attempt that failed and why.
+VIEWER_PREP: dict[str, dict] = {}
+VIEWER_LOCK = threading.Lock()
+# One Blender at a time: each loads a whole model.
+VIEWER_QUEUE = threading.Lock()
+
+
+def area_name_ok(name: str) -> bool:
+    """A name that can only ever be one folder inside output/ and work/."""
+    return (
+        bool(name)
+        and name not in (".", "..")
+        and all(c.isalnum() or c in "._-" for c in name)
+    )
+
+
+def model_blend(name: str) -> Path | None:
+    """The saved model of an area: model.blend, or else the newest .blend."""
+    out_dir = REPO_ROOT / "output" / name
+    preferred = out_dir / "model.blend"
+    if preferred.is_file():
+        return preferred
+    found = sorted(out_dir.glob("*.blend"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return found[0] if found else None
+
+
+def _read_stamp(path: Path) -> dict | None:
+    try:
+        stamp = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return stamp if isinstance(stamp, dict) else None
+
+
+def _blend_key(blend: Path) -> tuple[int, int] | None:
+    try:
+        stat = blend.stat()
+    except OSError:
+        return None
+    return int(stat.st_size), int(stat.st_mtime_ns)
+
+
+def view_is_current(stamp: dict | None, blend: Path | None) -> bool:
+    """Whether a view shows the saved model as it is now, in today's layout."""
+    if not stamp or stamp.get("format") != VIEWER_FORMAT:
+        return False
+    if blend is None:
+        # Nothing to write a newer one from, so this is the model.
+        return True
+    return (
+        stamp.get("source") == blend.name
+        and (stamp.get("source_size"), stamp.get("source_mtime_ns")) == _blend_key(blend)
+    )
+
+
+def area_is_building(name: str) -> bool:
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+    return any(j.name == name and j.status in ("starting", "running") for j in jobs)
+
+
+def _error_line(stderr: str) -> str:
+    """The line of a Blender traceback that says what went wrong."""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    for line in reversed(lines):
+        if re.match(r"^[A-Za-z_][\w.]*(Error|Exception|Exit)\b", line):
+            return line[:300]
+    return lines[-1][:300] if lines else ""
+
+
+def prepare_view(name: str, blend: Path, key: tuple[int, int] | None) -> None:
+    """Write an area's 3D view from its .blend, in a Blender of its own."""
+    glb = REPO_ROOT / "work" / name / VIEWER_FILE
+    error = ""
+    with VIEWER_QUEUE:
+        try:
+            from pipeline import blender_command
+
+            _, command = blender_command(
+                "web_export.py", ["--blend", str(blend), "--out", str(glb)], None
+            )
+            result = subprocess.run(
+                command, cwd=str(REPO_ROOT), capture_output=True, text=True,
+                timeout=VIEWER_TIMEOUT_S,
+            )
+            stamp = _read_stamp(glb.with_name(VIEWER_STAMP))
+            # Blender in background mode exits 0 when its script raises, so
+            # the file and its stamp are what count.
+            if result.returncode != 0 or not glb.is_file() or not stamp or (
+                stamp.get("format") != VIEWER_FORMAT
+            ):
+                error = _error_line(result.stderr) or (
+                    f"Blender stopped with code {result.returncode} without writing the view"
+                )
+        except subprocess.TimeoutExpired:
+            error = f"Blender took longer than {VIEWER_TIMEOUT_S // 60} minutes"
+        except SystemExit as exc:
+            # find_blender's way of saying there is no Blender at all.
+            error = str(exc).splitlines()[0] if str(exc) else "no Blender found"
+        except Exception as exc:  # noqa: BLE001 - shown on the page
+            error = f"{type(exc).__name__}: {exc}"
+
+    with VIEWER_LOCK:
+        VIEWER_PREP[name] = {
+            "status": "failed" if error else "done",
+            "error": error,
+            "key": key,
+            "finished": time.time(),
+        }
+
+
+def viewer_state(name: str, *, retry: bool = False, start: bool = True) -> dict:
+    """Where an area's 3D view stands, starting to write it when it is due.
+
+    `ready` comes with the file's address and where its textures are;
+    `preparing` while Blender writes it; `building` while the area itself is
+    being built and has no view yet; `failed` with the reason, until asked
+    to `retry`; `unavailable` when there is no saved model to write one from.
+    """
+    out_dir = REPO_ROOT / "output" / name
+    if not out_dir.is_dir():
+        return {"state": "unavailable", "error": f"there is no model called {name}"}
+
+    glb = REPO_ROOT / "work" / name / VIEWER_FILE
+    blend = model_blend(name)
+    stamp = _read_stamp(glb.with_name(VIEWER_STAMP)) if glb.is_file() else None
+    current = glb.is_file() and view_is_current(stamp, blend)
+    readable = glb.is_file() and bool(stamp) and stamp.get("format") == VIEWER_FORMAT
+    building = area_is_building(name)
+
+    if current or (readable and building):
+        quoted = urllib.parse.quote(name)
+        return {
+            "state": "ready",
+            "url": f"/viewer/{quoted}/{VIEWER_FILE}?v={glb.stat().st_mtime_ns}",
+            "textures": f"/output/{quoted}/",
+            "bytes": glb.stat().st_size,
+            # Shown while the area is rebuilt: the view of the model before.
+            "stale": not current,
+            "stats": {k: stamp.get(k) for k in ("triangles", "objects", "layers")},
+        }
+    if building:
+        return {"state": "building"}
+    if blend is None:
+        return {
+            "state": "unavailable",
+            "error": "this model has no .blend to make a 3D view from",
+        }
+
+    key = _blend_key(blend)
+    with VIEWER_LOCK:
+        prep = VIEWER_PREP.get(name)
+        if prep and prep["status"] == "running":
+            return {"state": "preparing", "elapsed": round(time.time() - prep["started"], 1)}
+        if prep and prep["key"] == key and not retry:
+            if prep["status"] == "failed":
+                return {"state": "failed", "error": prep["error"]}
+            # Written for this very save and still not current: writing it
+            # again would only go round in a circle.
+            return {
+                "state": "failed",
+                "error": "the view written does not match the saved model; try again",
+            }
+        if not start:
+            return {"state": "absent"}
+        VIEWER_PREP[name] = {"status": "running", "started": time.time(), "key": key}
+    threading.Thread(target=prepare_view, args=(name, blend, key), daemon=True).start()
+    return {"state": "preparing", "elapsed": 0.0}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MapPipelineUI/1.0"
 
@@ -584,7 +777,13 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def serve_file(self, path: Path, root: Path) -> None:
-        """Serve a file, refusing anything that escapes `root`."""
+        """Serve a file, refusing anything that escapes `root`.
+
+        Streamed rather than read whole: the 3D view and the aerial are tens
+        of megabytes. Every response carries its modification time and asks
+        the browser to check back, so opening a model again costs a "not
+        modified" per file instead of the whole download.
+        """
         try:
             resolved = path.resolve()
             resolved.relative_to(root.resolve())
@@ -597,26 +796,50 @@ class Handler(BaseHTTPRequestHandler):
 
         types = {
             ".html": "text/html; charset=utf-8",
+            ".js": "text/javascript; charset=utf-8",
             ".json": "application/json; charset=utf-8",
             ".png": "image/png",
             ".jpg": "image/jpeg",
             ".fbx": "application/octet-stream",
+            ".glb": "model/gltf-binary",
             ".txt": "text/plain; charset=utf-8",
             ".pgw": "text/plain; charset=utf-8",
             ".tif": "image/tiff",
             ".svg": "image/svg+xml",
         }
         content_type = types.get(resolved.suffix.lower(), "application/octet-stream")
-        body = resolved.read_bytes()
+        stat = resolved.stat()
+        modified = email.utils.formatdate(stat.st_mtime, usegmt=True)
+
+        since = self.headers.get("If-Modified-Since")
+        if since:
+            try:
+                unchanged = int(stat.st_mtime) <= email.utils.parsedate_to_datetime(since).timestamp()
+            except (TypeError, ValueError, IndexError):
+                unchanged = False
+            if unchanged:
+                self.send_response(304)
+                self.send_header("Last-Modified", modified)
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                return
+
         self.send_response(200)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(stat.st_size))
+        self.send_header("Last-Modified", modified)
+        self.send_header("Cache-Control", "no-cache")
         if resolved.suffix.lower() in (".fbx", ".tif"):
             self.send_header(
                 "Content-Disposition", f'attachment; filename="{resolved.name}"'
             )
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            with resolved.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile, 1 << 20)
+        except (BrokenPipeError, ConnectionResetError):
+            # The page went elsewhere mid-download, which is allowed.
+            pass
 
     # -- routes ----------------------------------------------------------
 
@@ -628,8 +851,30 @@ class Handler(BaseHTTPRequestHandler):
         if route in ("/", "/index.html"):
             self.serve_file(UI_DIR / "index.html", UI_DIR)
             return
-        if route in ("/icon.svg", "/logo-dark.svg", "/logo-light.svg"):
+        if route in ("/icon.svg", "/logo-dark.svg", "/logo-light.svg", "/viewer.js"):
             self.serve_file(UI_DIR / route.lstrip("/"), UI_DIR)
+            return
+
+        if route == "/api/viewer":
+            # Where an area's 3D view stands; asking starts writing it when
+            # the model has none, or only one of an older save.
+            name = (query.get("name") or [""])[0]
+            if not area_name_ok(name):
+                self.send_json({"error": "bad model name"}, status=400)
+                return
+            retry = (query.get("retry") or ["0"])[0] not in ("", "0", "false", "no")
+            self.send_json(viewer_state(name, retry=retry))
+            return
+
+        if route.startswith("/viewer/"):
+            # The view itself, from the work folder: only that one file.
+            parts = urllib.parse.unquote(route[len("/viewer/") :]).split("/")
+            if len(parts) == 2 and parts[1] == VIEWER_FILE and area_name_ok(parts[0]):
+                self.serve_file(
+                    REPO_ROOT / "work" / parts[0] / VIEWER_FILE, REPO_ROOT / "work"
+                )
+                return
+            self.send_json({"error": "not found"}, status=404)
             return
 
         if route == "/api/geocode":

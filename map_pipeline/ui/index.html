@@ -154,6 +154,15 @@
           grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
   .card { display: flex; flex-direction: column; background: var(--bg-300); border-radius: var(--radius-lg); overflow: hidden; }
   .card .shot { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; background: var(--bg-000); }
+  /* The picture opens the model in 3D; the chip says so before the click. */
+  .shotbtn { position: relative; display: block; width: 100%; padding: 0; border: 0; background: none; color: inherit;
+             font: inherit; cursor: pointer; text-align: left; }
+  .shotbtn .chip { position: absolute; right: 10px; bottom: 10px; display: inline-flex; align-items: center; gap: 6px;
+                   padding: 4px 10px; border-radius: 999px; background: var(--glass-deep); color: var(--text-primary);
+                   font-size: 13px; line-height: 18px; font-weight: 700; box-shadow: 0 0 0 1px var(--line); }
+  .shotbtn .chip svg { width: 16px; height: 16px; }
+  .shotbtn:hover .chip, .shotbtn:focus-visible .chip { background: var(--signal); box-shadow: var(--shadow-signal-glow); }
+  .shotbtn:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   .card .noimg { display: grid; place-items: center; color: var(--text-muted); font-size: 14px; }
   .card .body { display: flex; flex-direction: column; gap: 6px; padding: 16px; flex: 1 1 auto; }
   .card h3 { font-size: 20px; line-height: 26px; overflow-wrap: anywhere; }
@@ -238,6 +247,66 @@
     #zoomUI { bottom: 384px; } #mapUI { bottom: 354px; } .attrib { bottom: 330px; }
   }
 
+  /* ---------- 3D view ---------- */
+  #view3d { position: fixed; inset: 0; overflow: hidden; background: #9db4c8; }
+  #viewerCanvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none;
+                  cursor: grab; outline: none; }
+  #viewerCanvas:active { cursor: grabbing; }
+  #viewerCanvas:focus-visible { box-shadow: inset 0 0 0 2px var(--focus); }
+  #viewerHead { top: 16px; left: 16px; max-width: calc(100% - 32px); padding: 8px 16px 8px 8px;
+                display: flex; align-items: center; gap: 12px; }
+  #viewerHead h1 { font-family: var(--font-heading); font-size: 20px; line-height: 26px; overflow-wrap: anywhere; }
+  #viewerTools { top: 16px; right: 16px; padding: 8px; display: flex; align-items: center; gap: 4px; }
+  #viewerTools .help { margin: 0 8px; }
+  #viewNorth svg { width: 26px; height: 26px; }
+  #viewerLayers { top: 88px; right: 16px; width: 320px; max-width: calc(100% - 32px); max-height: calc(100% - 180px);
+                  overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 4px; }
+  .lrow { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); cursor: pointer; }
+  .lrow .name { flex: 1 1 auto; min-width: 0; font-size: 15px; line-height: 20px; }
+  .lrow .who { display: block; font-size: 12px; line-height: 16px; color: var(--text-muted); overflow-wrap: anywhere; }
+  .lrow.off .name { color: var(--text-muted); }
+  #viewerInfo { left: 16px; bottom: 52px; width: 380px; max-width: calc(100% - 32px); max-height: calc(100% - 160px);
+                overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  #viewerInfo .ihead { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  #viewerInfo h2 { font-size: 18px; line-height: 24px; overflow-wrap: anywhere; margin-top: 2px; }
+  #viewerInfo .kv { white-space: pre-wrap; margin: 0; }
+  #viewerCoords { position: absolute; left: 16px; bottom: 16px; max-width: calc(100% - 32px); padding: 4px 8px;
+                  border-radius: var(--radius-xs); background: rgba(6, 32, 40, .8); color: var(--text-secondary);
+                  font: 12px/18px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #viewerCoords:empty { display: none; }
+  /* Above the row the coordinates take, so the two never cover each other. */
+  #viewerHint { position: absolute; left: 50%; bottom: 52px; transform: translateX(-50%); max-width: calc(100% - 32px);
+                padding: 8px 16px; border-radius: 999px; background: var(--glass-deep); border: 1px solid var(--line);
+                color: var(--text-secondary); font-size: 14px; line-height: 20px; text-align: center; pointer-events: none;
+                transition: opacity 400ms; }
+  #viewerHint.gone { opacity: 0; }
+  #viewerStatus { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px;
+                  background: rgba(6, 32, 40, .6); }
+  #viewerStatus .vcard { width: min(460px, 100%); padding: 24px; display: flex; flex-direction: column; gap: 12px;
+                         background: var(--glass-deep); border: 1px solid var(--line); border-radius: var(--radius-lg);
+                         box-shadow: var(--shadow-panel); }
+  #viewerStatus h2 { font-family: var(--font-heading); font-size: 22px; line-height: 28px; }
+  #viewerStatus .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+  @media (min-width: 901px) {
+    #toggleViewerLayers { display: none; }
+    #viewerHead { max-width: calc(100% - 360px); }
+  }
+  /* Narrow: the tools become a bar along the bottom, with the layers and
+     what was clicked stacked above it, and the title alone at the top. */
+  @media (max-width: 900px) {
+    #viewerHead { top: 12px; left: 12px; max-width: calc(100% - 24px); }
+    #viewerTools { top: auto; left: 12px; right: 12px; bottom: 12px; justify-content: space-between; }
+    #viewerLayers { top: auto; left: auto; right: 12px; bottom: 80px; max-height: 50%; display: none; }
+    #viewerLayers.shown:not([hidden]) { display: flex; }
+    #viewerInfo { left: 12px; bottom: 80px; max-width: calc(100% - 24px); }
+    #viewerCoords { left: 12px; bottom: 80px; }
+    #viewerHint { display: none; }
+  }
+  @media (max-width: 640px) {
+    #viewerMeta { display: none; }
+    #viewerLayers { left: 12px; width: auto; }
+  }
+
   /* ---------- dialogs ---------- */
   dialog { width: min(960px, calc(100% - 32px)); max-height: calc(100% - 64px); padding: 0; color: var(--text-primary);
            background: var(--bg-100); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); }
@@ -314,7 +383,8 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
           Stoppen
         </button>
-        <button class="btn" id="openResult" hidden>Bekijken</button>
+        <button class="btn" id="open3dResult" hidden>In 3D</button>
+        <button class="btn ghost" id="openResult" hidden>Bekijken</button>
         <button class="btn ghost icon" id="dismissRun" aria-label="Melding sluiten" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
@@ -476,13 +546,88 @@
 </section>
 
 <!-- ===================================================================== -->
+<!-- 3D: a built model, to walk round and click on.                         -->
+<!-- ===================================================================== -->
+<section id="view3d" aria-label="3D-weergave" hidden>
+  <canvas id="viewerCanvas" tabindex="0"
+    aria-label="3D-weergave van het model. Pijltjes verschuiven, Shift en pijltjes draaien, plus en min zoomen, Home toont het geheel."></canvas>
+
+  <div class="float" id="viewerHead">
+    <button class="btn ghost" id="viewerBack">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+      Modellen
+    </button>
+    <div>
+      <h1 id="viewerTitle">&hellip;</h1>
+      <span class="muted small" id="viewerMeta"></span>
+    </div>
+  </div>
+
+  <nav class="float" id="viewerTools" aria-label="Weergave">
+    <button class="btn ghost" id="viewOverview" title="Het hele gebied, schuin van boven (Home)">Overzicht</button>
+    <button class="btn ghost" id="viewTop" title="Recht van boven, met het noorden boven">Boven</button>
+    <button class="btn ghost icon" id="viewNorth" aria-label="Draai met het noorden boven" title="Noorden boven">
+      <svg id="compass" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.5" fill="none" stroke="var(--line-control)" stroke-width="1.5"/><path d="M12 3.5 15.2 12H8.8z" fill="var(--signal-bright)"/><path d="M8.8 12h6.4L12 20.5z" fill="var(--text-muted)"/></svg>
+    </button>
+    <button class="btn ghost" id="toggleViewerLayers" aria-controls="viewerLayers">Lagen</button>
+    <span class="help" tabindex="0" role="button" aria-label="Over de bediening"
+      data-tip="<b>Muis:</b> slepen verschuift, rechts slepen of Shift + slepen draait en kantelt, scrollen zoomt naar de cursor, dubbelklik vliegt erheen. Klik op iets om te zien wat het is en waar het ligt. <b>Touch:</b> één vinger verschuift, twee vingers zoomen, draaien en kantelen. <b>Toetsen:</b> pijltjes verschuiven, Shift + pijltjes draaien en kantelen, + en − zoomen, Home toont het hele gebied.">?</span>
+  </nav>
+
+  <aside class="float" id="viewerLayers" aria-label="Lagen in het model">
+    <div class="lhead">
+      <span class="overline">Lagen
+        <span class="help" tabindex="0" role="button" aria-label="Over de lagen in het model"
+          data-tip="Elke regel is een collectie in <b>model.blend</b> en een ouderobject in Unity. Zet er een uit om te zien wat eronder ligt: de bomen weg om de straat te zien, de gebouwen weg om de grond te zien.">?</span>
+      </span>
+      <button class="linkish" id="viewerAllLayers">Alles aan</button>
+    </div>
+    <div id="viewerLayerList"></div>
+    <p class="muted caption" id="viewerStats" style="margin-top:8px"></p>
+  </aside>
+
+  <section class="float" id="viewerInfo" aria-label="Wat je aanklikte" hidden>
+    <div class="ihead">
+      <div>
+        <span class="overline" id="infoKind"></span>
+        <h2 id="infoName"></h2>
+      </div>
+      <button class="btn ghost icon" id="infoClose" aria-label="Sluiten">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="kv" id="infoProps"></div>
+    <div><button class="btn" id="infoFocus">Inzoomen</button></div>
+  </section>
+
+  <div id="viewerCoords" aria-live="off"></div>
+  <div id="viewerHint">Slepen verschuift · rechts slepen draait · scrollen zoomt · klik op iets voor wat het is</div>
+
+  <div id="viewerStatus" role="status">
+    <div class="vcard">
+      <h2 id="viewerStatusTitle">3D-weergave laden</h2>
+      <p class="muted small" id="viewerStatusText"></p>
+      <div class="pbar" id="viewerBar"><div class="pfill" id="viewerFill"></div></div>
+      <div class="buttons" id="viewerStatusButtons" hidden>
+        <button class="btn" id="viewerRetry">Opnieuw proberen</button>
+        <button class="btn ghost" id="viewerStatusBack">Terug naar Modellen</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================================================================== -->
 <!-- Dialogs                                                                -->
 <!-- ===================================================================== -->
 <dialog id="modelDialog" aria-labelledby="modelTitle">
   <div class="dhead">
     <h2 id="modelTitle">Model</h2>
     <div style="display:flex;gap:8px">
-      <button class="btn" id="rebuildModel">Opnieuw bouwen</button>
+      <button class="btn" id="open3dModel">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7 12 12l8.7-5M12 22V12"/></svg>
+        In 3D bekijken
+      </button>
+      <button class="btn ghost" id="rebuildModel">Opnieuw bouwen</button>
       <button class="btn ghost icon" id="closeModel" aria-label="Sluiten">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
@@ -515,6 +660,7 @@
     <p>Kies een vierkant ergens in Nederland. Dit haalt de officiële open data ervoor op, de gebouwen, de hoogte van de grond, de wegen en de luchtfoto, en bouwt er een <b>model.blend</b> van om te bewerken en een <b>model.fbx</b> voor Unity. Alles komt op ware grootte in meters, op zijn echte hoogte boven NAP.</p>
     <p>Een map <code>output/&lt;naam&gt;/</code> met: <code>model.blend</code>, het model voor Blender, elke laag een eigen collectie en één object per gebouw en boom; <code>model.fbx</code>, hetzelfde model voor Unity; <code>maptile_tools.py</code>, Blender-gereedschap dat de grond onder de wegen houdt als je ze bewerkt; <code>aerial.png</code> en de gevelbeelden; <code>metadata.json</code>, waar het in de wereld ligt; en <code>ATTRIBUTION.txt</code>, de bronvermelding. Houd die bij het model als je het doorgeeft.</p>
     <p><b>Blender:</b> open <code>model.blend</code>. Installeer <code>maptile_tools.py</code> eenmalig als add-on (Edit &rarr; Preferences &rarr; Add-ons &rarr; Install from Disk); het tabblad <i>Maptile</i> staat dan in de zijbalk (N). In de gelaagde stijl volgen wegen, stoepen en gazons het terrein vanzelf, en is de stoeprand van elke stoep zijn <i>CurbGenerator</i>-modifier. Gebruik Blender 5 voor de stoepranden. In de inmetingsstijl druk je na het verplaatsen van een weg op <i>Fit terrain under roads</i>.</p>
+    <p><b>In de browser:</b> elk gebouwd model opent hier ook in 3D, met <i>In 3D</i> op zijn kaart onder Modellen. Klik op een gebouw, boom of weg en je ziet wat het is en waar het ligt, in RD en NAP. Zet lagen uit om te zien wat eronder ligt. Bewaar je het model in Blender na een bewerking, dan toont de 3D-weergave de nieuwe versie zodra je hem opnieuw opent.</p>
     <p><b>Unity:</b> sleep de map naar Assets. Zet op de FBX <i>Scale Factor</i> op 1, laat <i>Convert Units</i> aan en vink <i>Bake Axis Conversion</i> aan, zodat niets gedraaid binnenkomt.</p>
     <p>Het midden van het vierkant is de oorsprong, dus het model ligt om 0,0 heen. Hoogte is gemeten vanaf NAP, net als op elke Nederlandse kaart.</p>
   </div>
@@ -558,6 +704,7 @@ const selLabelEl = $("selLabel");
 /* ---------- views ---------- */
 function showModels() {
   $("viewBuild").hidden = true;
+  $("view3d").hidden = true;
   $("viewModels").hidden = false;
   hideTip();
   loadAreas();
@@ -565,6 +712,7 @@ function showModels() {
 
 function showBuild() {
   $("viewModels").hidden = true;
+  $("view3d").hidden = true;
   $("viewBuild").hidden = false;
   hideTip();
   // The map has no size while hidden; fit once it has one.
@@ -1138,6 +1286,11 @@ function checksLine(v) {
 }
 
 const ICON_OK = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>';
+const ICON_CUBE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7 12 12l8.7-5M12 22V12"/></svg>';
+
+/* Whether an area can be opened in 3D: anything with a saved model can, the
+   server writing the view the first time it is asked. */
+function can3d(a) { return !!a && !!a.view && a.view !== "unavailable"; }
 const ICON_FAIL = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>';
 
 async function loadAreas() {
@@ -1171,19 +1324,27 @@ function renderAreas() {
     li.className = "card";
     const shot = areaShot(a);
     const checks = checksLine(a.validation);
+    const viewable = can3d(a);
+    const picture = shot
+      ? `<img class="shot" src="${shot}" alt="${viewable ? "" : `Voorbeeldbeeld van ${escapeHtml(a.name)}`}" loading="lazy">`
+      : `<div class="shot noimg">Geen voorbeeldbeeld</div>`;
     li.innerHTML =
-      (shot
-        ? `<img class="shot" src="${shot}" alt="Voorbeeldbeeld van ${escapeHtml(a.name)}" loading="lazy">`
-        : `<div class="shot noimg">Geen voorbeeldbeeld</div>`) +
+      // The picture opens the 3D view too; the button below is the way in
+      // for the keyboard, so the picture is not a second stop on the way.
+      (viewable
+        ? `<button class="shotbtn" data-3d tabindex="-1" aria-hidden="true">${picture}<span class="chip">${ICON_CUBE}3D</span></button>`
+        : picture) +
       `<div class="body">
          <h3>${escapeHtml(a.name)}</h3>
          <span class="muted small">${escapeHtml(areaMeta(a))}</span>
          <span class="checks">${checks.ok === false ? ICON_FAIL : checks.ok ? ICON_OK : ""}${escapeHtml(checks.text)}</span>
          <div class="buttons">
-           <button class="btn" data-open>Bekijken</button>
+           ${viewable ? `<button class="btn" data-3d aria-label="${escapeHtml(a.name)} in 3D bekijken">${ICON_CUBE}In 3D</button>` : ""}
+           <button class="btn${viewable ? " ghost" : ""}" data-open>Bekijken</button>
            <button class="btn ghost" data-rebuild>Opnieuw bouwen</button>
          </div>
        </div>`;
+    for (const button of li.querySelectorAll("[data-3d]")) button.onclick = () => open3d(a);
     li.querySelector("[data-open]").onclick = () => openModel(a);
     li.querySelector("[data-rebuild]").onclick = () => rebuild(a);
     grid.appendChild(li);
@@ -1227,6 +1388,7 @@ $("rebuildModel").onclick = () => { if (openArea) rebuild(openArea); };
 function openModel(a) {
   openArea = a;
   $("modelTitle").textContent = a.name;
+  $("open3dModel").hidden = !can3d(a);
   showResult(a);
   $("modelDialog").showModal();
 }
@@ -1338,6 +1500,7 @@ function showRunCard(name, meta) {
   $("cancel").hidden = false;
   $("showLog").hidden = false;
   $("openResult").hidden = true;
+  $("open3dResult").hidden = true;
   $("dismissRun").hidden = true;
 }
 
@@ -1440,6 +1603,7 @@ async function poll() {
     const checks = checksLine(lastArea.validation);
     $("runMeta").textContent = checks.text;
     $("openResult").hidden = false;
+    $("open3dResult").hidden = !can3d(lastArea);
     const shot = areaShot(lastArea);
     if (shot) {
       $("runThumb").src = shot;
@@ -1584,11 +1748,350 @@ async function checkServices() {
 
 $("recheck").onclick = () => { checkServices(); };
 
+/* ---------------------------------------------------------------------------
+   3D: a built model in the browser.
+
+   The drawing is ui/viewer.js, fetched the first time a model is opened.
+   The server says where the model's 3D file is, writing it from the .blend
+   first when there is none yet or only one of an older save; the page waits
+   for that, then hands the file over and lists the layers it holds.
+
+   #3d/<name> in the address opens a model straight away, and the browser's
+   back button leaves the view as it would leave a page.
+--------------------------------------------------------------------------- */
+const LAYER_NAME = {
+  "Terrain": "Grond", "Terrain Cutout": "Gras", "Roads": "Wegen", "Buildings": "Gebouwen",
+  "Water": "Water", "Trees": "Bomen", "Street furniture": "Straatmeubilair",
+  "Barriers": "Muren, hekken en hagen", "Vehicles": "Auto's en boten", "Rail": "Spoor",
+  "Structures": "Bruggen en tunnels"
+};
+/* The layered style names its own collections after the area. */
+const LAYER_SUFFIX = {
+  "_Terrain": "Grond, wegen en stoepen", "_Water": "Water", "_Haven": "Kades en steigers"
+};
+/* What one object of a layer is called, where that says more than the layer. */
+const LAYER_ITEM = { "Buildings": "Gebouw", "Trees": "Boom", "Roads": "Weg" };
+/* The properties a clicked object carries, as the page names them. */
+const PROPERTY = {
+  bag_id: ["BAG-pand", v => String(v).replace(/^NL\.IMBAG\.Pand\./, "")],
+  build_year: ["bouwjaar", v => String(v)],
+  height_m: ["hoogte", v => `${String(v).replace(".", ",")} m`],
+  detected: ["herkomst", v => (v ? "gevonden in het hoogtemodel" : "BGT-bomenregister")],
+  kind: ["soort", v => String(v)]
+};
+
+function layerLabel(name) {
+  if (LAYER_NAME[name]) return LAYER_NAME[name];
+  for (const [suffix, label] of Object.entries(LAYER_SUFFIX)) {
+    if (name.endsWith(suffix)) return label;
+  }
+  return name || "Overig";
+}
+
+const nl = n => Number(n).toLocaleString("nl-NL");
+const hashFor = name => `#3d/${encodeURIComponent(name)}`;
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+let viewer = null, viewerModule = null, viewerArea = null, viewerRun = 0, viewerPushed = false;
+let hintTimer = null;
+
+function status3d(title, text, { fraction = null, error = false } = {}) {
+  $("viewerStatus").hidden = false;
+  $("viewerStatusTitle").textContent = title;
+  $("viewerStatusText").textContent = text || "";
+  $("viewerStatusText").style.color = error ? "var(--text-secondary)" : "";
+  $("viewerBar").hidden = error;
+  const fill = $("viewerFill");
+  fill.classList.toggle("indeterminate", fraction === null && !error);
+  if (fraction !== null) fill.style.width = `${Math.round(fraction * 100)}%`;
+  $("viewerStatusButtons").hidden = !error;
+}
+
+function fail3d(text, { retry = true } = {}) {
+  status3d("Dit model kan niet in 3D worden getoond", text, { error: true });
+  $("viewerRetry").hidden = !retry;
+}
+
+function disposeViewer() {
+  if (viewer) { viewer.dispose(); viewer = null; }
+  // A canvas whose context was let go of cannot draw again: a new model
+  // gets a new canvas.
+  const old = $("viewerCanvas"), fresh = old.cloneNode(false);
+  old.replaceWith(fresh);
+}
+
+function hide3d() {
+  viewerRun++;
+  disposeViewer();
+  viewerArea = null;
+  $("view3d").hidden = true;
+  clearTimeout(hintTimer);
+}
+
+async function open3d(area, { push = true, retry = false } = {}) {
+  if (!area) return;
+  const run = ++viewerRun;
+  disposeViewer();
+  viewerArea = area;
+  if ($("modelDialog").open) $("modelDialog").close();
+  hideTip();
+  $("viewModels").hidden = true;
+  $("viewBuild").hidden = true;
+  $("view3d").hidden = false;
+  $("viewerTitle").textContent = area.name;
+  $("viewerMeta").textContent = areaMeta(area);
+  $("viewerInfo").hidden = true;
+  $("viewerCoords").textContent = "";
+  $("viewerLayerList").innerHTML = "";
+  $("viewerStats").textContent = "";
+  // The layers and the hint about the mouse wait for a model to be there.
+  $("viewerLayers").hidden = true;
+  $("viewerHint").hidden = true;
+  $("viewerHint").classList.remove("gone");
+  if (push) {
+    history.pushState({ view: "3d", name: area.name }, "", hashFor(area.name));
+    viewerPushed = true;
+  }
+  status3d("3D-weergave laden", "");
+
+  try {
+    viewerModule = viewerModule || await import("/viewer.js");
+  } catch {
+    fail3d("De 3D-weergave kon niet worden geladen. Is de lokale server bijgewerkt en opnieuw gestart?");
+    return;
+  }
+  if (run !== viewerRun) return;
+  if (!viewerModule.webgl2Supported()) {
+    fail3d("Deze browser kan geen 3D tekenen: WebGL2 ontbreekt of staat uit. Probeer een recente Chrome, Edge, Firefox of Safari.", { retry: false });
+    return;
+  }
+
+  const state = await waitForView(area.name, run, retry);
+  if (!state || run !== viewerRun) return;
+
+  status3d("Model laden", "", { fraction: 0 });
+  const m = area.metadata || {};
+  const origin = Array.isArray(m.origin_rd) && m.origin_rd.length >= 2
+    ? { x: Number(m.origin_rd[0]), y: Number(m.origin_rd[1]), z: Number(m.ground_z_offset_nap) || 0 }
+    : null;
+  // The square the ground covers, in the model's own axes: X east of the
+  // origin, Z south of it.
+  const extent = origin && Array.isArray(m.bbox_rd) && m.bbox_rd.length === 4
+    ? { minX: m.bbox_rd[0] - origin.x, maxX: m.bbox_rd[2] - origin.x,
+        minZ: origin.y - m.bbox_rd[3], maxZ: origin.y - m.bbox_rd[1] }
+    : null;
+  try {
+    viewer = new viewerModule.Viewer($("viewerCanvas"), {
+      progress: (stage, done, total) => run === viewerRun && progress3d(stage, done, total),
+      hover: info => run === viewerRun && showPoint(info),
+      select: info => run === viewerRun && showObject(info),
+      view: camera => { $("compass").style.transform = `rotate(${camera.yaw}rad)`; },
+      lost: () => run === viewerRun && fail3d("De grafische kaart is gestopt met tekenen, vaak omdat het geheugen vol was. Probeer het opnieuw, of sluit andere tabbladen eerst.")
+    });
+    const summary = await viewer.load(state.url, { textureBase: state.textures, origin, extent });
+    if (run !== viewerRun || !summary) return;
+    showLayers(summary);
+    $("viewerLayers").hidden = false;
+    $("viewerHint").hidden = false;
+    $("viewerStatus").hidden = true;
+    $("viewerCanvas").focus({ preventScroll: true });
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(() => $("viewerHint").classList.add("gone"), 9000);
+    for (const kind of ["pointerdown", "wheel"]) {
+      $("viewerCanvas").addEventListener(kind, () => $("viewerHint").classList.add("gone"), { once: true });
+    }
+  } catch (err) {
+    if (run !== viewerRun || (err && err.name === "AbortError")) return;
+    fail3d(`Het model kon niet worden geladen: ${err && err.message ? err.message : err}`);
+  }
+}
+
+/* Ask the server for the model's 3D file until it is there, saying why it
+   is not yet: being written from the .blend, or the area still building. */
+async function waitForView(name, run, retry) {
+  for (;;) {
+    if (run !== viewerRun) return null;
+    let state;
+    try {
+      const r = await fetch(`/api/viewer?name=${encodeURIComponent(name)}${retry ? "&retry=1" : ""}`);
+      state = await r.json();
+      if (!r.ok) throw new Error(state.error || r.status);
+    } catch {
+      fail3d("De lokale server is niet bereikbaar.");
+      return null;
+    }
+    retry = false;
+    if (run !== viewerRun) return null;
+    if (state.state === "ready") return state;
+    if (state.state === "preparing") {
+      status3d("3D-weergave voorbereiden",
+        `Eenmalig voor dit model: Blender zet het om voor de browser, meestal binnen een halve minuut. ${humanTime(state.elapsed || 0)}`);
+    } else if (state.state === "building") {
+      status3d("Dit gebied wordt gebouwd", "Het opent hier vanzelf zodra het klaar is.");
+    } else if (state.state === "unavailable") {
+      fail3d("Er is geen model.blend om een 3D-weergave van te maken. Bouw het gebied opnieuw.", { retry: false });
+      return null;
+    } else {
+      fail3d(`Blender kon het model niet omzetten: ${state.error || "onbekende fout"}`);
+      return null;
+    }
+    await sleep(1000);
+  }
+}
+
+function progress3d(stage, done, total) {
+  if (stage === "download") {
+    const mb = v => (v / 1e6).toFixed(1).replace(".", ",");
+    status3d("Model laden", total ? `${mb(done)} van ${mb(total)} MB` : "", { fraction: total ? done / total : null });
+  } else if (stage === "build") {
+    status3d("Model opbouwen", "");
+  } else if (stage === "textures" && viewer && viewer.summary) {
+    $("viewerStats").textContent = done < total
+      ? `Foto's en gevels laden: ${done} van ${total}`
+      : statsLine(viewer.summary);
+  } else if (stage === "done" && viewer && viewer.summary) {
+    $("viewerStats").textContent = statsLine(viewer.summary);
+  }
+}
+
+function statsLine(summary) {
+  return `${nl(summary.triangles)} driehoeken, ${nl(summary.objects)} objecten`;
+}
+
+function showLayers(summary) {
+  const host = $("viewerLayerList");
+  host.innerHTML = "";
+  for (const layer of viewer.layers) {
+    const row = document.createElement("label");
+    row.className = "lrow";
+    const name = document.createElement("span");
+    name.className = "name";
+    const count = layer.objects === 1 ? "1 object" : `${nl(layer.objects)} objecten`;
+    name.innerHTML = `${escapeHtml(layerLabel(layer.name))}<span class="who">${escapeHtml(layer.name)} · ${count}</span>`;
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "switch";
+    box.checked = layer.visible;
+    box.setAttribute("aria-label", layerLabel(layer.name));
+    box.onchange = () => {
+      viewer.setLayerVisible(layer.index, box.checked);
+      row.classList.toggle("off", !box.checked);
+    };
+    row.append(name, box);
+    host.appendChild(row);
+  }
+  $("viewerStats").textContent = statsLine(summary);
+}
+
+/* Where a point is: RD as the exact coordinates are written elsewhere on the
+   page, ready to copy; the height above NAP as a height is said. Without the
+   model's metadata, its own coordinates from the middle of the area. */
+function pointRows(info) {
+  if (!info.rd) {
+    const [x, y, z] = info.point;
+    return [["x, y", `${x.toFixed(1)}, ${(-z).toFixed(1)} m van het midden`],
+            ["hoogte", `${y.toFixed(2).replace(".", ",")} m`]];
+  }
+  return [["RD", `${info.rd[0].toFixed(1)}, ${info.rd[1].toFixed(1)}`],
+          ["NAP", `${info.nap >= 0 ? "+" : ""}${info.nap.toFixed(2).replace(".", ",")} m`]];
+}
+
+function showPoint(info) {
+  $("viewerCoords").textContent = info
+    ? [...pointRows(info).map(([k, v]) => `${k} ${v}`), info.name].join("  ·  ")
+    : "";
+}
+
+let selectedInfo = null;
+
+function showObject(info) {
+  selectedInfo = info;
+  if (!info) { $("viewerInfo").hidden = true; return; }
+  $("infoKind").textContent = LAYER_ITEM[info.layerName] || layerLabel(info.layerName);
+  $("infoName").textContent = info.name;
+  const rows = [["laag", info.layerName && layerLabel(info.layerName) !== info.layerName
+    ? `${layerLabel(info.layerName)} (${info.layerName})` : layerLabel(info.layerName)]];
+  for (const [key, value] of Object.entries(info.properties || {})) {
+    if (key.startsWith("maptile_")) continue;
+    const [label, format] = PROPERTY[key] || [key, v => String(v)];
+    rows.push([label, format(value)]);
+  }
+  rows.push(...pointRows(info));
+  $("infoProps").innerHTML = rows
+    .map(([k, v]) => `<b>${escapeHtml(k.padEnd(10))}</b>${escapeHtml(v)}`).join("\n");
+  $("viewerInfo").hidden = false;
+}
+
+$("infoClose").onclick = () => { if (viewer) viewer.select(null); showObject(null); };
+$("infoFocus").onclick = () => { if (viewer && selectedInfo) viewer.focus(selectedInfo.point); };
+$("viewOverview").onclick = () => viewer && viewer.overview();
+$("viewTop").onclick = () => viewer && viewer.topDown();
+$("viewNorth").onclick = () => viewer && viewer.north();
+$("toggleViewerLayers").onclick = () => $("viewerLayers").classList.toggle("shown");
+$("viewerAllLayers").onclick = () => {
+  if (!viewer) return;
+  for (const layer of viewer.layers) viewer.setLayerVisible(layer.index, true);
+  for (const row of document.querySelectorAll(".lrow")) {
+    row.classList.remove("off");
+    row.querySelector("input").checked = true;
+  }
+};
+$("viewerRetry").onclick = () => { if (viewerArea) open3d(viewerArea, { push: false, retry: true }); };
+
+function leave3d() {
+  if (viewerPushed) {
+    // The view was a step in this tab's history: going back closes it.
+    history.back();
+    return;
+  }
+  history.replaceState(null, "", location.pathname + location.search);
+  hide3d();
+  showModels();
+}
+$("viewerBack").onclick = leave3d;
+$("viewerStatusBack").onclick = leave3d;
+
+$("open3dModel").onclick = () => { if (openArea) open3d(openArea); };
+$("open3dResult").onclick = () => { if (lastArea) open3d(lastArea); };
+
+window.addEventListener("popstate", () => {
+  const match = /^#3d\/(.+)$/.exec(location.hash);
+  if (match) {
+    const area = areas.find(a => a.name === decodeURIComponent(match[1]));
+    if (area && (!viewerArea || viewerArea.name !== area.name)) {
+      viewerPushed = true;
+      open3d(area, { push: false });
+    }
+    return;
+  }
+  if (!$("view3d").hidden) {
+    viewerPushed = false;
+    hide3d();
+    showModels();
+  }
+});
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !$("view3d").hidden && !tipOwner && selectedInfo) {
+    if (viewer) viewer.select(null);
+    showObject(null);
+  }
+});
+
+/* An address with #3d/<name> opens that model once the list is in. */
+function openFromAddress() {
+  const match = /^#3d\/(.+)$/.exec(location.hash);
+  if (!match) return;
+  const area = areas.find(a => a.name === decodeURIComponent(match[1]));
+  if (area && can3d(area)) open3d(area, { push: false });
+  else history.replaceState(null, "", location.pathname + location.search);
+}
+
 /* ---------- start ---------- */
 updateBboxInfo();
 applyStyle();
 checkServices();
-loadAreas().then(resumeRunning);
+loadAreas().then(() => { openFromAddress(); return resumeRunning(); });
 
 probeTileSource().then(source => {
   if (source === tileSource) return;

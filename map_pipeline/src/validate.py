@@ -1304,6 +1304,31 @@ def check_export(
             f"model centre at ({center_x:.1f}, {center_y:.1f}) m from origin, "
             f"within the {allowed_x:.1f} x {allowed_y:.1f} m the overhang allows",
         )
+        check_web_view(report, work_dir, summary.get("web_view"), blend_name)
+
+
+def check_web_view(
+    report: CheckReport, work_dir: Path, written: dict | None, blend_name: str
+) -> None:
+    """The page's 3D view was written beside the work files.
+
+    A warning at most: the model is whole without it, and the page writes
+    the view from the .blend when it finds none. What this catches is the
+    exporter breaking, which would otherwise only show as a wait in the page.
+    """
+    path = work_dir / str((written or {}).get("file") or "viewer.glb")
+    ok = bool(written) and path.is_file() and path.stat().st_size > 0
+    report.add(
+        "web_view_written",
+        ok,
+        f"{path.name} is {path.stat().st_size / 1e6:.1f} MB: "
+        f"{written.get('triangles', 0)} triangles, {written.get('objects', 0)} "
+        f"objects in {written.get('layers', 0)} layers, for the page's 3D view"
+        if ok
+        else f"no 3D view was written; the page writes one from {blend_name} "
+        f"when the model is first opened there",
+        severity="warning",
+    )
 
 
 def _centring_tolerance(span: float, bbox_size: float) -> float:
