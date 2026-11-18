@@ -313,6 +313,40 @@ void main() {
   }
 }`;
 
+// The wireframe's lines, over the model. Dark where the surface under them
+// is light and light where it is dark, so they read on the aerial, on black
+// asphalt and on pale walls alike; the selected object's in its own colour.
+const WIRE = `#version 300 es
+precision highp float;
+in vec3 v_world;
+in vec2 v_uv;
+flat in float v_object;
+uniform sampler2D u_texture;
+uniform float u_hasTexture;
+uniform vec4 u_color;
+uniform vec3 u_eye;
+uniform float u_fogStart;
+uniform float u_fogRange;
+uniform float u_selected;
+uniform vec3 u_highlight;
+uniform float u_focal;
+out vec4 o_color;
+${COMMON}
+void main() {
+  vec4 base = u_color;
+  if (u_hasTexture > 0.5) base *= texture(u_texture, v_uv);
+  float light = dot(base.rgb, vec3(0.2126, 0.7152, 0.0722));
+  vec3 color = light > 0.12 ? vec3(0.0) : vec3(1.0);
+  float alpha = light > 0.12 ? 0.55 : 0.45;
+  // Full where a metre is a few pixels or more, faint where edges a few
+  // metres long crowd into a pixel or two and would only blacken the model.
+  float perMetre = u_focal / max(length(u_eye - v_world), 0.001);
+  alpha *= mix(0.12, 1.0, smoothstep(0.6, 3.0, perMetre));
+  if (abs(v_object - u_selected) < 0.5) { color = u_highlight; alpha = 1.0; }
+  float fog = clamp((length(u_eye - v_world) - u_fogStart) / u_fogRange, 0.0, 1.0);
+  o_color = vec4(srgb(color), alpha * (1.0 - fog));
+}`;
+
 const SKY_VERTEX = `#version 300 es
 out vec2 v_ndc;
 void main() {
@@ -392,6 +426,19 @@ function readAccessor(gltf, bin, index) {
   return out;
 }
 
+/* An accessor of whole numbers, indices or a mask, as a copy in its own
+   type: as floats, vertex numbers past sixteen million would round. */
+function readIntegers(gltf, bin, index) {
+  const accessor = gltf.accessors[index];
+  const view = gltf.bufferViews[accessor.bufferView], Type = COMPONENT[accessor.componentType];
+  const width = WIDTH[accessor.type], start = bin.byteOffset + (view.byteOffset || 0) + (accessor.byteOffset || 0);
+  const packed = !view.byteStride || view.byteStride === Type.BYTES_PER_ELEMENT * width;
+  if (Type !== Float32Array && packed && start % Type.BYTES_PER_ELEMENT === 0) {
+    return new Type(bin.buffer, start, accessor.count * width).slice();
+  }
+  return Uint32Array.from(readAccessor(gltf, bin, index));
+}
+
 async function fetchBytes(url, signal, onProgress) {
   const response = await fetch(url, { signal });
   if (!response.ok) throw new Error(`het model kwam niet binnen (${response.status})`);
@@ -453,7 +500,8 @@ export class Viewer {
       shade: this.program(VERTEX, SHADE),
       pick: this.program(VERTEX, PICK),
       shadow: this.program(VERTEX, SHADOW),
-      sky: this.program(SKY_VERTEX, SKY)
+      sky: this.program(SKY_VERTEX, SKY),
+      wire: this.program(VERTEX, WIRE)
     };
     this.emptyVao = gl.createVertexArray();
     // Texture unit 0 holds pictures, unit 1 the shadow map, and nothing
@@ -688,26 +736,35 @@ export class Viewer {
   primitive(gltf, bin, primitive, bufferFor, matrix, instances, instanceObjects) {
     const gl = this.gl;
     if ((primitive.mode ?? 4) !== 4 || primitive.attributes.POSITION === undefined) return null;
-    const vao = gl.createVertexArray();
-    gl.bindVertexArray(vao);
-    const has = {};
+    // What each attribute reads, kept so the wireframe's lines can read the
+    // same buffers through a vertex array of their own.
+    const bindings = [], has = {};
     for (const name of ["POSITION", "NORMAL", "TEXCOORD_0", "_OBJECT"]) {
       const index = primitive.attributes[name];
       if (index === undefined) continue;
       const accessor = gltf.accessors[index], view = gltf.bufferViews[accessor.bufferView];
-      gl.bindBuffer(gl.ARRAY_BUFFER, bufferFor(accessor.bufferView, gl.ARRAY_BUFFER));
-      gl.enableVertexAttribArray(LOC[name]);
-      gl.vertexAttribPointer(LOC[name], WIDTH[accessor.type], accessor.componentType, !!accessor.normalized,
-        view.byteStride || 0, accessor.byteOffset || 0);
+      bindings.push({
+        loc: LOC[name], buffer: bufferFor(accessor.bufferView, gl.ARRAY_BUFFER), size: WIDTH[accessor.type],
+        type: accessor.componentType, normalized: !!accessor.normalized,
+        stride: view.byteStride || 0, offset: accessor.byteOffset || 0, divisor: 0
+      });
       has[name] = true;
     }
     let count = gltf.accessors[primitive.attributes.POSITION].count, indexType = null, offset = 0;
+    let elements = null, wire = null;
     if (primitive.indices !== undefined) {
       const accessor = gltf.accessors[primitive.indices];
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufferFor(accessor.bufferView, gl.ELEMENT_ARRAY_BUFFER));
+      elements = bufferFor(accessor.bufferView, gl.ELEMENT_ARRAY_BUFFER);
       count = accessor.count;
       indexType = accessor.componentType;
       offset = accessor.byteOffset || 0;
+      // The triangles and which of their sides are edges, copied out of
+      // the file so it can go; the lines are made from them when asked for.
+      const edges = primitive.extras && primitive.extras.edges;
+      wire = {
+        indices: readIntegers(gltf, bin, primitive.indices),
+        mask: edges !== undefined ? readIntegers(gltf, bin, edges) : null
+      };
     }
     let n = 0;
     if (instances) {
@@ -717,27 +774,65 @@ export class Viewer {
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
       gl.bufferData(gl.ARRAY_BUFFER, instances, gl.STATIC_DRAW);
       for (let c = 0; c < 4; c++) {
-        gl.enableVertexAttribArray(LOC.MATRIX + c);
-        gl.vertexAttribPointer(LOC.MATRIX + c, 4, gl.FLOAT, false, 64, c * 16);
-        gl.vertexAttribDivisor(LOC.MATRIX + c, 1);
+        bindings.push({ loc: LOC.MATRIX + c, buffer, size: 4, type: gl.FLOAT, normalized: false,
+          stride: 64, offset: c * 16, divisor: 1 });
       }
       if (instanceObjects) {
         const ids = gl.createBuffer();
         this.buffers.push(ids);
         gl.bindBuffer(gl.ARRAY_BUFFER, ids);
         gl.bufferData(gl.ARRAY_BUFFER, instanceObjects, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(LOC._OBJECT);
-        gl.vertexAttribPointer(LOC._OBJECT, 1, gl.FLOAT, false, 0, 0);
-        gl.vertexAttribDivisor(LOC._OBJECT, 1);
+        bindings.push({ loc: LOC._OBJECT, buffer: ids, size: 1, type: gl.FLOAT, normalized: false,
+          stride: 0, offset: 0, divisor: 1 });
         has._OBJECT = true;
       }
     }
+    return {
+      vao: this.vertexArray(bindings, elements), count, indexType, offset, instances: n, has, matrix,
+      bindings, wire, material: primitive.material !== undefined ? primitive.material : 0
+    };
+  }
+
+  vertexArray(bindings, elements) {
+    const gl = this.gl, vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    for (const b of bindings) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.buffer);
+      gl.enableVertexAttribArray(b.loc);
+      gl.vertexAttribPointer(b.loc, b.size, b.type, b.normalized, b.stride, b.offset);
+      gl.vertexAttribDivisor(b.loc, b.divisor);
+    }
+    if (elements) gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, elements);
     gl.bindVertexArray(null);
     this.vaos.push(vao);
-    return {
-      vao, count, indexType, offset, instances: n, has, matrix,
-      material: primitive.material !== undefined ? primitive.material : 0
-    };
+    return vao;
+  }
+
+  /* The wireframe of a draw: a line for every side of a triangle that is an
+     edge of the mesh, so a quad shows as a quad, as in Blender. A file with
+     no record of that shows every side. Made once, the first time. */
+  wireOf(d) {
+    if (d.wireLines !== undefined) return d.wireLines;
+    d.wireLines = null;
+    if (!d.wire) return null;
+    const { indices, mask } = d.wire, triangles = Math.floor(indices.length / 3);
+    const lines = new Uint32Array(triangles * 6);
+    let n = 0;
+    for (let t = 0; t < triangles; t++) {
+      const sides = mask ? mask[t] : 7, i = t * 3;
+      if (sides & 1) { lines[n++] = indices[i]; lines[n++] = indices[i + 1]; }
+      if (sides & 2) { lines[n++] = indices[i + 1]; lines[n++] = indices[i + 2]; }
+      if (sides & 4) { lines[n++] = indices[i + 2]; lines[n++] = indices[i]; }
+    }
+    d.wire = null;
+    if (!n) return null;
+    const gl = this.gl, elements = gl.createBuffer();
+    this.buffers.push(elements);
+    gl.bindVertexArray(null);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, elements);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, lines.subarray(0, n), gl.STATIC_DRAW);
+    d.wireLines = { vao: this.vertexArray(d.bindings, elements), count: n };
+    return d.wireLines;
   }
 
   /* The ground's usual height: low, but not the bed of a canal. */
@@ -1044,9 +1139,62 @@ export class Viewer {
       gl.bindVertexArray(this.base.vao);
       gl.drawArrays(gl.TRIANGLES, 0, this.base.count);
     }
+    if (this.wireframe) {
+      // The faces stand back a hair, so the lines on them always win.
+      gl.enable(gl.POLYGON_OFFSET_FILL);
+      gl.polygonOffset(1, 1);
+    }
     this.drawAll(u, true);
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+    if (this.wireframe) this.drawWires(m);
     gl.bindVertexArray(null);
     if (this.on.view) this.on.view({ ...this.camera });
+  }
+
+  /* The wireframe, after the faces. The lines write depth and pass only in
+     front of what is there, so a side two triangles share, or two flat
+     faces with their own copies of a corner, is drawn once, not twice as
+     dark. */
+  drawWires(m) {
+    const gl = this.gl, wire = this.programs.wire, u = wire.uniforms;
+    gl.useProgram(wire.program);
+    gl.uniformMatrix4fv(u.u_viewProj, false, m.viewProj);
+    gl.uniform3fv(u.u_eye, m.eye);
+    gl.uniform1f(u.u_fogStart, this.camera.distance + this.radius * 0.25);
+    gl.uniform1f(u.u_fogRange, this.radius * 2.2);
+    gl.uniform1f(u.u_selected, this.selected >= 0 ? this.selected : -1e9);
+    gl.uniform3fv(u.u_highlight, SELECTED);
+    // Pixels per metre at a metre away, on the drawing buffer.
+    gl.uniform1f(u.u_focal, this.canvas.height / (2 * Math.tan(FOV / 2)));
+    gl.uniform1i(u.u_texture, 0);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthFunc(gl.LESS);
+    gl.depthMask(true);
+    gl.activeTexture(gl.TEXTURE0);
+    let bound = null;
+    for (const d of this.draws) {
+      if (!this.layers[d.layer] || !this.layers[d.layer].visible) continue;
+      const lines = this.wireOf(d);
+      if (!lines) continue;
+      const material = this.materials[d.material] || this.materials[0];
+      const texture = this.textureFor(material);
+      if (texture !== bound) {
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        bound = texture;
+      }
+      this.setMaterial(u, material);
+      this.setConstants(d);
+      gl.bindVertexArray(lines.vao);
+      if (d.instances) gl.drawElementsInstanced(gl.LINES, lines.count, gl.UNSIGNED_INT, 0, d.instances);
+      else gl.drawElements(gl.LINES, lines.count, gl.UNSIGNED_INT, 0);
+    }
+    gl.disable(gl.BLEND);
+  }
+
+  setWireframe(on) {
+    this.wireframe = !!on;
+    this.redraw();
   }
 
   /* Every visible draw, with the program whose uniforms are `u` in use.
@@ -1249,7 +1397,7 @@ export class Viewer {
   describe(hit) {
     if (!hit) return null;
     const entry = this.objects[hit.id] || [`#${hit.id}`, -1, {}];
-    const [name, layer, properties] = entry;
+    const [name, layer, properties, counts] = entry;
     const p = hit.point, o = this.origin;
     return {
       id: hit.id,
@@ -1257,6 +1405,10 @@ export class Viewer {
       layer,
       layerName: this.layers[layer] ? this.layers[layer].name : "",
       properties: properties || {},
+      // As Blender counts them, before the export cuts the quads in two.
+      mesh: Array.isArray(counts) && counts.length === 4
+        ? { vertices: counts[0], triangles: counts[1], quads: counts[2], ngons: counts[3] }
+        : null,
       point: p,
       // X east, -Z north, Y up, from the model's origin.
       rd: o ? [o.x + p[0], o.y - p[2]] : null,

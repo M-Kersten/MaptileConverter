@@ -259,6 +259,7 @@
   #viewerTools { top: 16px; right: 16px; padding: 8px; display: flex; align-items: center; gap: 4px; }
   #viewerTools .help { margin: 0 8px; }
   #viewNorth svg { width: 26px; height: 26px; }
+  #viewWire[aria-pressed="true"] { background: var(--bg-200); color: var(--signal-bright); }
   #viewerLayers { top: 88px; right: 16px; width: 320px; max-width: calc(100% - 32px); max-height: calc(100% - 180px);
                   overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 4px; }
   .lrow { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); cursor: pointer; }
@@ -304,6 +305,11 @@
   }
   @media (max-width: 640px) {
     #viewerMeta { display: none; }
+    #viewWire .label { display: none; }
+    #viewerTools { padding: 6px; gap: 0; }
+    #viewerTools .btn { padding: 0 10px; }
+    #viewerTools .btn.icon, #viewWire { width: 40px; padding: 0; }
+    #viewerTools .help { margin: 0 6px; }
     #viewerLayers { left: 12px; width: auto; }
   }
 
@@ -566,12 +572,17 @@
   <nav class="float" id="viewerTools" aria-label="Weergave">
     <button class="btn ghost" id="viewOverview" title="Het hele gebied, schuin van boven (Home)">Overzicht</button>
     <button class="btn ghost" id="viewTop" title="Recht van boven, met het noorden boven">Boven</button>
+    <button class="btn ghost" id="viewWire" aria-pressed="false" aria-label="Draadmodel"
+      title="De randen van de vlakken zoals Blender ze toont: quads als quads (Z)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16v16H4zM4 12h16M12 4v16"/></svg>
+      <span class="label">Draadmodel</span>
+    </button>
     <button class="btn ghost icon" id="viewNorth" aria-label="Draai met het noorden boven" title="Noorden boven">
       <svg id="compass" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.5" fill="none" stroke="var(--line-control)" stroke-width="1.5"/><path d="M12 3.5 15.2 12H8.8z" fill="var(--signal-bright)"/><path d="M8.8 12h6.4L12 20.5z" fill="var(--text-muted)"/></svg>
     </button>
     <button class="btn ghost" id="toggleViewerLayers" aria-controls="viewerLayers">Lagen</button>
     <span class="help" tabindex="0" role="button" aria-label="Over de bediening"
-      data-tip="<b>Muis:</b> slepen verschuift, rechts slepen of Shift + slepen draait en kantelt, scrollen zoomt naar de cursor, dubbelklik vliegt erheen. Klik op iets om te zien wat het is en waar het ligt. <b>Touch:</b> één vinger verschuift, twee vingers zoomen, draaien en kantelen. <b>Toetsen:</b> pijltjes verschuiven, Shift + pijltjes draaien en kantelen, + en − zoomen, Home toont het hele gebied.">?</span>
+      data-tip="<b>Muis:</b> slepen verschuift, rechts slepen of Shift + slepen draait en kantelt, scrollen zoomt naar de cursor, dubbelklik vliegt erheen. Klik op iets om te zien wat het is en waar het ligt. <b>Draadmodel</b> (of Z) tekent de randen van de vlakken zoals Blender ze toont, quads als quads; die van het aangeklikte object in oranje. <b>Touch:</b> één vinger verschuift, twee vingers zoomen, draaien en kantelen. <b>Toetsen:</b> pijltjes verschuiven, Shift + pijltjes draaien en kantelen, + en − zoomen, Home toont het hele gebied.">?</span>
   </nav>
 
   <aside class="float" id="viewerLayers" aria-label="Lagen in het model">
@@ -1888,6 +1899,7 @@ async function open3d(area, { push = true, retry = false } = {}) {
       view: camera => { $("compass").style.transform = `rotate(${camera.yaw}rad)`; },
       lost: () => run === viewerRun && fail3d("De grafische kaart is gestopt met tekenen, vaak omdat het geheugen vol was. Probeer het opnieuw, of sluit andere tabbladen eerst.")
     });
+    viewer.setWireframe(wireOn);
     const summary = await viewer.load(state.url, { textureBase: state.textures, origin, extent });
     if (run !== viewerRun || !summary) return;
     showLayers(summary);
@@ -2016,14 +2028,32 @@ function showObject(info) {
     const [label, format] = PROPERTY[key] || [key, v => String(v)];
     rows.push([label, format(value)]);
   }
+  if (info.mesh) {
+    // As Blender counts them, with its modifiers: the quads before the
+    // export cuts them in two.
+    const m = info.mesh, faces = [];
+    if (m.quads) faces.push(`${nl(m.quads)} quads`);
+    if (m.triangles) faces.push(`${nl(m.triangles)} driehoeken`);
+    if (m.ngons) faces.push(`${nl(m.ngons)} n-hoeken`);
+    rows.push(["vlakken", faces.join(", ") || "geen"], ["hoekpunten", nl(m.vertices)]);
+  }
   rows.push(...pointRows(info));
   $("infoProps").innerHTML = rows
-    .map(([k, v]) => `<b>${escapeHtml(k.padEnd(10))}</b>${escapeHtml(v)}`).join("\n");
+    .map(([k, v]) => `<b>${escapeHtml(k.padEnd(11))}</b>${escapeHtml(v)}`).join("\n");
   $("viewerInfo").hidden = false;
 }
 
 $("infoClose").onclick = () => { if (viewer) viewer.select(null); showObject(null); };
 $("infoFocus").onclick = () => { if (viewer && selectedInfo) viewer.focus(selectedInfo.point); };
+/* The wireframe stays as it was set when the next model opens: whoever is
+   checking meshes checks more than one. */
+let wireOn = false;
+function setWire(on) {
+  wireOn = on;
+  $("viewWire").setAttribute("aria-pressed", String(on));
+  if (viewer) viewer.setWireframe(on);
+}
+$("viewWire").onclick = () => setWire(!wireOn);
 $("viewOverview").onclick = () => viewer && viewer.overview();
 $("viewTop").onclick = () => viewer && viewer.topDown();
 $("viewNorth").onclick = () => viewer && viewer.north();
@@ -2072,6 +2102,12 @@ window.addEventListener("popstate", () => {
 });
 
 document.addEventListener("keydown", e => {
+  if ((e.key === "z" || e.key === "Z") && !$("view3d").hidden && !e.ctrlKey && !e.metaKey
+      && !e.altKey && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) {
+    setWire(!wireOn);
+    e.preventDefault();
+    return;
+  }
   if (e.key === "Escape" && !$("view3d").hidden && !tipOwner && selectedInfo) {
     if (viewer) viewer.select(null);
     showObject(null);

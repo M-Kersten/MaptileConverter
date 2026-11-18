@@ -45,7 +45,7 @@ MAX_JOBS = 24
 # The 3D view. Its file is written by blender/web_export.py into the area's
 # work folder; FORMAT there and this number are held equal by a test, so a
 # view written for an older page is written again rather than misread.
-VIEWER_FORMAT = 1
+VIEWER_FORMAT = 2
 VIEWER_FILE = "viewer.glb"
 VIEWER_STAMP = "viewer.json"
 # Writing a view from a saved model takes seconds; this only stops a Blender

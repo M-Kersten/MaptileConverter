@@ -209,7 +209,8 @@ Blender or Unity, and for showing it to someone who has neither.
 | Right-drag, or Shift + drag | turn and tilt |
 | Scroll | zoom towards the cursor |
 | Double-click | fly to that point |
-| Click | what it is and where: name, layer, properties, RD and NAP |
+| Click | what it is and where: name, layer, properties, faces, RD and NAP |
+| Z, or **Draadmodel** | the wireframe on and off |
 | Touch | one finger moves, two fingers zoom, turn and tilt |
 | Keys | arrows move, Shift + arrows turn and tilt, + and − zoom, Home shows the whole area |
 
@@ -222,6 +223,19 @@ whether it came from the BGT register or was found in the height model. Under
 the cursor the page reads out RD and NAP all the time, so the view also measures
 a model against the map.
 
+**The wireframe is the mesh as Blender shows it.** **Draadmodel** draws the
+edges of every face over the model: quads as quads, n-gons whole, without the
+diagonals the export triangulation adds, so the 4 m squares, the rungs across a
+road and the rows along a verge can be checked in the browser as in Blender's
+edit mode. Lines are dark on a light surface and light on a dark one; the
+clicked object's are orange. Far off, where an edge of a few metres shrinks to
+a pixel or two, the lines fade, or the whole model would turn black: zoom in
+to read them. Switch layers off to look at one alone: the
+ground with the buildings and trees off is the layout the modellers asked for.
+A click also counts the object's faces and vertices as Blender does, with its
+modifiers and before the triangulation: the kerbed walkways of Utrecht centre
+are 44,166 quads, 2,504 triangles and 6 n-gons.
+
 The address carries the model: `http://<your-machine>:8765/#3d/utrecht_dom`
 opens it straight away, and the browser's back button leaves it.
 
@@ -232,11 +246,16 @@ The objects of a layer are merged per material, so a thousand buildings are a
 few dozen draws. The trees, ten thousand objects sharing a dozen meshes, stay
 instances (`EXT_mesh_gpu_instancing`), and normals are bytes
 (`KHR_mesh_quantization`). Every vertex carries the number of its object and
-the file lists the objects with their custom properties, which is what a click
-reads back. The textures are not in it: it names them, and the page loads them
-from `output/<area>/`, so the aerial is not stored twice. Over a 500 m square
-of Utrecht centre the file is 17.5 MB for 399,219 triangles and 1,927 objects,
-written in under two seconds, and the browser has it on screen in under one.
+the file lists the objects with their custom properties and face counts, which
+is what a click reads back. The wireframe costs a byte per triangle: which of
+its three sides are edges of the mesh. The triangulation is render-only and
+keeps every vertex and its number, so the edges are read from the scene as the
+viewport has it and looked up among the triangles' sides; the page makes the
+lines from that the first time it is switched on. The textures are not in the
+file: it names them, and the page loads them from `output/<area>/`, so the
+aerial is not stored twice. Over a 500 m square of Utrecht centre the file is
+17.9 MB for 399,219 triangles and 1,927 objects, written in under three
+seconds, and the browser has it on screen in under one.
 
 It lives in `work/` because it is a cache for the page and no part of the
 model: `output/<area>/` stays what goes into Unity, and deleting the view
@@ -244,9 +263,11 @@ loses nothing.
 
 **When there is none, or it is out of date, the server writes it.** A
 `viewer.json` beside the view stamps it with the size and time of the
-`model.blend` it shows. A model built before there was a 3D view, one whose
-`work/` folder was cleared, and one edited in Blender and saved since all miss
-that stamp, and opening them runs `blender/web_export.py` on the `.blend`
+`model.blend` it shows, and with the layout of the file, which the page and the
+server agree on. A model built before there was a 3D view, one whose `work/`
+folder was cleared, one edited in Blender and saved since, and one whose view
+is of an older layout (from before the wireframe, say) all miss that stamp,
+and opening them runs `blender/web_export.py` on the `.blend`
 through the same Blender the pipeline uses, one model at a time; the page says
 *3D-weergave voorbereiden* meanwhile, about three seconds over that square. So
 the next time it opens, the 3D view shows what was saved in Blender. A `.blend`

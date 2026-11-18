@@ -10907,7 +10907,7 @@ class TestUIPage(unittest.TestCase):
     def test_the_3d_view_is_there_and_starts_hidden(self):
         """Opened from a model's card, its dialog and a finished run."""
         for wanted in ("view3d", "viewerCanvas", "viewerLayers", "viewerInfo",
-                       "viewerStatus", "viewerBack", "open3dModel", "open3dResult"):
+                       "viewerStatus", "viewerBack", "open3dModel", "open3dResult", "viewWire"):
             self.assertIn(wanted, self.page.ids, f"the page lost #{wanted}")
         self.assertRegex(self.html, r'<section id="view3d"[^>]*\bhidden\b',
                          "the 3D view should start hidden behind Modellen")
@@ -11108,6 +11108,31 @@ class TestWebView(unittest.TestCase):
         face = np.cross(b - a, c - a)
         self.assertGreater(float(np.dot(face, out["normals"][0].astype(float))), 0.0)
 
+    def test_the_wireframe_leaves_out_the_diagonals(self):
+        """A quad cut in two for the export shows as a quad: its diagonal is
+        a side of both triangles and an edge of neither."""
+        # Vertices 0-1-2-3 round a quad, cut along 0-2; triangle 2 is a lone
+        # triangle 3-2-4 sharing the quad's edge 2-3.
+        corners = np.array([[0, 1, 2], [0, 2, 3], [3, 2, 4]])
+        edges = np.array(sorted(a * 5 + b for a, b in ((0, 1), (1, 2), (2, 3), (0, 3), (2, 4), (3, 4))))
+        mask = self.web.edge_mask(corners, edges, 5)
+        # Sides run corner k to corner k+1: 0-1, 1-2 real and 2-0 not; then
+        # 0-2 not, 2-3 and 3-0 real; every side of the lone triangle real.
+        np.testing.assert_array_equal(mask, [0b011, 0b110, 0b111])
+
+    def test_a_mirrored_triangle_keeps_its_edges_marked(self):
+        """Turning a mirrored triangle round reorders its sides, and which of
+        them are edges has to turn with them."""
+        tris = self._triangles([[0, 0, 0], [1, 0, 0], [1, 1, 0]], [[0, 1, 2]])
+        tris["edges"] = np.array([0b001], dtype=np.uint8)  # only the side 0-1
+        out = self.web.triangles_as_vertices(tris, np.diag([-1.0, 1.0, 1.0, 1.0]))
+        corners = out["triangles"][0]
+        marked = [k for k in range(3) if out["edges"][0] >> k & 1]
+        self.assertEqual(len(marked), 1)
+        # The marked side still joins the corners that came from 0 and 1.
+        side = {tuple(out["points"][corners[marked[0]]]), tuple(out["points"][corners[(marked[0] + 1) % 3]])}
+        self.assertEqual(side, {(0.0, 0.0, 0.0), (-1.0, 0.0, 0.0)})
+
     def test_instances_come_apart_into_translation_rotation_and_scale(self):
         """What EXT_mesh_gpu_instancing stores, and what the page puts back
         together: every tree where Blender has it."""
@@ -11199,6 +11224,10 @@ class TestWebView(unittest.TestCase):
                 if "_OBJECT" in attributes:
                     ids = _accessor(document, binary, attributes["_OBJECT"])
                     self.assertTrue(((ids >= 0) & (ids < objects)).all())
+                # One byte per triangle saying which sides the wireframe draws.
+                edges = _accessor(document, binary, primitive["extras"]["edges"])
+                self.assertEqual(len(edges), len(indices) // 3)
+                self.assertTrue((edges <= 7).all())
 
         instanced = [n for n in document["nodes"] if "extensions" in n]
         self.assertEqual(len(instanced), 1)
@@ -11292,13 +11321,21 @@ class TestWebViewInBlender(unittest.TestCase):
         self.assertEqual(len(tables["objects"]), 11)
         building = next(o for o in tables["objects"] if o[0] == "Pand_1")
         self.assertEqual(building[2], {"bag_id": "NL.IMBAG.Pand.1", "build_year": 1900})
+        # Counted as Blender shows it: six quads, before the render-only
+        # triangulation cuts them.
+        self.assertEqual(building[3], [8, 0, 6, 0])
 
         # The building, merged, in glTF axes: north is -Z.
         merged = [n for n in document["nodes"] if "mesh" in n and "extensions" not in n]
-        position = document["accessors"][
-            document["meshes"][merged[0]["mesh"]]["primitives"][0]["attributes"]["POSITION"]]
+        primitive = document["meshes"][merged[0]["mesh"]]["primitives"][0]
+        position = document["accessors"][primitive["attributes"]["POSITION"]]
         np.testing.assert_allclose(position["min"], [0, 0, -6], atol=1e-5)
         np.testing.assert_allclose(position["max"], [10, 9, 0], atol=1e-5)
+        # Its wireframe: twelve triangles, and of their 36 sides the 24 that
+        # are the quads' edges; the six diagonals, each twice, are not.
+        edges = _accessor(document, binary, primitive["extras"]["edges"]).ravel()
+        self.assertEqual(len(edges), 12)
+        self.assertEqual(int(np.unpackbits(edges[:, None], axis=1).sum()), 24)
 
         # The trees, one mesh drawn ten times, each where Blender put it.
         instanced = [n for n in document["nodes"] if "extensions" in n]
