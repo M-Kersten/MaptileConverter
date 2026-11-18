@@ -37,9 +37,10 @@ output/<area_name>/
 └── ATTRIBUTION.txt  source credits
 ```
 
-The pipeline stops there: no Unity layer and no WebGL build. To look round a
-model without opening Blender or Unity, the UI opens it in 3D in the browser;
-see [The 3D view](#the-3d-view).
+The pipeline stops there: no Unity scene and no WebGL build. A Unity package
+in `unity/` sets up the import; see [Importing into Unity](#importing-into-unity).
+To look round a model without opening Blender or Unity, the UI opens it in 3D
+in the browser; see [The 3D view](#the-3d-view).
 
 **Two styles of ground.** By default the ground is built the way our 3D
 modellers build an area by hand — the *layered* style: a terrain of quads
@@ -455,7 +456,7 @@ close-up work. The run reports these figures for its own area as
 **Unity has its own limits.** Textures over 16384 px cannot be imported at full
 size, which a 2 km area at native resolution would exceed. Imported textures
 are also capped at 2048 by default, so raise *Max Size* on `aerial.png` or none
-of this is visible. A terrain over 65k vertices needs a 32-bit index buffer,
+of this is visible; the Unity package does that by itself. A terrain over 65k vertices needs a 32-bit index buffer,
 which Unity sets automatically.
 
 **The services cap a single response, so large areas are fetched in pieces.**
@@ -480,8 +481,9 @@ the join on a 3 km area, the height difference between neighbouring cells is
 The facade normal map is the one quality lever that is not about resolution: it
 gives window reveals, sills and storey bands real relief under a moving light.
 It costs one small extra texture and survives FBX as the material's bump slot.
-It is written as `*_normal.png` because Unity keys off that suffix to set the
-texture type automatically.
+It is written as `*_normal.png`, the suffix the Unity package keys off to
+import it as a normal map; without the package, set its Texture Type to
+*Normal map* by hand.
 
 Other knobs worth knowing:
 
@@ -570,6 +572,8 @@ blender/web_export.py  the scene as one binary glTF, for the 3D view
 ui/server.py       local web UI, standard library only
 ui/index.html      the page: models gallery, full-screen RD map with build bar, live log, results
 ui/viewer.js       the 3D view: WebGL2, reads what web_export.py writes
+unity/com.terreinlab.importer/  Unity package: imports every model with the
+                   right settings, its properties and RD/NAP on components
 ```
 
 The heavy CityJSON and raster work all happens on the Python side.
@@ -707,8 +711,75 @@ Blender halts every file that asks to with a security warning. Four buttons:
 
 ## Importing into Unity
 
-Copy the whole output folder into `Assets/` — the FBX finds its textures by
-name beside it. Then select `model.fbx`, and in the Inspector:
+**Install the TerreinLab Importer package once per Unity project**, and every
+model imports with the right settings by itself. It needs Unity 2021.3 or
+later. In *Window → Package Manager*, click **+** at the top left, choose *Add
+package from disk…* and pick `unity/com.terreinlab.importer/package.json` from
+this folder. Unity uses the package where it lies rather than copying it, so
+put the folder somewhere it will stay before you add it.
+
+Then copy the whole output folder into `Assets/`. The FBX finds its textures by
+name beside it.
+
+The package treats an `.fbx` as a TerreinLab model when the same folder holds
+`metadata.json` and `ATTRIBUTION.txt` and the metadata gives the RD origin
+(`crs`, `origin_rd` and `ground_z_offset_nap`). It leaves every other asset in
+the project alone. For a TerreinLab model it:
+
+- **sets the model up as the list below says**: Scale Factor 1 with Convert
+  Units on, Bake Axis Conversion on, Generate Lightmap UVs off, Index Format
+  Auto, the materials kept inside the model and pointing at the textures beside
+  it, and no rig or animation, since the model has none;
+- **sets up the textures beside it**: `aerial.png` at Max Size 8192, or 16384
+  when the aerial is larger than 8192 px (Android, iOS, tvOS and WebGL stay at
+  8192); every `*_normal.png` as a normal map; `landcover.png` as data, which
+  means no filtering, mipmaps or compression, and readable from scripts; and
+  the rest with mipmaps and repeat wrapping. `fence.png` keeps its alpha
+  coverage in every mipmap, so fences do not thin out with distance;
+- **turns on GPU instancing** in every material of the model. `M_tree` is the
+  one that matters: ten thousand trees share twelve meshes and that material,
+  and with instancing each shape is drawn in one batch. Marking the
+  `Buildings` and `Roads` hierarchies *Static* is still yours to do;
+- **keeps the custom properties** of each object on a `TerreinLabProperties`
+  component: `bag_id`, `build_year` and `height_m` on a building, `kind` on a
+  road, `height_m` and `detected` on a tree, `maptile_role` on the pieces of
+  ground. The Inspector lists them, and scripts read them as `BagId`,
+  `BuildYear`, `HeightM`, `Kind`, `Detected` and `MaptileRole`;
+- **puts a `TerreinLabModel` component on the model's root**, holding the area
+  name, `origin_rd` and `ground_z_offset_nap` from `metadata.json`, with
+  methods that turn a Unity position into RD and NAP and back (see
+  [Coordinates](#coordinates)). They go through the root's transform, so they
+  still hold after you move, turn or scale the model:
+
+  ```csharp
+  using TerreinLab;
+
+  var model = GetComponentInParent<TerreinLabModel>();
+  RdNapPosition here = model.WorldToRdNap(transform.position);  // here.RdX, here.RdY, here.Nap
+  Vector3 there = model.RdNapToWorld(136900.0, 455850.0, 5.2);
+  ```
+
+  A script in an assembly definition of its own needs a reference to
+  `TerreinLab.Importer` to see these.
+
+The package applies these settings on every import, so a model cannot arrive
+half set up, and changing one of them in the Inspector has no effect while it
+is installed. To import a model differently, to bake lightmaps for example, use
+a copy of `model.fbx` in a folder without `metadata.json`: to the package that
+is an ordinary FBX.
+
+**Models already in the project** before the package was installed, or before
+it was updated, keep their old import until you choose *Tools → TerreinLab →
+Reimport models*. It reimports every TerreinLab model in the project and the
+textures beside it, writes the settings into their import settings so the
+Inspector shows them, and turns on GPU instancing in any material you have
+extracted from a model, which an import cannot reach. If you copy a model in
+while Unity is open and its `metadata.json` or `ATTRIBUTION.txt` arrives after
+the FBX, the package reimports the FBX and the textures by itself.
+
+**Without the package**, select `model.fbx` and set these in the Inspector.
+They are also what to look at when a model imported with the package looks
+wrong.
 
 1. **Model → Scale Factor: 1, Convert Units: on.** The model is in metres.
 2. **Model → Bake Axis Conversion: on.** Without it the root object arrives
@@ -728,8 +799,9 @@ name beside it. Then select `model.fbx`, and in the Inspector:
    `Roads` hierarchies *Static* lets Unity batch those too.
 
 Custom properties (`kind` on roads, `bag_id` and `build_year` on buildings)
-arrive as FBX user properties, which an `AssetPostprocessor` reads in
-`OnPostprocessGameObjectWithUserProperties`.
+arrive as FBX user properties either way. Without the package, an
+`AssetPostprocessor` of your own reads them in
+`OnPostprocessGameObjectWithUserProperties`, which is what the package does.
 
 ## When 3DBAG is down
 
