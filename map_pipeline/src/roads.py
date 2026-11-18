@@ -83,6 +83,15 @@ SIMPLIFY_M = 0.15
 # well under it; a car park or a square is not.
 GRID_FACE_M2 = 150.0
 GRID_M = 4.0
+# A face the ground strays further than this from, between its corners, is
+# cut along the height model's grid lines. Over Utrecht's Vismarkt at 2 m that
+# is about one face in twenty-five, nearly all of them along the quay walls of
+# the Oudegracht and on the ramps down to its wharf.
+FOLLOW_M = 0.5
+# Points per triangle side at which that is judged.
+FOLLOW_SAMPLES = 8
+# The height model's spacing, when the caller does not say.
+GROUND_GRID_M = 2.0
 # How far a kerb may move again when a run of it between two cross-sections is
 # straightened. Together with SIMPLIFY_M this is the 25 cm the outline is
 # allowed to give up.
@@ -486,6 +495,9 @@ def plan_faces(
     reach_m: float = REACH_M,
     skeleton: bool = True,
     group_start: int = 1,
+    ground=None,
+    ground_grid: tuple[float, float, float] | None = None,
+    follow_m: float = FOLLOW_M,
 ) -> _Plan:
     """Cut the partition across every street and return its faces.
 
@@ -493,6 +505,10 @@ def plan_faces(
     they leave without a cross-section -- an estate's own lanes, the paths
     through a park -- then gets centrelines drawn down its own middle (see
     `skeleton_centrelines`), and is cut the same way.
+
+    With a `ground` sampler and the `ground_grid` it is read from (x and y of
+    a node, spacing), a face the ground under it strays more than `follow_m`
+    from is cut along that grid.
     """
     import shapely
     from shapely import LineString, STRtree
@@ -572,9 +588,46 @@ def plan_faces(
     if big:
         grid = [line for face in big for line in _grid_lines(face, GRID_M)]
         if grid:
-            faces, face_item = _split(linework + grid, poly_tree)
+            linework = linework + grid
+            faces, face_item = _split(linework, poly_tree)
     plan.stats["gridded_faces"] = len(big)
 
+    plan.faces, source, removed = _faces_of(faces, face_item, partition)
+
+    # A face whose corners straddle a height step -- the top of a quay wall
+    # on one side, the wharf on the other -- is one flat face over ground
+    # that is not: the street dips metres into it between the corners, or
+    # the wharf path rises over it. Those are cut along the height model's
+    # own grid lines, so every piece lies within one cell of it and follows
+    # it as closely as anything flat can.
+    rough: set = set()
+    if ground is not None and ground_grid is not None:
+        departure = _departure_from_ground(plan.faces, ground)
+        rough = {source[i] for i in np.flatnonzero(departure > follow_m)}
+        if rough:
+            lines = [
+                line for index in sorted(rough)
+                for line in _ground_grid_lines(faces[index], ground_grid)
+            ]
+            if lines:
+                faces, face_item = _split(linework + lines, poly_tree)
+                plan.faces, source, removed = _faces_of(faces, face_item, partition)
+    plan.stats["faces_cut_to_the_ground"] = len(rough)
+    plan.stats["faces"] = len(plan.faces)
+    plan.stats["vertices_straightened_away"] = removed
+    return plan
+
+
+def _faces_of(faces, face_item, partition) -> tuple[list, list, int]:
+    """The plan's faces from the split, straightened.
+
+    Returns the faces, the index into `faces` each came from, and how many
+    vertices straightening took away.
+    """
+    import shapely
+
+    out: list = []
+    source: list[int] = []
     for index in np.flatnonzero(face_item >= 0):
         face = faces[index]
         if face.area < 1e-4:
@@ -584,12 +637,100 @@ def plan_faces(
             coords = np.asarray(shapely.orient_polygons(piece).exterior.coords)[:-1, :2]
             coords = _distinct_corners(coords)
             if len(coords) >= 3:
-                plan.faces.append((coords, code, level, part))
-    before = sum(len(f[0]) for f in plan.faces)
-    plan.faces = _straighten_runs(plan.faces, STRAIGHTEN_M)
-    plan.stats["faces"] = len(plan.faces)
-    plan.stats["vertices_straightened_away"] = before - sum(len(f[0]) for f in plan.faces)
-    return plan
+                out.append((coords, code, level, part))
+                source.append(int(index))
+    before = sum(len(f[0]) for f in out)
+    out = _straighten_runs(out, STRAIGHTEN_M)
+    return out, source, before - sum(len(f[0]) for f in out)
+
+
+def _face_triangles(coords: np.ndarray) -> np.ndarray:
+    """Corner indices of a face's triangles, split the way the mesh splits it."""
+    if len(coords) == 3:
+        return np.array([[0, 1, 2]])
+    if len(coords) == 4:
+        # As `RoadMesh.triangles` and the export: first corner to third.
+        return np.array([[0, 1, 2], [0, 2, 3]])
+    import mapbox_earcut
+
+    try:
+        found = mapbox_earcut.triangulate_float64(
+            np.asarray(coords, dtype=np.float64), np.array([len(coords)], dtype=np.uint32)
+        )
+    except Exception:  # noqa: BLE001 - judged on its fan instead
+        found = []
+    if len(found) < 3:
+        return np.array([[0, k, k + 1] for k in range(1, len(coords) - 1)])
+    return np.asarray(found, dtype=np.int64).reshape(-1, 3)
+
+
+def _departure_from_ground(faces: list[tuple], ground, steps: int = FOLLOW_SAMPLES) -> np.ndarray:
+    """How far the ground strays, at most, from each face draped on its corners.
+
+    Each face is triangulated as the mesh will be, its corners set on the
+    ground, and the ground read at a lattice of points across every
+    triangle. Lift and kerb are left out: they move a face, not bend it.
+    """
+    if not faces:
+        return np.zeros(0)
+    tris = []
+    owner = []
+    for fi, (coords, *_rest) in enumerate(faces):
+        corners = _face_triangles(coords)
+        tris.append(np.asarray(coords, dtype=np.float64)[corners])
+        owner.append(np.full(len(corners), fi, dtype=np.int64))
+    tris = np.concatenate(tris)
+    owner = np.concatenate(owner)
+    corner_z = np.stack(
+        [np.asarray(ground(tris[:, k, 0], tris[:, k, 1]), dtype=np.float64) for k in range(3)],
+        axis=1,
+    )
+    weights = np.array(
+        [
+            (i / steps, j / steps, (steps - i - j) / steps)
+            for i in range(steps + 1)
+            for j in range(steps + 1 - i)
+        ]
+    )
+    points = np.einsum("pk,nkd->npd", weights, tris)
+    flat = corner_z @ weights.T
+    actual = np.asarray(
+        ground(points[..., 0].ravel(), points[..., 1].ravel()), dtype=np.float64
+    ).reshape(flat.shape)
+    worst = np.nanmax(np.abs(actual - flat), axis=1, initial=0.0)
+    out = np.zeros(len(faces))
+    np.maximum.at(out, owner, np.nan_to_num(worst))
+    return out
+
+
+def _ground_grid_lines(face, grid: tuple[float, float, float]) -> list:
+    """The height model's grid lines across a face, clipped to it.
+
+    `grid` is the x and y of one grid node and the spacing. Lines closer than
+    a tenth of the spacing to the face's extent are left out: they would only
+    shave a sliver off it.
+    """
+    import shapely
+
+    x0, y0, step = (float(v) for v in grid)
+    xmin, ymin, xmax, ymax = face.bounds
+    margin = 0.1 * step
+    lines = []
+    for lo, hi, origin, vertical in ((xmin, xmax, x0, True), (ymin, ymax, y0, False)):
+        first = math.ceil((lo + margin - origin) / step)
+        last = math.floor((hi - margin - origin) / step)
+        for k in range(first, last + 1):
+            at = origin + k * step
+            if vertical:
+                line = shapely.LineString([(at, ymin - 1.0), (at, ymax + 1.0)])
+            else:
+                line = shapely.LineString([(xmin - 1.0, at), (xmax + 1.0, at)])
+            clipped = shapely.intersection(line, face)
+            lines.extend(
+                part for part in shapely.get_parts(clipped)
+                if part.geom_type == "LineString" and part.length > margin
+            )
+    return lines
 
 
 def _split(linework: list, poly_tree):
@@ -1107,12 +1248,18 @@ def build_road_mesh(
     deck_sampler=None,
     raised_classes: tuple[int, ...] = RAISED_CLASSES,
     uv_origin: tuple[float, float] = (0.0, 0.0),
+    ground_grid: tuple[float, float, float] | None = None,
 ) -> RoadMesh:
     """The whole road network as one mesh, split into objects.
 
     `ground` is the surveyed ground, a sampler of RD coordinates. Roads on a
     bridge (BGT level above zero) are meshed apart from those at grade and
     ride their deck, read from `deck_sampler` when there is one.
+
+    `ground_grid` is the grid `ground` reads from: the x and y of one node and
+    the spacing. A face at grade that the ground strays from by more than
+    `FOLLOW_M` between its corners is cut along it. Without one, a grid of
+    `GROUND_GRID_M` through the origin stands in.
     """
     import shapely
 
@@ -1130,6 +1277,9 @@ def build_road_mesh(
         plan = plan_faces(
             partition, network, station_m=station_m, reach_m=reach_m,
             group_start=1 + 1000 * group,
+            # A deck is flat whatever the ground under it does.
+            ground=ground if group == 0 else None,
+            ground_grid=ground_grid or (0.0, 0.0, GROUND_GRID_M),
         )
         plans.append((group, plan))
 
@@ -1289,10 +1439,13 @@ def build_road_mesh(
         "kerb_m": float(kerb_m),
         "lift_m": float(lift_m),
         "cross_sections": sum(plan.stats.get("cuts", 0) for _, plan in plans),
+        "faces_cut_to_the_ground": sum(
+            plan.stats.get("faces_cut_to_the_ground", 0) for _, plan in plans
+        ),
     }
     LOG.info(
         "roads: %d faces (%.0f%% quads), %d kerb faces, %d streets, %d junctions, "
-        "%d cross-sections from %d centrelines",
+        "%d cross-sections from %d centrelines, %d faces cut along the height grid",
         mesh.stats["faces"],
         100 * mesh.stats["quad_share"],
         mesh.stats["kerb_faces"],
@@ -1300,6 +1453,7 @@ def build_road_mesh(
         mesh.stats["junctions"],
         mesh.stats["cross_sections"],
         mesh.stats["centrelines"],
+        mesh.stats["faces_cut_to_the_ground"],
     )
     return mesh
 

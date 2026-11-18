@@ -4908,6 +4908,86 @@ class TestBigFacesFollowTheGround(unittest.TestCase):
         self.assertGreater(float((mesh.face_sizes[faces] == 4).mean()), 0.7)
 
 
+class TestRoadFacesFollowAQuayWall(unittest.TestCase):
+    """A road face whose corners straddle a quay wall is cut along the grid.
+
+    Over Utrecht's Vismarkt a ramp down to the Oudegracht wharf and the wharf
+    path along the wall were single faces with the street on one side and the
+    wharf on the other: flat between their corners, they ran up to 2.1 m off
+    the ground in between and failed `road_surface_follows_terrain`.
+    """
+
+    # A street at 5.3 m NAP, a wharf at 1.2 m, and the wall between y = 6
+    # and y = 8: what a 2 m height grid makes of a quay wall.
+    @staticmethod
+    def wall(x, y):
+        return np.interp(np.asarray(y, dtype=float), [6.0, 8.0], [5.3, 1.2]) + 0.0 * np.asarray(x)
+
+    RAMP = _rect(0.0, 0.0, 3.0, 13.0)
+
+    def _mesh(self, ground):
+        from src.nwb import Centreline, Network
+        from src.roads import build_road_mesh
+        from src.surfaces import CLASS_ROAD, RoadPart
+
+        ramp = RoadPart([self.RAMP], CLASS_ROAD, 0)
+        line = Centreline(np.array([[1.5, -5.0], [1.5, 18.0]]), 1, 1, 2, "Oudegracht", "RB")
+        return build_road_mesh(
+            [ramp], Network(lines=[line]), ground=ground, lift_m=0.0, kerb_m=0.0,
+            ground_grid=(0.0, 0.0, 2.0),
+        )
+
+    @staticmethod
+    def _worst_departure(mesh, ground):
+        """How far the ground strays from the surface, at most, inside any triangle."""
+        tris, _ = mesh.triangles()
+        worst = 0.0
+        steps = 10
+        for i in range(steps + 1):
+            for j in range(steps + 1 - i):
+                w = np.array([i, j, steps - i - j], dtype=float) / steps
+                p = np.einsum("k,nkd->nd", w, tris)
+                worst = max(worst, float(np.abs(ground(p[:, 0], p[:, 1]) - p[:, 2]).max()))
+        return worst
+
+    def test_a_face_across_the_wall_is_cut_so_it_follows_it(self):
+        from src.roads import FOLLOW_M, SURFACE
+
+        mesh = self._mesh(self.wall)
+        self.assertGreater(mesh.stats["faces_cut_to_the_ground"], 0)
+        # Uncut, the cross-sections every 2.6 m put one face from y = 5.2 to
+        # 7.8, whose middle hangs 1.1 m below the top of the wall. Cut along
+        # the grid, the piece over the wall lies within one cell of it.
+        self.assertLess(self._worst_departure(mesh, self.wall), FOLLOW_M)
+        faces = [mesh.face(i) for i in range(len(mesh)) if mesh.face_kind[i] == SURFACE]
+        surface = mesh.vertices[np.unique(np.concatenate(faces))]
+        tops = surface[np.isclose(surface[:, 1], 6.0)]
+        # Across the whole road, not one corner.
+        self.assertAlmostEqual(float(np.ptp(tops[:, 0])), 3.0, places=6)
+        self.assertTrue(np.allclose(tops[:, 2], 5.3))
+        # The cuts are shared by the faces either side: no corner of one
+        # face sits part way along an edge of another, where it would open
+        # a crack.
+        corners = mesh.vertices[np.unique(np.concatenate(faces)), :2]
+        for loop in faces:
+            ring = mesh.vertices[loop, :2]
+            for a, b in zip(ring, np.roll(ring, -1, axis=0)):
+                d = b - a
+                t = np.clip((corners - a) @ d / float(d @ d), 0.0, 1.0)
+                off = np.hypot(*(corners - (a + t[:, None] * d)).T)
+                inside = (off < 1e-6) & (t > 1e-6) & (t < 1 - 1e-6)
+                self.assertFalse(inside.any(), f"a T-junction on edge {a} -> {b}")
+
+    def test_a_street_on_even_ground_keeps_its_ladder(self):
+        def flat(x, y):
+            return np.full(np.shape(x), 2.0)
+
+        mesh = self._mesh(flat)
+        self.assertEqual(mesh.stats["faces_cut_to_the_ground"], 0)
+        faces = [i for i in range(len(mesh)) if mesh.face_kind[i] == 0]
+        self.assertTrue((mesh.face_sizes[faces] == 4).all())
+
+
 class TestMedialAxis(unittest.TestCase):
     def test_an_l_shaped_path_gets_one_centreline_without_spurs(self):
         import shapely
