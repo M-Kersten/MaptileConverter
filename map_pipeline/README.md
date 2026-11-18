@@ -1420,6 +1420,15 @@ corners while the ground under it is not. Any road face over 150 m² is cut into
 a 4 m grid of its own, so it follows the ground in rows and columns instead of
 forcing the terrain metres down to get under it.
 
+A small face can have the same trouble when its corners straddle a height step:
+a ramp down to a canal wharf, or the wharf path along a quay wall. Flat between
+its corners, it hangs metres below the top of the wall or rises over the wharf.
+Any face at grade that the ground strays more than 50 cm from is cut along the
+terrain's own grid lines, so each piece lies within one cell of the height model
+and follows it as closely as anything flat can. Over Utrecht's Vismarkt that is
+91 faces at standard detail; before, 32 road triangles there were up to 2.1 m
+off the ground and `road_surface_follows_terrain` failed.
+
 The checks `terrain_stays_under_roads` and `road_surface_follows_terrain` hold
 both ends of this: no ground through any road, and no road far off the survey.
 
@@ -1570,7 +1579,9 @@ outlines are surveyed to the centimetre and wobble by a few centimetres between
 rungs, and every wobble kept is one more corner on a face, so each kerb run is
 straightened between the rungs it meets — within 10 cm, and once per kerb, so
 the two surfaces sharing it stay welded. A face over 150 m² with no street to cut
-it (a car park, a square) is cut into a 4 m grid. On Bronbeek:
+it (a car park, a square) is cut into a 4 m grid, and a face whose corners
+straddle a step in the ground (a quay wall) is cut along the terrain grid. On
+Bronbeek:
 
 | | |
 | --- | --- |
