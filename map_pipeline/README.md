@@ -37,7 +37,9 @@ output/<area_name>/
 └── ATTRIBUTION.txt  source credits
 ```
 
-The pipeline stops there. No Unity layer, no viewer, no WebGL build.
+The pipeline stops there: no Unity layer and no WebGL build. To look round a
+model without opening Blender or Unity, the UI opens it in 3D in the browser;
+see [The 3D view](#the-3d-view).
 
 **Two styles of ground.** By default the ground is built the way our 3D
 modellers build an area by hand — the *layered* style: a terrain of quads
@@ -116,10 +118,12 @@ pip install -r requirements.txt
 python ui/server.py --open
 ```
 
-Open <http://127.0.0.1:8765>. The page is in Dutch and has two views.
+Open <http://127.0.0.1:8765>. The page is in Dutch and has three views.
 
 - **Modellen** (the start page) shows every area built so far as a card with
-  its preview render, style, size, date and check result. **Bekijken** opens
+  its preview render, style, size, date and check result. **In 3D**, or a
+  click on the picture, opens the model in the browser (see
+  [The 3D view](#the-3d-view)); **Bekijken** opens
   the renders, the check results and the download links; **Opnieuw bouwen**
   opens the map with that area's square, name, style, detail and collision
   setting filled in. A build that is running shows on top as a card with a
@@ -184,12 +188,74 @@ them off cuts the wait noticeably.
 
 The map works directly in RD New, so the square you position *is* the bbox that
 gets built — no reprojection anywhere in the page. It is plain HTML with no
-JavaScript dependencies, and the server is standard library only.
+JavaScript dependencies, and the server is standard library only. The 3D view
+is `ui/viewer.js`, WebGL2 written for this page, without a library either.
 
 Tiles come straight from PDOK. If the browser cannot reach it — behind a
 corporate proxy, or on a machine where only the pipeline process has network —
 the page detects that at startup and routes tiles through the local server
 instead.
+
+### The 3D view
+
+**In 3D** on a model's card, in its dialog or on a finished run opens the model
+full screen: the scene as built, with the aerial, the facades and the trees,
+under a low sun with shadows. It is for looking at a model without opening
+Blender or Unity, and for showing it to someone who has neither.
+
+| | |
+| --- | --- |
+| Drag | move over the map; the ground under the cursor stays under it |
+| Right-drag, or Shift + drag | turn and tilt |
+| Scroll | zoom towards the cursor |
+| Double-click | fly to that point |
+| Click | what it is and where: name, layer, properties, RD and NAP |
+| Touch | one finger moves, two fingers zoom, turn and tilt |
+| Keys | arrows move, Shift + arrows turn and tilt, + and − zoom, Home shows the whole area |
+
+**Overzicht** and **Boven** frame the whole area, at an angle or straight from
+above with north up, and the compass turns the view back to north. **Lagen**
+lists every collection of the `.blend` with a switch: the trees off to see the
+street, the buildings off to see the ground. A click on a building gives its
+BAG id, construction year and height from 3DBAG; on a tree its height and
+whether it came from the BGT register or was found in the height model. Under
+the cursor the page reads out RD and NAP all the time, so the view also measures
+a model against the map.
+
+The address carries the model: `http://<your-machine>:8765/#3d/utrecht_dom`
+opens it straight away, and the browser's back button leaves it.
+
+**What it reads.** The Blender stage writes the view as its last step, to
+`work/<area>/viewer.glb`: a binary glTF of the scene with every modifier as the
+render has it, so the kerbs and the export triangulation are in, as in the FBX.
+The objects of a layer are merged per material, so a thousand buildings are a
+few dozen draws. The trees, ten thousand objects sharing a dozen meshes, stay
+instances (`EXT_mesh_gpu_instancing`), and normals are bytes
+(`KHR_mesh_quantization`). Every vertex carries the number of its object and
+the file lists the objects with their custom properties, which is what a click
+reads back. The textures are not in it: it names them, and the page loads them
+from `output/<area>/`, so the aerial is not stored twice. Over a 500 m square
+of Utrecht centre the file is 17.5 MB for 399,219 triangles and 1,927 objects,
+written in under two seconds, and the browser has it on screen in under one.
+
+It lives in `work/` because it is a cache for the page and no part of the
+model: `output/<area>/` stays what goes into Unity, and deleting the view
+loses nothing.
+
+**When there is none, or it is out of date, the server writes it.** A
+`viewer.json` beside the view stamps it with the size and time of the
+`model.blend` it shows. A model built before there was a 3D view, one whose
+`work/` folder was cleared, and one edited in Blender and saved since all miss
+that stamp, and opening them runs `blender/web_export.py` on the `.blend`
+through the same Blender the pipeline uses, one model at a time; the page says
+*3D-weergave voorbereiden* meanwhile, about three seconds over that square. So
+the next time it opens, the 3D view shows what was saved in Blender. A `.blend`
+that Blender cannot open is reported with Blender's own message and tried again
+only when asked.
+
+The view needs WebGL2, which every current browser has. A texture larger than
+8192 px, an aerial over two kilometres at High detail, is scaled down to fit
+the graphics card.
 
 ### The command line
 
@@ -441,8 +507,10 @@ src/validate.py    the headless checks
 blender/process.py builds the scene, assigns materials, saves .blend, exports FBX
 blender/maptile_tools.py  the Blender add-on shipped beside the model
 blender/preview.py renders preview images of an exported FBX
+blender/web_export.py  the scene as one binary glTF, for the 3D view
 ui/server.py       local web UI, standard library only
 ui/index.html      the page: models gallery, full-screen RD map with build bar, live log, results
+ui/viewer.js       the 3D view: WebGL2, reads what web_export.py writes
 ```
 
 The heavy CityJSON and raster work all happens on the Python side.
@@ -2074,6 +2142,10 @@ kerb), `walkways_have_kerbs` (the curb generator ran),
 holds the coarse terrain to its own tolerance rather than to the survey
 style's 25 cm. In both styles `terrain_exported_as_triangles` checks the FBX
 holds the terrain cut as the pipeline cut it.
+
+`web_view_written` says whether the 3D view was written. It only ever warns:
+the model is whole without it, and the page writes the view from the `.blend`
+when it finds none.
 
 ## Attribution
 
