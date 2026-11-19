@@ -656,7 +656,7 @@ def check_signs(report: CheckReport, signs, bbox: BBox) -> None:
         )
 
 
-def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) -> None:
+def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None, mouths=None) -> None:
     """Walls and fences are closed, on the ground, and a believable height.
 
     `deck_at(x, y)` is the top of a bridge deck, NaN off one: a parapet stands
