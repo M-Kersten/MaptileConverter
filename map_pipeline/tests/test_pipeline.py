@@ -14571,6 +14571,25 @@ class TestTrafficSigns(unittest.TestCase):
         self.assertEqual(black_text("D2", "RO"), "")
         self.assertEqual(black_text("H1", "Utrecht"), "Utrecht")
 
+    def test_plate_text_is_repaired_and_never_cut_short(self):
+        """NDW stores some plate texts as UTF-8 read as Latin-1, once or twice
+        over, and writes pictograms as [[names]]. A long text gets more lines,
+        never fewer words."""
+        from src.sign_faces import MAX_PLATE_LINES, clean_text, plate_lines
+
+        for original in ("bij groen \u00e9\u00e9n auto", "opladen elektrische auto\u2019s",
+                         "wielklemregeling van kracht \u20ac159,-"):
+            once = original.encode("utf-8").decode("cp1252")
+            twice = once.encode("utf-8").decode("latin-1")
+            self.assertEqual(clean_text(once), original)
+            self.assertEqual(clean_text(twice), original)
+        self.assertEqual(clean_text("[[bus]] [[route-links]]"), "bus \u2190")
+        self.assertEqual(plate_lines("onleesbaar"), [])
+        text = " ".join(f"woord{i}" for i in range(45))
+        lines = plate_lines(text)
+        self.assertLessEqual(len(lines), MAX_PLATE_LINES)
+        self.assertEqual(" ".join(lines), text)
+
     def test_commons_file_addresses(self):
         """Commons keeps a file under the first one and two hex digits of the
         MD5 of its name, spaces as underscores."""

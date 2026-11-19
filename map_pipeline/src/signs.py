@@ -56,6 +56,7 @@ from .sign_faces import (
     CommonsClient,
     black_text,
     build_atlas,
+    clean_text,
     code_parts,
     rank_of,
 )
@@ -248,7 +249,7 @@ def parse_signs(features: list[dict], bbox: BBox) -> list[Sign]:
             continue
         seen.add(ndw_id)
         plates = [
-            (str(s.get("signCode") or ""), str(s.get("text") or ""))
+            (str(s.get("signCode") or ""), clean_text(s.get("text")))
             for s in sorted(props.get("supplementarySigns") or [], key=lambda s: s.get("index", 0))
         ]
         bearing = props.get("bearing")
