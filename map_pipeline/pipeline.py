@@ -83,7 +83,15 @@ from src.facade import (  # noqa: E402
     generate_water_texture,
 )
 from src.barriers import BarrierSet, build_barriers  # noqa: E402
-from src.furniture import FurnitureSet, build_furniture  # noqa: E402
+from src.furniture import KIND_NAMES as FURNITURE_KINDS  # noqa: E402
+from src.furniture import KIND_SIGN, FurnitureSet, build_furniture, save_furniture  # noqa: E402
+from src.signs import (  # noqa: E402
+    SignSet,
+    build_signs,
+    drop_covered_posts,
+    save_signs,
+    write_sign_list,
+)
 from src.imagery import build_aerial  # noqa: E402
 from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
 from src.rails import RailSet, build_rails, save_rails  # noqa: E402
@@ -128,6 +136,7 @@ from src.validate import (  # noqa: E402
     check_layered,
     check_furniture,
     check_rails,
+    check_signs,
     check_structures,
     check_vehicles,
     check_harbour,
@@ -203,6 +212,7 @@ def write_timings(
             "trees": bool(config.trees["enabled"]),
             "surfaces": bool(config.surfaces["water"] or config.surfaces["land_cover"]),
             "furniture": bool(config.furniture["enabled"]),
+            "signs": bool(config.signs["enabled"]),
             "barriers": bool(config.barriers["enabled"]),
             "usage": bool(config.usage["enabled"]),
             # Rendering previews costs more than every data stage put together,
@@ -604,6 +614,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         config.surfaces["water"] or config.surfaces["land_cover"] or layered
     )
     want_furniture = bool(config.furniture["enabled"])
+    want_signs = bool(config.signs["enabled"])
     want_barriers = bool(config.barriers["enabled"])
     want_usage = bool(config.usage["enabled"])
     want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
@@ -616,7 +627,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     # the optional sources, plus Blender.
     total = 7 + sum(
         (
-            want_trees, want_surfaces, want_furniture, want_barriers,
+            want_trees, want_surfaces, want_furniture, want_signs, want_barriers,
             want_usage,
             want_vehicles, want_rails, want_structures,
         )
@@ -819,7 +830,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     # as the bridges stage will build the decks.
     deck_at = None
     surface_at = None
-    if want_trees or want_barriers:
+    # A sign post on a bridge stands on it too.
+    if want_trees or want_barriers or want_signs:
         surface_dsm = ensure_dsm(
             terrain.bbox,
             work_dir,
@@ -910,6 +922,45 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             )
             if len(furniture):
                 furniture_texture = generate_furniture_texture(work_dir)
+
+    signs = SignSet()
+    sign_texture = None
+    if want_signs:
+        with Stage("traffic signs (NDW)", next_step(), total):
+            signs = build_signs(
+                config.bbox,
+                work_dir,
+                signs_cfg=config.signs,
+                terrain=terrain,
+                # Each sign is turned to its own road section. Cached by the
+                # surfaces stage when it read them; read here when it did not.
+                network=fetch_centrelines(
+                    config.bbox,
+                    url=str(config.surfaces.get("nwb_url", NWB_URL)),
+                    timeout=float(config.surfaces["timeout_s"]),
+                    max_retries=int(config.surfaces["max_retries"]),
+                    cache_dir=work_dir / "_bgt",
+                ),
+                deck_at=deck_at,
+                # Which roads are on a bridge, for a pole inside a deck's
+                # outline: on the deck, or on the road under it.
+                roads=surfaces.roads if want_surfaces else None,
+            )
+            if len(signs):
+                save_signs(signs, work_dir / "signs.npz")
+                write_sign_list(signs, config.geo, out_dir)
+                sign_texture = signs.atlas.path
+                # The BGT's bare post where NDW has the pole with its signs.
+                dropped = drop_covered_posts(furniture, signs, sign_kind=KIND_SIGN)
+                if dropped:
+                    furniture.counts[FURNITURE_KINDS[KIND_SIGN]] = int(
+                        (furniture.kind == KIND_SIGN).sum()
+                    )
+                    save_furniture(furniture, work_dir / "furniture.npz")
+                    LOG.info(
+                        "dropped %d BGT sign posts that an NDW pole stands on",
+                        dropped,
+                    )
 
     barriers = BarrierSet()
     fence_texture = None
@@ -1033,6 +1084,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             tree_texture=tree_texture,
             water_texture=water_texture,
             furniture_texture=furniture_texture,
+            sign_texture=sign_texture,
             surfaces_cfg=config.surfaces,
             surface_class_names={
                 int(k): v for k, v in CLASS_NAMES.items()
@@ -1078,6 +1130,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             extra={
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
+                "traffic_signs": signs.stats(),
                 "barriers": barriers.stats(),
                 "vehicles": vehicles.stats(),
                 "railways": rails.stats(),
@@ -1137,6 +1190,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_harbour(report, harbour)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
+        check_signs(report, signs if want_signs else None, config.bbox)
         # Against what they were placed on: the model's own surface, which
         # is the road where there is one and the terrain as drawn elsewhere.
         check_barriers(

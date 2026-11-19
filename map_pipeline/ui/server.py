@@ -82,6 +82,10 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     # kilometre, measured.
     "trees":              {"c": 1.0, "a": 26.0, "m": 0.0},
     "furniture":          {"c": 0.5, "a": 3.0,  "m": 0.0},
+    # One download per municipality a month (Utrecht is 18 MB), then the
+    # faces: drawn in a second, or fetched from Commons at one a second the
+    # first time an area needs them and from the cache after that.
+    "signs":              {"c": 8.0, "a": 4.0,  "m": 0.0},
     # Five collections, and more features than any other BGT stage: 3013
     # separations over one square kilometre of Utrecht. Cheaper than that
     # sounds -- measured at 7.4 s for the demo square, fetch included -- because
@@ -138,6 +142,7 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
         "usage": on("usage"),
         "trees": on("trees"),
         "furniture": on("furniture"),
+        "signs": on("signs"),
         "barriers": on("barriers"),
         "vehicles": on("vehicles"),
         "rails": on("rails"),
@@ -207,6 +212,7 @@ def measured_speed_factor() -> tuple[float, int]:
                 "water": drivers.get("surfaces", True),
                 "land_cover": drivers.get("surfaces", True),
                 "furniture": drivers.get("furniture", True),
+                "signs": drivers.get("signs", True),
                 "barriers": drivers.get("barriers", True),
                 "usage": drivers.get("usage", True),
                 "preview": drivers.get("preview", False),
@@ -1083,6 +1089,7 @@ class Handler(BaseHTTPRequestHandler):
                     "water": flag("water"),
                     "land_cover": flag("land_cover"),
                     "furniture": flag("furniture"),
+                    "signs": flag("signs"),
                     "barriers": flag("barriers"),
                     "usage": flag("usage"),
                     "preview": flag("preview"),

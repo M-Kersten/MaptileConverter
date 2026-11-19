@@ -46,6 +46,14 @@ ATTRIBUTION = {
         "Wall surfaces under the generated facades from Poly Haven (CC0, no "
         "attribution required). https://polyhaven.com"
     ),
+    "signs": (
+        "Traffic signs from the NDW traffic sign register (Nationaal Dataportaal "
+        "Wegverkeer), open data. https://docs.ndw.nu/producten/verkeersborden/"
+    ),
+    "sign_art": (
+        "Traffic sign artwork: the RVV 1990 signs from Wikimedia Commons, public "
+        "domain (Auteurswet article 11). https://commons.wikimedia.org"
+    ),
 }
 
 
@@ -171,6 +179,7 @@ def write_scene_description(
     tree_texture: Path | None = None,
     water_texture: Path | None = None,
     furniture_texture: Path | None = None,
+    sign_texture: Path | None = None,
     surfaces_cfg: dict | None = None,
     road_class_names: dict | None = None,
     surface_class_names: dict | None = None,
@@ -269,6 +278,13 @@ def write_scene_description(
             if furniture_texture is not None
             else {}
         ),
+        # Every face on one atlas with real holes round each outline, so a
+        # round sign is round and its back is the same shape in aluminium.
+        "signs": (
+            {"file": "signs.npz", "texture": sign_texture.name}
+            if sign_texture is not None
+            else {}
+        ),
         # Barriers share the furniture atlas, so they are gated on the same
         # texture existing rather than on one of their own.
         "barriers": (
@@ -362,6 +378,8 @@ def write_attribution(out_dir: Path) -> Path:
         f"BAG:       {ATTRIBUTION['bag']}",
         f"NWB:       {ATTRIBUTION['roads']}",
         f"Textures:  {ATTRIBUTION['textures']}",
+        f"Signs:     {ATTRIBUTION['signs']}",
+        f"Sign art:  {ATTRIBUTION['sign_art']}",
         "",
         "Keep this notice with the model when you redistribute it.",
         "",
