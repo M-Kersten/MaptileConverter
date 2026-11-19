@@ -229,7 +229,8 @@ def clip_ring_to_bbox(ring: np.ndarray, bbox: BBox) -> np.ndarray:
         ("y", bbox.ymax, False),
     )
     points = np.asarray(ring, dtype=np.float64)
-    if len(points) > 1 and np.allclose(points[0], points[-1]):
+    # Absolutely: numpy's default relative tolerance is metres in RD.
+    if len(points) > 1 and np.allclose(points[0], points[-1], rtol=0.0, atol=1e-6):
         points = points[:-1]
 
     for axis, limit, keep_greater in edges:

@@ -42,8 +42,10 @@ DEFAULTS: dict[str, Any] = {
         "outline_m": 0.25,
         # How the ground is laid out: "quads", rows along the outlines and one
         # grid of square_m squares everywhere, turned to the way the streets
-        # run, or "triangles", the triangulation refined until it is within
-        # tolerance_m everywhere.
+        # run; "ribcage", no grid -- ribs across what is narrow and a lattice
+        # turned to each space in what is wide, 2 x square_m where the ground
+        # allows, with triangles at the edges; or "triangles", the
+        # triangulation refined until it is within tolerance_m everywhere.
         "mesher": "quads",
         # The size of the grid squares, the same everywhere, and the spacing
         # of the points along every outline: rounded to whole survey grid
@@ -803,8 +805,10 @@ def load_config(path: str | Path) -> PipelineConfig:
             raise ValueError(f"layered.{key} must be positive, got {value}")
         layered[key] = value
     mesher = str(layered.get("mesher", "quads")).strip().lower()
-    if mesher not in ("quads", "triangles"):
-        raise ValueError(f"layered.mesher must be 'quads' or 'triangles', got {mesher!r}")
+    if mesher not in ("quads", "ribcage", "triangles"):
+        raise ValueError(
+            f"layered.mesher must be 'quads', 'ribcage' or 'triangles', got {mesher!r}"
+        )
     layered["mesher"] = mesher
     layered["water_surface"] = bool(layered.get("water_surface", True))
     layered["harbour"] = bool(layered.get("harbour", True))

@@ -559,6 +559,16 @@
           <label><input type="radio" name="style" value="survey"><span>Inmeting</span></label>
         </div>
       </div>
+      <div id="mesherField">
+        <div class="flabel" data-explains="mesher">Grondindeling
+          <span class="help" tabindex="0" role="button" aria-label="Over de grondindeling"
+            data-tip="Hoe de gelaagde grond in vlakken wordt verdeeld. <b>Raster</b>: rijen langs elke rand en één raster van vierkanten overal, gedraaid naar de straten. <b>Ribbenkast</b>: zoals het 3D-team het tekent, zonder raster: ribben dwars over wat smal is, grote vlakken gedraaid naar elke ruimte in wat breed is, en driehoeken alleen aan de randen. Ongeveer de helft van de vlakken.">?</span>
+        </div>
+        <div class="seg" role="radiogroup" aria-label="Grondindeling" id="mesher">
+          <label><input type="radio" name="mesher" value="quads" checked><span>Raster</span></label>
+          <label><input type="radio" name="mesher" value="ribcage"><span>Ribbenkast</span></label>
+        </div>
+      </div>
       <div>
         <div class="flabel" data-explains="detail">Detail
           <span class="help" tabindex="0" role="button" aria-label="Over het detail"
@@ -1176,6 +1186,8 @@ const setRadio = (name, value) => {
   if (box) box.checked = true;
 };
 function styleValue() { return radioValue("style") || "layered"; }
+function mesherValue() { return radioValue("mesher") || "quads"; }
+const MESHER_NAME = { quads: "Raster", ribcage: "Ribbenkast" };
 function detailValue() { return radioValue("detail") || "standard"; }
 function currentStyle() { return STYLE[styleValue()] || STYLE.layered; }
 
@@ -1227,6 +1239,8 @@ function applyStyle() {
   for (const id of style.unticked) {
     if (!sourceOff.has(id)) { sourceOff.add(id); styleUnticked.add(id); }
   }
+  // The ground layout is a choice for the layered ground only.
+  $("mesherField").hidden = styleValue() !== "layered";
   updateQuality();
   renderSources();
   refreshEstimate();
@@ -1306,6 +1320,7 @@ function areaMeta(a) {
   const parts = [];
   const style = areaStyle(a), detail = a.settings && a.settings.detail;
   if (style) parts.push(STYLE_NAME[style] || style);
+  if (style === "layered" && a.settings.mesher === "ribcage") parts.push(MESHER_NAME.ribcage);
   if (detail) parts.push(DETAIL_NAME[detail] || detail);
   const size = a.metadata && a.metadata.size_m;
   if (size) parts.push(`${Math.round(size)} m`);
@@ -1423,6 +1438,7 @@ function rebuild(a) {
   }
   $("name").value = a.name;
   const s = a.settings || {};
+  setRadio("mesher", s.mesher || "quads");
   if (s.style) { setRadio("style", s.style); applyStyle(); }
   if (s.detail) { setRadio("detail", s.detail); updateQuality(); }
   if (typeof s.collision === "boolean") $("collision").checked = s.collision;
@@ -1570,6 +1586,7 @@ $("run").onclick = async () => {
     // STYLE_PRESETS in src/config.py.
     style: styleValue(),
     detail: detailValue(),
+    ...(styleValue() === "layered" ? { mesher: mesherValue() } : {}),
     sources: selectedSources(),
     preview: $("preview").checked,
     collision: $("collision").checked

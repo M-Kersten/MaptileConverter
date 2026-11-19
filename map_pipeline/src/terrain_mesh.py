@@ -1431,8 +1431,6 @@ def _fill_spaced(face, xs, ys) -> list:
     outline as an edge, or a neighbour would not match; where it does not,
     the face is filled from its corners after all.
     """
-    import shapely
-
     g = float(xs[1] - xs[0])
     x0, y0, x1, y1 = face.bounds
     i0 = max(0, int(np.ceil((x0 - xs[0]) / g)))
@@ -1442,18 +1440,53 @@ def _fill_spaced(face, xs, ys) -> list:
     if i1 < i0 or j1 < j0:
         return _fill(face)
     gx, gy = np.meshgrid(xs[i0: i1 + 1], ys[j0: j1 + 1])
-    inner = np.column_stack([gx.ravel(), gy.ravel()])
+    return _fill_through(face, np.column_stack([gx.ravel(), gy.ravel()]), 0.45 * g)
+
+
+def _fill_through(face, inner, clearance: float, kept=None, gabriel: bool = False) -> list:
+    """A face triangulated through `inner` points, paired back into quads.
+
+    Points outside the face or within `clearance` of its outline are left
+    out; `kept` are points used whatever their clearance (an edge loop a
+    hand's breadth in from a quay). The triangulation has to have every edge
+    of the outline as an edge, or a neighbour would not match; where it does
+    not, the face is filled from its corners after all.
+
+    With `gabriel`, points inside the circle on any outline edge as diameter
+    are left out too. An outline edge is then always in the triangulation,
+    however long: a rib twenty metres across a square has no stations along
+    it, and a lattice point near its middle used to take the edge out of the
+    triangulation and the whole square back to a fan from its corners.
+    """
+    import shapely
+
+    inner = np.asarray(inner, dtype=np.float64).reshape(-1, 2)
     shapely.prepare(face)
-    keep = shapely.contains_xy(face, inner[:, 0], inner[:, 1])
-    inner = inner[keep]
     if len(inner):
-        far = shapely.distance(face.boundary, shapely.points(inner)) > 0.45 * g
+        inner = inner[shapely.contains_xy(face, inner[:, 0], inner[:, 1])]
+    if len(inner):
+        far = shapely.distance(face.boundary, shapely.points(inner)) > clearance
         inner = inner[far]
-    if not len(inner):
-        return _fill(face)
+    if kept is not None and len(kept):
+        kept = np.asarray(kept, dtype=np.float64).reshape(-1, 2)
+        kept = kept[shapely.contains_xy(face, kept[:, 0], kept[:, 1])]
+        inner = np.vstack([inner, kept]) if len(inner) else kept
     rings = [np.asarray(face.exterior.coords)[:-1, :2]] + [
         np.asarray(r.coords)[:-1, :2] for r in face.interiors
     ]
+    if gabriel and len(inner):
+        starts = np.vstack(rings)
+        ends = np.vstack([np.roll(r, -1, axis=0) for r in rings])
+        middles = 0.5 * (starts + ends)
+        radii = 0.5 * np.linalg.norm(ends - starts, axis=1) * 1.02
+        tree = shapely.STRtree(shapely.points(inner))
+        _, hit = tree.query(shapely.points(middles), predicate="dwithin", distance=radii)
+        if len(hit):
+            keep = np.ones(len(inner), dtype=bool)
+            keep[np.unique(hit)] = False
+            inner = inner[keep]
+    if not len(inner):
+        return _fill(face)
     outline = np.vstack(rings)
     points = np.vstack([outline, inner])
     triangles = shapely.get_parts(shapely.delaunay_triangles(shapely.multipoints(points)))
@@ -1487,6 +1520,85 @@ def _fill_spaced(face, xs, ys) -> list:
     return quads + rest
 
 
+# The hole each inner point is put into the constrained triangulation as.
+PIN_M = 0.002
+
+
+def _fill_pinned(face, inner, clearance: float, kept=None) -> list:
+    """A face triangulated through `inner` points with its outline kept, paired
+    back into quads.
+
+    `_fill_through` triangulates the points freely and checks the outline came
+    out whole; where it did not -- the outline's own stations crowding one of
+    its edges, as along any narrow passage -- the face was filled from its
+    corners instead, which over a big region is a fan of slivers half a
+    kilometre long. Here the outline is a constraint: GEOS triangulates a
+    polygon, not points, so each inner point goes in as a pin -- a hole two
+    millimetres across -- and each pin is closed back up to its point after.
+    Points within `clearance` of the outline are left out; `kept` are used
+    whatever their clearance.
+    """
+    import shapely
+
+    inner = np.asarray(inner, dtype=np.float64).reshape(-1, 2)
+    shapely.prepare(face)
+    if len(inner):
+        inner = inner[shapely.contains_xy(face, inner[:, 0], inner[:, 1])]
+    if len(inner):
+        inner = inner[shapely.distance(face.boundary, shapely.points(inner)) > clearance]
+    if kept is not None and len(kept):
+        kept = np.asarray(kept, dtype=np.float64).reshape(-1, 2)
+        kept = kept[shapely.contains_xy(face, kept[:, 0], kept[:, 1])]
+        if len(kept):
+            kept = kept[shapely.distance(face.boundary, shapely.points(kept)) > 4.0 * PIN_M]
+        inner = np.vstack([inner, kept]) if len(inner) else kept
+    if not len(inner):
+        return _fill(face)
+    # One pin per place: two closer than a few pins' width would overlap.
+    _, unique = np.unique(np.round(inner / (8.0 * PIN_M)).astype(np.int64), axis=0,
+                          return_index=True)
+    inner = inner[np.sort(unique)]
+    corners = np.array([[1.0, 0.0], [-0.5, 0.8660254], [-0.5, -0.8660254]]) * PIN_M
+    pins = inner[:, None, :] + corners[None, :, :]
+    pinned = shapely.Polygon(
+        face.exterior.coords,
+        [r.coords for r in face.interiors] + [p for p in pins],
+    )
+    if not pinned.is_valid:
+        return _fill_through(face, inner, 0.0)
+    triangles = shapely.get_parts(shapely.constrained_delaunay_triangles(pinned))
+    if not len(triangles):
+        return _fill(face)
+    coords = shapely.get_coordinates(shapely.get_exterior_ring(triangles)).reshape(-1, 4, 2)[:, :3]
+    # Each pin's corners back to its point.
+    owner = {}
+    for index, pin in enumerate(pins):
+        for corner in pin:
+            owner[(round(float(corner[0]), 7), round(float(corner[1]), 7))] = index
+    flat = coords.reshape(-1, 2)
+    for k, (x, y) in enumerate(flat):
+        hit = owner.get((round(float(x), 7), round(float(y), 7)))
+        if hit is not None:
+            flat[k] = inner[hit]
+    coords = flat.reshape(-1, 3, 2)
+    # A triangle along a pin's edge closes up to nothing.
+    distinct = (
+        np.any(coords[:, 0] != coords[:, 1], axis=1)
+        & np.any(coords[:, 1] != coords[:, 2], axis=1)
+        & np.any(coords[:, 0] != coords[:, 2], axis=1)
+    )
+    coords = _without_flat_triangles(_ccw_many(coords[distinct]))
+    if not len(coords):
+        return _fill(face)
+    coords = _ccw_many(coords)
+    covered = float(np.sum(np.abs(_signed_areas(coords))))
+    if abs(covered - face.area) > 1e-3 * max(face.area, 1.0) or (
+            _signed_areas(coords) <= 1e-9).any():
+        return _fill(face)
+    quads, rest = _recombine(coords)
+    return quads + rest
+
+
 def _signed_areas(triangles: np.ndarray) -> np.ndarray:
     t = np.asarray(triangles)
     return 0.5 * ((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
@@ -1507,40 +1619,63 @@ def _without_flat_triangles(triangles: np.ndarray) -> np.ndarray:
 
     if not len(triangles) or (np.abs(area2(triangles)) >= 1e-8).all():
         return triangles
-    tris = [t for t in triangles]
-    for _ in range(len(tris)):
-        a2 = area2(np.array(tris))
-        flat = np.flatnonzero(np.abs(a2) < 1e-8)
-        if not len(flat):
-            break
-        f = int(flat[0])
+
+    # Which triangles use each edge, so the one across a flat triangle's long
+    # edge is found at once: searched for through the whole list, a big open
+    # space with a few hundred stations along a straight outline took minutes.
+    tris = [np.asarray(t) for t in triangles]
+    alive = [True] * len(tris)
+    by_edge: dict[tuple, set] = {}
+
+    def edges_of(t):
+        keys = [_key(p) for p in t]
+        return [tuple(sorted((keys[i], keys[(i + 1) % 3]))) for i in range(3)]
+
+    def add(index):
+        for edge in edges_of(tris[index]):
+            by_edge.setdefault(edge, set()).add(index)
+
+    def remove(index):
+        alive[index] = False
+        for edge in edges_of(tris[index]):
+            by_edge.get(edge, set()).discard(index)
+
+    for index in range(len(tris)):
+        add(index)
+    queue = [i for i in np.flatnonzero(np.abs(area2(triangles)) < 1e-8)]
+    budget = 4 * len(tris) + 16
+    while queue and budget > 0:
+        budget -= 1
+        f = int(queue.pop())
+        if not alive[f]:
+            continue
         t = tris[f]
+        if abs(float(area2(t[None])[0])) >= 1e-8:
+            continue
         # The middle vertex is the one between the other two.
         lengths = [np.hypot(*(t[(i + 2) % 3] - t[(i + 1) % 3])) for i in range(3)]
         m = int(np.argmax(lengths))  # opposite the long edge
         a, b, middle = t[(m + 1) % 3], t[(m + 2) % 3], t[m]
         key_a, key_b = _key(a), _key(b)
-        partner = None
-        for j, other in enumerate(tris):
-            if j == f:
-                continue
-            keys = [_key(p) for p in other]
-            if key_a in keys and key_b in keys:
-                partner = j
-                break
-        del tris[f]
-        if partner is None:
+        partners = by_edge.get(tuple(sorted((key_a, key_b))), set()) - {f}
+        remove(f)
+        if not partners:
             continue
-        if partner > f:
-            partner -= 1
-        other = tris.pop(partner)
+        partner = min(partners)
+        other = tris[partner]
+        remove(partner)
         keys = [_key(p) for p in other]
         apex = other[[i for i, k in enumerate(keys) if k not in (key_a, key_b)][0]]
-        tris.append(np.array([a, middle, apex]))
-        tris.append(np.array([middle, b, apex]))
-    if not tris:
+        for new in (np.array([a, middle, apex]), np.array([middle, b, apex])):
+            tris.append(new)
+            alive.append(True)
+            add(len(tris) - 1)
+            if abs(float(area2(new[None])[0])) < 1e-8:
+                queue.append(len(tris) - 1)
+    out = [t for t, keep in zip(tris, alive) if keep]
+    if not out:
         return np.zeros((0, 3, 2))
-    out = np.array(tris)
+    out = np.array(out)
     return out[np.abs(area2(out)) >= 1e-8]
 
 

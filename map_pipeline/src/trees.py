@@ -56,8 +56,8 @@ class Tree:
             "height_m": round(self.height_m, 2),
             "crown_radius_m": round(self.crown_radius_m, 2),
             "trunk_height_m": round(self.trunk_height_m, 2),
-            "height_measured": self.measured,
-            "detected": self.detected,
+            "height_measured": bool(self.measured),
+            "detected": bool(self.detected),
         }
 
 
@@ -68,6 +68,8 @@ class TreeSet:
     raw_features: int = 0
     superseded_dropped: int = 0
     outside_bbox_dropped: int = 0
+    on_deck: int = 0
+    deck_dropped: int = 0
 
     def __len__(self) -> int:
         return len(self.trees)
@@ -86,6 +88,8 @@ class TreeSet:
             "heights_defaulted": len(self.trees) - measured,
             "registered": sum(1 for t in self.trees if not t.detected),
             "detected": sum(1 for t in self.trees if t.detected),
+            "on_deck": self.on_deck,
+            "deck_dropped": self.deck_dropped,
             "raw_features": self.raw_features,
             "superseded_dropped": self.superseded_dropped,
             "pages_fetched": self.pages_fetched,
@@ -619,13 +623,19 @@ def build_trees(
     terrain,
     buildings=None,
     surfaces=None,
+    deck_at=None,
 ) -> TreeSet:
-    """Fetch BGT trees over `bbox` and give each one a height from AHN."""
+    """Fetch BGT trees over `bbox` and give each one a height from AHN.
+
+    `deck_at(x, y)` is the top of a bridge deck there, NaN off one. A tree in
+    a planter on a deck stands on the deck: see `_on_decks`.
+    """
     result = TreeSet()
 
     LOG.info("querying BGT trees for %s", bbox)
     points: list[tuple[float, float]] = []
     seen_ids: set[str] = set()
+    seen_spots: set[tuple[float, float]] = set()
 
     for payload in iter_bgt_pages(
         bbox,
@@ -661,6 +671,14 @@ def build_trees(
             if not (bbox.xmin <= x <= bbox.xmax and bbox.ymin <= y <= bbox.ymax):
                 result.outside_bbox_dropped += 1
                 continue
+            # The same tree registered twice under two identifiers, at the
+            # same spot to the centimetre: two at Utrecht Centraal. Two trees
+            # in one place is one tree drawn twice, crowns through each other.
+            spot = (round(float(x), 2), round(float(y), 2))
+            if spot in seen_spots:
+                result.superseded_dropped += 1
+                continue
+            seen_spots.add(spot)
             points.append((float(x), float(y)))
 
     LOG.info(
@@ -771,9 +789,76 @@ def build_trees(
     if not result.trees:
         return result
 
+    if deck_at is not None:
+        result.trees, result.on_deck, result.deck_dropped = _on_decks(
+            result.trees, deck_at, min_height_m=min_h, default_height_m=default_h,
+            crown_ratio=crown_ratio, trunk_ratio=trunk_ratio,
+        )
+
     LOG.info("%s", _summary_line(result))
     save_trees(result, work_dir / "trees.npz")
     return result
+
+
+# A deck has to be this far above the ground to count: closer, and the tree is
+# as good as on the ground either way. Under a deck by more than this, a tree
+# is one growing beneath the bridge, and stays where it is.
+DECK_CLEAR_M = 1.0
+UNDER_DECK_M = 1.0
+# A tree in a planter on a deck is a small tree. A "tree" found on a deck that
+# reaches higher than this above it is a roof or a mast over the deck.
+DECK_TREE_MAX_M = 15.0
+
+
+def _on_decks(trees, deck_at, *, min_height_m, default_height_m, crown_ratio, trunk_ratio):
+    """Trees on a deck stood on it. Returns (trees kept, stood on a deck, dropped).
+
+    Every tree is measured from the ground the terrain gives: the AHN ground
+    model, which runs on under a bridge. A tree planted on a station deck was
+    therefore stood on the street under the deck, its height the deck plus the
+    tree, or -- where the crown search saw only the deck -- the deck alone: a
+    tree whose top just touched the underside of the deck it should stand on.
+
+    On a deck, a registered tree stands on it and its height is what it
+    reaches above the deck; where that is nothing, the canopy was too small
+    for the survey to see apart from the deck, and it gets the default
+    height. A tree whose top stays clearly below the deck is under the
+    bridge, and stays.
+
+    A tree the canopy model *found* on a deck has to show a crown above it.
+    One that reaches no higher than the deck was the deck: 286 of them over
+    Utrecht Centraal, each stood on the tracks under the station deck with
+    its top against the underside. One reaching far above it was the roof
+    over the deck. Both are dropped.
+    """
+    if not trees:
+        return trees, 0, 0
+    xs = np.array([t.x for t in trees], dtype=np.float64)
+    ys = np.array([t.y for t in trees], dtype=np.float64)
+    deck = np.asarray(deck_at(xs, ys), dtype=np.float64).reshape(xs.shape)
+    kept, moved, dropped = [], 0, 0
+    for tree, top_of_deck in zip(trees, deck):
+        if not np.isfinite(top_of_deck) or top_of_deck < tree.ground_z_nap + DECK_CLEAR_M:
+            kept.append(tree)
+            continue
+        top = tree.ground_z_nap + tree.height_m
+        if tree.measured and top < top_of_deck - UNDER_DECK_M:
+            kept.append(tree)
+            continue
+        above = top - top_of_deck
+        measured = bool(tree.measured and above >= min_height_m)
+        if tree.detected and (not measured or above > DECK_TREE_MAX_M):
+            dropped += 1
+            continue
+        height = above if measured else default_height_m
+        tree.ground_z_nap = float(top_of_deck)
+        tree.height_m = float(height)
+        tree.measured = measured
+        tree.crown_radius_m = float(np.clip(crown_ratio * height, 0.8, 7.0))
+        tree.trunk_height_m = float(np.clip(trunk_ratio * height, 0.6, 6.0))
+        kept.append(tree)
+        moved += 1
+    return kept, moved, dropped
 
 
 def _road_classes(names) -> set[int]:
@@ -939,6 +1024,11 @@ def _summary_line(result: TreeSet) -> str:
         f"{stats['heights_defaulted']} defaulted; "
         f"{stats['registered']} from the BGT register, "
         f"{stats['detected']} found in the canopy model"
+        + (f"; {stats['on_deck']} stand on a deck" if stats["on_deck"] else "")
+        + (
+            f"; {stats['deck_dropped']} found on a deck were the deck or a roof over it"
+            if stats["deck_dropped"] else ""
+        )
     )
 
 

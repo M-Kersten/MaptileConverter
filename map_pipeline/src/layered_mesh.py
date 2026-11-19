@@ -908,12 +908,9 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
         FILL,
         WATER,
         _cross_rungs,
-        _distinct_corners,
         _fill,
         _fill_gaps,
         _mesh_region,
-        _orient,
-        _water_heights,
     )
 
     started = time.time()
@@ -1075,6 +1072,57 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
     timings["grid_s"] = round(time.time() - t, 1)
 
     # ---- assemble, one vertex per position ----------------------------------
+    vertices, sizes, loops, face_kind, face_part, face_code, finished = _assemble(
+        faces, terrain=terrain, bodies=bodies, depth_m=depth_m, shift=shift,
+        size=(width, height), turn=turn, centre=centre, quay_zone=quay_zone,
+    )
+    mended, patched, slivers, welded = (
+        finished["t_junctions_mended"], finished["holes_patched_or_strays_dropped"],
+        finished["slivers_merged"], finished["vertices_welded"],
+    )
+
+    stats = {
+        "mesher": "quads",
+        "grid_angle_deg": float(turn),
+        "grid_squares": {f"{near_m:g} m": int(len(jj))},
+        "cross_rungs": int(sum(len(v) for v in across.values())),
+        "regions_meshed_without_rows": int(failed),
+        "rungs_divided": int(divided),
+        "roads_given_a_middle_loop": int(crowned),
+        "regions_filled_whole": int(refilled),
+        "pieces_overlapping": int(overlaps),
+        "thin_strips_folded": int(thin),
+        "t_junctions_mended": int(mended),
+        "water_along_quays": int(sum(1 for r in rows if r == QUAY_ROW_M)),
+        "slivers_merged": int(slivers),
+        "vertices_welded": int(welded),
+        "holes_patched_or_strays_dropped": int(patched),
+        "water_faces": int((face_kind == WATER).sum()),
+        **timings,
+        "mesher_s": round(time.time() - started, 1),
+    }
+    return vertices, sizes.astype(np.int64), loops, face_code, face_part, stats
+
+
+def _assemble(faces, *, terrain, bodies, depth_m, shift, size, turn=0.0, centre=None,
+              quay_zone=None):
+    """Faces in local coordinates into the finished ground.
+
+    `faces` is ``(corners, part, mesher kind, code)`` per face. One vertex per
+    position, welded; T-junctions mended, holes patched, slivers merged; the
+    heights read off the survey, the beds carved and the banks eased; every
+    quad's diagonal turned to fit. Returns the RD vertices with heights, face
+    sizes, loops, kinds, parts and codes, and the counts of what was mended.
+    """
+    from .terrain_mesh import (
+        GRID_SIZE,
+        WATER,
+        _distinct_corners,
+        _orient,
+        _water_heights,
+    )
+
+    width, height = size
     corner_lists = [np.asarray(c, dtype=np.float64) for c, _, _, _ in faces]
     sizes = np.array([len(c) for c in corner_lists], dtype=np.int64)
     all_corners = np.vstack(corner_lists)
@@ -1135,28 +1183,13 @@ def quad_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
     heights = _gentle_banks(heights, loops, sizes, face_kind, local_xy, WATER, steep=quay_zone)
     vertices = np.column_stack([xy, heights])
     sizes, loops = _orient(vertices, sizes, loops, face_part, face_kind, terrain)
-
-    stats = {
-        "mesher": "quads",
-        "grid_angle_deg": float(turn),
-        "grid_squares": {f"{near_m:g} m": int(len(jj))},
-        "cross_rungs": int(sum(len(v) for v in across.values())),
-        "regions_meshed_without_rows": int(failed),
-        "rungs_divided": int(divided),
-        "roads_given_a_middle_loop": int(crowned),
-        "regions_filled_whole": int(refilled),
-        "pieces_overlapping": int(overlaps),
-        "thin_strips_folded": int(thin),
+    counts = {
         "t_junctions_mended": int(mended),
-        "water_along_quays": int(sum(1 for r in rows if r == QUAY_ROW_M)),
+        "holes_patched_or_strays_dropped": int(patched),
         "slivers_merged": int(slivers),
         "vertices_welded": int(welded),
-        "holes_patched_or_strays_dropped": int(patched),
-        "water_faces": int((face_kind == WATER).sum()),
-        **timings,
-        "mesher_s": round(time.time() - started, 1),
     }
-    return vertices, sizes.astype(np.int64), loops, face_code, face_part, stats
+    return vertices, sizes, loops, face_kind, face_part, face_code, counts
 
 
 def _parts(geometry):

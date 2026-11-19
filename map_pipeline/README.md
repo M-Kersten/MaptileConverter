@@ -625,7 +625,7 @@ an add-on** — *Edit → Preferences → Add-ons*, the ⌄ menu at the top righ
 sidebar (N) of every model from then on. It is also inside each `.blend` as a
 text block: to use the tools without installing, open it in the Text Editor and
 press *Run Script*. The file does not run it by itself on opening, because
-Blender halts every file that asks to with a security warning. Four buttons:
+Blender halts every file that asks to with a security warning. Four buttons, and the problem finder under them:
 
 * **Fit terrain under roads.** After moving, widening or raising a road, the
   ground under it is wrong. This redoes the pipeline's fit: the same points,
@@ -645,6 +645,27 @@ Blender halts every file that asks to with a security warning. Four buttons:
   or anything you added.
 * **Export FBX for Unity.** The pipeline's own export settings, so a re-export
   after editing lands in Unity exactly like the original did.
+
+Under them, **Problem areas**. *Find problems* colours, over the model in the
+viewport, the faces a modeller would want to look at — nothing is written into
+the mesh, so nothing of it reaches an export:
+
+| | colour | what |
+|---|---|---|
+| Slivers | red | a triangle more than *Sliver ratio* (10) times longer than it is high, once it is over a metre long; a quad with a corner under 10° |
+| Too dense | orange | more than *Vertices per square* (30) vertices in one *Density square* (5 m) of the plan |
+| N-gons | violet | faces with more than four sides |
+| Flipped | magenta | ground facing down; on anything else, a face wound against its neighbour |
+| Seams | cyan | an open edge of one ground piece with no partner in the next — a crack, a T-junction, or a step in height between two pieces (dots at the vertices) |
+| Moved | yellow | vertices further than *Moved by* (0.5 m) from their surveyed height (`measured_z`) |
+
+It scans the selected objects, or with nothing selected the ground and the
+barriers; the whole of Utrecht Centraal takes under two seconds. The tick boxes
+show and hide each kind, with its count beside it. ◀ ▶ frame the view on each
+problem spot in turn, worst first, and *Select problem faces* selects the ticked
+kinds on the active object in edit mode, to fix or delete. *Clear* takes the
+overlay away; it is a view of the mesh as it was when scanned, so scan again
+after editing.
 
 ## Importing into Unity
 
@@ -845,6 +866,35 @@ How it is built (`src/layered.py`):
   along the edges where they meet, and none lies on another.
   `layered.mesher: "triangles"` gives the old triangulation back, and is what
   a quad mesh that fails falls back to.
+* **The ribcage, beside the grid** (`layered.mesher: "ribcage"`,
+  `src/ribcage_mesh.py`). The 3D team's layout, to compare with the grid: quads
+  do the work across the spaces and follow their shape, triangles fill in at the
+  edges, and there is no grid. Every region is meshed in its own frame:
+  * **Ribs across what is narrow.** A street, a footpath, a verge, a ditch:
+    ribs straight across from station to station, a ladder that follows the
+    street round its bends. A road the survey shows a crown on gets a loop down
+    its middle; narrow water always does, and that loop is the bed.
+  * **A lattice turned to each space in what is wide.** What the ribs leave — a
+    square, a field, a junction, open water — gets quads turned to that
+    piece's own main direction, at twice `square_m` where the ground is plain
+    enough and `square_m` in the patches where a big quad would miss the survey
+    by more than the tolerance. Ribs that only cut an open space into wedges
+    are taken back out, so it is one space with one lattice. The lattice is
+    joined to the outline by a constrained triangulation, so the outline is
+    always kept and never filled as a fan from its corners, and every pair of
+    triangles that makes a good quad is one.
+  * The outline stations are the grid mesher's, so neighbours meet vertex for
+    vertex, and the finishing — welding, heights, beds, banks, diagonals — is
+    the grid mesher's own, so the two differ in layout only.
+
+  Over Hoek van Holland, from the same inputs:
+
+  | | grid (`quads`) | `ribcage` |
+  |---|---|---|
+  | faces | 82,348 | 46,315 |
+  | quads / triangles | 65,068 / 17,280 | 30,909 / 15,406 |
+  | slivers (10:1 or worse) | 1,044 | 851 |
+  | survey miss, 95% of the ground | 0.155 m | 0.18 m |
 * **Water.** Water is meshed like the rest, with rungs across a ditch split
   at the middle: the middle line is the bed, `ditch_depth_m` (0.6 m) below the
   water level (one per connected water, see [Ground surfaces](#ground-surfaces)),
@@ -959,7 +1009,7 @@ The layered style's settings, all optional:
 | --- | --- | --- |
 | `layered.prefix` | the area name | what every ground object's name starts with |
 | `layered.tolerance_m` | 0.5 | how far the survey may be off a road's rungs before a loop goes down its middle, and what the checks warn past |
-| `layered.mesher` | `"quads"` | `"quads"`, or `"triangles"` for the triangulation refined to `tolerance_m` |
+| `layered.mesher` | `"quads"` | `"quads"`; `"ribcage"`, ribs across what is narrow and a lattice turned to each space in what is wide, no grid; or `"triangles"` for the triangulation refined to `tolerance_m` |
 | `layered.square_m` | 4 | the size of the grid squares and the spacing of the points along every outline, the same everywhere, in whole survey grid squares; 8 has about a third of the faces over open ground |
 | `layered.ditch_depth_m` | 0.6 | how far below its water level a ditch is cut |
 | `layered.water_surface` | true | the flat water object over every BGT water |
@@ -1363,7 +1413,10 @@ None of this is structurally important, which is exactly the point. A street
 with nothing on it reads as a model; the same street with lampposts along the
 kerb, a wall between the plots and a hedge behind it reads as a place. Everything
 here shares one 8-patch atlas and one material, so a few thousand objects cost
-one draw call.
+one draw call. Its patches are addressed with V counted up from the bottom of
+the image, as Blender reads it; counted from the top, as the image is written,
+every lookup read the patch from the other row — metal came out hedge green, a
+green roof on every station canopy, hedges dark metal and quay walls glass.
 
 The BGT registers far more of it than the model used to draw. These are real
 counts for one square kilometre of Utrecht centre:
@@ -1406,21 +1459,49 @@ Three things about the geometry are worth knowing:
   triangles against 88,324 for the same walls followed to 5 cm. The survey's own
   vertices are anchors and always survive, because those are the shape of the
   fence rather than the shape of the ground under it.
-- **A polygon is cut up before its ground is sampled.** A survey draws a 30 m
-  wall as a four-vertex rectangle, and sampling only at the corners leaves the
-  base a straight chord over whatever the ground does in between: one ring edge
-  in five departed from its chord by more than the 15 cm embed, and the worst by
-  3.9 m. The swept lines had always been cut up first; polygons were the ones
-  left out.
+- **A polygon follows the ground between its corners, where it bends.** A
+  survey draws a 30 m wall as a four-vertex rectangle, and sampling only at the
+  corners leaves the base a straight chord over whatever the ground does in
+  between: one ring edge in five departed from its chord by more than the 15 cm
+  embed, and the worst by 3.9 m. The outline is now draped like the lines are —
+  a vertex only where leaving it out would let the base leave the ground by more
+  than `barriers.drape_tolerance_m` — rather than cut every metre, which held
+  straight walls straight at a hundred triangles each. Over Utrecht Centraal the
+  barriers went from 197,613 triangles to 94,743.
+- **The top of a wall is a ladder of quads.** Earcut fanned a wall's top from
+  one corner to every vertex along the far side. A strip-shaped outline (2.5
+  times longer than wide) is now capped by walking both long sides from one end
+  to the other: each step is a rung across, and where one side has a vertex the
+  other lacks, the other gets one opposite it (on its side wall too, so nothing
+  hangs off an edge). Every side and every rung is written as a pair of
+  triangles that the Blender stage joins back into one quad.
+- **Every barrier faces out.** The survey does not promise which way round it
+  drew an outline, and a wall drawn clockwise came out inside out — black in a
+  lit viewport, invisible with backface culling. Outlines are now turned
+  anticlockwise (holes clockwise) first, and the ends of a swept wall, which
+  faced into the wall on every run, face out.
 - **A polygon's base is sampled per vertex.** One height for a whole outline
   fails exactly where these objects live — a quay wall runs along a canal bank,
   the steepest ground in a Dutch city — and on a test surface a single median
   buried one end of a wall by 0.65 m. Awnings are the exception: they hang off a
-  facade at one height, so they stay flat — taken from the *highest* ground
-  under their footprint, not the median. The median looks like the fair choice
-  and is not: an awning whose footprint straddles a slope ends up half buried,
-  by 1.43 m on the Gelderland square. Too high at one end is a thing nobody
-  notices; underground is not.
+  facade at one height, so they stay flat, keep only their corners, and are
+  taken from the *highest* ground under their footprint, not the median. The
+  median looks like the fair choice and is not: an awning whose footprint
+  straddles a slope ends up half buried, by 1.43 m on the Gelderland square. Too
+  high at one end is a thing nobody notices; underground is not.
+- **A canopy takes its roof from the survey.** `overkapping` is anything from a
+  bicycle shelter to the roof over a station's platforms, and its old fixed
+  2.6 m put the platform roof at Utrecht Centraal a few metres over the
+  platform. The AHN surface model sees the roof: its median reading inside the
+  outline, a metre in from the edge, between 2 and 30 m above the ground, is the
+  top. Where under 30% of the outline gives such a reading — glass, a mesh roof
+  the laser went through — the fixed lift is kept.
+- **Corners are matched to the micrometre.** The survey's own corners were
+  found among the draped points with numpy's default *relative* tolerance —
+  metres at RD coordinates — so a small wall lost every corner but one and came
+  out as a point, and a fence could lose the corner it turned at. The same
+  comparison closing a ring is fixed in the surfaces, bridges, road network and
+  rails code too.
 - **A fence is see-through.** It gets its own alpha-clipped material and a
   palisade texture that tiles along the run — about two thirds open, so the
   uprights read as uprights. Drawn as a solid slab a railing is a hoarding, and
@@ -1597,6 +1678,18 @@ point lands on whatever is beside the tree and reads far too low, so the height
 is the local maximum within a few metres. Building roofs are cut out of the
 canopy model first, otherwise a tree standing near a wall inherits the height of
 the building next to it.
+
+**A tree on a deck stands on the deck.** Heights are measured from the AHN
+ground model, which runs on under a bridge, so a tree in a planter on the
+station deck at Utrecht Centraal stood on the tracks beneath it, its top against
+the deck's underside. A registered tree inside a deck's outline now stands on
+the deck, its height what it reaches above it (the default where the survey sees
+nothing above the deck); one whose top stays clearly under the deck is under
+the bridge and stays. A tree the canopy model *found* there has to show a crown
+above the deck: of the 353 found over Utrecht Centraal's decks, 286 reached no
+higher than the deck — they were the deck — and the rest were the roof over it,
+and all of those are dropped. The same tree registered twice under two
+identifiers, at the same spot to the centimetre, is now drawn once.
 
 ### Finding the trees nobody registered
 

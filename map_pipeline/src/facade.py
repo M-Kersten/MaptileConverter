@@ -1064,14 +1064,21 @@ FURNITURE_ROWS = 2
 
 
 def furniture_uv(name: str) -> tuple[float, float]:
-    """The UV centre of one atlas patch, by name."""
+    """The UV centre of one atlas patch, by name.
+
+    V counts up from the bottom of the image, as Blender reads it, while the
+    rows above are counted down from the top, as the image is written. Counted
+    from the same end, every lookup read the patch from the other row: metal
+    came out hedge green -- a green roof on every station canopy -- hedges
+    dark metal and quay walls glass.
+    """
     for index, (patch, *_rest) in enumerate(FURNITURE_PATCHES):
         if patch == name:
             column = index % FURNITURE_COLUMNS
             row = index // FURNITURE_COLUMNS
             return (
                 (column + 0.5) / FURNITURE_COLUMNS,
-                (row + 0.5) / FURNITURE_ROWS,
+                1.0 - (row + 0.5) / FURNITURE_ROWS,
             )
     raise KeyError(f"no furniture atlas patch named {name!r}")
 

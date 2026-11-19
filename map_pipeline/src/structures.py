@@ -148,7 +148,7 @@ def extrude_ring(ring: np.ndarray, top, bottom) -> np.ndarray:
             f"bottom heights"
         )
 
-    if n > 1 and np.allclose(points[0], points[-1]):
+    if n > 1 and np.allclose(points[0], points[-1], rtol=0.0, atol=1e-6):
         points, top, bottom = points[:-1], top[:-1], bottom[:-1]
     if len(points) < 3:
         return np.zeros((0, 3, 3))
@@ -331,11 +331,13 @@ def deck_surface(bbox: BBox, *, structures_cfg: dict, terrain, dsm_sampler):
                 decks.append(polygon)
                 levels.append(level)
     if not decks:
-        return lambda x, y: np.full(np.shape(np.atleast_1d(x)), np.nan)
+        return lambda x, y, reach=DECK_EDGE_M: np.full(np.shape(np.atleast_1d(x)), np.nan)
     tree = shapely.STRtree(np.array(decks, dtype=object))
     levels = np.asarray(levels)
 
-    def at(x, y):
+    def at(x, y, reach=DECK_EDGE_M):
+        """`reach`: how far outside the outline still counts as on the deck.
+        A parapet wants the edge; a tree wants to be inside (0)."""
         x = np.atleast_1d(np.asarray(x, dtype=np.float64))
         y = np.atleast_1d(np.asarray(y, dtype=np.float64))
         out = np.full(x.shape, np.nan)
@@ -344,7 +346,10 @@ def deck_surface(bbox: BBox, *, structures_cfg: dict, terrain, dsm_sampler):
         # both its faces: read only inside the outline, one face stood on the
         # deck and the other on the canal bed, a comb of teeth down to the
         # water. Close to the edge is on it.
-        hit_point, hit_deck = tree.query(points, predicate="dwithin", distance=DECK_EDGE_M)
+        if reach > 0:
+            hit_point, hit_deck = tree.query(points, predicate="dwithin", distance=reach)
+        else:
+            hit_point, hit_deck = tree.query(points, predicate="within")
         if len(hit_point):
             out[hit_point] = np.fmax(out[hit_point], levels[hit_deck])
             # Held up where the ground rises through the deck, as the deck is.

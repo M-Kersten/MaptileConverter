@@ -586,6 +586,39 @@ class TestTrees(unittest.TestCase):
         self.assertEqual(len(kept), 2)
         self.assertEqual(result.superseded_dropped, 1)
 
+    def test_one_tree_registered_twice_is_one_tree(self):
+        """Two register rows, two identifiers, one spot to the centimetre:
+        Utrecht Centraal has two. Drawn twice, the crowns grow through each
+        other, and the duplicate check fails the run."""
+        from unittest import mock
+
+        from src import trees as trees_module
+        from src.geo import BBox
+
+        page = {"features": [
+            {"properties": {"lokaal_id": "a"},
+             "geometry": {"type": "Point", "coordinates": [50.0, 50.0]}},
+            {"properties": {"lokaal_id": "b"},
+             "geometry": {"type": "Point", "coordinates": [50.001, 50.002]}},
+            {"properties": {"lokaal_id": "c"},
+             "geometry": {"type": "Point", "coordinates": [60.0, 50.0]}},
+        ]}
+        cfg = {"api_url": "x", "page_limit": 10, "timeout_s": 1, "max_retries": 0,
+               "max_pages": 1, "detect": False, "min_height_m": 2.0, "max_height_m": 30.0,
+               "default_height_m": 7.0, "crown_radius_ratio": 0.25,
+               "trunk_height_ratio": 0.3, "crown_search_m": 2.0}
+        terrain = types_namespace(
+            geotiff_path=None, surface=lambda x, y: np.zeros(len(np.atleast_1d(x))),
+        )
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(trees_module, "iter_bgt_pages", lambda *a, **k: [page]), \
+                mock.patch.object(trees_module, "_load_ndsm",
+                                  lambda *a, **k: (np.full((100, 100), 9.0), (0, 0, 100, 100))):
+            result = trees_module.build_trees(
+                BBox(0.0, 0.0, 100.0, 100.0), Path(tmp), trees_cfg=cfg, terrain=terrain,
+            )
+        self.assertEqual(len(result), 2)
+
     def test_building_mask_covers_roofs(self):
         from src.buildings import Building, BuildingSet
         from src.trees import _rasterize_buildings
@@ -1032,6 +1065,110 @@ class TestTreeDetection(unittest.TestCase):
             "bbox=bbox", source,
             "build_trees no longer tells the detector what area it is in",
         )
+
+    @staticmethod
+    def _deck_trees():
+        from src.trees import Tree
+
+        def tree(x, height, measured=True):
+            return Tree(
+                x=x, y=0.0, ground_z_nap=0.0, height_m=height, crown_radius_m=2.0,
+                trunk_height_m=2.0, measured=measured,
+            )
+
+        # A deck six metres up over x in [0, 100], nothing beyond.
+        def deck_at(x, y):
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            return np.where((x >= 0) & (x <= 100), 6.0, np.nan)
+
+        return tree, deck_at
+
+    def test_a_tree_on_a_deck_stands_on_the_deck(self):
+        """Utrecht Centraal: a planter on the station deck."""
+        from src.trees import _on_decks
+
+        tree, deck_at = self._deck_trees()
+        on = tree(50.0, 14.0)          # canopy model: deck plus an 8 m tree
+        kept, moved, dropped = _on_decks(
+            [on], deck_at, min_height_m=2.0, default_height_m=7.0,
+            crown_ratio=0.25, trunk_ratio=0.3,
+        )
+        self.assertEqual((len(kept), moved, dropped), (1, 1, 0))
+        self.assertAlmostEqual(on.ground_z_nap, 6.0)
+        self.assertAlmostEqual(on.height_m, 8.0)
+        self.assertTrue(on.measured)
+
+    def test_a_tree_the_survey_only_saw_as_deck_gets_the_default(self):
+        """The crown search found the deck itself: a tree reaching up to the
+        underside of the deck it should stand on, as in the screenshot."""
+        from src.trees import _on_decks
+
+        tree, deck_at = self._deck_trees()
+        young = tree(50.0, 6.0)
+        _on_decks(
+            [young], deck_at, min_height_m=2.0, default_height_m=7.0,
+            crown_ratio=0.25, trunk_ratio=0.3,
+        )
+        self.assertAlmostEqual(young.ground_z_nap, 6.0)
+        self.assertAlmostEqual(young.height_m, 7.0)
+        self.assertFalse(young.measured)
+
+    def test_a_found_tree_that_was_the_deck_is_dropped(self):
+        """286 found trees over Utrecht Centraal reached exactly the deck: the
+        deck itself, stood on the tracks with its top against the underside.
+        One reaching 23 m above it was the station roof."""
+        from src.trees import _on_decks
+
+        tree, deck_at = self._deck_trees()
+        deck_itself = tree(50.0, 6.2)
+        deck_itself.detected = True
+        roof = tree(60.0, 30.0)
+        roof.detected = True
+        planter = tree(70.0, 13.0)
+        planter.detected = True
+        kept, moved, dropped = _on_decks(
+            [deck_itself, roof, planter], deck_at, min_height_m=2.0,
+            default_height_m=7.0, crown_ratio=0.25, trunk_ratio=0.3,
+        )
+        self.assertEqual((kept, moved, dropped), ([planter], 1, 2))
+        self.assertAlmostEqual(planter.height_m, 7.0)
+        self.assertIs(type(planter.measured), bool)
+
+    def test_a_tree_beside_a_bridge_is_not_on_it(self):
+        """The parapets read the deck to just past its edge; a tree must be
+        inside it, or every tree on a canal bank by a bridge went up."""
+        import shapely
+
+        from src import structures
+
+        deck = shapely.Polygon([(0, 0), (10, 0), (10, 5), (0, 5)])
+        tree = shapely.STRtree(np.array([deck], dtype=object))
+        points = shapely.points([10.3, 5.0], [2.0, 2.0])
+        near, _ = tree.query(points, predicate="dwithin", distance=structures.DECK_EDGE_M)
+        inside, _ = tree.query(points, predicate="within")
+        self.assertEqual(sorted(near.tolist()), [0, 1])
+        self.assertEqual(inside.tolist(), [1])
+        source = Path(structures.__file__).read_text()
+        self.assertIn('predicate="within"', source)
+
+    def test_a_tree_under_a_bridge_or_off_it_stays_on_the_ground(self):
+        from src.trees import _on_decks
+
+        tree, deck_at = self._deck_trees()
+        under = tree(50.0, 3.5)        # its top clearly below the deck
+        off = tree(150.0, 9.0)
+        kept, moved, _ = _on_decks(
+            [under, off], deck_at, min_height_m=2.0, default_height_m=7.0,
+            crown_ratio=0.25, trunk_ratio=0.3,
+        )
+        self.assertEqual((len(kept), moved), (2, 0))
+        self.assertEqual((under.ground_z_nap, under.height_m), (0.0, 3.5))
+        self.assertEqual((off.ground_z_nap, off.height_m), (0.0, 9.0))
+
+    def test_the_pipeline_hands_the_trees_the_decks(self):
+        source = (Path(__file__).resolve().parents[1] / "pipeline.py").read_text()
+        start = source.index("trees = build_trees(")
+        self.assertIn("deck_at(x, y, reach=0.0)", source[start:start + 900])
 
     def test_the_settings_reach_the_config(self):
         from src.config import DEFAULTS
@@ -5339,6 +5476,9 @@ class TestBlenderStageIsolation(unittest.TestCase):
     BUNDLED = {
         "bpy", "numpy", "mathutils", "bmesh", "gpu", "aud",
         "addon_utils", "bpy_extras", "bl_ui",
+        # In Blender's own scripts/modules, beside bpy_extras: the problem
+        # overlay in maptile_tools.py draws with it.
+        "gpu_extras",
     }
 
     @staticmethod
@@ -6279,6 +6419,139 @@ class TestMaptileTools(unittest.TestCase):
         theirs = self._tools()["TriangleLocator"](xy, triangles, cell=2.0, bounds=bounds).locate(x, y)
         np.testing.assert_array_equal(ours[0], theirs[0])
         np.testing.assert_allclose(ours[1], theirs[1])
+
+
+class TestProblemFinder(unittest.TestCase):
+    """The Problem areas scan in the TerreinLab tab, run without Blender."""
+
+    @staticmethod
+    def _scan():
+        import ast
+
+        source = (REPO_ROOT / "blender" / "maptile_tools.py").read_text(encoding="utf-8")
+        namespace = {"np": np}
+        wanted = {"face_problems", "_loop_geometry", "boundary_vertices", "seam_vertices",
+                  "problem_spots", "GROUND_ROLES"}
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.FunctionDef) and node.name in wanted:
+                exec(compile(ast.Module([node], []), "maptile_tools.py", "exec"), namespace)
+            elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and (
+                    node.targets[0].id.isupper()):
+                try:
+                    exec(compile(ast.Module([node], []), "maptile_tools.py", "exec"), namespace)
+                except NameError:
+                    pass
+        return namespace
+
+    @staticmethod
+    def _mesh(faces):
+        """Blender's arrays for a list of faces given as vertex index lists."""
+        loops = np.concatenate([np.asarray(f) for f in faces])
+        total = np.array([len(f) for f in faces])
+        start = np.concatenate([[0], np.cumsum(total)[:-1]])
+        return loops, start, total
+
+    def test_a_long_thin_triangle_is_a_sliver_and_a_square_is_not(self):
+        scan = self._scan()
+        co = np.array([[0, 0, 0], [20, 0, 0], [20, 0.5, 0], [0, 4, 0], [4, 4, 0]], float)
+        loops, start, total = self._mesh([[0, 1, 2], [0, 1, 4, 3]])
+        found, _ = scan["face_problems"](co, loops, start, total, ground=True)
+        self.assertEqual(found["sliver"].tolist(), [True, False])
+        # A small one is not worth a modeller's look.
+        tiny = co * 0.02
+        found, _ = scan["face_problems"](tiny, loops, start, total, ground=True)
+        self.assertFalse(found["sliver"][0])
+
+    def test_ngons_and_ground_facing_down(self):
+        scan = self._scan()
+        co = np.array([[0, 0, 0], [4, 0, 0], [6, 2, 0], [4, 4, 0], [0, 4, 0]], float)
+        up = [0, 1, 2, 3, 4]
+        loops, start, total = self._mesh([up, up[::-1]])
+        found, _ = scan["face_problems"](co, loops, start, total, ground=True)
+        self.assertEqual(found["ngon"].tolist(), [True, True])
+        self.assertEqual(found["flipped"].tolist(), [False, True])
+
+    def test_a_face_wound_against_its_neighbour_is_flipped(self):
+        """Barriers are closed solids: a face that disagrees with its
+        neighbour about their shared edge is inside out, whichever way it faces."""
+        scan = self._scan()
+        co = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], float)
+        found, _ = scan["face_problems"](co, *self._mesh([[0, 1, 2], [0, 2, 3]]), ground=False)
+        self.assertFalse(found["flipped"].any())
+        found, _ = scan["face_problems"](co, *self._mesh([[0, 1, 2], [0, 3, 2]]), ground=False)
+        self.assertTrue(found["flipped"].all())
+
+    def test_too_many_vertices_in_one_square(self):
+        scan = self._scan()
+        # A fan of 40 thin triangles in one 5 m square, and one plain quad.
+        fan_points = [[1.0, 1.0, 0.0]] + [[1.0 + 3 * np.cos(a), 1.0 + 3 * np.sin(a), 0.0]
+                                          for a in np.linspace(0, 1.4, 41)]
+        quad = [[20, 20, 0], [24, 20, 0], [24, 24, 0], [20, 24, 0]]
+        co = np.array(fan_points + quad, float)
+        faces = [[0, k, k + 1] for k in range(1, 41)] + [[42, 43, 44, 45]]
+        loops, start, total = self._mesh(faces)
+        found, _ = scan["face_problems"](co, loops, start, total, ground=True,
+                                         cell_m=5.0, max_vertices=30)
+        self.assertTrue(found["dense"][:40].all())
+        self.assertFalse(found["dense"][40])
+
+    def test_vertices_moved_off_the_survey(self):
+        scan = self._scan()
+        co = np.array([[0, 0, 0.0], [4, 0, 0.0], [4, 4, 0.9], [0, 4, 0.0]], float)
+        loops, start, total = self._mesh([[0, 1, 2, 3]])
+        found, _ = scan["face_problems"](co, loops, start, total, ground=True,
+                                         surveyed_z=np.zeros(4), moved_m=0.5)
+        self.assertTrue(found["moved"][0])
+        found, _ = scan["face_problems"](co, loops, start, total, ground=True,
+                                         surveyed_z=co[:, 2], moved_m=0.5)
+        self.assertFalse(found["moved"][0])
+
+    def test_seams_between_ground_pieces(self):
+        """Two pieces of one sheet meet vertex for vertex. A vertex in the
+        middle of the neighbour's edge is a T-junction; a partner at another
+        height is a step. The outside of the tile is not a seam."""
+        scan = self._scan()
+        left = np.array([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]], float)
+        right = np.array([[10, 0, 0], [20, 0, 0], [20, 10, 0], [10, 10, 0]], float)
+        quad = self._mesh([[0, 1, 2, 3]])
+        pieces = [(left, scan["boundary_vertices"](*quad)),
+                  (right, scan["boundary_vertices"](*quad))]
+        self.assertEqual([len(s) for s in scan["seam_vertices"](pieces)], [0, 0])
+
+        # The right piece split at (10, 5): a T-junction against the left one.
+        right_t = np.array([[10, 0, 0], [20, 0, 0], [20, 10, 0], [10, 10, 0], [10, 5, 0]], float)
+        mesh_t = self._mesh([[0, 1, 2, 3, 4]])
+        pieces = [(left, scan["boundary_vertices"](*quad)),
+                  (right_t, scan["boundary_vertices"](*mesh_t))]
+        seams = scan["seam_vertices"](pieces)
+        self.assertEqual(seams[0].tolist(), [])
+        self.assertEqual(seams[1].tolist(), [4])
+
+        # A step: both pieces share (10, 5), the right one 30 cm higher there.
+        left_5 = np.array([[0, 0, 0], [10, 0, 0], [10, 5, 0], [10, 10, 0], [0, 10, 0]], float)
+        right_5 = np.array([[10, 0, 0], [20, 0, 0], [20, 10, 0], [10, 10, 0], [10, 5, 0.3]], float)
+        pentagon = self._mesh([[0, 1, 2, 3, 4]])
+        pieces = [(left_5, scan["boundary_vertices"](*pentagon)),
+                  (right_5, scan["boundary_vertices"](*pentagon))]
+        seams = scan["seam_vertices"](pieces)
+        self.assertEqual((seams[0].tolist(), seams[1].tolist()), ([2], [4]))
+
+    def test_spots_are_worst_first(self):
+        scan = self._scan()
+        names = [n for n, _, _ in scan["PROBLEMS"]]
+        centroids = np.array([[1, 1, 0], [2, 2, 0], [3, 1, 0], [55, 55, 0], [99, 1, 0]], float)
+        mask = {n: np.zeros(5, bool) for n in names}
+        mask["sliver"][:3] = True
+        mask["dense"][3] = True
+        spots = scan["problem_spots"]([centroids], [mask])
+        self.assertEqual([s[1] for s in spots], [3, 1])
+        self.assertEqual(spots[0][2], ["sliver"])
+        self.assertAlmostEqual(spots[0][0][0], 2.0)
+
+    def test_the_panel_lists_every_problem_it_draws(self):
+        source = (REPO_ROOT / "blender" / "maptile_tools.py").read_text(encoding="utf-8")
+        for name, _, _ in self._scan()["PROBLEMS"]:
+            self.assertIn(f"show_{name}: bpy.props.BoolProperty", source)
 
 
 class TestBarrierHeightCheck(unittest.TestCase):
@@ -7441,6 +7714,132 @@ class TestQuadTerrain(unittest.TestCase):
         ground = build_layered_ground(self.terrain, self.areas, prefix="T", mesher="triangles")
         self.assertEqual(ground.stats["mesher"], "triangles")
         self.assertLessEqual(ground.stats["grid_error_max_m"], 0.5 + 1e-6)
+
+
+class TestRibcageTerrain(unittest.TestCase):
+    """The ribcage layout: the 3D team's, beside the grid, on the same fixture.
+
+    Quads do the work across the spaces and follow their shape, triangles
+    fill in at the edges, and the quads are never just the underlying grid.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from src.layered import build_layered_ground
+        from src.surfaces import WaterBody
+
+        cls.terrain, cls.areas = _layered_fixture()
+        cls.ditch = WaterBody(
+            rings=[_rect_ring(1100.0, 2040.0, 1150.0, 2043.0)], level_nap=2.0,
+            area_m2=150.0, measured=True,
+        )
+        cls.ground = build_layered_ground(
+            cls.terrain, cls.areas, prefix="T", water=[cls.ditch], mesher="ribcage",
+        )
+        cls.grid = build_layered_ground(
+            cls.terrain, cls.areas, prefix="T", water=[cls.ditch], mesher="quads",
+        )
+
+    def test_it_is_the_ribcage_and_it_is_lighter(self):
+        stats = self.ground.stats
+        self.assertEqual(stats["mesher"], "ribcage")
+        self.assertTrue(set(np.unique(self.ground.mesh.face_sizes)) <= {3, 4})
+        self.assertGreater(stats["quad_share"], 0.5)
+        self.assertLess(len(self.ground.mesh.face_sizes), len(self.grid.mesh.face_sizes))
+        self.assertEqual(stats["regions_filled_whole"], 0)
+
+    def test_it_is_one_closed_sheet(self):
+        TestQuadTerrain._assert_closed(self, self.ground.mesh)
+
+    def test_a_road_is_one_quad_from_kerb_to_kerb(self):
+        """Ribs straight across the 10 m street, away from the junction and
+        the island: a ladder."""
+        from src.layered import ROAD
+
+        across = []
+        for corners in TestQuadTerrain._faces(self, self.ground, ROAD):
+            x, y = corners[:, 0], corners[:, 1]
+            if 1010.0 < x.min() and x.max() < 1060.0 and y.min() >= 2074.9 and y.max() <= 2085.1:
+                across.append(len(corners) == 4 and y.min() < 2075.1 and y.max() > 2084.9)
+        self.assertGreater(len(across), 5)
+        self.assertTrue(all(across))
+
+    def test_a_ditch_is_still_cut_in(self):
+        v = self.ground.mesh.vertices
+        middle = (v[:, 0] > 1102) & (v[:, 0] < 1148) & (v[:, 1] > 2040.2) & (v[:, 1] < 2042.8)
+        self.assertTrue(middle.any(), "no vertex inside the ditch to carve its bed with")
+        self.assertLess(float(v[middle, 2].min()), 2.0 - 0.1)
+
+    def test_it_stays_on_the_survey(self):
+        self.assertLess(self.ground.stats["grid_error_p95_m"], 0.5)
+
+    def test_an_open_space_gets_quads_turned_to_it_not_the_grid(self):
+        """A lawn set at 30 degrees to the area: its lattice runs with the
+        lawn, where the grid mesher's runs with the streets."""
+        import shapely
+
+        from src.layered import GRASS, GroundArea, build_layered_ground
+
+        centre = np.array([1080.0, 2080.0])
+        a = np.radians(30.0)
+        turn = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        corners = np.array([[-35, -25], [35, -25], [35, 25], [-35, 25]]) @ turn.T + centre
+        lawn = GroundArea([np.vstack([corners, corners[:1]])], GRASS, "Gras")
+        ground = build_layered_ground(self.terrain, [lawn], prefix="T", mesher="ribcage")
+        mesh = ground.mesh
+        inner = shapely.Polygon(corners).buffer(-8.0)
+        angles = []
+        starts = mesh.loop_starts
+        for f in np.flatnonzero((mesh.face_kind == GRASS) & (mesh.face_sizes == 4)):
+            q = mesh.vertices[mesh.face_loops[starts[f]: starts[f] + 4], :2]
+            if not inner.contains(shapely.Point(q.mean(axis=0))):
+                continue
+            d = q[1] - q[0]
+            angles.append(np.degrees(np.arctan2(d[1], d[0])) % 90.0)
+        self.assertGreater(len(angles), 4)
+        off = (np.array(angles) - 30.0 + 45.0) % 90.0 - 45.0
+        self.assertLess(float(np.abs(off).max()), 2.0)
+
+    def test_two_regions_meet_vertex_for_vertex(self):
+        """Each region is meshed on its own; the stations on their shared
+        outline are the same on both sides, so there is no crack."""
+        import shapely
+
+        from src.ribcage_mesh import ribcage_terrain
+        from src.terrain_mesh import TerrainMesh
+
+        west = shapely.Polygon([(0, 0), (80, 0), (79.8, 160), (0, 160)])
+        east = shapely.Polygon([(80, 0), (160, 0), (160, 160), (80, 160)])
+        vertices, sizes, loops, codes, part, stats = ribcage_terrain(
+            self.terrain, [(west, 0), (east, 6 * 16 + 6)], [], codes_wet=15,
+            depth_m=0.6, paved_codes=set(),
+        )
+        mesh = TerrainMesh(
+            vertices=vertices, measured_z=vertices[:, 2], face_sizes=sizes,
+            face_loops=loops, face_kind=np.zeros(len(sizes), dtype=np.int8),
+            face_part=part.astype(np.int8), vertex_on=np.zeros(len(vertices), dtype=np.int32),
+            edges=np.zeros((0, 2), dtype=np.int64), edge_on=np.zeros(0, dtype=np.int32),
+        )
+        TestQuadTerrain._assert_closed(self, mesh)
+        self.assertEqual(stats["t_junctions_mended"], 0)
+
+    def test_the_setting_reaches_the_config(self):
+        from src.config import load_config
+
+        def load(mesher):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({
+                    "name": "t",
+                    "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                    "layered": {"mesher": mesher},
+                }))
+                return load_config(path)
+
+        self.assertEqual(load("Ribcage").layered["mesher"], "ribcage")
+        self.assertEqual(load("quads").layered["mesher"], "quads")
+        with self.assertRaises(ValueError):
+            load("spiderweb")
 
 
 class TestLayeredGround(unittest.TestCase):
@@ -10117,6 +10516,40 @@ class TestStreetDetail(unittest.TestCase):
             u, v = furniture_uv(style.material)
             self.assertTrue(0.0 < u < 1.0 and 0.0 < v < 1.0)
 
+    def test_every_patch_name_reads_its_own_colour(self):
+        """Read back through the UV the way Blender reads an image -- V up
+        from the bottom row -- each name lands on its own colour. Counted from
+        the top, metal read hedge: the green canopy roof at Utrecht Centraal."""
+        from PIL import Image
+
+        from src.facade import FURNITURE_PATCHES, furniture_uv, generate_furniture_texture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = np.asarray(Image.open(generate_furniture_texture(Path(tmp))), dtype=float)
+        height, width = image.shape[:2]
+        for name, colour, *_rest in FURNITURE_PATCHES:
+            u, v = furniture_uv(name)
+            row = height - 1 - int(v * height)
+            column = int(u * width)
+            # The patch's average around that point: one pixel is grain.
+            pixel = image[row - 12:row + 12, column - 12:column + 12].reshape(-1, 3).mean(0)
+            self.assertLess(np.abs(pixel - np.asarray(colour)).max(), 25, name)
+            others = [c for n, c, *_r in FURNITURE_PATCHES if n != name]
+            nearest = min(others, key=lambda c: np.abs(pixel - np.asarray(c)).sum())
+            self.assertLess(
+                np.abs(pixel - np.asarray(colour)).sum(),
+                np.abs(pixel - np.asarray(nearest)).sum(), name,
+            )
+
+    def test_blenders_fallback_atlas_table_matches(self):
+        """process.py keeps its own copy of the table for an older scene file."""
+        from src.facade import FURNITURE_PATCHES, furniture_uv
+
+        source = (Path(__file__).resolve().parents[1] / "blender" / "process.py").read_text()
+        for name, *_rest in FURNITURE_PATCHES:
+            u, v = furniture_uv(name)
+            self.assertIn(f'("{name}", ({u:g}, {v:g}))', source, name)
+
     def test_a_wall_on_a_bank_does_not_bury_itself(self):
         """A wall has width, and the mitre at a corner widens it further -- up
         to two and a half times the half-thickness, which on a half-metre quay
@@ -10251,6 +10684,211 @@ class TestStreetDetail(unittest.TestCase):
             float(gap.min()), -(EMBED_M + 1e-6),
             f"and buries itself {-gap.min():.2f} m at the worst corner",
         )
+
+    @staticmethod
+    def _winding_faults(triangles, open_bottom=0):
+        """Directed edges used twice: two neighbouring faces wound against
+        each other, one of them inside out."""
+        from collections import Counter
+
+        edges = Counter()
+        for a, b, c in np.asarray(triangles).tolist():
+            for p, q in ((a, b), (b, c), (c, a)):
+                edges[(p, q)] += 1
+        return sum(1 for count in edges.values() if count > 1)
+
+    @staticmethod
+    def _quads(triangles):
+        """How many faces the Blender stage joins back into quads."""
+        t = np.asarray(triangles).tolist()
+        quads, i = 0, 0
+        while i < len(t):
+            if i + 1 < len(t) and t[i][0] == t[i + 1][0] and t[i][2] == t[i + 1][1]:
+                quads += 1
+                i += 2
+            else:
+                i += 1
+        return quads
+
+    def test_a_wall_faces_out_whichever_way_the_survey_drew_it(self):
+        """A wall drawn clockwise came out inside out: black in the viewport."""
+        from src.barriers import AREA_STYLES, LINE_STYLES, _extrude_rings, _sweep_line
+
+        flat = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
+        ring = np.array([[0.0, 0.0], [30.0, 0.0], [30.0, 0.6], [0.0, 0.6]])
+        for style in (AREA_STYLES[("scheiding_vlak", "muur")],
+                      AREA_STYLES[("gebouwinstallatie", "luifel")]):
+            for drawn in (ring, ring[::-1]):
+                vertices, triangles, _ = _extrude_rings([drawn], flat, style)
+                self.assertEqual(self._winding_faults(triangles), 0, style.name)
+                # Outward: the side facing -y has its normal pointing -y.
+                for a, b, c in triangles:
+                    normal = np.cross(vertices[b] - vertices[a], vertices[c] - vertices[a])
+                    centre = (vertices[a] + vertices[b] + vertices[c]) / 3
+                    if abs(normal[2]) < 1e-9 and centre[1] < 1e-6:
+                        self.assertLess(normal[1], 0.0, style.name)
+        # And a swept wall's ends face away from it, not into it.
+        vertices, triangles, _ = _sweep_line(
+            np.array([[0.0, 0.0], [10.0, 0.0]]), flat, LINE_STYLES[("scheiding_lijn", "muur")]
+        )
+        self.assertEqual(self._winding_faults(triangles), 0)
+        for a, b, c in triangles:
+            normal = np.cross(vertices[b] - vertices[a], vertices[c] - vertices[a])
+            centre = (vertices[a] + vertices[b] + vertices[c]) / 3
+            if abs(normal[0]) > 1e-9:
+                self.assertEqual(np.sign(normal[0]), np.sign(centre[0] - 5.0))
+
+    def test_a_flat_piece_keeps_only_its_corners(self):
+        """An awning cut every metre was a hundred triangles holding a flat
+        plate flat: 26,580 of them over Hoek van Holland."""
+        from src.barriers import AREA_STYLES, _extrude_rings
+
+        bumpy = lambda x, y: 0.3 * np.sin(np.asarray(x, dtype=float))  # noqa: E731
+        ring = np.array([[0.0, 0.0], [12.0, 0.0], [12.0, 1.5], [0.0, 1.5]])
+        _, triangles, _ = _extrude_rings(
+            [ring], bumpy, AREA_STYLES[("gebouwinstallatie", "luifel")], step_m=1.0
+        )
+        self.assertEqual(len(triangles), 12)            # a box
+        self.assertEqual(self._quads(triangles), 6)
+
+    def test_a_small_wall_in_rd_keeps_every_corner(self):
+        """Corners were matched with numpy's relative tolerance: metres at
+        RD coordinates. A wall under a metre across lost every corner but one
+        and came out as a point; a fence lost the corners it turned at."""
+        from src.barriers import AREA_STYLES, _drape_points, _extrude_rings
+
+        flat = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
+        ring = np.array([[0.15, 0.64], [0.04, 0.3], [0.0, 0.18], [0.57, 0.0], [0.61, 0.12],
+                         [0.72, 0.45], [0.76, 0.57], [0.18, 0.76]]) + [135606.7, 456165.2]
+        vertices, triangles, _ = _extrude_rings(
+            [ring], flat, AREA_STYLES[("scheiding_vlak", "muur")], step_m=1.0
+        )
+        self.assertEqual(len(vertices), 2 * len(ring))
+        self.assertEqual(self._winding_faults(triangles), 0)
+        fence = np.array([[0.0, 0.0], [3.0, 0.0], [3.0, 2.5], [6.0, 2.5]]) + [135606.7, 456165.2]
+        kept, _ = _drape_points(fence, flat, 2.0, 0.05)
+        for corner in fence:
+            self.assertTrue(np.any(np.all(np.abs(kept - corner) < 1e-6, axis=1)), corner)
+
+    def test_a_wall_on_flat_ground_keeps_only_its_corners(self):
+        from src.barriers import AREA_STYLES, _extrude_rings
+
+        flat = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
+        ring = np.array([[0.0, 0.0], [40.0, 0.0], [40.0, 0.5], [0.0, 0.5]])
+        vertices, _, _ = _extrude_rings(
+            [ring], flat, AREA_STYLES[("scheiding_vlak", "muur")], step_m=1.0
+        )
+        self.assertEqual(len(vertices), 8)
+
+    def test_the_top_of_a_wall_is_a_ladder_not_a_fan(self):
+        """The two long sides of a wall drawn with different vertices: earcut
+        joined one corner to every vertex along the far side, a fan of
+        slivers. As a ladder, every rung meets both sides and the top is
+        quads."""
+        from src.barriers import AREA_STYLES, _extrude_rings
+
+        flat = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
+        ring = np.array([
+            [0.0, 0.0], [7.0, 0.0], [13.0, 0.02], [21.0, 0.0], [30.0, 0.0],
+            [30.0, 0.6], [22.0, 0.62], [9.0, 0.6], [0.0, 0.6],
+        ])
+        vertices, triangles, _ = _extrude_rings(
+            [ring], flat, AREA_STYLES[("scheiding_vlak", "muur")], step_m=0.0
+        )
+        top = [t for t in triangles if np.allclose(vertices[t][:, 2], vertices[:, 2].max())]
+        self.assertEqual(self._winding_faults(triangles), 0)
+        self.assertEqual(self._quads(top) * 2, len(top), "a triangle left in the top")
+        # No sliver: every rung is short, so no top triangle has an edge much
+        # longer than the longest rung is wide.
+        for t in top:
+            p = vertices[t][:, :2]
+            u, w = p[1] - p[0], p[2] - p[0]
+            area = 0.5 * abs(u[0] * w[1] - u[1] * w[0])
+            longest = max(np.linalg.norm(p[i] - p[(i + 1) % 3]) for i in range(3))
+            self.assertGreater(2 * area / longest, 0.3, "a sliver across the top")
+        # Each side's vertex got a partner, and the sides carry them too: the
+        # vertices all sit on the outline, none hangs in the middle.
+        self.assertTrue(np.all(np.isin(np.round(vertices[:, 1], 2), [0.0, 0.02, 0.6, 0.62])
+                               | (np.abs(vertices[:, 1] - 0.3) > 0.25)))
+
+    def test_a_canopy_takes_its_roof_from_the_surface_model(self):
+        """Utrecht Centraal: the platform roof stood at a bicycle shelter's
+        2.6 m. The surface model sees the roof."""
+        from src.barriers import AREA_STYLES, _extrude_rings, _measured_top
+
+        ground = lambda x, y: np.full(len(np.atleast_1d(x)), 4.0)  # noqa: E731
+        ring = np.array([[0.0, 0.0], [120.0, 0.0], [120.0, 14.0], [0.0, 14.0]])
+
+        def roof(x, y):          # the roof at 12.5 m NAP, ground at the edges
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            y = np.atleast_1d(np.asarray(y, dtype=float))
+            inside = (x > 0.5) & (x < 119.5) & (y > 0.5) & (y < 13.5)
+            return np.where(inside, 12.5, 4.0)
+
+        top = _measured_top([ring], ground, roof)
+        self.assertAlmostEqual(top, 12.5)
+        style = AREA_STYLES[("overigbouwwerk", "overkapping")]
+        vertices, triangles, _ = _extrude_rings([ring], ground, style, top_z=top)
+        self.assertAlmostEqual(float(vertices[:, 2].max()), 12.5)
+        self.assertAlmostEqual(float(vertices[:, 2].min()), 12.5 - style.height_m)
+        self.assertEqual(self._winding_faults(triangles), 0)
+
+        # Glass the survey saw through: the lift, not the platform.
+        self.assertIsNone(_measured_top([ring], ground, ground))
+
+    def test_blender_joins_a_wall_back_into_quads(self):
+        """Every side and rung comes out of the barriers stage as a pair of
+        triangles; the Blender stage puts the quad back."""
+        from src.barriers import AREA_STYLES, _extrude_rings
+
+        faces = _process_namespace({"_barrier_faces"})["_barrier_faces"]
+        flat = lambda x, y: np.zeros(len(np.atleast_1d(x)))  # noqa: E731
+        ring = np.array([[0.0, 0.0], [30.0, 0.0], [30.0, 0.6], [12.0, 0.62], [0.0, 0.6]])
+        vertices, triangles, _ = _extrude_rings(
+            [ring], flat, AREA_STYLES[("scheiding_vlak", "muur")], step_m=0.0
+        )
+        loops, sizes = faces(triangles)
+        self.assertEqual(int(sizes.sum()), len(loops))
+        self.assertTrue(np.all(sizes == 4), sizes.tolist())
+        # Each quad flat and the right way round: its corners in order, with
+        # the same normal as the two triangles it was made from.
+        start = 0
+        for size in sizes:
+            quad = vertices[loops[start:start + size]]
+            normal = np.cross(quad[1] - quad[0], quad[2] - quad[0])
+            other = np.cross(quad[2] - quad[0], quad[3] - quad[0])
+            self.assertGreater(float(np.dot(normal, other)), 0.0)
+            start += size
+
+    def test_a_roof_on_two_levels_follows_the_survey(self):
+        """Utrecht Centraal's platform roof is one outline over a hall roof at
+        25 m and platform roofs at 8: laid flat at the median, half of it was
+        metres off. Draped, each part is at its own height, and it is still a
+        closed slab."""
+        from src.barriers import AREA_STYLES, _draped_roof, _oriented
+
+        ground = lambda x, y: np.full(len(np.atleast_1d(x)), 4.0)  # noqa: E731
+
+        def roof(x, y):
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            return np.where(x < 60.0, 25.0, 8.0)
+
+        ring = np.array([[0.0, 0.0], [120.0, 0.0], [120.0, 40.0], [0.0, 40.0]])
+        style = AREA_STYLES[("overigbouwwerk", "overkapping")]
+        vertices, triangles, _ = _draped_roof(_oriented([ring]), ground, roof, style)
+        self.assertEqual(self._winding_faults(triangles), 0)
+        top = vertices[len(vertices) // 2:]
+        west, east = top[top[:, 0] < 50.0], top[top[:, 0] > 70.0]
+        self.assertTrue(np.allclose(west[:, 2], 25.0))
+        self.assertTrue(np.allclose(east[:, 2], 8.0))
+        # One roof the survey sees at one height stays one flat slab.
+        flat = lambda x, y: np.full(len(np.atleast_1d(x)), 8.0)  # noqa: E731
+        self.assertIsNone(_draped_roof(_oriented([ring]), ground, flat, style))
+
+    def test_the_pipeline_hands_the_barriers_the_surface_model(self):
+        source = (Path(__file__).resolve().parents[1] / "pipeline.py").read_text()
+        start = source.index("barriers = build_barriers(")
+        self.assertIn("surface_at=", source[start:start + 1200])
 
     def test_an_awning_clears_the_ground_at_every_corner(self):
         """An awning is flat, and its footprint can straddle a slope. Taking
@@ -10431,6 +11069,25 @@ class TestUIServer(unittest.TestCase):
         self.assertEqual(loaded.terrain["grid_m"], 4.0)
         self.assertEqual(loaded.facade["variants"], 4)
         self.assertEqual(loaded.buildings["clip_mode"], "intersect")
+
+    def test_the_ground_layout_choice_reaches_the_build_and_comes_back(self):
+        """The form's Grondindeling: Raster or Ribbenkast, so the two can be
+        built side by side and the card says which is which."""
+        payload = {
+            "name": "somewhere",
+            "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 136500, "ymax": 455500},
+            "style": "layered",
+            "mesher": "ribcage",
+        }
+        config = self.server.build_config(payload)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(config))
+            self.assertEqual(load_config(path).layered["mesher"], "ribcage")
+        self.assertNotIn("layered", self.server.build_config({**payload, "mesher": None}))
+        html = (REPO_ROOT / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('name="mesher" value="ribcage"', html)
+        self.assertIn('setRadio("mesher"', html)
 
     def test_defaults_apply_when_the_form_omits_fields(self):
         config = self.server.build_config(
@@ -10850,14 +11507,15 @@ class TestUIPage(unittest.TestCase):
     def test_there_are_no_sliders_left(self):
         """The ask was fewer controls. What is left: where, which style, how
         much detail, which layers, and whether to add collision shapes and
-        previews."""
+        previews -- and, for the layered style only, the ground layout, asked
+        for so the grid and the ribcage can be built side by side."""
         self.assertNotIn('type="range"', self.html)
         controls = set(re.findall(r'<(?:input|select)[^>]*\bid="(\w+)"', self.html))
         groups = set(re.findall(r'<input type="radio" name="(\w+)"', self.html))
         # The model list's own search and style filter are not build settings.
         self.assertEqual(
             (controls | groups) - {"modelStyle", "modelFilter"},
-            {"q", "size", "name", "style", "detail", "preview", "collision"},
+            {"q", "size", "name", "style", "detail", "mesher", "preview", "collision"},
         )
 
     def test_the_styles_match_the_server(self):

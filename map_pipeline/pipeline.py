@@ -814,6 +814,29 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 )
             terrain.save(work_dir)
 
+    # The top of every bridge deck, for the things that stand on one: a tree in
+    # a planter on a station deck, a parapet along a canal bridge. Read once,
+    # as the bridges stage will build the decks.
+    deck_at = None
+    surface_at = None
+    if want_trees or want_barriers:
+        surface_dsm = ensure_dsm(
+            terrain.bbox,
+            work_dir,
+            wcs_url=str(config.terrain["wcs_url"]),
+            resolution_m=float(config.terrain["resolution_m"]),
+            timeout=float(config.terrain["timeout_s"]),
+            max_retries=int(config.terrain["max_retries"]),
+        )
+        surface_at = raster_sampler(surface_dsm) if surface_dsm else None
+        if want_structures:
+            deck_at = deck_surface(
+                config.bbox,
+                structures_cfg=config.structures,
+                terrain=terrain,
+                dsm_sampler=surface_at,
+            )
+
     trees = TreeSet()
     tree_texture = None
     if want_trees:
@@ -827,6 +850,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # For the water mask: lidar scatter over a canal is six metres
                 # of noise, which any height threshold reads as forest.
                 surfaces=surfaces if want_surfaces else None,
+                # Inside the outline: a tree beside a bridge is on the bank.
+                deck_at=(
+                    (lambda x, y: deck_at(x, y, reach=0.0)) if deck_at is not None else None
+                ),
             )
             if len(trees):
                 write_tree_list(trees, config.geo, out_dir)
@@ -886,27 +913,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     barriers = BarrierSet()
     fence_texture = None
-    deck_at = None
     if want_barriers:
         with Stage("walls, fences and hedges (BGT)", next_step(), total):
             # A parapet on a bridge stands on its deck, not on the ground (or
-            # canal bed) under it; the decks are read as the bridges stage
-            # will build them.
-            if want_structures:
-                deck_dsm = ensure_dsm(
-                    terrain.bbox,
-                    work_dir,
-                    wcs_url=str(config.terrain["wcs_url"]),
-                    resolution_m=float(config.terrain["resolution_m"]),
-                    timeout=float(config.terrain["timeout_s"]),
-                    max_retries=int(config.terrain["max_retries"]),
-                )
-                deck_at = deck_surface(
-                    config.bbox,
-                    structures_cfg=config.structures,
-                    terrain=terrain,
-                    dsm_sampler=raster_sampler(deck_dsm) if deck_dsm else None,
-                )
+            # canal bed) under it: `deck_at`, read above.
             barriers = build_barriers(
                 config.bbox,
                 work_dir,
@@ -919,6 +929,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # The layered style builds quay walls as the face of the quay.
                 skip_styles=("quay_wall",) if len(harbour) else (),
                 deck_at=deck_at,
+                # A canopy's roof, where the survey can see it.
+                surface_at=surface_at,
             )
             # Shares the furniture atlas: the same eight flat patches cover a
             # brick wall and a wooden bench, and one texture is one material.

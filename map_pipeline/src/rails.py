@@ -175,7 +175,7 @@ def clip_line_to_bbox(points: np.ndarray, bbox: BBox) -> list[np.ndarray]:
         entry = start + delta * t0
         exit_ = start + delta * t1
 
-        if current and np.allclose(current[-1], entry, atol=1e-9):
+        if current and np.allclose(current[-1], entry, rtol=0.0, atol=1e-9):
             current.append(exit_)
         else:
             if len(current) >= 2:

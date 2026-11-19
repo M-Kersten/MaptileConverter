@@ -110,13 +110,16 @@ def _drape_points(points: np.ndarray, sampler, step_m: float, tolerance_m: float
         return dense, height
 
     # Which of the dense points are the survey's own. densify keeps them, so
-    # they are the ones that match an input vertex exactly.
+    # they are the ones that match an input vertex exactly -- absolutely, not
+    # relatively: numpy's default relative tolerance is metres at RD
+    # coordinates, which took every corner of a small wall for the first one
+    # and the wall down to a point.
     steps = np.linalg.norm(np.diff(dense, axis=0), axis=1)
     along = np.concatenate([[0.0], np.cumsum(steps)])
     anchors = [0]
     at = 0
     for vertex in points[1:]:
-        while at < len(dense) - 1 and not np.allclose(dense[at], vertex, atol=1e-9):
+        while at < len(dense) - 1 and not np.allclose(dense[at], vertex, rtol=0.0, atol=1e-6):
             at += 1
         if at != anchors[-1]:
             anchors.append(at)
@@ -135,6 +138,449 @@ def _drape_points(points: np.ndarray, sampler, step_m: float, tolerance_m: float
                 profile[start : end + 1], tolerance_m
             )
     return dense[keep], height[keep]
+
+
+# A surface-model reading inside a canopy's outline counts as its roof between
+# these heights above the ground under it: lower is the ground or a parked
+# car seen through a gap, higher is a building the canopy runs in under.
+ROOF_MIN_M = 2.0
+ROOF_MAX_M = 30.0
+# And there must be enough of them: under this share of the outline, the
+# survey saw through the roof -- glass, a mesh -- and the lift is the better
+# guess.
+ROOF_SHARE = 0.3
+ROOF_SAMPLE_M = 1.0
+
+
+def _measured_top(rings, ground, surface_at) -> float | None:
+    """The height of a canopy's roof from the surface model, or None.
+
+    The style's lift is a bicycle shelter's: 2.6 m up. Stood on that, the
+    roof over the platforms at Utrecht Centraal hung a few metres above the
+    platform, under its own roof in the survey. The surface model sees the
+    roof itself; the median of what it reads inside the outline, at least a
+    metre in from the edge where the reading is part roof and part ground, is
+    the height of the top.
+    """
+    import shapely
+
+    polygon = shapely.Polygon(rings[0], rings[1:])
+    if not polygon.is_valid:
+        polygon = shapely.make_valid(polygon)
+    inner = polygon.buffer(-ROOF_SAMPLE_M)
+    if inner.is_empty or inner.area < 1.0:
+        inner = polygon
+    xmin, ymin, xmax, ymax = inner.bounds
+    xs, ys = np.meshgrid(
+        np.arange(xmin + ROOF_SAMPLE_M / 2, xmax, ROOF_SAMPLE_M),
+        np.arange(ymin + ROOF_SAMPLE_M / 2, ymax, ROOF_SAMPLE_M),
+    )
+    xs, ys = xs.ravel(), ys.ravel()
+    inside = shapely.contains_xy(inner, xs, ys)
+    if inside.sum() < 3:
+        centre = inner.representative_point()
+        xs, ys = np.array([centre.x]), np.array([centre.y])
+    else:
+        xs, ys = xs[inside], ys[inside]
+    roof = np.asarray(surface_at(xs, ys), dtype=np.float64).reshape(xs.shape)
+    under = np.asarray(ground(xs, ys), dtype=np.float64).reshape(xs.shape)
+    above = roof - under
+    seen = np.isfinite(above) & (above >= ROOF_MIN_M) & (above <= ROOF_MAX_M)
+    if seen.sum() < max(1, int(np.ceil(ROOF_SHARE * len(xs)))):
+        return None
+    return float(np.median(roof[seen]))
+
+
+# A canopy whose roof the survey sees at heights this far apart (10th to 90th
+# percentile) is not one flat roof but several -- a station hall over its
+# platform roofs -- and is draped on the survey rather than laid flat.
+ROOF_SPREAD_M = 2.0
+# The lattice a draped roof is built on.
+ROOF_LATTICE_M = 4.0
+
+
+def _roof_heights(xs, ys, ground, surface_at):
+    """The survey's roof at points: the median of a few readings round each,
+    held between `ROOF_MIN_M` and `ROOF_MAX_M` above the ground, NaN where
+    there is no such reading."""
+    offsets = np.array([[0.0, 0.0], [0.6, 0.0], [-0.6, 0.0], [0.0, 0.6], [0.0, -0.6]])
+    readings = np.stack([
+        np.asarray(surface_at(xs + dx, ys + dy), dtype=np.float64).reshape(xs.shape)
+        for dx, dy in offsets
+    ])
+    under = np.asarray(ground(xs, ys), dtype=np.float64).reshape(xs.shape)
+    above = readings - under[None, :]
+    readings = np.where((above >= ROOF_MIN_M) & (above <= ROOF_MAX_M), readings, np.nan)
+    import warnings
+
+    with warnings.catch_warnings():
+        # A point with no reading at all is NaN, which is the answer.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(readings, axis=0), under
+
+
+def _draped_roof(rings, ground, surface_at, style):
+    """A canopy's roof following the survey, as ``(vertices, triangles, uvs)``,
+    or None where one flat roof will do.
+
+    The roof over Utrecht Centraal's platforms is one BGT outline of 3.5
+    hectares, and the survey sees it anywhere from 7 to 26 m NAP: the hall
+    roof high over the tracks, the platform roofs low beside it. Laid flat at
+    its median, most of it was metres off. So where the survey's readings
+    spread by more than `ROOF_SPREAD_M`, the roof is a sheet on a
+    `ROOF_LATTICE_M` lattice -- the ground's own constrained fill, quads where
+    they fit -- with each vertex at the survey's roof there, a slab the
+    style's thickness under it, and its edge closed all round.
+    """
+    import shapely
+
+    from .terrain_mesh import _fill_pinned, _key
+
+    polygon = shapely.Polygon(rings[0], rings[1:])
+    if not polygon.is_valid or polygon.area < 4.0 * ROOF_LATTICE_M ** 2:
+        return None
+    x0, y0, x1, y1 = polygon.bounds
+    gx, gy = np.meshgrid(
+        np.arange(x0 + ROOF_LATTICE_M / 2, x1, ROOF_LATTICE_M),
+        np.arange(y0 + ROOF_LATTICE_M / 2, y1, ROOF_LATTICE_M),
+    )
+    inner = np.column_stack([gx.ravel(), gy.ravel()])
+    inside = shapely.contains_xy(polygon, inner[:, 0], inner[:, 1])
+    if inside.sum() < 4:
+        return None
+    probe, _ = _roof_heights(inner[inside, 0], inner[inside, 1], ground, surface_at)
+    seen = probe[np.isfinite(probe)]
+    if len(seen) < ROOF_SHARE * len(probe):
+        return None
+    if np.percentile(seen, 90) - np.percentile(seen, 10) <= ROOF_SPREAD_M:
+        return None
+
+    faces = _fill_pinned(polygon, inner, 0.45 * ROOF_LATTICE_M)
+    if not faces:
+        return None
+    index: dict[tuple, int] = {}
+    points: list = []
+    loops = []
+    for face in faces:
+        corners = []
+        for p in np.asarray(face)[:, :2]:
+            key = _key(p)
+            if key not in index:
+                index[key] = len(points)
+                points.append(p)
+            corners.append(index[key])
+        loops.append(corners)
+    points = np.asarray(points, dtype=np.float64)
+    top, _ = _roof_heights(points[:, 0], points[:, 1], ground, surface_at)
+    if not np.isfinite(top).any():
+        return None
+    # A vertex with no reading of its own takes its nearest neighbour's.
+    missing = ~np.isfinite(top)
+    if missing.any():
+        have = np.flatnonzero(~missing)
+        tree = shapely.STRtree(shapely.points(points[have]))
+        nearest = tree.query_nearest(shapely.points(points[missing]), all_matches=False)[1]
+        top[missing] = top[have[nearest]]
+    n = len(points)
+    vertices = np.vstack([
+        np.column_stack([points, top - style.height_m]),
+        np.column_stack([points, top]),
+    ])
+    triangles = []
+    for corners in loops:
+        corners = corners if _signed_area(points[corners]) >= 0 else corners[::-1]
+        lid = [c + n for c in corners]
+        floor = corners[::-1]
+        for face in (lid, floor):
+            if len(face) == 4:
+                triangles.extend([[face[0], face[1], face[2]], [face[0], face[2], face[3]]])
+            else:
+                for k in range(1, len(face) - 1):
+                    triangles.append([face[0], face[k], face[k + 1]])
+    # The edge, all round: the outline's own points, which the fill kept.
+    for ring in _oriented([np.asarray(r, dtype=np.float64) for r in rings]):
+        ids = [index.get(_key(p)) for p in ring]
+        if any(i is None for i in ids):
+            return None
+        for a, b in zip(ids, ids[1:] + ids[:1]):
+            triangles.extend([[a, b, n + b], [a, n + b, n + a]])
+    local = np.vstack([points, points]) - points.min(axis=0)
+    return vertices, np.asarray(triangles, dtype=np.int64), local
+
+
+def _without_repeats(ring: np.ndarray, within: float = 1e-3) -> np.ndarray:
+    """A closed ring without consecutive vertices closer than `within`."""
+    if len(ring) < 2:
+        return ring
+    step = np.linalg.norm(ring - np.roll(ring, 1, axis=0), axis=1)
+    keep = step >= within
+    if not keep.any():
+        return ring[:1]
+    return ring[keep]
+
+
+def _signed_area(ring: np.ndarray) -> float:
+    """Positive for an anticlockwise ring, seen from above."""
+    x, y = ring[:, 0], ring[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _oriented(rings: list[np.ndarray]) -> list[np.ndarray]:
+    """The outer ring anticlockwise and the holes clockwise.
+
+    The sides are built facing out of an anticlockwise ring. The survey does
+    not promise an order, and a wall it drew the other way round came out
+    inside out: its sides faced in, which is a black wall in a lit viewport
+    and an invisible one with backface culling on.
+    """
+    out = []
+    for index, ring in enumerate(rings):
+        anticlockwise = _signed_area(ring) > 0.0
+        want = index == 0
+        out.append(ring if anticlockwise == want else ring[::-1].copy())
+    return out
+
+
+def _ring_drape(ring: np.ndarray, sampler, step_m: float, tolerance_m: float) -> np.ndarray:
+    """A closed ring, with a vertex added only where the ground bends.
+
+    The swept lines' rule (`_drape_points`) on a ring: every survey corner
+    stays, and a cut between them survives only where leaving it out would
+    let the base leave the ground by more than the tolerance. Cutting every
+    edge at a fixed step instead put a vertex every metre along every wall
+    and awning, holding a straight line straight.
+    """
+    closed = np.vstack([ring, ring[:1]])
+    dense, _height = _drape_points(closed, sampler, step_m, tolerance_m)
+    out = dense[:-1]
+    return out if len(out) >= len(ring) else ring
+
+
+# A polygon is capped as a ladder when it is a strip: this many times longer
+# than it is wide. Below that it is a block -- a transformer, a stoop -- and
+# the triangulation of a handful of corners is already clean.
+STRIP_ASPECT = 2.5
+
+
+def _strip_cap(ring: np.ndarray):
+    """The top of a strip-shaped outline as a ladder of quads, or None.
+
+    Earcut fans a strip: one corner of a wall joined to every vertex along the
+    far side, a spray of slivers on top of every wall the drape gave more
+    than four corners. A strip has two long sides; walked from one end to the
+    other together, each step is one rung across, and two rungs and the sides
+    between them are a quad. Where one side has a vertex the other has not,
+    the other gets one opposite it, so the rungs meet both sides square and
+    the cap is quads all the way along, with a triangle fan only at a rounded
+    end.
+
+    Returns the ring with those vertices added (the sides are built from it,
+    so nothing is left hanging off an edge) and the cap faces as index lists
+    into it, or None for an outline that is not a strip.
+    """
+    import shapely
+
+    n = len(ring)
+    if n < 4:
+        return None
+    box = shapely.minimum_rotated_rectangle(shapely.Polygon(ring))
+    corners = np.asarray(box.exterior.coords)[:4] if box.geom_type == "Polygon" else None
+    if corners is None:
+        return None
+    sides = np.diff(np.vstack([corners, corners[:1]]), axis=0)
+    lengths = np.hypot(sides[:, 0], sides[:, 1])
+    long_side = int(np.argmax(lengths[:2]))
+    length, width = float(lengths[long_side]), float(lengths[1 - long_side])
+    if width <= 1e-6 or length / width < STRIP_ASPECT:
+        return None
+    axis = sides[long_side] / length
+    along = ring @ axis
+    reach = 0.75 * width
+
+    def end_run(mask):
+        """The one cyclic run of vertices in `mask`, as (first, last)."""
+        if mask.all() or not mask.any():
+            return None
+        starts = np.flatnonzero(mask & ~np.roll(mask, 1))
+        if len(starts) != 1:
+            return None
+        first = int(starts[0])
+        last = first
+        while mask[(last + 1) % n]:
+            last = (last + 1) % n
+        return first, last
+
+    head = end_run(along <= along.min() + reach)
+    tail = end_run(along >= along.max() - reach)
+    if head is None or tail is None:
+        return None
+
+    def walk(start, stop):
+        out = [start]
+        while out[-1] != stop:
+            out.append((out[-1] + 1) % n)
+        return out
+
+    # One long side from the head to the tail, the other back again; turned
+    # round, both run head to tail. A pointed end is one vertex both share.
+    side_a = walk(head[1], tail[0])
+    side_b = walk(tail[1], head[0])[::-1]
+    shared = set(side_a) & set(side_b)
+    allowed = {end[0] for end in (head, tail) if end[0] == end[1]}
+    if len(side_a) < 2 or len(side_b) < 2 or shared - allowed:
+        return None
+
+    def fractions(indices):
+        points = ring[indices]
+        steps = np.hypot(*np.diff(points, axis=0).T)
+        total = float(steps.sum())
+        if total <= 1e-9:
+            return None
+        return np.concatenate([[0.0], np.cumsum(steps)]) / total
+
+    t_a, t_b = fractions(side_a), fractions(side_b)
+    if t_a is None or t_b is None:
+        return None
+    # Two vertices this close along the strip share a rung rather than each
+    # getting a partner a few centimetres from the other.
+    gap = max(0.2, 0.5 * width) / max(length, 1e-9)
+
+    points = [p for p in ring]
+    a = [side_a[0]]
+    b = [side_b[0]]
+    i = j = 0
+    added_a: dict[int, list[int]] = {}
+    added_b: dict[int, list[int]] = {}
+
+    # Where each side's last rung landed, as a fraction of the strip.
+    reached = {"a": 0.0, "b": 0.0}
+
+    def partner(name, rungs, side, t_side, k, t, added):
+        """The vertex opposite a station at fraction t, on edge k..k+1 of the
+        other side: that side's last rung end if it is close, else a new one."""
+        if t - reached[name] <= gap:
+            return rungs[-1]
+        span = t_side[k + 1] - t_side[k]
+        f = float(np.clip((t - t_side[k]) / span, 0.0, 1.0)) if span > 1e-12 else 0.0
+        start, end = ring[side[k]], ring[side[k + 1]]
+        points.append(start + (end - start) * f)
+        added.setdefault(k, []).append(len(points) - 1)
+        reached[name] = t
+        return len(points) - 1
+
+    last_a, last_b = len(side_a) - 1, len(side_b) - 1
+    while i < last_a or j < last_b:
+        next_a = t_a[i + 1] if i < last_a else 2.0
+        next_b = t_b[j + 1] if j < last_b else 2.0
+        if abs(next_a - next_b) <= gap or next_a > 1.0 or next_b > 1.0:
+            i = min(i + 1, last_a)
+            j = min(j + 1, last_b)
+            a.append(side_a[i])
+            b.append(side_b[j])
+            reached["a"], reached["b"] = t_a[i], t_b[j]
+        elif next_a < next_b:
+            i += 1
+            a.append(side_a[i])
+            reached["a"] = next_a
+            b.append(partner("b", b, side_b, t_b, j, next_a, added_b))
+        else:
+            j += 1
+            b.append(side_b[j])
+            reached["b"] = next_b
+            a.append(partner("a", a, side_a, t_a, i, next_b, added_a))
+
+    # The ring again, with the new vertices in their places along it. Side B
+    # was walked backwards, so its additions go in backwards.
+    position = {}
+    new_ring = []
+    for index in range(n):
+        new_ring.append(index)
+        k_a = side_a.index(index) if index in side_a[:-1] else None
+        if k_a is not None:
+            new_ring.extend(added_a.get(k_a, []))
+        if index in side_b[1:]:
+            k_b = side_b.index(index) - 1
+            new_ring.extend(reversed(added_b.get(k_b, [])))
+    for slot, index in enumerate(new_ring):
+        position[index] = slot
+
+    faces = []
+    for k in range(len(a) - 1):
+        quad = [a[k], a[k + 1], b[k + 1], b[k]]
+        unique = list(dict.fromkeys(quad))
+        if len(unique) >= 3:
+            faces.append([position[v] for v in unique])
+    for first, last in (head, tail):
+        run = walk(first, last)
+        if len(run) >= 3:
+            for k in range(1, len(run) - 1):
+                faces.append([position[run[0]], position[run[k]], position[run[k + 1]]])
+    out = np.asarray([points[v] for v in new_ring], dtype=np.float64)
+    # Built the right way, every face runs anticlockwise and together they
+    # cover the outline exactly once. A short or crooked outline can fold
+    # the ladder over its own end -- three faces on one edge, on three small
+    # walls over Utrecht Centraal -- and is capped by earcut instead.
+    total = 0.0
+    for face in faces:
+        for k in range(1, len(face) - 1):
+            area = _signed_area(out[[face[0], face[k], face[k + 1]]])
+            if area <= 1e-9:
+                return None
+            total += area
+    if abs(total - _signed_area(out)) > 1e-6 * max(1.0, abs(_signed_area(out))):
+        return None
+    return out, faces
+
+
+def _cdt_cap(rings, flat):
+    """A top that is not a strip, as the ground fills a face: a constrained
+    Delaunay triangulation, paired into quads where they make good ones.
+
+    Earcut clips ears off the outline in order, which on an awning drawn
+    with a curve in it is a fan of slivers from one corner -- 1,773 over
+    Hoek van Holland. Returns index faces into `flat`, or None where the
+    outline will not triangulate cleanly, for earcut to do.
+    """
+    import shapely
+
+    from .terrain_mesh import _fill, _key
+
+    try:
+        polygon = shapely.Polygon(rings[0], rings[1:])
+        if not polygon.is_valid:
+            return None
+        faces = _fill(polygon)
+    except Exception:  # noqa: BLE001 - earcut is the fallback
+        return None
+    if not faces:
+        return None
+    index = {_key(p): i for i, p in enumerate(flat)}
+    out = []
+    for face in faces:
+        ids = [index.get(_key(p)) for p in np.asarray(face)[:, :2]]
+        if any(i is None for i in ids) or len(set(ids)) != len(ids):
+            return None
+        out.append(ids)
+    # Every face up, and together exactly the outline: a face folded over
+    # its neighbour cancels the overlap in the total, so both are needed.
+    areas = [_signed_area(flat[f]) for f in out]
+    if min(areas) <= 1e-12:
+        return None
+    if abs(sum(areas) - polygon.area) > 1e-6 * max(1.0, polygon.area):
+        return None
+    # And no edge used twice the same way round.
+    seen = set()
+    for f in out:
+        for a, b in zip(f, f[1:] + f[:1]):
+            if (a, b) in seen:
+                return None
+            seen.add((a, b))
+    return out
+
+
+def _up(points: np.ndarray, face: list[int]) -> list[int]:
+    """A cap face wound to face up."""
+    return face if _signed_area(points[face]) >= 0.0 else face[::-1]
 
 
 def _ring_steps(ring: np.ndarray, step_m: float) -> np.ndarray:
@@ -197,6 +643,11 @@ class BarrierStyle:
     # Awnings and canopies hang off a facade. Drawn from the ground they are a
     # solid block against the wall, which is worse than leaving them out.
     lift_m: float = 0.0
+    # Read the top off the surface model where it can see one (`_measured_top`),
+    # and fall back on `lift_m` where it cannot. A canopy is anything from a
+    # bicycle shelter to the roof over a station's platforms, and no one lift
+    # fits both.
+    top_from_survey: bool = False
 
 
 # Linear types, by collection and plus_type.
@@ -231,7 +682,7 @@ AREA_STYLES: dict[tuple[str, str], BarrierStyle] = {
         "awning", 0.12, 0.0, "metal", lift_m=2.4
     ),
     ("overigbouwwerk", "overkapping"): BarrierStyle(
-        "canopy", 0.14, 0.0, "metal", lift_m=2.6
+        "canopy", 0.14, 0.0, "metal", lift_m=2.6, top_from_survey=True
     ),
     ("overigbouwwerk", "lage trafo"): BarrierStyle("transformer", 2.4, 0.0, "brick"),
     ("overigbouwwerk", "open loods"): BarrierStyle("shed", 2.8, 0.0, "metal"),
@@ -423,27 +874,40 @@ def _sweep_line(points: np.ndarray, sampler, style: BarrierStyle):
             triangles.append([a0 + i, b0 + i + 1, a0 + i + 1])
 
     # Close both ends, or the prism is a tube and reads as hollow from any
-    # position that can see into it.
-    for i, sign in ((0, 1), (n - 1, -1)):
-        quad = [0 * n + i, 1 * n + i, 2 * n + i, 3 * n + i]
-        if sign > 0:
-            triangles.append([quad[0], quad[1], quad[2]])
-            triangles.append([quad[0], quad[2], quad[3]])
-        else:
-            triangles.append([quad[0], quad[2], quad[1]])
-            triangles.append([quad[0], quad[3], quad[2]])
+    # position that can see into it. Facing out: the start looks back down
+    # the run, the end along it. These were the other way round, so every
+    # wall's ends faced into the wall -- black in a lit viewport, see-through
+    # with backface culling. Each as the pair (a, b, c), (a, c, d), which the
+    # Blender stage joins back into one quad.
+    for i, quad in (
+        (0, [0, 3, 2, 1]),
+        (n - 1, [0, 1, 2, 3]),
+    ):
+        q = [r * n + i for r in quad]
+        triangles.append([q[0], q[1], q[2]])
+        triangles.append([q[0], q[2], q[3]])
 
     return vertices, np.asarray(triangles, dtype=np.int64), uvs
 
 
 def _extrude_rings(
-    rings: list[np.ndarray], sampler, style: BarrierStyle, step_m: float = 1.0
+    rings: list[np.ndarray],
+    sampler,
+    style: BarrierStyle,
+    step_m: float = 1.0,
+    *,
+    tolerance_m: float = 0.05,
+    top_z: float | None = None,
 ):
-    """A polygon into a prism, as ``(vertices, triangles)``.
+    """A polygon into a prism, as ``(vertices, triangles, uvs)``.
 
-    The outer ring and any holes all become vertical quads; the top is capped
-    by earcut. See the module docstring for why a sliver in the cap is
-    acceptable here and would not be on a road.
+    The outer ring and any holes all become vertical quads. The top of a
+    strip -- most walls -- is a ladder of quads across it (`_strip_cap`);
+    anything else is capped by earcut. Every quad is written as the pair of
+    triangles (a, b, c), (a, c, d), which the Blender stage joins back up.
+
+    `top_z` puts the top at a measured height -- a canopy read off the
+    surface model -- rather than at the style's height above the ground.
 
     The base is sampled per vertex, not once for the whole outline. One height
     for the whole thing is the obvious shortcut and it fails exactly where
@@ -458,31 +922,49 @@ def _extrude_rings(
     import mapbox_earcut
 
     rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in rings]
-    rings = [r[:-1] if np.allclose(r[0], r[-1]) else r for r in rings]
+    rings = [r[:-1] if np.allclose(r[0], r[-1], rtol=0.0, atol=1e-6) else r for r in rings]
+    # A survey vertex drawn twice in a row is an edge of no length: a side
+    # with no width, and on top a triangle the triangulation made twice.
+    rings = [_without_repeats(r) for r in rings]
     rings = [r for r in rings if len(r) >= 3]
     if not rings:
-        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64), np.zeros((0, 2))
+    rings = _oriented(rings)
+    flat_piece = style.lift_m > 0.0 or top_z is not None
 
-    # Cut the ring up before sampling the ground along it. A survey draws a
-    # thirty-metre wall as a four-vertex rectangle, and sampling the ground
-    # only at the corners leaves the base a straight chord over whatever the
-    # ground does in between: measured over the Gelderland square, one ring
-    # edge in five departed from its chord by more than the fifteen-centimetre
-    # embed, and the worst by 3.9 m. Walls floated, steps buried themselves.
+    # Follow the ground along the ring. A survey draws a thirty-metre wall as
+    # a four-vertex rectangle, and sampling the ground only at the corners
+    # leaves the base a straight chord over whatever the ground does in
+    # between: measured over the Gelderland square, one ring edge in five
+    # departed from its chord by more than the fifteen-centimetre embed, and
+    # the worst by 3.9 m. Walls floated, steps buried themselves.
     #
-    # The swept lines have always done this. Polygons were the ones left out.
-    if step_m > 0:
-        rings = [_ring_steps(ring, step_m) for ring in rings]
+    # Only where it bends, though (`_ring_drape`), and not at all for a piece
+    # that is flat anyway: an awning cut every metre was a hundred triangles
+    # holding a flat plate flat, 26,580 of them over Hoek van Holland.
+    if step_m > 0 and not flat_piece:
+        rings = [_ring_drape(ring, sampler, step_m, tolerance_m) for ring in rings]
+
+    cap_faces = None
+    if len(rings) == 1:
+        strip = _strip_cap(rings[0])
+        if strip is not None:
+            rings[0], cap_faces = strip
 
     flat = np.vstack(rings)
     ground = np.asarray(sampler(flat[:, 0], flat[:, 1]), dtype=np.float64)
-    if style.lift_m > 0.0:
-        # Flat, and clear of the ground at its worst corner. The median looks
-        # like the fair choice and is not: an awning whose footprint straddles
-        # a slope ends up half buried, by 1.43 m on the Gelderland square.
-        # Too high at one end is a thing nobody notices; underground is not.
-        ground = np.full(len(flat), float(ground.max()))
-    low, high = _span(ground, style)
+    if top_z is not None:
+        low = np.full(len(flat), float(top_z) - style.height_m)
+        high = np.full(len(flat), float(top_z))
+    else:
+        if style.lift_m > 0.0:
+            # Flat, and clear of the ground at its worst corner. The median
+            # looks like the fair choice and is not: an awning whose footprint
+            # straddles a slope ends up half buried, by 1.43 m on the
+            # Gelderland square. Too high at one end is a thing nobody
+            # notices; underground is not.
+            ground = np.full(len(flat), float(ground.max()))
+        low, high = _span(ground, style)
 
     n = len(flat)
     vertices = np.vstack([
@@ -501,20 +983,41 @@ def _extrude_rings(
             triangles.append([a, n + b, n + a])
         start += count
 
-    ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
-    try:
-        cap = np.asarray(
-            mapbox_earcut.triangulate_float64(flat, ends), dtype=np.int64
-        ).reshape(-1, 3)
-    except Exception as exc:  # noqa: BLE001 - one bad outline is not fatal
-        LOG.debug("could not cap a barrier outline: %s", exc)
-        cap = np.zeros((0, 3), dtype=np.int64)
-    if len(cap):
-        triangles.extend((cap + n).tolist())
-        # An awning has no ground under it, so it needs a floor as well as a
-        # lid. A wall's underside is buried and nobody will look.
-        if style.lift_m > 0.0:
-            triangles.extend(cap[:, ::-1].tolist())
+    if cap_faces is None:
+        cap_faces = _cdt_cap(rings, flat)
+    if cap_faces is None:
+        ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
+        try:
+            found = np.asarray(
+                mapbox_earcut.triangulate_float64(flat, ends), dtype=np.int64
+            ).reshape(-1, 3)
+        except Exception as exc:  # noqa: BLE001 - one bad outline is not fatal
+            LOG.debug("could not cap a barrier outline: %s", exc)
+            found = np.zeros((0, 3), dtype=np.int64)
+        cap_faces = found.tolist()
+        # Earcut winds every triangle the same way; turned up together, by
+        # their total, not one by one -- a near-flat sliver's own sign is
+        # rounding, and turned on its own it faced the other way from its
+        # neighbours.
+        if cap_faces and sum(_signed_area(flat[f]) for f in cap_faces) < 0.0:
+            cap_faces = [f[::-1] for f in cap_faces]
+    else:
+        cap_faces = [_up(flat, list(face)) for face in cap_faces]
+
+    def split(face, lift):
+        """A face as triangles, a quad as the pair (a, b, c), (a, c, d)."""
+        face = [v + lift for v in face]
+        if len(face) == 4:
+            return [[face[0], face[1], face[2]], [face[0], face[2], face[3]]]
+        return [face]
+
+    for face in cap_faces:
+        triangles.extend(split(face, n))
+    # An awning has no ground under it, so it needs a floor as well as a lid.
+    # A wall's underside is buried and nobody will look.
+    if flat_piece:
+        for face in cap_faces:
+            triangles.extend(split(face[::-1], 0))
 
     # Metres from the outline's own corner rather than RD eastings, which
     # would be six-figure UVs for anything that ever reads them. The solid
@@ -535,8 +1038,12 @@ def build_barriers(
     collision: bool = False,
     skip_styles=(),
     deck_at=None,
+    surface_at=None,
 ) -> BarrierSet:
     """Fetch every barrier collection and turn it into draped geometry.
+
+    `surface_at(x, y)` is the surface model (AHN DSM), NaN where it has no
+    reading. A canopy's top is read from it (`_measured_top`).
 
     `skip_styles` names styles left to someone else: the layered style builds
     quay walls as the face of the quay (`harbour`), not a wall standing on it.
@@ -656,8 +1163,36 @@ def build_barriers(
                     rings = _prepare_rings(group, bbox)
                     if not rings:
                         continue
+                    top = None
+                    if style.top_from_survey and surface_at is not None:
+                        open_rings = [
+                            np.asarray(r, dtype=np.float64)[:, :2] for r in rings
+                        ]
+                        open_rings = [
+                            r[:-1] if np.allclose(r[0], r[-1], rtol=0.0, atol=1e-6) else r
+                            for r in open_rings
+                        ]
+                        draped = _draped_roof(_oriented(open_rings), ground, surface_at, style)
+                        if draped is not None:
+                            chunks.append((*draped, style))
+                            counts[style.name] = counts.get(style.name, 0) + 1
+                            key = f"{style.name}_draped"
+                            counts[key] = counts.get(key, 0) + 1
+                            fat = collider_for(style)
+                            if fat is not None:
+                                fat_roof = _draped_roof(
+                                    _oriented(open_rings), ground, surface_at, fat
+                                )
+                                if fat_roof is not None:
+                                    collision_chunks.append(fat_roof[:2])
+                            continue
+                        top = _measured_top(rings, ground, surface_at)
+                        if top is not None:
+                            key = f"{style.name}_measured"
+                            counts[key] = counts.get(key, 0) + 1
                     verts, tris, uvs = _extrude_rings(
-                        rings, ground, style, step_m
+                        rings, ground, style, step_m,
+                        tolerance_m=drape_tolerance_m, top_z=top,
                     )
                     if len(tris):
                         chunks.append((verts, tris, uvs, style))
@@ -665,7 +1200,8 @@ def build_barriers(
                         fat = collider_for(style)
                         if fat is not None:
                             c_verts, c_tris, _ = _extrude_rings(
-                                rings, ground, fat, step_m
+                                rings, ground, fat, step_m,
+                                tolerance_m=drape_tolerance_m, top_z=top,
                             )
                             if len(c_tris):
                                 collision_chunks.append((c_verts, c_tris))

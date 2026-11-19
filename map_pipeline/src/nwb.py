@@ -98,7 +98,7 @@ def parse_features(features: list[dict]) -> Network:
             if array.ndim != 2 or len(array) < 2:
                 continue
             array = array[:, :2]
-            if points and np.allclose(points[-1][-1], array[0]):
+            if points and np.allclose(points[-1][-1], array[0], rtol=0.0, atol=1e-6):
                 array = array[1:]
             points.append(array)
         if not points:

@@ -2279,43 +2279,70 @@ def build_barriers(scene: dict, work_dir: Path, material, fence_material=None):
         renumber = np.zeros(len(local), dtype=np.int64)
         renumber[used] = np.arange(len(used))
         corners = local[used]
-        indices = renumber[part]
-        n_triangles = len(part)
+        loops, sizes = _barrier_faces(renumber[part])
+        n_faces = len(sizes)
 
         see_through = name in cutout and fence_material is not None and uv is not None
         if see_through:
             # Metres in the file, tiles here: a fence four hundred metres long
             # gets four hundred metres of uprights rather than eight stretched
             # across the whole run.
-            loop_uv = uv[used][indices.reshape(-1)].copy()
+            loop_uv = uv[used][loops].copy()
             loop_uv[:, 0] /= tile_m      # U tiles along the run; V does not
         else:
             patch = np.asarray(
-                table.get(material_names[int(material_of[mask][0])], (0.125, 0.25)),
+                table.get(material_names[int(material_of[mask][0])], (0.125, 0.75)),
                 dtype=np.float64,
             )
-            loop_uv = np.tile(patch, (n_triangles * 3, 1))
+            loop_uv = np.tile(patch, (len(loops), 1))
 
         objects.append(
             build_mesh_object(
                 f"Barriers_{name}",
                 corners,
-                indices.reshape(-1),
-                np.arange(0, n_triangles * 3, 3),
-                np.full(n_triangles, 3),
+                loops,
+                np.concatenate([[0], np.cumsum(sizes)[:-1]]),
+                sizes,
                 loop_uv,
-                np.zeros(n_triangles),
+                np.zeros(n_faces),
                 [fence_material if see_through else material],
                 shade_smooth=False,
             )
         )
-        total += n_triangles
+        total += n_faces
 
     log(
-        f"barriers: {len(objects)} kinds, {total} triangles "
+        f"barriers: {len(objects)} kinds, {total} faces from {len(triangles)} triangles "
         f"({', '.join(kind_names)})"
     )
     return objects
+
+
+def _barrier_faces(triangles):
+    """Barrier triangles joined back into the quads they were cut from.
+
+    The barriers stage writes every quad -- a wall's side, a rung across its
+    top -- as the pair (a, b, c), (a, c, d), so a pair is found by its
+    indices, not guessed from its shape; anything else stays a triangle.
+    Returns the face corners in order and the face sizes.
+    """
+    t = np.asarray(triangles, dtype=np.int64).reshape(-1, 3)
+    if not len(t):
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    pairs = np.zeros(len(t), dtype=bool)
+    pairs[:-1] = (t[:-1, 0] == t[1:, 0]) & (t[:-1, 2] == t[1:, 1])
+    loops, sizes = [], []
+    i, n = 0, len(t)
+    while i < n:
+        if pairs[i]:
+            loops.extend([t[i, 0], t[i, 1], t[i, 2], t[i + 1, 2]])
+            sizes.append(4)
+            i += 2
+        else:
+            loops.extend(t[i].tolist())
+            sizes.append(3)
+            i += 1
+    return np.asarray(loops, dtype=np.int64), np.asarray(sizes, dtype=np.int64)
 
 
 def build_furniture(scene: dict, work_dir: Path, material):
@@ -2346,10 +2373,12 @@ def build_furniture(scene: dict, work_dir: Path, material):
     uv = {
         name: np.asarray(table.get(name, default), dtype=np.float64)
         for name, default in (
-            ("metal", (0.125, 0.25)), ("wood", (0.375, 0.25)),
-            ("brick", (0.625, 0.25)), ("concrete", (0.875, 0.25)),
-            ("hedge", (0.125, 0.75)), ("paint", (0.375, 0.75)),
-            ("stone", (0.625, 0.75)), ("glass", (0.875, 0.75)),
+            # V from the bottom of the image: the first row is written at
+            # the top. See `furniture_uv`.
+            ("metal", (0.125, 0.75)), ("wood", (0.375, 0.75)),
+            ("brick", (0.625, 0.75)), ("concrete", (0.875, 0.75)),
+            ("hedge", (0.125, 0.25)), ("paint", (0.375, 0.25)),
+            ("stone", (0.625, 0.25)), ("glass", (0.875, 0.25)),
         )
     }
 

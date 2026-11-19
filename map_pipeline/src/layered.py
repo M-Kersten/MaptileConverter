@@ -284,8 +284,11 @@ def build_layered_ground(
     the same everywhere; a whole number of survey grid squares.
 
     `mesher` "quads" lays the terrain out in quads (`layered_mesh`);
-    "triangles" is the triangulation refined until every grid node is within
-    `tolerance_m`, which is also what a failed quad mesh falls back to.
+    "ribcage" lays it out as the 3D team draws it: ribs across what is
+    narrow, a lattice turned to each space in what is wide, triangles at the
+    edges, and no grid (`ribcage_mesh`); "triangles" is the triangulation
+    refined until every grid node is within `tolerance_m`, which is also what
+    a failed quad or ribcage mesh falls back to.
     """
     import shapely
 
@@ -344,12 +347,14 @@ def build_layered_ground(
     mesh_stats: dict = {}
     face_part = None
     built = None
-    if mesher == "quads":
+    if mesher in ("quads", "ribcage"):
         from .layered_mesh import quad_terrain
+        from .ribcage_mesh import ribcage_terrain
 
+        generate = ribcage_terrain if mesher == "ribcage" else quad_terrain
         t = time.time()
         try:
-            built = quad_terrain(
+            built = generate(
                 terrain, pieces, bodies, codes_wet=WATER_CODE,
                 depth_m=float(ditch_depth_m), tolerance_m=float(tolerance_m),
                 # Roads get rows wide enough to ladder straight across;
@@ -364,8 +369,8 @@ def build_layered_ground(
             )
         except Exception as exc:  # noqa: BLE001 - the triangulation always works
             LOG.warning(
-                "layered ground: the quad terrain could not be built (%s); "
-                "using the triangulation", exc,
+                "layered ground: the %s terrain could not be built (%s); "
+                "using the triangulation", mesher, exc,
             )
             mesh_stats["quad_failure"] = str(exc)[:200]
         timings["terrain_s"] = round(time.time() - t, 1)

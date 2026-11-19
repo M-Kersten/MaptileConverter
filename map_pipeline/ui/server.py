@@ -352,6 +352,8 @@ _OVERRIDES = {
     "car_occupancy": ("vehicles", "car_occupancy", float),
     "collision_tree_crowns": ("export", "collision_tree_crowns", bool),
     "collision_thickness_m": ("barriers", "collision_thickness_m", float),
+    # The layered ground's layout: "quads" (the grid) or "ribcage".
+    "mesher": ("layered", "mesher", str),
 }
 
 
@@ -534,6 +536,9 @@ def area_settings(name: str) -> dict:
         export = data.get("export")
         if isinstance(export, dict) and "collision" in export:
             settings.setdefault("collision", bool(export["collision"]))
+        layered = data.get("layered")
+        if isinstance(layered, dict) and isinstance(layered.get("mesher"), str):
+            settings.setdefault("mesher", layered["mesher"])
     return settings
 
 
