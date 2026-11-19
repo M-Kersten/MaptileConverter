@@ -462,13 +462,24 @@ HARBOUR_OBJECTS = {
     "catwalk": ("Loopbruggen", "Beton", (0.8, 0.8, 0.8), 0.6),
     "fender": ("Remmingswerk", "Hout", (0.16, 0.1, 0.055), 0.8),
     "railing": ("Leuningen", "Staal", (0.2, 0.22, 0.24), 0.4),
+    "pile": ("Steigerpalen", "Meerpaal", (0.06, 0.05, 0.04), 0.7),
+    "bollard": ("Bolders", "Gietijzer", (0.03, 0.03, 0.035), 0.5),
+    "ladder": ("Kadetrappen", "Staal", (0.2, 0.22, 0.24), 0.4),
+    "crane_rail": ("Kraanbanen", "Staal", (0.2, 0.22, 0.24), 0.4),
+    # Painted per crane and per container: the paints are in harbour.npz.
+    "crane": ("Kranen", "Staal", (0.2, 0.22, 0.24), 0.4),
+    "container": ("Containers", "Container_Grijs", (0.35, 0.36, 0.37), 0.6),
 }
 # Painted steel: the railings along bridges and catwalks.
 RAILING_MATERIAL = ("Staal", (0.2, 0.22, 0.24), 0.4)
 
 
 def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
-    """Quay faces, jetties, pontoons and mooring posts: one object per kind."""
+    """Quay faces, jetties, cranes, containers and the rest: one object per kind.
+
+    A kind is one material, except where its triangles carry a paint of
+    their own (a crane's colour, a container's): those get a slot each.
+    """
     import bmesh
 
     path = work_dir / str(scene["layered"]["harbour"])
@@ -478,6 +489,11 @@ def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
     tris = data["tris"].astype(np.float64)
     kinds = data["tri_kind"].astype(np.int64)
     names = [str(n) for n in data["kind_names"]]
+    paints = (
+        data["tri_paint"].astype(np.int64) if "tri_paint" in data.files
+        else np.full(len(kinds), -1, dtype=np.int64)
+    )
+    paint_names = [str(n) for n in data["paint_names"]] if "paint_names" in data.files else []
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
     tris = tris - [origin_x, origin_y, z_offset]
@@ -487,9 +503,21 @@ def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
         if not len(sel) or kind not in HARBOUR_OBJECTS:
             continue
         word, material_name, rgb, rough = HARBOUR_OBJECTS[kind]
-        material = bpy.data.materials.get(material_name) or make_plain_material(
-            material_name, rgb, rough
-        )
+        # Slot 0 is the kind's own material; each paint used gets the next.
+        slots = [(material_name, rgb, rough)]
+        painted = paints[kinds == k]
+        slot_of = np.zeros(len(sel), dtype=np.int64)
+        for paint in np.unique(painted[painted >= 0]):
+            slot_of[painted == paint] = len(slots)
+            slots.append((
+                paint_names[paint],
+                tuple(float(c) for c in data["paint_rgb"][paint]),
+                float(data["paint_rough"][paint]),
+            ))
+        materials = [
+            bpy.data.materials.get(name) or make_plain_material(name, colour, roughness)
+            for name, colour, roughness in slots
+        ]
         corners = sel.reshape(-1, 3)
         n = len(sel)
         obj = build_mesh_object(
@@ -499,8 +527,8 @@ def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
             np.arange(0, n * 3, 3),
             np.full(n, 3),
             np.column_stack([corners[:, 0] / 2.0, corners[:, 1] / 2.0]),
-            np.zeros(n),
-            [material],
+            slot_of,
+            materials,
             shade_smooth=False,
         )
         # One vertex per corner, and the faces turned outwards.

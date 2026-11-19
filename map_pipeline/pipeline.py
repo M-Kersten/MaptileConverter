@@ -763,7 +763,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             terrain.save(work_dir)
             if surfaces.water and bool(settings.get("harbour", True)):
                 # Quay faces, jetties, pontoons and mooring posts, at the
-                # water levels just read and the ground just built.
+                # water levels just read and the ground just built; and the
+                # cranes and containers the surface model saw.
                 harbour = build_harbour(
                     config.bbox,
                     work_dir,
@@ -771,6 +772,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     quays=surfaces.quays,
                     surface_at=ground_layers.surface_at,
                     dsm_path=level_dsm,
+                    fittings=bool(settings.get("harbour_fittings", True)),
+                    cranes=bool(settings.get("harbour_cranes", True)),
+                    containers=bool(settings.get("harbour_containers", True)),
                     fetch_kwargs={
                         "page_limit": int(config.surfaces["page_limit"]),
                         "timeout": float(config.surfaces["timeout_s"]),
@@ -854,6 +858,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 deck_at=(
                     (lambda x, y: deck_at(x, y, reach=0.0)) if deck_at is not None else None
                 ),
+                # A crane is not a clump of tall trees, nor a stack a hedge.
+                keep_off=harbour.no_trees,
             )
             if len(trees):
                 write_tree_list(trees, config.geo, out_dir)

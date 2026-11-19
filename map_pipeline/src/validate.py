@@ -1024,6 +1024,21 @@ def check_harbour(report: CheckReport, harbour) -> None:
             f"{len(tops)} jetty and pontoon decks, {clear.min():.2f} to {clear.max():.2f} m "
             f"above the water",
         )
+    cranes = np.asarray(getattr(harbour, "crane_height", ()), dtype=np.float64)
+    if len(cranes):
+        report.add(
+            "cranes_as_high_as_cranes",
+            bool((cranes >= 8.0).all() and (cranes <= 160.0).all()),
+            f"{len(cranes)} cranes, {cranes.min():.0f} to {cranes.max():.0f} m above the quay",
+        )
+    tiers = np.asarray(getattr(harbour, "stack_tiers", ()), dtype=np.int64)
+    if len(tiers):
+        report.add(
+            "containers_stacked_no_higher_than_six",
+            bool((tiers >= 1).all() and (tiers <= 6).all()),
+            f"{int(tiers.sum())} containers in {len(tiers)} stacks, "
+            f"{tiers.mean():.1f} high on average and {int(tiers.max())} at most",
+        )
 
 
 def check_layered(
