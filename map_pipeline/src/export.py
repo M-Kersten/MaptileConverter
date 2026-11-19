@@ -42,6 +42,15 @@ ATTRIBUTION = {
         "Road centrelines and street names from the NWB (Nationaal Wegenbestand) "
         "by Rijkswaterstaat, via PDOK (CC0)."
     ),
+    "signs": (
+        "Traffic signs from the NDW traffic sign register (Nationaal "
+        "Dataportaal Wegverkeer), CC0. https://www.ndw.nu"
+    ),
+    "osm": (
+        "Lane counts, crossings, speed humps and signalled junctions "
+        "\u00a9 OpenStreetMap contributors, ODbL 1.0. "
+        "https://www.openstreetmap.org/copyright"
+    ),
     "textures": (
         "Wall surfaces under the generated facades from Poly Haven (CC0, no "
         "attribution required). https://polyhaven.com"
@@ -171,6 +180,7 @@ def write_scene_description(
     tree_texture: Path | None = None,
     water_texture: Path | None = None,
     furniture_texture: Path | None = None,
+    traffic_texture: Path | None = None,
     surfaces_cfg: dict | None = None,
     road_class_names: dict | None = None,
     surface_class_names: dict | None = None,
@@ -269,6 +279,13 @@ def write_scene_description(
             if furniture_texture is not None
             else {}
         ),
+        # Signs, lights, paint and covers arrive as finished meshes: the
+        # Blender stage only moves them to the model's origin.
+        "traffic": (
+            {"file": "traffic.npz", "texture": traffic_texture.name}
+            if traffic_texture is not None
+            else {}
+        ),
         # Barriers share the furniture atlas, so they are gated on the same
         # texture existing rather than on one of their own.
         "barriers": (
@@ -344,11 +361,13 @@ def write_scene_description(
     return path
 
 
-def write_attribution(out_dir: Path) -> Path:
+def write_attribution(out_dir: Path, *, osm: bool = False, signs: bool = False) -> Path:
     """Drop the source credits next to the model.
 
     3DBAG asks for a copyright notice on reuse, and the AHN and aerial layers
-    are CC BY 4.0, so the credits travel with the output.
+    are CC BY 4.0, so the credits travel with the output. OpenStreetMap's
+    licence requires its credit wherever its data went in, and only there:
+    `osm` says whether this model has any.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "ATTRIBUTION.txt"
@@ -361,6 +380,8 @@ def write_attribution(out_dir: Path) -> Path:
         f"BGT:       {ATTRIBUTION['bgt']}",
         f"BAG:       {ATTRIBUTION['bag']}",
         f"NWB:       {ATTRIBUTION['roads']}",
+        *([f"Signs:     {ATTRIBUTION['signs']}"] if signs else []),
+        *([f"OSM:       {ATTRIBUTION['osm']}"] if osm else []),
         f"Textures:  {ATTRIBUTION['textures']}",
         "",
         "Keep this notice with the model when you redistribute it.",

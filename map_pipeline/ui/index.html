@@ -1177,6 +1177,8 @@ const SOURCE_NAME = {
   terrain: "Hoogte", aerial: "Luchtfoto", buildings: "Gebouwen", usage: "Gebouwfunctie",
   trees: "Bomen", water: "Water en kades", land_cover: "Bodembedekking",
   furniture: "Straatmeubilair", barriers: "Muren, hekken en hagen",
+  signs: "Verkeersborden", markings: "Rijstroken en oversteken",
+  signals: "Verkeerslichten", covers: "Putdeksels en kolken",
   vehicles: "Auto's en boten", structures: "Bruggen en tunnels", rails: "Spoor"
 };
 
@@ -1272,6 +1274,7 @@ function settingsForEstimate() {
     trees: chosen.has("trees"), water: chosen.has("water"),
     land_cover: chosen.has("land_cover"), furniture: chosen.has("furniture"),
     barriers: chosen.has("barriers"),
+    traffic: ["signs", "markings", "signals", "covers"].some(id => chosen.has(id)),
     vehicles: chosen.has("vehicles"), rails: chosen.has("rails"),
     structures: chosen.has("structures"),
     usage: chosen.has("usage")
@@ -1825,7 +1828,7 @@ $("recheck").onclick = () => { checkServices(); };
 --------------------------------------------------------------------------- */
 const LAYER_NAME = {
   "Terrain": "Grond", "Terrain Cutout": "Gras", "Roads": "Wegen", "Buildings": "Gebouwen",
-  "Water": "Water", "Trees": "Bomen", "Street furniture": "Straatmeubilair",
+  "Water": "Water", "Trees": "Bomen", "Street furniture": "Straatmeubilair", "Traffic": "Borden, lichten en markering",
   "Barriers": "Muren, hekken en hagen", "Vehicles": "Auto's en boten", "Rail": "Spoor",
   "Structures": "Bruggen en tunnels"
 };

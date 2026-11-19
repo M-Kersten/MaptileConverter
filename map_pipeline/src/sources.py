@@ -39,6 +39,10 @@ class Source:
     # its own. The source is only down when neither answers -- treating the
     # first as decisive would abort runs that would have finished.
     backup_probe_url: str = ""
+    # Detail the model stands without. Its stage carries on empty-handed when
+    # the service is away, so an outage there is a warning and not a reason to
+    # refuse the run.
+    optional: bool = False
 
     def url(self, config: dict) -> str:
         node: Any = config
@@ -130,6 +134,60 @@ SOURCES: tuple[Source, ...] = (
             "waste points, flagpoles and catenary masts"
         ),
         toggles=(("furniture", "enabled"),),
+        url_path=("trees", "api_url"),
+    ),
+    Source(
+        id="signs",
+        label="Traffic signs (NDW)",
+        provider="NDW",
+        contributes=(
+            "every traffic sign as a plate of the right shape with the right "
+            "face, and the give-way teeth and stop lines the signs require"
+        ),
+        toggles=(("traffic", "signs"),),
+        fallback_url=(
+            "https://data.ndw.nu/api/rest/static-road-data/traffic-signs/v4/"
+            "current-state"
+        ),
+        # Without a municipality the register sends the whole country, which
+        # is 300 MB. One that does not exist answers at once.
+        probe_url=(
+            "https://data.ndw.nu/api/rest/static-road-data/traffic-signs/v4/"
+            "current-state?countyCode=GM0000"
+        ),
+        optional=True,
+    ),
+    Source(
+        id="markings",
+        label="Lanes and crossings (OpenStreetMap)",
+        provider="OpenStreetMap",
+        contributes=(
+            "lane lines from the lane count, zebras and dashed crossings, "
+            "and the white blocks on speed humps"
+        ),
+        toggles=(("traffic", "markings"),),
+        fallback_url="https://api.openstreetmap.org/api/0.6/map.json",
+        probe_url="https://api.openstreetmap.org/api/0.6/capabilities",
+        optional=True,
+        note="ODbL: credited in ATTRIBUTION.txt when used",
+    ),
+    Source(
+        id="signals",
+        label="Traffic lights (BGT)",
+        provider="PDOK",
+        contributes=(
+            "a signal head on every surveyed signal pole, and on the junctions "
+            "OpenStreetMap tags as signalled where none was surveyed"
+        ),
+        toggles=(("traffic", "signals"),),
+        url_path=("trees", "api_url"),
+    ),
+    Source(
+        id="covers",
+        label="Manholes and gullies (BGT)",
+        provider="PDOK",
+        contributes="manhole lids and gully grates, flat on the road",
+        toggles=(("traffic", "covers"),),
         url_path=("trees", "api_url"),
     ),
     Source(

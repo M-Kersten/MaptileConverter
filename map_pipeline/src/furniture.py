@@ -125,8 +125,14 @@ def build_furniture(
     *,
     furniture_cfg: dict,
     terrain,
+    skip_types: set[str] | frozenset[str] = frozenset(),
 ) -> FurnitureSet:
-    """Fetch poles and street furniture, and put them on the terrain."""
+    """Fetch poles and street furniture, and put them on the terrain.
+
+    `skip_types` are BGT types another stage has drawn already: the traffic
+    stage turns signal poles into traffic lights and replaces the few sign
+    posts the BGT has with the signs themselves.
+    """
     result = FurnitureSet()
     points: list[tuple[float, float]] = []
     kinds: list[int] = []
@@ -152,7 +158,7 @@ def build_furniture(
         for feature in features:
             plus_type = str((feature.get("properties") or {}).get("plus_type") or "")
             kind = mapping.get(plus_type)
-            if kind is None:
+            if kind is None or plus_type in skip_types:
                 continue
             geometry = feature.get("geometry") or {}
             if geometry.get("type") != "Point":

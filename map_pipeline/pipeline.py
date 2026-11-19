@@ -84,6 +84,12 @@ from src.facade import (  # noqa: E402
 )
 from src.barriers import BarrierSet, build_barriers  # noqa: E402
 from src.furniture import FurnitureSet, build_furniture  # noqa: E402
+from src.traffic import (  # noqa: E402
+    TrafficSet,
+    build_traffic,
+    generate_traffic_texture,
+    write_traffic_list,
+)
 from src.imagery import build_aerial  # noqa: E402
 from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
 from src.rails import RailSet, build_rails, save_rails  # noqa: E402
@@ -127,6 +133,7 @@ from src.validate import (  # noqa: E402
     check_barriers,
     check_layered,
     check_furniture,
+    check_traffic,
     check_rails,
     check_structures,
     check_vehicles,
@@ -203,6 +210,10 @@ def write_timings(
             "trees": bool(config.trees["enabled"]),
             "surfaces": bool(config.surfaces["water"] or config.surfaces["land_cover"]),
             "furniture": bool(config.furniture["enabled"]),
+            "traffic": any(
+                bool(config.traffic.get(key))
+                for key in ("signs", "signals", "markings", "covers")
+            ),
             "barriers": bool(config.barriers["enabled"]),
             "usage": bool(config.usage["enabled"]),
             # Rendering previews costs more than every data stage put together,
@@ -566,6 +577,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         # Aborting on the first would stop runs that the fallback would have
         # finished, which is most of what 3DBAG's API outages used to cost.
         blocked = down_sources(settings, reachable, active)
+        for source in [s for s in blocked if s.optional]:
+            LOG.warning(
+                "%s is not answering; the run goes ahead without it",
+                source.label,
+            )
+        blocked = [s for s in blocked if not s.optional]
         for source in active:
             urls = source.probes(settings)
             if (
@@ -604,6 +621,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         config.surfaces["water"] or config.surfaces["land_cover"] or layered
     )
     want_furniture = bool(config.furniture["enabled"])
+    want_traffic = any(
+        bool(config.traffic.get(key)) for key in ("signs", "signals", "markings", "covers")
+    )
     want_barriers = bool(config.barriers["enabled"])
     want_usage = bool(config.usage["enabled"])
     want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
@@ -617,7 +637,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     total = 7 + sum(
         (
             want_trees, want_surfaces, want_furniture, want_barriers,
-            want_usage,
+            want_usage, want_traffic,
             want_vehicles, want_rails, want_structures,
         )
     ) + (0 if args.skip_blender else 1)
@@ -898,6 +918,35 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 strength=float(config.trees.get("ground_shade", 0.35)),
             )
 
+    # Before the furniture: the signal poles and sign posts this draws are
+    # the same BGT points the furniture stage would otherwise draw blank.
+    traffic = TrafficSet()
+    traffic_texture = None
+    if want_traffic:
+        with Stage("signs, lights and road markings (NDW, OSM, BGT)", next_step(), total):
+            traffic = build_traffic(
+                config.bbox,
+                work_dir,
+                traffic_cfg=config.traffic,
+                terrain=terrain,
+                # A zebra on a bridge lies on the deck, not on the canal bed.
+                deck_at=(
+                    (lambda x, y: deck_at(x, y, reach=0.0)) if deck_at is not None else None
+                ),
+                # Cached by the ground stage when it read it; an empty network
+                # on failure, and the signs then find their road without it.
+                network=fetch_centrelines(
+                    config.bbox,
+                    url=str(config.surfaces.get("nwb_url", NWB_URL)),
+                    timeout=float(config.surfaces["timeout_s"]),
+                    max_retries=int(config.surfaces["max_retries"]),
+                    cache_dir=work_dir / "_bgt",
+                ),
+            )
+            if len(traffic):
+                traffic_texture = generate_traffic_texture(work_dir)
+                write_traffic_list(traffic, config.geo, out_dir)
+
     furniture = FurnitureSet()
     furniture_texture = None
     if want_furniture:
@@ -907,6 +956,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 work_dir,
                 furniture_cfg=config.furniture,
                 terrain=terrain,
+                skip_types=traffic.replaces,
             )
             if len(furniture):
                 furniture_texture = generate_furniture_texture(work_dir)
@@ -1033,6 +1083,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             tree_texture=tree_texture,
             water_texture=water_texture,
             furniture_texture=furniture_texture,
+            traffic_texture=traffic_texture,
             surfaces_cfg=config.surfaces,
             surface_class_names={
                 int(k): v for k, v in CLASS_NAMES.items()
@@ -1078,6 +1129,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             extra={
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
+                "traffic": traffic.stats(),
                 "barriers": barriers.stats(),
                 "vehicles": vehicles.stats(),
                 "railways": rails.stats(),
@@ -1103,7 +1155,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
-        write_attribution(out_dir)
+        write_attribution(out_dir, osm=traffic.used_osm, signs=bool(traffic.signs))
 
         report = CheckReport()
         check_bbox(report, config.bbox)
@@ -1137,6 +1189,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_harbour(report, harbour)
         check_furniture(report, furniture if want_furniture else None, config.bbox)
+        check_traffic(report, traffic if want_traffic else None, config.bbox)
         # Against what they were placed on: the model's own surface, which
         # is the road where there is one and the terrain as drawn elsewhere.
         check_barriers(

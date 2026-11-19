@@ -25,12 +25,15 @@ output/<area_name>/
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
 ├── vehicles.json    car and boat positions and headings, same idea
+├── traffic.json     every traffic sign with its RVV code, the traffic lights
+│                    and the crossings, for prefabs and for traffic logic
 ├── landcover.png    surface class per pixel, registered to the same bbox
 ├── landcover.json   what the class values mean
 ├── facade*.png      generated facade textures, referenced by the FBX
 ├── tree.png         bark and foliage atlas
 ├── water.png        canal water
 ├── furniture.png    metal and wood atlas
+├── traffic.png      traffic sign faces, road paint and signal lamps
 ├── vehicle.png      car paint, hull and timber atlas
 ├── rail.png         ballast with sleepers, and rail steel
 ├── structure.png    concrete for decks, piers and tunnel walls
@@ -452,6 +455,11 @@ Other knobs worth knowing:
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
 | `furniture.enabled` | `true` | Lampposts, bollards, sign posts and benches. |
+| `traffic.signs` | `true` | Traffic signs from NDW, and the give-way teeth and stop lines they require. See [Signs, lights and road markings](#signs-lights-and-road-markings). |
+| `traffic.markings` | `true` | Lane lines, zebras and speed-hump blocks from OpenStreetMap. |
+| `traffic.signals` | `true` | Traffic lights on the BGT's signal poles. |
+| `traffic.covers` | `true` | Manhole lids and gully grates from the BGT. |
+| `traffic.marking_lift_m` | `0.03` | How far paint lies above the road. Raise it if markings flicker at long range in your renderer. |
 | `export.collision` | `false` | Add invisible `Collision_*` shapes for physics. See [Collision shapes](#collision-shapes). |
 | `export.collision_tree_crowns` | `true` | Whether a tree's collider includes its canopy. `false` leaves the trunk alone, at a quarter of the triangles. |
 | `barriers.collision_thickness_m` | `0.30` | The thinnest a collider may be, which is not the thinnest a fence may look: a 6 cm panel is thin enough to tunnel through at 50 Hz. |
@@ -498,6 +506,8 @@ src/surfaces.py    BGT water bodies, land cover and road surfaces
 src/nwb.py         NWB-Wegen road centrelines, names and junctions
 src/roads.py       road ladders: stations, cross-sections, kerbs, objects
 src/furniture.py   BGT lampposts, bollards, signs and benches
+src/osm.py         OpenStreetMap highways and tagged nodes, via the main API
+src/traffic.py     NDW signs, traffic lights, road paint, manholes and gullies
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
 src/structures.py  bridge decks and piers, and tunnels below ground
@@ -580,6 +590,7 @@ outliner and an empty that everything in it hangs from:
 | `Water` | water surfaces and beds |
 | `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
 | `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named |
+| `Traffic` | `TrafficSigns`, `TrafficLights`, `RoadMarkings` and `StreetCovers`, one material between them |
 | `Collision` | the physics proxies, hidden; see [Collision shapes](#collision-shapes) |
 
 **Trees are instances.** Ten thousand trees share twelve meshes: three kinds,
@@ -1535,6 +1546,77 @@ does not permit extraction. What is above is the other route to the same
 density: every object is a known thing, in a named group, that a level designer
 can take apart.
 
+## Signs, lights and road markings
+
+The BGT draws the carriageway and stops there. A street built from it alone is
+grey from kerb to kerb, and the only trace of traffic on it used to be a handful
+of blank sign posts. Over the Utrecht centre square kilometre the registers
+below hold this, and all of it is now in the model:
+
+| What | Source | In the square |
+| --- | --- | --- |
+| Traffic signs, with RVV code, road section and driving direction | NDW verkeersborden (CC0) | 635 |
+| Lane counts, crossings and how they are marked, speed humps | OpenStreetMap (ODbL) | 570 m of lane line, 15 crossings, 23 humps |
+| Signal poles | BGT `paal` | 8, plus 11 placed at junctions OpenStreetMap tags as signalled |
+| Manholes and gullies | BGT `put` | 1074 and 2005 |
+
+For comparison, the BGT has 16 sign posts in the same square and no notion of
+what is on them.
+
+**Signs** come from NDW's national register, which records each sign's RVV
+code, the NWB road section it belongs to and whether its traffic drives with or
+against that section. That last pair is what orients the plate: the register's
+own bearing is rounded to a compass point, so it is only used to choose between
+a road's two directions when the section is missing. Each sign becomes a plate
+of the right shape — disc, triangle, octagon, diamond, square — with its face
+drawn into `traffic.png`. Forty-seven faces are drawn: the common signs
+individually (speed limits with their number, no entry, one-way, the parking
+signs, cycle path, give way, stop), and every other sign by its series, which
+gets the shape and colours right and leaves the pictogram out. Signs that share
+a post are stacked on it. The register answers per municipality, so a run
+downloads a whole municipality (18 MB for Utrecht) and caches what falls inside.
+
+**Lane lines** are not surveyed by anyone. OpenStreetMap has the lane count,
+and the BGT has the kerbs, so a line is put where the count says it must be:
+the carriageway is measured kerb to kerb at every dash and divided by the
+number of lanes. Where the measured width is not what that many lanes need —
+at a junction, a bus bay, a flare — the dash is left out, which is why the
+lines stop at a junction instead of running across it. Ways tagged
+`lane_markings=no` get none.
+
+**Crossings** are painted as OpenStreetMap tags them: a zebra as half-metre
+stripes from kerb to kerb, a signalled crossing as two dashed lines. A speed
+hump gets the row of white blocks on its ramp.
+
+**Give-way teeth and stop lines** are in no register, but the signs that
+require them are. Every B6 gets a row of teeth across the lane it governs, at
+the sign, pointing at the driver; every B7 a line. On a carriageway wide enough
+for two directions that is the right-hand half.
+
+**Traffic lights** stand on the BGT's `verkeersregelinstallatiepaal` points,
+which used to be drawn as one more blank sign post, and face the traffic that
+has the pole on its right. Not every municipality surveys them, so a junction
+OpenStreetMap tags `highway=traffic_signals` with no surveyed pole within 30 m
+gets one pole per approach, on the kerb.
+
+**Manholes and gullies** lie flat on the road where the BGT has them, the
+gullies turned along the nearest road.
+
+`traffic.json` lists every sign (code, position, the direction it faces, its
+sub-sign text), light and crossing, in RD and in the model frame. The meshes
+make the FBX look right; the list says what each thing is, which is what a
+traffic simulation needs, or a swap for your own prefabs.
+
+What this does not have: turn arrows, edge lines, cycle-lane colour and the
+markings of parking bays. OpenStreetMap carries `turn:lanes` on six ways in the
+square, too few to be worth a pictogram yet. Outside the Randstad the lane
+tagging thins out, and a road with no lane count gets no lines.
+
+OpenStreetMap is read from its main API rather than Overpass, which office
+proxies refuse often enough that a run could not depend on it. Both new
+services are optional: when one is not answering, the run says so and builds
+the rest.
+
 ## Bridges and tunnels
 
 The parts of the ground that are not the ground. Until now both were dropped:
@@ -2266,6 +2348,12 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
   (CC BY 4.0)
 - **Road centrelines and street names** — NWB-Wegen (Nationaal Wegenbestand),
   Rijkswaterstaat, via PDOK (CC0)
+- **Traffic signs** — NDW (Nationaal Dataportaal Wegverkeer) traffic sign
+  register (CC0)
+- **Lane counts, crossings, speed humps and signalled junctions** —
+  © OpenStreetMap contributors (ODbL). Credited in `ATTRIBUTION.txt` only when
+  a model actually contains OpenStreetMap data; the ODbL asks that you keep
+  that credit with the model.
 - **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution
   is required for these; they are credited because it is the decent thing, and
   listed here so you know nothing in the model carries an obligation you did not

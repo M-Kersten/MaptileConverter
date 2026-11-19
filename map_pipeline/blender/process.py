@@ -2433,6 +2433,58 @@ def build_furniture(scene: dict, work_dir: Path, material):
     return obj
 
 
+TRAFFIC_OBJECTS = (
+    # npz prefix, object name
+    ("signs", "TrafficSigns"),
+    ("signals", "TrafficLights"),
+    ("markings", "RoadMarkings"),
+    ("covers", "StreetCovers"),
+)
+
+
+def build_traffic(scene: dict, work_dir: Path, material) -> list:
+    """Signs, lights, road paint and covers, one object each.
+
+    The meshes arrive finished from `src/traffic.py`, in RD and NAP: all that
+    is left to do here is move them to the model's origin. They share one
+    atlas and one material, so the four objects are four draw calls at most.
+    """
+    traffic_file = scene.get("traffic", {}).get("file")
+    if not traffic_file or not (work_dir / traffic_file).is_file():
+        return []
+
+    data = np.load(work_dir / traffic_file)
+    origin_x, origin_y = scene["origin_rd"]
+    shift = np.array([origin_x, origin_y, float(scene["ground_z_offset_nap"])])
+
+    objects = []
+    for prefix, name in TRAFFIC_OBJECTS:
+        if f"{prefix}_faces" not in data.files:
+            continue
+        faces = np.asarray(data[f"{prefix}_faces"], dtype=np.int64)
+        if not len(faces):
+            continue
+        vertices = np.asarray(data[f"{prefix}_vertices"], dtype=np.float64) - shift
+        uv = np.asarray(data[f"{prefix}_uv"], dtype=np.float64)
+        n_triangles = len(faces)
+        loops = faces.reshape(-1)
+        objects.append(
+            build_mesh_object(
+                name,
+                vertices,
+                loops,
+                np.arange(0, n_triangles * 3, 3),
+                np.full(n_triangles, 3),
+                uv[loops],
+                np.zeros(n_triangles),
+                [material],
+                shade_smooth=False,
+            )
+        )
+        log(f"{name}: {n_triangles} triangles")
+    return objects
+
+
 def _hull(cx, cy, cz, length, beam, depth, freeboard, spin):
     """A boat hull: a box with the bow drawn to a point, as (verts, faces).
 
@@ -3180,6 +3232,7 @@ def copy_textures(
         ("water", "surfaces"),
         ("furniture", "furniture"),
         ("fence", "barriers"),
+        ("traffic", "traffic"),
         ("vehicle", "vehicles"),
         ("rail", "rails"),
         ("structure", "structures"),
@@ -3326,6 +3379,16 @@ def main() -> int:
                 make_cutout_material("M_fence", extra_textures["fence"], roughness=0.6)
                 if "fence" in extra_textures
                 else None,
+            )
+
+    if "traffic" in extra_textures:
+        with _Layer("Traffic", "Traffic"):
+            build_traffic(
+                scene,
+                work_dir,
+                make_textured_material(
+                    "M_traffic", extra_textures["traffic"], roughness=0.6
+                ),
             )
 
     if "vehicle" in extra_textures:

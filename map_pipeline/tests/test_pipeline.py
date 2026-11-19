@@ -6053,7 +6053,7 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(
             set(bgt[0].split(",")),
             {"trees", "water", "land_cover", "furniture", "barriers",
-             "vehicles", "rails", "structures"},
+             "vehicles", "rails", "structures", "signals", "covers"},
         )
 
     def test_disabled_sources_are_not_checked(self):
@@ -11318,10 +11318,13 @@ class TestUIServer(unittest.TestCase):
         # The Utrecht runs predate the terrain mesh stage, so its own measured
         # cost -- 48 s a square kilometre over Bronbeek -- is added to them.
         mesh = 48.0
+        # And the signs, lights and markings stage: 41 s over the Utrecht
+        # square, of which six are the sign register however small the area.
+        traffic = 35.0
         measured = [
-            (seconds(1000, 4096, preview=True), 468 + mesh),
-            (seconds(1000, 4096, preview=False), 218 + mesh),
-            (seconds(500, 2048, preview=False), 75 + mesh / 4),
+            (seconds(1000, 4096, preview=True), 468 + mesh + 6 + traffic),
+            (seconds(1000, 4096, preview=False), 218 + mesh + 6 + traffic),
+            (seconds(500, 2048, preview=False), 75 + mesh / 4 + 6 + traffic / 4),
         ]
         for predicted, actual in measured:
             self.assertLess(
@@ -12170,6 +12173,550 @@ class TestUIViewer(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class TestTraffic(unittest.TestCase):
+    """Signs, lights and paint: built from fixtures, with no service asked."""
+
+    @staticmethod
+    def _road(width=7.0, length=200.0):
+        """A straight east-west carriageway as one BGT wegdeel feature."""
+        half = width / 2.0
+        ring = [[0, -half], [length, -half], [length, half], [0, half], [0, -half]]
+        return {
+            "properties": {"functie": "rijbaan lokale weg", "relatieve_hoogteligging": 0},
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+        }
+
+    @staticmethod
+    def _osm(tags, node_tags=None, length=200.0):
+        from src.osm import OsmData, OsmNode, OsmWay
+
+        points = np.array([[0.0, 0.0], [length / 2.0, 0.0], [length, 0.0]])
+        data = OsmData(ways=[OsmWay(id=1, points=points, node_ids=(1, 2, 3), tags=tags)])
+        if node_tags is not None:
+            data.nodes.append(OsmNode(id=2, xy=(length / 2.0, 0.0), tags=node_tags))
+        return data
+
+    @staticmethod
+    def _flat(x, y):
+        return np.zeros(np.broadcast(np.asarray(x), np.asarray(y)).shape)
+
+    def test_osm_elements_become_highways_in_rd(self):
+        from src.osm import parse_elements
+
+        elements = [
+            {"type": "node", "id": 1, "lon": 5.1100, "lat": 52.0850},
+            {"type": "node", "id": 2, "lon": 5.1110, "lat": 52.0850,
+             "tags": {"highway": "crossing", "crossing:markings": "zebra", "name": "x"}},
+            {"type": "node", "id": 3, "lon": 5.1120, "lat": 52.0850},
+            {"type": "way", "id": 9, "nodes": [1, 2, 3],
+             "tags": {"highway": "tertiary", "lanes": "2"}},
+            # A building is the registers' business.
+            {"type": "way", "id": 10, "nodes": [1, 2, 3], "tags": {"building": "yes"}},
+        ]
+        data = parse_elements(elements)
+        self.assertEqual([w.id for w in data.ways], [9])
+        way = data.ways[0]
+        # 0.001 degrees of longitude at 52 N is about 68 m, running east.
+        self.assertAlmostEqual(way.points[1, 0] - way.points[0, 0], 68.5, delta=1.0)
+        self.assertLess(abs(way.points[1, 1] - way.points[0, 1]), 2.0)
+        self.assertTrue(130000 < way.points[0, 0] < 140000)
+        self.assertEqual(len(data.nodes), 1)
+        self.assertEqual(
+            data.nodes[0].tags, {"highway": "crossing", "crossing:markings": "zebra"}
+        )
+        self.assertEqual([w.id for w in data.ways_through()[2]], [9])
+
+    def test_osm_tile_too_full_is_split(self):
+        from unittest import mock
+
+        from src import osm
+        from src.http_util import ServiceError
+
+        calls = []
+
+        class Reply:
+            def json(self):
+                return {"elements": [{"type": "node", "id": len(calls), "lon": 5.1, "lat": 52.0}]}
+
+        def fake(url, params=None, **kwargs):
+            calls.append(params["bbox"])
+            if len(calls) == 1:
+                raise ServiceError(
+                    "failed with HTTP 400: You requested too many nodes (limit is 50000)"
+                )
+            return Reply()
+
+        with mock.patch.object(osm, "get_with_retry", fake):
+            elements = osm._fetch_tile(
+                BBox(136000, 455000, 136500, 455500),
+                url="x", timeout=1.0, max_retries=1,
+            )
+        self.assertEqual(len(calls), 5, "one refusal, then four quarters")
+        self.assertEqual(len(elements), 4)
+
+    def test_osm_outage_is_empty_not_fatal(self):
+        from unittest import mock
+
+        from src import osm
+
+        def down(*args, **kwargs):
+            raise OSError("no route to host")
+
+        with mock.patch.object(osm, "get_with_retry", down):
+            data = osm.fetch_osm(BBox(136000, 455000, 136500, 455500))
+        self.assertFalse(data)
+
+    def test_every_sign_series_has_a_face(self):
+        from src.traffic import SHAPES, SIGN_FACES, face_cell, face_key, ATLAS_GRID
+
+        for code in ("A1", "B6", "C2", "D2", "E9", "F6", "G11", "H1", "J16", "K14", "L8"):
+            self.assertIsNotNone(face_key(code), code)
+        self.assertEqual(face_key("A1", "30"), "A1-30")
+        self.assertEqual(face_key("A1", "45"), "A1")
+        self.assertEqual(face_key("E8-vracht"), "E")
+        self.assertEqual(face_key("C22b"), "C")
+        self.assertIsNone(face_key("onbekend-x"[0:0]))
+        self.assertIsNone(face_key("9x"))
+        cells = [face_cell(key) for key in SIGN_FACES]
+        self.assertEqual(len(set(cells)), len(cells))
+        self.assertLess(max(cells), ATLAS_GRID * ATLAS_GRID)
+        for shape, _, _ in SIGN_FACES.values():
+            outline = SHAPES[shape]
+            # Counter-clockwise, or the plate faces away from its traffic.
+            x, y = outline[:, 0], outline[:, 1]
+            area = 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+            self.assertGreater(area, 0.0, shape)
+            self.assertLessEqual(float(np.abs(outline).max()), 1.0 + 1e-9)
+
+    def test_atlas_puts_each_colour_where_its_uv_points(self):
+        from PIL import Image
+
+        from src.traffic import FLAT_CELLS, face_uv, flat_uv, generate_traffic_texture, SHAPES
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = np.asarray(Image.open(generate_traffic_texture(Path(tmp))), dtype=float)
+        height, width = image.shape[:2]
+
+        def pixel(u, v):
+            return image[int((1.0 - v) * height), int(u * width)]
+
+        for name, (_, colour) in FLAT_CELLS.items():
+            np.testing.assert_allclose(pixel(*flat_uv(name)), colour, atol=3, err_msg=name)
+        # No entry: red at the rim, the white bar through the middle.
+        rim = face_uv("C2", SHAPES["disc"] * 0.85)
+        self.assertGreater(pixel(*rim[4])[0], 150)
+        self.assertLess(pixel(*rim[4])[1], 80)
+        centre = face_uv("C2", np.zeros((1, 2)))[0]
+        self.assertGreater(float(pixel(*centre).min()), 200)
+        # A blue sign is blue.
+        blue = face_uv("G11", np.array([[0.8, 0.8]]))[0]
+        self.assertGreater(pixel(*blue)[2], pixel(*blue)[0] + 80)
+
+    def test_ndw_signs_are_parsed_and_filtered(self):
+        from src.traffic import parse_signs
+
+        def feature(code, lon=5.1100, lat=52.0850, **props):
+            return {
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {"rvvCode": code, "status": "PLACED", "placement": "L", **props},
+            }
+
+        signs = parse_signs(
+            [
+                feature("A1", blackCode="30", bearing=90, roadSectionId=42,
+                        drivingDirection="H", textSigns=[{"type": "UIT", "text": "uitgezonderd"}]),
+                feature("onbekend"),
+                feature("C2", placement="B"),  # on a gantry
+                feature("C2", status="REMOVED"),
+                feature("B6", lon=4.0),  # the other side of the country
+            ],
+            BBox(130000, 450000, 140000, 460000),
+        )
+        self.assertEqual([s.code for s in signs], ["A1"])
+        sign = signs[0]
+        self.assertEqual((sign.speed, sign.section_id, sign.direction), ("30", 42, "H"))
+        self.assertEqual(sign.bearing, 90.0)
+        self.assertEqual(sign.text, "uitgezonderd")
+        self.assertTrue(130000 < sign.xy[0] < 140000)
+
+    def test_a_sign_faces_the_traffic_it_is_for(self):
+        from src.traffic import RoadIndex, Sign, sign_mesh, travel_direction
+
+        line = np.array([[0.0, 0.0], [100.0, 0.0]])
+        roads = RoadIndex([line], {7: line})
+        # On the section, driving with its digitising: east.
+        east, point = travel_direction(Sign((50.0, -4.0), "C2", 0.0, 7, "H"), roads)
+        np.testing.assert_allclose(east, [1.0, 0.0], atol=1e-9)
+        np.testing.assert_allclose(point, [50.0, 0.0], atol=1e-9)
+        west, _ = travel_direction(Sign((50.0, 4.0), "C2", 90.0, 7, "T"), roads)
+        np.testing.assert_allclose(west, [-1.0, 0.0], atol=1e-9)
+        # No section: the rounded bearing picks between the road's two ways.
+        picked, _ = travel_direction(Sign((50.0, 4.0), "C2", 270.0), roads)
+        np.testing.assert_allclose(picked, [-1.0, 0.0], atol=1e-9)
+        # No bearing either: a sign stands on the right of its traffic.
+        right, _ = travel_direction(Sign((50.0, -4.0), "C2"), roads)
+        np.testing.assert_allclose(right, [1.0, 0.0], atol=1e-9)
+        # Nowhere near a road: the bearing is all there is.
+        lone, where = travel_direction(Sign((50.0, 400.0), "C2", 0.0), roads)
+        np.testing.assert_allclose(lone, [0.0, 1.0], atol=1e-9)
+        self.assertIsNone(where)
+
+        signs = [Sign((50.0, -4.0), "C2"), Sign((50.1, -4.0), "A1", speed="30")]
+        mesh, records = sign_mesh(signs, np.array([[1.0, 0.0], [1.0, 0.0]]), np.array([2.0, 2.0]))
+        vertices, faces, uv = mesh.arrays()
+        self.assertEqual(len(records), 2, "two plates")
+        self.assertEqual(records[0]["facing_deg"], 270.0, "looking back west")
+        self.assertGreater(records[0]["height_m"], records[1]["height_m"], "stacked on one post")
+        self.assertEqual(len(vertices), len(uv))
+        self.assertAlmostEqual(float(vertices[:, 2].min()), 2.0, places=6)
+        # The front of the top plate: its triangles' normals point west.
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        plate = (uv[faces[:, 0], 1] < 0.75) & (np.abs(normals[:, 2]) < 1e-9) & (np.abs(normals[:, 0]) > 1e-6)
+        front = plate & (tri[:, :, 0].mean(axis=1) < 50.0 - 0.04)
+        self.assertTrue(front.any())
+        self.assertTrue((normals[front, 0] < 0).all())
+
+    def test_carriageway_is_measured_kerb_to_kerb(self):
+        from src.traffic import carriageways
+
+        tunnel = self._road()
+        tunnel["properties"]["relatieve_hoogteligging"] = -1
+        tunnel["geometry"]["coordinates"][0] = [
+            [x, y + 100] for x, y in tunnel["geometry"]["coordinates"][0]
+        ]
+        footway = {
+            "properties": {"functie": "voetpad"},
+            "geometry": {"type": "Polygon",
+                         "coordinates": [[[0, 3.5], [200, 3.5], [200, 6], [0, 6], [0, 3.5]]]},
+        }
+        road, cycle = carriageways([self._road(), tunnel, footway])
+        self.assertTrue(road)
+        self.assertFalse(cycle)
+        lo, hi = road.section((100.0, 1.0), (0.0, 1.0))
+        self.assertAlmostEqual(lo, -4.5, delta=0.05)
+        self.assertAlmostEqual(hi, 2.5, delta=0.05, msg="stops at the kerb, not the footway")
+        self.assertIsNone(road.section((100.0, 30.0), (0.0, 1.0)), "not on a road")
+        self.assertIsNone(road.section((100.0, 100.0), (0.0, 1.0)), "the tunnel is not up here")
+        # Looking along the road finds no kerb at all.
+        self.assertIsNone(road.section((100.0, 0.0), (1.0, 0.0)))
+
+    def test_lane_lines_follow_the_lane_count(self):
+        from src.traffic import GroundPaint, carriageways, paint_lanes
+
+        road, _ = carriageways([self._road(7.0)])
+        paint = GroundPaint()
+        stats = paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "2"}), road)
+        self.assertEqual(stats["laned_ways"], 1)
+        self.assertGreater(stats["lane_line_m"], 80.0)
+        vertices, faces, _ = paint.mesh(self._flat, 0.03).arrays()
+        # One line, down the middle, a hand's width wide and just off the road.
+        self.assertLess(float(np.abs(vertices[:, 1]).max()), 0.06)
+        np.testing.assert_allclose(vertices[:, 2], 0.03)
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        self.assertTrue((normals[:, 2] > 0).all(), "paint faces up")
+
+        # Three lanes need two lines; a road only wide enough for one lane gets none.
+        paint = GroundPaint()
+        road9, _ = carriageways([self._road(9.6)])
+        paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "3", "oneway": "yes"}), road9)
+        ys = paint.mesh(self._flat, 0.0).arrays()[0][:, 1]
+        self.assertEqual(sorted(set(np.round(np.round(ys / 1.6) * 1.6, 1))), [-1.6, 1.6])
+        for tags, width in (
+            ({"highway": "tertiary", "lanes": "2"}, 3.5),
+            ({"highway": "tertiary", "lanes": "2"}, 14.0),
+            ({"highway": "tertiary", "lanes": "2", "lane_markings": "no"}, 7.0),
+            ({"highway": "tertiary", "lanes": "1"}, 7.0),
+            ({"highway": "footway", "lanes": "2"}, 7.0),
+        ):
+            paint = GroundPaint()
+            narrow, _ = carriageways([self._road(width)])
+            paint_lanes(paint, self._osm(tags), narrow)
+            self.assertEqual(len(paint), 0, (tags, width))
+        # A line stops short of a zebra.
+        paint = GroundPaint()
+        paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "2"}), road,
+                    crossings=[{"rd": [100.0, 0.0]}])
+        xs = paint.mesh(self._flat, 0.0).arrays()[0][:, 0]
+        self.assertFalse(((xs > 97.5) & (xs < 102.5)).any())
+        self.assertTrue((xs < 90).any() and (xs > 110).any())
+        # And nothing outside the area, however far the way runs.
+        paint = GroundPaint()
+        paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "2"}), road,
+                    BBox(0, -10, 50, 10))
+        self.assertLess(float(paint.mesh(self._flat, 0.0).arrays()[0][:, 0].max()), 52.0)
+
+    def test_crossings_are_painted_as_tagged(self):
+        from src.traffic import GroundPaint, carriageways, crossing_style, paint_crossings
+
+        self.assertEqual(crossing_style({"crossing:markings": "zebra"}), "zebra")
+        self.assertEqual(crossing_style({"crossing": "zebra"}), "zebra")
+        self.assertEqual(crossing_style({"crossing": "uncontrolled"}), "zebra")
+        self.assertEqual(
+            crossing_style({"crossing": "traffic_signals", "crossing:markings": "zebra"}), "zebra"
+        )
+        self.assertEqual(crossing_style({"crossing": "traffic_signals"}), "dashes")
+        self.assertEqual(crossing_style({"crossing:markings": "dashes"}), "dashes")
+        self.assertEqual(crossing_style({"crossing": "unmarked"}), "")
+        self.assertEqual(crossing_style({"crossing:markings": "no", "crossing": "marked"}), "")
+
+        road, cycle = carriageways([self._road(7.0)])
+        paint = GroundPaint()
+        stats, records = paint_crossings(
+            paint,
+            self._osm({"highway": "tertiary"}, {"highway": "crossing", "crossing:markings": "zebra"}),
+            road, cycle,
+        )
+        self.assertEqual(stats["zebras"], 1)
+        self.assertEqual(records[0]["style"], "zebra")
+        self.assertAlmostEqual(records[0]["width_m"], 7.0, delta=0.1)
+        vertices = paint.mesh(self._flat, 0.0).arrays()[0]
+        # Across the whole road but not onto the kerb, and 4 m along it.
+        self.assertLess(float(np.abs(vertices[:, 1]).max()), 3.5)
+        self.assertGreater(float(np.abs(vertices[:, 1]).max()), 3.0)
+        self.assertAlmostEqual(float(np.ptp(vertices[:, 0])), 4.0, places=6)
+        self.assertAlmostEqual(float(vertices[:, 0].mean()), 100.0, delta=0.01)
+
+        # A hump gets its blocks; a bare crossing gets nothing.
+        for node_tags, key in (({"traffic_calming": "hump"}, "humps"),
+                               ({"highway": "crossing", "crossing": "traffic_signals"},
+                                "dashed_crossings")):
+            paint = GroundPaint()
+            stats, _ = paint_crossings(paint, self._osm({"highway": "tertiary"}, node_tags), road, cycle)
+            self.assertEqual(stats[key], 1, node_tags)
+            self.assertGreater(len(paint), 0)
+        paint = GroundPaint()
+        paint_crossings(
+            paint, self._osm({"highway": "tertiary"}, {"highway": "crossing", "crossing": "unmarked"}),
+            road, cycle,
+        )
+        self.assertEqual(len(paint), 0)
+
+    def test_give_way_teeth_cross_the_lane_and_point_at_the_driver(self):
+        from src.traffic import GroundPaint, Sign, carriageways, paint_give_way
+
+        road, cycle = carriageways([self._road(7.0)])
+        east = np.array([1.0, 0.0])
+        signs = [Sign((60.0, -4.5), "B6"), Sign((60.5, 4.5), "B6"), Sign((120.0, -4.5), "B7"),
+                 Sign((150.0, -4.5), "C2")]
+        directions = np.array([east, east, east, east])
+        points = [np.array([60.0, 0.0]), np.array([60.5, 0.0]), np.array([120.0, 0.0]),
+                  np.array([150.0, 0.0])]
+        paint = GroundPaint()
+        stats = paint_give_way(paint, signs, directions, points, road, cycle)
+        self.assertEqual(stats, {"give_way_lines": 1, "stop_lines": 1},
+                         "two signs on one lane are one line")
+        vertices, faces, _ = paint.mesh(self._flat, 0.0).arrays()
+        teeth = vertices[vertices[:, 0] < 100.0]
+        # Driving east keeps right: the southern half, and the points face west.
+        self.assertLess(float(teeth[:, 1].max()), 0.01)
+        self.assertGreater(float(teeth[:, 1].min()), -3.5)
+        self.assertAlmostEqual(float(teeth[:, 0].min()), 60.0 - 0.6, places=6)
+        self.assertAlmostEqual(float(teeth[:, 0].max()), 60.0, places=6)
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        self.assertTrue((normals[:, 2] > 0).all())
+        # A lane too narrow for two directions is crossed whole.
+        lane, _ = carriageways([self._road(3.5)])
+        paint = GroundPaint()
+        paint_give_way(paint, signs[:1], directions[:1], points[:1], lane, cycle)
+        ys = paint.mesh(self._flat, 0.0).arrays()[0][:, 1]
+        self.assertGreater(float(ys.max()), 1.0)
+        self.assertLess(float(ys.min()), -1.0)
+
+    def test_signals_stand_right_of_their_traffic(self):
+        from src.traffic import RoadIndex, carriageways, place_signals, signal_mesh
+
+        line = np.array([[0.0, 0.0], [200.0, 0.0]])
+        roads = RoadIndex([line])
+        road, _ = carriageways([self._road(7.0)])
+        osm = self._osm({"highway": "tertiary"}, {"highway": "traffic_signals"})
+        # A surveyed pole south of the road serves traffic driving east.
+        positions, directions, stats = place_signals(np.array([[100.0, -4.2]]), osm, roads, road)
+        self.assertEqual(stats, {"surveyed": 1, "from_osm": 0}, "the survey wins near its poles")
+        np.testing.assert_allclose(directions[0], [1.0, 0.0], atol=1e-9)
+        # None surveyed: one pole per approach, each on its own kerb.
+        positions, directions, stats = place_signals(np.zeros((0, 2)), osm, roads, road)
+        self.assertEqual(stats["from_osm"], 2)
+        for position, direction in zip(positions, directions):
+            rightward = np.array([direction[1], -direction[0]])
+            self.assertAlmostEqual(float((position - [100.0, 0.0]) @ rightward), 4.2, delta=0.1)
+        one_way = self._osm({"highway": "tertiary", "oneway": "yes"}, {"highway": "traffic_signals"})
+        self.assertEqual(place_signals(np.zeros((0, 2)), one_way, roads, road)[2]["from_osm"], 1)
+
+        vertices, faces, uv = signal_mesh(positions[:1], directions[:1], np.array([1.0])).arrays()
+        self.assertAlmostEqual(float(vertices[:, 2].min()), 1.0, places=6)
+        self.assertAlmostEqual(float(vertices[:, 2].max()), 1.0 + 3.4, delta=0.01)
+        from src.traffic import flat_uv
+        for colour in ("red", "amber", "green"):
+            self.assertTrue((np.abs(uv - flat_uv(colour)).sum(axis=1) < 1e-9).any(), colour)
+
+    def test_covers_lie_where_the_bgt_has_them(self):
+        from src.traffic import GroundPaint, RoadIndex, paint_covers
+
+        def put(kind, x, y):
+            return {"properties": {"plus_type": kind},
+                    "geometry": {"type": "Point", "coordinates": [x, y]}}
+
+        paint = GroundPaint()
+        stats = paint_covers(
+            paint,
+            [put("inspectie- / rioolput", 10, 0), put("kolk", 20, 3), put("niet-bgt", 30, 0),
+             put("kolk", 500, 0)],
+            BBox(0, -10, 100, 10),
+            RoadIndex([np.array([[0.0, 0.0], [0.0, 100.0]])]),
+        )
+        self.assertEqual(stats, {"manholes": 1, "gullies": 1})
+        vertices = paint.mesh(self._flat, 0.015).arrays()[0]
+        gully = vertices[vertices[:, 0] > 15]
+        # Lengthways along the road, which here runs north.
+        self.assertGreater(float(np.ptp(gully[:, 1])), float(np.ptp(gully[:, 0])))
+
+    def test_stage_builds_from_fixtures_and_survives_outages(self):
+        from unittest import mock
+
+        from src import traffic as module
+        from src.traffic import Sign, build_traffic, write_traffic_list
+        from src.validate import CheckReport, check_traffic
+
+        bbox = BBox(0, -50, 200, 50)
+        osm = self._osm({"highway": "tertiary", "lanes": "2"},
+                        {"highway": "crossing", "crossing:markings": "zebra"})
+
+        def fetch_bgt(collection, bbox, **kwargs):
+            if collection == "wegdeel":
+                return [self._road(7.0)], None
+            if collection == "paal":
+                return [{"properties": {"plus_type": "verkeersregelinstallatiepaal"},
+                         "geometry": {"type": "Point", "coordinates": [100.0, -4.2]}}], None
+            if collection == "put":
+                return [{"properties": {"plus_type": "kolk"},
+                         "geometry": {"type": "Point", "coordinates": [40.0, 3.3]}}], None
+            raise AssertionError(collection)
+
+        class Terrain:
+            def surface(self, x, y):
+                return np.full(np.broadcast(np.asarray(x), np.asarray(y)).shape, 5.0)
+
+        signs = [Sign((60.0, -4.5), "B6", 90.0), Sign((30.0, -4.5), "A1", 90.0, speed="30")]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("src.osm.fetch_osm", lambda *a, **k: osm), \
+                mock.patch.object(module, "fetch_signs", lambda *a, **k: signs):
+            result = build_traffic(
+                bbox, Path(tmp), traffic_cfg={}, terrain=Terrain(), fetch_bgt=fetch_bgt,
+                deck_at=lambda x, y: np.where(np.asarray(x) > 150, 9.0, np.nan),
+            )
+            self.assertTrue((Path(tmp) / "traffic.npz").is_file())
+            saved = np.load(Path(tmp) / "traffic.npz")
+            for name in ("signs", "signals", "markings", "covers"):
+                self.assertGreater(len(saved[f"{name}_faces"]), 0, name)
+                self.assertEqual(len(saved[f"{name}_uv"]), len(saved[f"{name}_vertices"]))
+            listed = json.loads(
+                write_traffic_list(result, GeoContext.from_bbox(bbox), Path(tmp)).read_text()
+            )
+        self.assertEqual(result.counts["signs"], 2)
+        self.assertEqual(result.counts["signals"], 1)
+        self.assertEqual(result.counts["zebras"], 1)
+        self.assertEqual(result.counts["give_way_lines"], 1)
+        self.assertEqual(result.counts["gullies"], 1)
+        self.assertTrue(result.used_osm)
+        self.assertEqual(result.replaces, {"verkeersbordpaal", "verkeersregelinstallatiepaal"})
+        markings = result.meshes["markings"][0]
+        # On the ground at 5 m, on the bridge deck at 9 m beyond x = 150.
+        np.testing.assert_allclose(markings[markings[:, 0] < 150, 2], 5.03)
+        np.testing.assert_allclose(markings[markings[:, 0] > 150, 2], 9.03)
+        self.assertEqual(listed["signs"][0]["local"]["x"], listed["signs"][0]["rd"][0] - 100.0)
+        self.assertEqual(len(listed["crossings"]), 1)
+
+        report = CheckReport()
+        check_traffic(report, result, bbox)
+        self.assertTrue(all(check.passed for check in report.checks), report.checks)
+
+        # Every service away: an empty result, and no exception.
+        def down(*args, **kwargs):
+            raise OSError("unreachable")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("src.osm.get_with_retry", down), \
+                mock.patch.object(module, "get_with_retry", down):
+            empty = build_traffic(bbox, Path(tmp), traffic_cfg={}, terrain=Terrain(), fetch_bgt=down)
+            self.assertEqual(len(empty), 0)
+            self.assertFalse((Path(tmp) / "traffic.npz").exists())
+
+    def test_furniture_leaves_what_traffic_drew(self):
+        from unittest import mock
+
+        from src import furniture
+        from src.config import DEFAULTS
+
+        def fetch(collection, bbox, **kwargs):
+            if collection != "paal":
+                return [], None
+            return [
+                {"properties": {"plus_type": kind},
+                 "geometry": {"type": "Point", "coordinates": [10.0 + i, 10.0]}}
+                for i, kind in enumerate(
+                    ("lichtmast", "verkeersbordpaal", "verkeersregelinstallatiepaal")
+                )
+            ], None
+
+        class Terrain:
+            def surface(self, x, y):
+                return np.zeros(len(x))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(furniture, "fetch_current", fetch):
+            everything = furniture.build_furniture(
+                BBox(0, 0, 100, 100), Path(tmp), furniture_cfg=DEFAULTS["furniture"], terrain=Terrain()
+            )
+            rest = furniture.build_furniture(
+                BBox(0, 0, 100, 100), Path(tmp), furniture_cfg=DEFAULTS["furniture"], terrain=Terrain(),
+                skip_types={"verkeersbordpaal", "verkeersregelinstallatiepaal"},
+            )
+        self.assertEqual(len(everything), 3)
+        self.assertEqual(len(rest), 1)
+
+    def test_sources_and_config_carry_the_four_layers(self):
+        from src.config import DEFAULTS
+        from src.sources import BY_ID, apply_selection, down_sources, enabled_sources
+        import copy
+
+        for key in ("signs", "signals", "markings", "covers"):
+            self.assertIs(DEFAULTS["traffic"][key], True)
+            self.assertIn(key, BY_ID)
+        self.assertTrue(BY_ID["signs"].optional and BY_ID["markings"].optional)
+        self.assertFalse(BY_ID["buildings"].optional)
+        # The probe must never be the bare register: that is the whole country.
+        self.assertIn("countyCode=", BY_ID["signs"].probe(DEFAULTS))
+        config = apply_selection(copy.deepcopy(DEFAULTS), {"signs"})
+        self.assertTrue(config["traffic"]["signs"])
+        self.assertFalse(config["traffic"]["markings"])
+        ids = {s.id for s in enabled_sources(config)}
+        self.assertIn("signs", ids)
+        self.assertNotIn("covers", ids)
+        down = down_sources(DEFAULTS, {}, [BY_ID["markings"]])
+        self.assertEqual([s.id for s in down], ["markings"])
+
+    def test_attribution_credits_openstreetmap_only_when_used(self):
+        from src.export import write_attribution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = write_attribution(Path(tmp)).read_text(encoding="utf-8")
+            credited = write_attribution(Path(tmp), osm=True, signs=True).read_text(encoding="utf-8")
+        self.assertNotIn("OpenStreetMap", plain)
+        self.assertIn("OpenStreetMap contributors", credited)
+        self.assertIn("ODbL", credited)
+        self.assertIn("NDW", credited)
+
+    def test_blender_stage_knows_the_traffic_objects(self):
+        from src.traffic import OBJECTS
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        for name in OBJECTS:
+            self.assertIn(f'("{name}", ', source)
+        self.assertIn('("traffic", "traffic")', source, "the atlas is copied beside the FBX")
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

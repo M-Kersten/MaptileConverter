@@ -346,6 +346,31 @@ DEFAULTS: dict[str, Any] = {
         "flagpole_height_m": 7.0,
         "catenary_height_m": 7.5,
     },
+    "traffic": {
+        # What tells a driver what to do. Each of the four is its own source
+        # and its own checkbox; see src/traffic.py.
+        #
+        # Signs from NDW's national register, as plates with the right face.
+        "signs": True,
+        # Signal poles from the BGT, and from OpenStreetMap where a
+        # municipality did not survey them.
+        "signals": True,
+        # Lane lines, zebras and humps from OpenStreetMap, give-way teeth and
+        # stop lines under the signs that require them.
+        "markings": True,
+        # Manhole lids and gully grates from the BGT.
+        "covers": True,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        # NDW answers per municipality, tens of megabytes at a time.
+        "signs_timeout_s": 300,
+        "max_retries": 4,
+        "max_pages": 200,
+        # How far paint lies above the road it is on. Enough to stay clear of
+        # the surface in a depth buffer, too little to cast a shadow.
+        "marking_lift_m": 0.03,
+        "cover_lift_m": 0.015,
+    },
     "barriers": {
         # Walls, fences, hedges and the small structures bolted onto buildings.
         # The largest thing the BGT publishes that the model used to ignore:
@@ -602,6 +627,7 @@ class PipelineConfig:
     trees: dict[str, Any]
     surfaces: dict[str, Any]
     furniture: dict[str, Any]
+    traffic: dict[str, Any]
     barriers: dict[str, Any]
     vehicles: dict[str, Any]
     rails: dict[str, Any]
@@ -633,6 +659,7 @@ class PipelineConfig:
             "trees": self.trees,
             "surfaces": self.surfaces,
             "furniture": self.furniture,
+            "traffic": self.traffic,
             "barriers": self.barriers,
             "vehicles": self.vehicles,
             "rails": self.rails,
@@ -839,6 +866,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         trees=merged["trees"],
         surfaces=merged["surfaces"],
         furniture=merged["furniture"],
+        traffic=merged["traffic"],
         barriers=merged["barriers"],
         vehicles=merged["vehicles"],
         rails=merged["rails"],

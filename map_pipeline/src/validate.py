@@ -582,6 +582,47 @@ def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
     )
 
 
+def check_traffic(report: CheckReport, traffic, bbox: BBox) -> None:
+    """Signs, lights and paint are inside the area and made of real triangles."""
+    if traffic is None or not len(traffic):
+        report.add(
+            "traffic_present", True, "no signs, lights or road markings",
+            severity="warning",
+        )
+        return
+
+    report.add(
+        "traffic_present",
+        True,
+        ", ".join(
+            f"{v} {k.replace('_', ' ')}" for k, v in traffic.counts.items() if v
+        ),
+    )
+    inside = True
+    sound = True
+    for vertices, faces, uv in traffic.meshes.values():
+        if not len(vertices):
+            continue
+        # A crossing at the edge reaches a stripe past it; half a road is
+        # the most that can.
+        inside &= bool(
+            (vertices[:, 0] >= bbox.xmin - 10).all()
+            and (vertices[:, 0] <= bbox.xmax + 10).all()
+            and (vertices[:, 1] >= bbox.ymin - 10).all()
+            and (vertices[:, 1] <= bbox.ymax + 10).all()
+        )
+        sound &= bool(
+            np.isfinite(vertices).all()
+            and len(uv) == len(vertices)
+            and (faces >= 0).all()
+            and (faces < len(vertices)).all()
+            and (uv >= 0).all()
+            and (uv <= 1).all()
+        )
+    report.add("traffic_inside_bbox", inside, "every sign and line is inside the bbox")
+    report.add("traffic_mesh_sound", sound, "finite vertices, valid faces and UVs")
+
+
 def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) -> None:
     """Walls and fences are closed, on the ground, and a believable height.
 
