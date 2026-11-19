@@ -910,9 +910,9 @@ class TestTreeDetection(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             path = save_trees(result, Path(folder) / "trees.npz")
-            data = np.load(path)
-            self.assertIn("detected", data.files)
-            self.assertEqual(list(data["detected"]), [False, False, True, True])
+            with np.load(path) as data:
+                self.assertIn("detected", data.files)
+                self.assertEqual(list(data["detected"]), [False, False, True, True])
 
     def test_a_found_tree_outside_the_area_is_dropped(self):
         """The canopy model covers whatever raster the AHN service returned,
@@ -5071,10 +5071,10 @@ class TestRoadLadders(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "r.npz"
             np.savez(path, **self.mesh.to_npz_fields())
-            data = np.load(path)
-            for key in data.files:
-                self.assertNotEqual(data[key].dtype, object, key)
-            self.assertIn("Road_Hoofdstraat", [str(n) for n in data["road_object_names"]])
+            with np.load(path) as data:
+                for key in data.files:
+                    self.assertNotEqual(data[key].dtype, object, key)
+                self.assertIn("Road_Hoofdstraat", [str(n) for n in data["road_object_names"]])
 
 
 def _ladder(parts, lines):
@@ -9224,12 +9224,12 @@ class TestLayeredGround(unittest.TestCase):
     def test_the_file_for_blender_needs_no_pickle(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self.ground.save(Path(tmp))
-            data = np.load(path)  # allow_pickle defaults to False
-            for key in data.files:
-                self.assertNotEqual(data[key].dtype, object, key)
-            self.assertEqual([str(n) for n in data["object_names"]], self.ground.object_names)
-            self.assertEqual(str(data["terrain_name"]), "T_Terrein")
-            self.assertEqual(len(data["face_object"]), len(self.mesh))
+            with np.load(path) as data:  # allow_pickle defaults to False
+                for key in data.files:
+                    self.assertNotEqual(data[key].dtype, object, key)
+                self.assertEqual([str(n) for n in data["object_names"]], self.ground.object_names)
+                self.assertEqual(str(data["terrain_name"]), "T_Terrein")
+                self.assertEqual(len(data["face_object"]), len(self.mesh))
 
     def test_names(self):
         from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY, object_name
@@ -9659,11 +9659,11 @@ class TestIntermediatesNeedNoPickle(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = save_barriers(barriers, Path(tmp) / "barriers.npz")
-            data = np.load(path)  # allow_pickle defaults to False
-            self.assertEqual([str(n) for n in data["kind_names"]], ["muur", "hek"])
-            self.assertEqual([str(n) for n in data["see_through"]], ["hek"])
-            for key in data.files:
-                self.assertNotEqual(data[key].dtype, object, key)
+            with np.load(path) as data:  # allow_pickle defaults to False
+                self.assertEqual([str(n) for n in data["kind_names"]], ["muur", "hek"])
+                self.assertEqual([str(n) for n in data["see_through"]], ["hek"])
+                for key in data.files:
+                    self.assertNotEqual(data[key].dtype, object, key)
 
     def test_blender_never_unpickles(self):
         self.assertNotIn(
@@ -10452,8 +10452,9 @@ class TestGuardrails(unittest.TestCase):
                 cls.ground, [], bbox=cls.bbox, guarded=cls.fence.buffer(0.6),
                 collision_thickness_m=0.3, work_dir=Path(tmp),
             )
-            data = np.load(Path(tmp) / "guardrails.npz")  # allow_pickle defaults to False
-            cls.saved = {key: data[key] for key in data.files}
+            # allow_pickle defaults to False
+            with np.load(Path(tmp) / "guardrails.npz") as data:
+                cls.saved = {key: data[key] for key in data.files}
 
     def _rails_at(self, y, within=0.05):
         """Every rail line point within `within` of the line y = `y`."""
@@ -11415,10 +11416,10 @@ class TestCollisionLayer(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = save_barriers(barriers, Path(tmp) / "barriers.npz")
-            data = np.load(path, allow_pickle=True)
-            self.assertEqual(len(data["collision_triangles"]), 1)
-            np.testing.assert_allclose(data["collision_vertices"], verts[3:])
-            self.assertAlmostEqual(float(data["collision_thickness_m"]), 0.30)
+            with np.load(path, allow_pickle=True) as data:
+                self.assertEqual(len(data["collision_triangles"]), 1)
+                np.testing.assert_allclose(data["collision_vertices"], verts[3:])
+                self.assertAlmostEqual(float(data["collision_thickness_m"]), 0.30)
 
     def test_an_empty_collider_round_trips_too(self):
         """Most runs have export.collision off, so the arrays are empty and
@@ -11435,11 +11436,11 @@ class TestCollisionLayer(unittest.TestCase):
             material_names=["paint"], kind_names=["fence"],
         )
         with tempfile.TemporaryDirectory() as tmp:
-            data = np.load(
+            with np.load(
                 save_barriers(barriers, Path(tmp) / "b.npz"), allow_pickle=True
-            )
-            self.assertIn("collision_triangles", data.files)
-            self.assertEqual(len(data["collision_triangles"]), 0)
+            ) as data:
+                self.assertIn("collision_triangles", data.files)
+                self.assertEqual(len(data["collision_triangles"]), 0)
 
     @staticmethod
     def _collision_ns(on_build=None):
@@ -14799,7 +14800,9 @@ class TestTrafficSigns(unittest.TestCase):
             )
             path = save_signs(result, work / "signs.npz")
             listed = json.loads(write_sign_list(result, geo, Path(tmp) / "out").read_text())
-            saved = np.load(path)
+            # Read whole, and closed, before the folder goes.
+            with np.load(path) as data:
+                saved = dict(data)
 
         self.assertEqual(len(result), 3)
         self.assertEqual(result.counts["poles"], 1)
