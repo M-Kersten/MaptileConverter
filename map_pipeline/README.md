@@ -1628,7 +1628,10 @@ it. The nearest BGT road surface settles which: one at
 **The BGT's own post goes where NDW has the pole.** A BGT sign post within 3 m
 of an NDW pole is the same post, and drawn twice it was two poles side by side,
 one with nothing on it. Posts with no NDW pole near them stay, as the plain
-proxy they always were: the register is not complete.
+proxy they always were. Over the Utrecht square that is 2 of the 16 dropped.
+The other 14, eight of them traffic-light poles, are 30 to 90 m from any NDW
+sign, along one road in the south-west of the square where the register has
+nothing. It is not complete, and that is where the BGT still helps.
 
 ### What is on each sign
 
@@ -1656,7 +1659,12 @@ painted onto the Commons art, which has one A1 with a sample number on it.
 **Plates carry their text.** NDW records what an onderbord says,
 "uitgezonderd", "ma t/m za 08.00-18.00 uur", "opladen elektrische voertuigen",
 and each distinct text is drawn as a white plate with a black edge. A plate
-NDW recorded as unreadable stays blank.
+NDW recorded as unreadable stays blank. Half of Utrecht's plates say ten
+characters or fewer and one says 258, so a plate takes as many lines as its
+text needs, up to six, and grows taller rather than dropping words. A few texts
+in the register were stored as UTF-8 read as Latin-1, some twice over ("bij
+groen één auto" arrived as a row of accented capitals); they are decoded back
+when read, and a pictogram NDW writes as `[[bus]]` is printed as its name.
 
 **One atlas, cut to each outline.** Every face goes into `signs.png` with
 real transparency round it, on an alpha-clipped material `M_signs`: a round

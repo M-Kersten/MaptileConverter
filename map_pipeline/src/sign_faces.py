@@ -569,13 +569,56 @@ def _wrap(text: str, width: int) -> list[str]:
 BLANK_TEXTS = {"", "onleesbaar", "autodate", "onbekend", "none"}
 
 
+# NDW writes a pictogram on a plate as its name in double brackets.
+PICTOGRAMS = {"route-links": "\u2190", "route-rechts": "\u2192"}
+MAX_PLATE_LINES = 6
+
+
+def clean_text(text) -> str:
+    """An onderbord's text as the plate prints it.
+
+    Six texts in Utrecht's register were stored as UTF-8 read as Latin-1, some
+    of them twice over, so "bij groen één auto" arrived as a string of accented
+    capitals. Undone a layer at a time until it stops changing. A pictogram,
+    "[[bus]]", becomes its name, or an arrow for the two route arrows.
+    """
+    text = str(text or "")
+    for _ in range(4):
+        if not re.search("[\u00c2\u00c3\u00c4\u00e2]", text):
+            break
+        repaired = None
+        for codec in ("cp1252", "latin-1"):
+            try:
+                repaired = text.encode(codec).decode("utf-8")
+                break
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+        if repaired is None or repaired == text:
+            break
+        text = repaired
+    text = re.sub(
+        r"\[\[([^\]]+)\]\]",
+        lambda m: PICTOGRAMS.get(m.group(1).strip().lower(), m.group(1).replace("-", " ")),
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def plate_lines(text: str) -> list[str]:
-    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    """The text in lines, as many as it needs up to six, none of it dropped.
+
+    Half of Utrecht's plates say ten characters or fewer; one says 258. A long
+    one gets a taller plate and longer lines rather than a font nobody can read
+    or a sentence that stops halfway.
+    """
+    text = clean_text(text)
     if text.lower() in BLANK_TEXTS:
         return []
-    lines = _wrap(text, 16)
-    if len(lines) > 3:
-        lines = _wrap(text, max(16, int(len(text) / 3) + 2))[:3]
+    width = 16
+    lines = _wrap(text, width)
+    while len(lines) > MAX_PLATE_LINES:
+        width += 4
+        lines = _wrap(text, width)
     return lines
 
 
@@ -837,6 +880,7 @@ __all__ = [
     "UNKNOWN",
     "black_text",
     "build_atlas",
+    "clean_text",
     "code_parts",
     "commons_names",
     "draw_face",
