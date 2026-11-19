@@ -597,7 +597,66 @@ def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
     )
 
 
-def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None, mouths=None) -> None:
+def check_signs(report: CheckReport, signs, bbox: BBox) -> None:
+    """Traffic signs are inside the area, on poles that hold them, and turned.
+
+    The two numbers worth watching are how many signs kept only the register's
+    rounded bearing -- a sign a quarter turn off its road is the first thing
+    anyone standing in the street sees -- and how many faces were drawn here
+    rather than taken from the regulation's artwork.
+    """
+    if signs is None or not len(signs):
+        report.add("signs_present", True, "no traffic signs", severity="warning")
+        return
+    counts = signs.counts
+    report.add(
+        "signs_present",
+        True,
+        f"{len(signs)} signs on {counts.get('poles', 0)} poles and "
+        f"{counts.get('overhead', 0)} overhead, {counts.get('codes', 0)} codes",
+    )
+    xs = np.array([s.x for s in signs.signs])
+    ys = np.array([s.y for s in signs.signs])
+    report.add(
+        "signs_inside_bbox",
+        bool(
+            (xs >= bbox.xmin).all() and (xs <= bbox.xmax).all()
+            and (ys >= bbox.ymin).all() and (ys <= bbox.ymax).all()
+        ),
+        "every sign is inside the bbox",
+    )
+    rounded = int(counts.get("faced_by_bearing_only", 0))
+    share = rounded / max(len(signs), 1)
+    report.add(
+        "signs_facing_their_road",
+        share <= 0.10,
+        f"{len(signs) - rounded} of {len(signs)} turned to a road; {rounded} "
+        "kept the register's bearing, rounded to the compass",
+        severity="warning",
+    )
+    drawn = int(counts.get("faces_drawn", 0))
+    real = int(counts.get("faces_from_commons", 0))
+    # A warning, not a failure: the drawn faces are the right shape and
+    # colour, and the run is no less usable for them.
+    report.add(
+        "signs_artwork",
+        not (drawn and not real),
+        f"{real} faces from the RVV artwork on Commons, {drawn} drawn here"
+        + (" (no artwork could be fetched)" if drawn and not real else ""),
+        severity="warning",
+    )
+    if len(signs.pole_xy):
+        # The lowest plate at the clearance, so a pole shorter than that has
+        # nothing on it and a pole over eight metres is a stacking bug.
+        tops = signs.pole_top
+        report.add(
+            "signs_pole_heights",
+            bool((tops > 1.5).all() and (tops < 8.0).all()),
+            f"pole tops {tops.min():.1f} to {tops.max():.1f} m above the ground",
+        )
+
+
+def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) -> None:
     """Walls and fences are closed, on the ground, and a believable height.
 
     `deck_at(x, y)` is the top of a bridge deck, NaN off one: a parapet stands

@@ -133,6 +133,29 @@ SOURCES: tuple[Source, ...] = (
         url_path=("trees", "api_url"),
     ),
     Source(
+        id="signs",
+        label="Traffic signs (NDW)",
+        provider="NDW",
+        contributes=(
+            "every traffic sign with its code, its number and the plates "
+            "under it, on rebuilt poles, turned to face its own road"
+        ),
+        toggles=(("signs", "enabled"),),
+        url_path=("signs", "api_url"),
+        # The bare endpoint streams every sign in the country; a municipality
+        # that does not exist answers in a second.
+        probe_url=(
+            "https://data.ndw.nu/api/rest/static-road-data/traffic-signs/v5/"
+            "current-state?countyCode=GM0000"
+        ),
+        # Without NDW the furniture stage's BGT sign posts stay, bare. The
+        # same URL the other BGT layers probe, so the host is asked once.
+        backup_probe_url=(
+            "https://api.pdok.nl/lv/bgt/ogc/v1/collections/vegetatieobject_punt/items"
+        ),
+        note="sign artwork from Wikimedia Commons, drawn here when that is unreachable",
+    ),
+    Source(
         id="barriers",
         label="Walls, fences and hedges (BGT)",
         provider="PDOK",
