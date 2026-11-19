@@ -511,6 +511,21 @@ def check_roads(report: CheckReport, surfaces, terrain) -> None:
     tri_class = surfaces.road_tri_class[at_grade]
     lift = float(getattr(surfaces, "road_lift_m", 0.0) or 0.0)
     kerb = float(mesh.stats.get("kerb_m", 0.0)) if mesh is not None else 0.0
+    mouths = getattr(getattr(terrain, "mesh", None), "mouths", None)
+    if mouths and len(tris):
+        # At a tunnel mouth the road was held down under the apron on purpose
+        # (`tunnels.open_mouths`); the survey there is the smeared step from
+        # the cutting floor onto the roof.
+        import shapely
+
+        from .tunnels import MOUTH_REACH_M
+
+        middle = tris.mean(axis=1)
+        clear = ~shapely.dwithin(
+            shapely.union_all(np.array(list(mouths), dtype=object)),
+            shapely.points(middle[:, 0], middle[:, 1]), MOUTH_REACH_M,
+        )
+        tris, tri_class = tris[clear], tri_class[clear]
     if len(tris):
         centroid = tris.mean(axis=1)
         ground = terrain.sample(centroid[:, 0], centroid[:, 1])
@@ -582,7 +597,7 @@ def check_furniture(report: CheckReport, furniture, bbox: BBox) -> None:
     )
 
 
-def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) -> None:
+def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None, mouths=None) -> None:
     """Walls and fences are closed, on the ground, and a believable height.
 
     `deck_at(x, y)` is the top of a bridge deck, NaN off one: a parapet stands
@@ -632,6 +647,21 @@ def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) ->
     if sampler is not None:
         ground = np.asarray(sampler(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
         above = vertices[:, 2] - ground
+        # At a tunnel mouth the ground was opened for the road, and held down
+        # in front of it and up behind it (`tunnels.open_mouths`), after the
+        # barriers were stood on it. Those points say nothing.
+        unread = ~np.isfinite(above)
+        if mouths:
+            import shapely
+
+            from .tunnels import MOUTH_REACH_M
+
+            unread |= shapely.dwithin(
+                shapely.union_all(np.array(list(mouths), dtype=object)),
+                shapely.points(vertices[:, 0], vertices[:, 1]), MOUTH_REACH_M,
+            )
+        above = np.where(unread, 0.0, above)
+        unread = int(unread.sum())
         if deck_at is not None:
             deck = np.asarray(deck_at(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
             on_deck = vertices[:, 2] - deck
@@ -669,7 +699,8 @@ def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) ->
             deepest <= 0.30,
             f"the lowest point is {deepest:.2f} m below the ground"
             + (f", at RD {where_deep[0]:.1f}, {where_deep[1]:.1f}, "
-               f"{where_deep[2]:.2f} m NAP" if deepest > 0.30 else ""),
+               f"{where_deep[2]:.2f} m NAP" if deepest > 0.30 else "")
+            + (f" ({unread} points over a tunnel mouth not measured)" if unread else ""),
         )
 
 
@@ -851,6 +882,14 @@ def check_structures(report: CheckReport, structures, terrain) -> None:
         return
 
     decks = structures.tri_kind == KIND_DECK
+    # The top of each deck only: its underside sits a deck's depth lower and
+    # is meant to be in the ground where the ground rises to an abutment.
+    tris = structures.tris
+    normal_z = (
+        (tris[:, 1, 0] - tris[:, 0, 0]) * (tris[:, 2, 1] - tris[:, 0, 1])
+        - (tris[:, 1, 1] - tris[:, 0, 1]) * (tris[:, 2, 0] - tris[:, 0, 0])
+    )
+    decks &= normal_z > 1e-9
     if decks.any():
         z = structures.tris[decks][:, :, 2]
         centre = structures.tris[decks].reshape(-1, 3)
@@ -876,13 +915,32 @@ def check_structures(report: CheckReport, structures, terrain) -> None:
             f"tunnel road runs {below.min():.2f} to {below.max():.2f} m below "
             f"the surface (a drawn profile, not a survey)",
         )
-        # Portals have to reach daylight, or the tunnel is a sealed box.
+
+    plan = getattr(structures, "tunnels", None)
+    if plan is not None and len(plan):
+        mouths = [(t, p) for t in plan.tunnels for p in t.portals]
         report.add(
-            "tunnel_reaches_its_portals",
-            float(below.min()) < 1.0,
-            f"shallowest tunnel point is {below.min():.2f} m down, so the "
-            f"ramps meet the surface",
+            "tunnel_mouths_read",
+            bool(mouths),
+            f"{len(plan)} tunnels, {len(mouths)} mouths read from the survey "
+            "(a tunnel cut by the edge of the area has none there)",
+            severity="warning",
         )
+        if mouths:
+            # The reason this exists: the first tunnels started at ground
+            # level, eight metres above the measured ramp running into them.
+            worst = 0.0
+            for tunnel, portal in mouths:
+                z = tunnel.floor_at(portal.points[:, 0], portal.points[:, 1])
+                z = z[np.isfinite(z)]
+                if len(z):
+                    worst = max(worst, float(np.abs(z - portal.floor_nap).max()))
+            report.add(
+                "tunnel_floor_meets_its_mouths",
+                worst < 0.5,
+                f"the floor at every mouth is within {worst:.2f} m of the cutting "
+                "floor the survey read in front of it",
+            )
 
     walls = structures.tri_kind == KIND_TUNNEL_WALL
     if walls.any() and tunnels.any():
@@ -1191,6 +1249,19 @@ def check_terrain_mesh(report: CheckReport, terrain, *, expect_outlines: bool = 
     # Open only along one side of the area: an edge from one side to another
     # cuts a corner off.
     along = (sides(xy[open_edges[:, 0]]) & sides(xy[open_edges[:, 1]])).any(axis=1)
+    # A tunnel's mouth is opened on purpose (`tunnels.open_mouths`): the
+    # ground cannot climb onto the roof across the opening. Its edges are not
+    # cracks, and what it took is not missing.
+    mouths = list(getattr(mesh, "mouths", []) or [])
+    cut = getattr(mesh, "opened", None)
+    opened = 0
+    if cut is not None and len(open_edges):
+        import shapely
+
+        middle = 0.5 * (mesh.vertices[open_edges[:, 0], :2] + mesh.vertices[open_edges[:, 1], :2])
+        near = shapely.dwithin(cut.boundary, shapely.points(middle[:, 0], middle[:, 1]), 0.01)
+        opened = int((~along & near).sum())
+        along |= near
     cracks = int((~along).sum())
     shared_by_three = int((counts > 2).sum())
     following_vertex = loops[following]
@@ -1200,13 +1271,16 @@ def check_terrain_mesh(report: CheckReport, terrain, *, expect_outlines: bool = 
     flipped = int((twice <= 0).sum())
     covered = 0.5 * float(twice.sum())
     whole = float(span[0] * span[1])
-    missing = abs(whole - covered)
+    mouths_m2 = float(getattr(mesh, "mouths_m2", 0.0) or 0.0)
+    missing = abs(whole - covered - mouths_m2)
     report.add(
         "terrain_is_one_closed_sheet",
         cracks == 0 and shared_by_three == 0 and flipped == 0 and missing <= max(0.01, 1e-9 * whole),
         f"{cracks} crack edges, {shared_by_three} edges with more than two faces "
         f"and {flipped} faces upside down, over {len(mesh)} faces covering "
-        f"{covered:,.2f} of {whole:,.2f} m2",
+        f"{covered:,.2f} of {whole:,.2f} m2"
+        + (f"; {len(mouths)} tunnel mouths opened, {mouths_m2:,.1f} m2 "
+           f"and {opened} edges round them" if mouths else ""),
     )
     stats = mesh.stats or {}
     if "outline_edges_missing" in stats:

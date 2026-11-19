@@ -400,18 +400,22 @@ DEFAULTS: dict[str, Any] = {
         # A deck floats this far over its measured height, so it does not fight
         # the road riding on it for the same depth.
         "deck_lift_m": 0.05,
+        # From a deck's top to its underside, edge beam included: what shows
+        # from the water, the quay and the road under a viaduct. The surface
+        # model sees only the top, so this is chosen; 0 is the old flat sheet.
+        "deck_thickness_m": 0.8,
         # Used only when the surface model has no reading over a deck, which is
         # rare. A Dutch road bridge clears what it crosses by about this much.
         "fallback_clearance_m": 5.0,
-        # Nothing measures how deep a tunnel runs, and no open dataset carries
-        # it, so this profile is drawn rather than surveyed: portals at ground
-        # level, ramping down to this depth in between. The Maastunnel road
-        # deck sits about 20 m under the Maas.
-        "tunnel_depth_m": 18.0,
-        "tunnel_ramp_m": 350.0,
-        # Side walls up to ground level, so a tunnel reads as a cutting rather
-        # than as a road floating underground. No ceiling, deliberately: a
-        # roofed tunnel is invisible in the model it was added to.
+        # A tunnel's mouths are measured: the AHN sees the cutting in front of
+        # each down to the tunnel's edge. Between them the floor is drawn, a
+        # roof and a clearance under what is over the tunnel. Under water that
+        # is the bed, which nothing here measures: it deepens from the bank to
+        # at most this. The Maas at the Maastunnel is dredged to about 12 m.
+        "tunnel_water_depth_m": 12.0,
+        # The tube: walls and a ceiling looking inward, and at each mouth a
+        # headwall, a cap and wing walls over where the ground is opened.
+        # False leaves the floor alone, for a road to drive on.
         "tunnel_walls": True,
         "page_limit": 1000,
         "timeout_s": 180,
@@ -525,6 +529,13 @@ RETIRED: dict[str, str] = {
     ),
     "layered.grass_lift_m": (
         "the roads, walkways and grass are the ground itself, not lifted onto a terrain"
+    ),
+    "structures.tunnel_depth_m": (
+        "a tunnel's mouths are read from the survey and its floor drawn under what is "
+        "over it; set structures.tunnel_water_depth_m for the bed of the water it crosses"
+    ),
+    "structures.tunnel_ramp_m": (
+        "a tunnel descends from each measured mouth at the grade a tunnel is built to"
     ),
 }
 

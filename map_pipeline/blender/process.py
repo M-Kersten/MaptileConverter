@@ -465,6 +465,9 @@ HARBOUR_OBJECTS = {
 }
 # Painted steel: the railings along bridges and catwalks.
 RAILING_MATERIAL = ("Staal", (0.2, 0.22, 0.24), 0.4)
+# The road through a tunnel: the layered style's own asphalt, by name, so a
+# model in that style has one asphalt rather than two.
+TUNNEL_ROAD_MATERIAL = ("Asfalt", (0.0496, 0.0496, 0.0496), 0.5)
 
 
 def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
@@ -2762,13 +2765,33 @@ def build_structures(scene: dict, work_dir: Path, material):
         # corner of every face, so after a weld the UVs follow `indices` rather
         # than `corners` -- and the loop indices have to be `indices` too, or
         # they address a buffer that no longer exists at that length.
-        loop_xy = corners[indices][:, :2]
-        uvs = np.column_stack([loop_xy[:, 0] / 6.0, loop_xy[:, 1] / 6.0])
-        # A railing is painted steel, not the concrete of the deck it is on.
-        own = (
-            bpy.data.materials.get(RAILING_MATERIAL[0])
-            or make_plain_material(*RAILING_MATERIAL)
-        ) if label == "railing" else material
+        #
+        # Box-mapped: a deck's edge, a pier and a tunnel wall are vertical,
+        # and a top-down projection smears the concrete into streaks down
+        # them. Each face takes the plane it faces most.
+        loop_xyz = corners[indices]
+        tri = part.reshape(-1, 3, 3)
+        normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        normal = np.abs(normal) / np.maximum(np.linalg.norm(normal, axis=1), 1e-12)[:, None]
+        facing = np.repeat(np.argmax(normal, axis=1), 3)
+        uvs = np.where(
+            (facing == 2)[:, None], loop_xyz[:, [0, 1]],
+            np.where((facing == 0)[:, None], loop_xyz[:, [1, 2]], loop_xyz[:, [0, 2]]),
+        ) / 6.0
+        # A railing is painted steel, not the concrete of the deck it is on;
+        # a tunnel's floor is the road through it.
+        if label == "railing":
+            own = (
+                bpy.data.materials.get(RAILING_MATERIAL[0])
+                or make_plain_material(*RAILING_MATERIAL)
+            )
+        elif label == "tunnel_road":
+            own = (
+                bpy.data.materials.get(TUNNEL_ROAD_MATERIAL[0])
+                or make_plain_material(*TUNNEL_ROAD_MATERIAL)
+            )
+        else:
+            own = material
         objects.append(
             build_mesh_object(
                 f"Structures_{label}",
@@ -2808,7 +2831,8 @@ def reused_colliders() -> dict:
             "the real camber and a car wants the real kerb"
         ),
         "Water": "one flat quad per body",
-        "Structures_*": "bridge decks and piers, already low-poly prisms",
+        "Structures_*": "bridge decks and piers, already low-poly prisms; a tunnel's "
+                        "floor, walls and ceiling, already the surfaces a car meets",
     }
 
 

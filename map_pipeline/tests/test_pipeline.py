@@ -3825,49 +3825,6 @@ class TestStructures(unittest.TestCase):
         )
         self.assertIsNone(deck_height([self._square()], mast, ground=0.0))
 
-    def test_the_tunnel_is_level_with_the_ground_at_its_portals(self):
-        from src.structures import tunnel_depth_profile
-
-        # A 2 km tunnel running east-west.
-        along = np.linspace(0, 2000, 201)
-        points = np.column_stack([along, np.zeros_like(along)])
-        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
-
-        self.assertAlmostEqual(float(depth[0]), 0.0, places=6)
-        self.assertAlmostEqual(float(depth[-1]), 0.0, places=6)
-
-    def test_the_tunnel_reaches_its_full_depth_in_the_middle(self):
-        from src.structures import tunnel_depth_profile
-
-        along = np.linspace(0, 2000, 201)
-        points = np.column_stack([along, np.zeros_like(along)])
-        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
-
-        self.assertAlmostEqual(float(depth.max()), 18.0, places=6)
-        # The deepest point is in the middle, not at an end.
-        self.assertGreater(float(depth[len(depth) // 2]), 17.9)
-
-    def test_the_descent_has_no_kink_in_it(self):
-        """Smoothstep, so the road eases into the ramp."""
-        from src.structures import tunnel_depth_profile
-
-        along = np.linspace(0, 2000, 401)
-        points = np.column_stack([along, np.zeros_like(along)])
-        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
-
-        slope = np.diff(depth)
-        # The gradient changes smoothly rather than stepping.
-        self.assertLess(float(np.abs(np.diff(slope)).max()), 0.05)
-
-    def test_a_short_tunnel_still_reaches_its_depth(self):
-        from src.structures import tunnel_depth_profile
-
-        along = np.linspace(0, 80, 41)
-        points = np.column_stack([along, np.zeros_like(along)])
-        depth = tunnel_depth_profile(points, depth_m=18.0, ramp_m=350.0)
-        self.assertGreater(float(depth.max()), 17.0)
-        self.assertAlmostEqual(float(depth[0]), 0.0, places=6)
-
 
 class TestBridgeDecks(unittest.TestCase):
     """A deck may not sink into the ground it crosses.
@@ -3925,6 +3882,422 @@ class TestBridgeDecks(unittest.TestCase):
 
         z = deck_corner_heights(self._flat(), level=9.0, terrain=Low(), lift=0.05)
         np.testing.assert_allclose(z, 9.05)
+
+
+class TestTunnels(unittest.TestCase):
+    """A tunnel's mouths are measured; between them its floor is drawn.
+
+    The ground here: a street level of +4 m, a tunnel 100 m long and 10 m
+    wide along x, and a cutting in front of each end, its floor at -3 m in
+    the west and -2 m in the east, which the survey sees. Over the tunnel the
+    survey sees nothing: the roof is a structure.
+    """
+
+    WEST, EAST = -3.0, -2.0
+
+    @classmethod
+    def _survey(cls, x, y):
+        x = np.atleast_1d(np.asarray(x, dtype=float))
+        y = np.atleast_1d(np.asarray(y, dtype=float))
+        out = np.full(x.shape, 4.0)
+        lane = np.abs(y) < 5.0
+        west = lane & (x < 0.0)
+        east = lane & (x > 100.0)
+        # The ramps climb at 4% away from each mouth.
+        out[west] = cls.WEST + 0.04 * np.minimum(-x[west], 150.0)
+        out[east] = cls.EAST + 0.04 * np.minimum(x[east] - 100.0, 150.0)
+        out[lane & (x >= 0.0) & (x <= 100.0)] = np.nan
+        return out
+
+    @staticmethod
+    def _ground(x, y):
+        return np.full(np.shape(np.atleast_1d(x)), 4.0)
+
+    @staticmethod
+    def _tunnel(x0=0.0, x1=100.0, y0=-5.0, y1=5.0):
+        import shapely
+
+        return shapely.box(x0, y0, x1, y1)
+
+    def _plan(self, polygons=None, area=(-200.0, -100.0, 300.0, 100.0), **kwargs):
+        import shapely
+
+        from src.tunnels import plan_tunnels
+
+        return plan_tunnels(
+            polygons if polygons is not None else [self._tunnel()],
+            ground=self._ground, survey=self._survey, area=shapely.box(*area), **kwargs,
+        )
+
+    def test_the_mouths_are_read_where_the_ground_drops_away(self):
+        plan = self._plan()
+        self.assertEqual(len(plan), 1)
+        floors = sorted(p.floor_nap for p in plan.tunnels[0].portals)
+        self.assertEqual(len(floors), 2)
+        self.assertAlmostEqual(floors[0], self.WEST, delta=0.15)
+        self.assertAlmostEqual(floors[1], self.EAST, delta=0.15)
+        # Each mouth is the whole end, not a piece of it.
+        for portal in plan.tunnels[0].portals:
+            self.assertGreater(portal.length, 8.0)
+
+    def test_the_floor_starts_at_the_measured_mouths(self):
+        """The first version started the road at ground level, eight metres
+        above the measured ramp running into it."""
+        tunnel = self._plan().tunnels[0]
+        self.assertAlmostEqual(float(tunnel.floor_at(0.5, 0.0)[0]), self.WEST, delta=0.2)
+        self.assertAlmostEqual(float(tunnel.floor_at(99.5, 0.0)[0]), self.EAST, delta=0.2)
+
+    def test_the_floor_never_climbs_before_its_deepest_point(self):
+        tunnel = self._plan().tunnels[0]
+        x = np.linspace(0.5, 99.5, 100)
+        z = tunnel.floor_at(x, np.zeros_like(x))
+        deepest = int(np.argmin(z))
+        self.assertTrue((np.diff(z[: deepest + 1]) <= 0.02).all())
+        self.assertTrue((np.diff(z[deepest:]) >= -0.02).all())
+
+    def test_a_street_beside_a_tunnel_is_not_a_mouth(self):
+        """The ground on a tunnel stands higher than the street beside it, but
+        only a mouth has room under the roof for a tunnel."""
+        survey = self._survey
+
+        def beside(x, y):
+            out = survey(x, y)
+            y = np.atleast_1d(np.asarray(y, dtype=float))
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            street = (y < -5.0) & (y > -20.0) & (x > 30.0) & (x < 70.0)
+            return np.where(street, 2.0, out)
+
+        import shapely
+
+        from src.tunnels import plan_tunnels
+
+        plan = plan_tunnels([self._tunnel()], ground=self._ground, survey=beside,
+                            area=shapely.box(-200, -100, 300, 100))
+        self.assertEqual(len(plan.tunnels[0].portals), 2)
+
+    def test_a_street_round_the_corner_does_not_join_a_mouth(self):
+        """Joined round its corner to the street beside the tunnel, the
+        Maastunnel's south mouth was 57 m long, and pressed the roof down to
+        the cutting floor along the side."""
+        survey = self._survey
+
+        def beside(x, y):
+            out = survey(x, y)
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            y = np.atleast_1d(np.asarray(y, dtype=float))
+            street = (y < -5.0) & (y > -20.0) & (x > -10.0) & (x < 40.0)
+            return np.where(street, 1.0, out)
+
+        import shapely
+
+        from src.tunnels import plan_tunnels
+
+        plan = plan_tunnels([self._tunnel()], ground=self._ground, survey=beside,
+                            area=shapely.box(-200, -100, 300, 100))
+        west = [p for p in plan.tunnels[0].portals if p.points[:, 0].mean() < 50.0]
+        self.assertEqual(len(west), 1)
+        self.assertAlmostEqual(west[0].floor_nap, self.WEST, delta=0.15)
+        self.assertLess(float(west[0].points[:, 0].max()), 1.0)
+
+    def test_each_tunnel_has_its_own_profile(self):
+        """One axis through every tunnel in the area put the Maastunnel's
+        north mouth 18 m down, because an underpass further north was the end
+        of "the tunnel"."""
+        far = self._tunnel(0.0, 100.0, 60.0, 70.0)
+        plan = self._plan([self._tunnel(), far])
+        self.assertEqual(len(plan), 2)
+        mine = [t for t in plan.tunnels if t.polygon.bounds[1] < 0][0]
+        self.assertAlmostEqual(float(mine.floor_at(0.5, 0.0)[0]), self.WEST, delta=0.2)
+
+    def test_the_edge_of_the_area_is_not_a_mouth(self):
+        """Cut by the area, a tunnel carries on underground: its floor at the
+        cut is no higher than a roof and a clearance under the ground."""
+        tunnel = self._plan(area=(-200.0, -100.0, 60.0, 100.0)).tunnels[0]
+        self.assertEqual(len(tunnel.portals), 1)
+        self.assertLessEqual(float(tunnel.floor_at(59.0, 0.0)[0]), 4.0 - tunnel.cover_m + 0.1)
+
+    def _river_plan(self, length):
+        """A tunnel `length` long under a 40 m river in its middle."""
+        import shapely
+
+        from src.surfaces import WaterBody
+        from src.tunnels import plan_tunnels
+
+        middle = length / 2.0
+
+        def survey(x, y):
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            y = np.atleast_1d(np.asarray(y, dtype=float))
+            out = np.full(x.shape, 4.0)
+            lane = np.abs(y) < 5.0
+            out[lane & (x < 0.0)] = self.WEST
+            out[lane & (x > length)] = self.EAST
+            out[(x >= 0.0) & (x <= length) & lane] = np.nan
+            out[np.abs(x - middle) < 20.0] = np.nan
+            return out
+
+        river = WaterBody(
+            [np.array([[middle - 20, -50], [middle + 20, -50], [middle + 20, 50],
+                       [middle - 20, 50], [middle - 20, -50]], float)],
+            level_nap=0.5, area_m2=4000.0, measured=True,
+        )
+        plan = plan_tunnels(
+            [self._tunnel(0.0, length)], ground=self._ground, survey=survey,
+            area=shapely.box(-200, -100, length + 200, 100), water=[river],
+        )
+        return plan.tunnels[0], middle
+
+    def test_under_water_the_floor_goes_under_the_bed(self):
+        from src.tunnels import BANK_DEPTH_M, BANK_SLOPE
+
+        tunnel, middle = self._river_plan(600.0)
+        bed = 0.5 - (BANK_DEPTH_M + BANK_SLOPE * 19.5)
+        self.assertLessEqual(float(tunnel.floor_at(middle, 0.0)[0]), bed - tunnel.cover_m + 0.1)
+        # And no steeper than a road tunnel is built.
+        x = np.linspace(0.5, 599.5, 600)
+        z = tunnel.floor_at(x, np.zeros_like(x))
+        self.assertLess(float(np.abs(np.diff(z) / np.diff(x)).max()), 0.05)
+
+    def test_a_measured_mouth_beats_a_guessed_river_bed(self):
+        """Too short to reach the bed at a tunnel's grade: the mouths hold,
+        and the floor goes as deep as the grade lets it."""
+        tunnel, middle = self._river_plan(100.0)
+        self.assertAlmostEqual(float(tunnel.floor_at(0.5, 0.0)[0]), self.WEST, delta=0.2)
+        self.assertAlmostEqual(float(tunnel.floor_at(99.5, 0.0)[0]), self.EAST, delta=0.2)
+        x = np.linspace(0.5, 99.5, 100)
+        z = tunnel.floor_at(x, np.zeros_like(x))
+        self.assertLess(float(np.abs(np.diff(z) / np.diff(x)).max()), 0.06)
+        self.assertLess(float(z.min()), self.WEST - 1.0)
+
+    def test_the_tube_looks_inward(self):
+        import shapely
+
+        from src.tunnels import tunnel_geometry
+
+        tunnel = self._plan().tunnels[0]
+        built = tunnel_geometry(tunnel, area=shapely.box(-200, -100, 300, 100), top=self._ground)
+        n = np.cross(built.floor[:, 1] - built.floor[:, 0], built.floor[:, 2] - built.floor[:, 0])
+        self.assertTrue((n[:, 2] > 0).all())
+        tube = built.tube
+        n = np.cross(tube[:, 1] - tube[:, 0], tube[:, 2] - tube[:, 0])
+        n /= np.linalg.norm(n, axis=1)[:, None]
+        centre = tube.mean(axis=1)
+        # Clear of the mouths, whose caps stand beside the tunnel.
+        inside = (centre[:, 0] > 10.0) & (centre[:, 0] < 90.0)
+        # The ceiling over the middle looks down, a clearance over the floor.
+        ceiling = inside & (n[:, 2] < -0.9)
+        self.assertTrue(ceiling.any())
+        floor = tunnel.floor_at(centre[ceiling, 0], centre[ceiling, 1])
+        np.testing.assert_allclose(centre[ceiling, 2] - floor, tunnel.clearance_m, atol=0.05)
+        # The side walls look into the tunnel.
+        side = inside & (np.abs(n[:, 2]) < 0.1) & (np.abs(centre[:, 1]) > 4.9)
+        self.assertTrue(side.any())
+        self.assertTrue((n[side, 1] * centre[side, 1] < 0).all())
+        # Nothing closes the mouths below the ceiling.
+        mouth = (np.abs(n[:, 0]) > 0.9) & (np.abs(tube[:, :, 0] - 0.0).max(axis=1) < 0.01)
+        across = mouth & (np.abs(centre[:, 1]) < 4.5)
+        self.assertTrue((tube[across][:, :, 2].min(axis=1) >= self.WEST + tunnel.clearance_m - 0.05).all())
+
+    def _grid(self, x0=-30.0, x1=30.0, y0=-15.0, y1=15.0, step=2.0):
+        from types import SimpleNamespace
+
+        xs = np.arange(x0, x1 + 1e-9, step)
+        ys = np.arange(y0, y1 + 1e-9, step)
+        gx, gy = np.meshgrid(xs, ys)
+        z = np.where(gx < 0.0, self._survey(gx.ravel(), gy.ravel()).reshape(gx.shape), 4.0)
+        # The ground over the roof, as a height field has it: the step
+        # smeared over a cell.
+        z = np.where(np.isfinite(z), z, 4.0)
+        vertices = np.column_stack([gx.ravel(), gy.ravel(), z.ravel()])
+        nx = len(xs)
+        loops, sizes = [], []
+        for j in range(len(ys) - 1):
+            for i in range(nx - 1):
+                a = j * nx + i
+                loops.extend([a, a + 1, a + nx + 1, a + nx])
+                sizes.append(4)
+        return SimpleNamespace(
+            vertices=vertices, measured_z=vertices[:, 2].copy(),
+            face_sizes=np.array(sizes), face_loops=np.array(loops),
+            face_kind=np.zeros(len(sizes), dtype=np.int8),
+        )
+
+    def test_the_ground_opens_across_a_mouth_and_only_there(self):
+        """A height field climbs from the cutting floor onto the roof across
+        every mouth; the faces doing that go, and nothing outside does."""
+        from src.tunnels import MIN_ROOF_M, mouths, open_mouths
+
+        plan = self._plan()
+        west = [m for m in mouths(plan) if m.points[:, 0].mean() < 50.0]
+        mesh = self._grid()
+        before = len(mesh.face_sizes)
+        result = open_mouths(mesh, west, face_arrays=("face_kind",))
+        self.assertGreater(result["faces_cut"], 0)
+        self.assertEqual(len(mesh.face_sizes), before - result["faces_cut"])
+        self.assertEqual(len(mesh.face_kind), len(mesh.face_sizes))
+        xy, z = mesh.vertices[:, :2], mesh.vertices[:, 2]
+        lane = np.abs(xy[:, 1]) < 4.5
+        # In front of the mouth the ground is down at the cutting floor.
+        front = lane & (xy[:, 0] >= 0.0) & (xy[:, 0] < 0.1)
+        self.assertFalse(front.any() and (z[front] > self.WEST + 0.5).any())
+        # Behind it, the ground is up over the ceiling.
+        behind = lane & (xy[:, 0] > 0.5) & (xy[:, 0] < 5.0)
+        ceiling = self.WEST + plan.tunnels[0].clearance_m + MIN_ROOF_M
+        self.assertTrue((z[behind] >= ceiling - 0.3).all())
+        # Every face left is wholly on one side of the mouth.
+        starts = np.concatenate([[0], np.cumsum(mesh.face_sizes)[:-1]])
+        for start, size in zip(starts, mesh.face_sizes):
+            face = xy[mesh.face_loops[start:start + size]]
+            if (np.abs(face[:, 1]) < 4.5).all():
+                self.assertFalse((face[:, 0] < -0.05).any() and (face[:, 0] > 0.05).any())
+
+    def test_track_below_ground_runs_on_the_tunnel_floor(self):
+        from src.rails import KIND_METRO, RailLine, RailSet, build_track_geometry
+
+        tunnel = self._plan().tunnels[0]
+        rails = RailSet()
+        rails.lines = [RailLine(np.array([[10.0, 0.0], [90.0, 0.0]]), KIND_METRO, -1)]
+        build_track_geometry(rails, self._ground, tunnel_floor=tunnel.floor_at)
+        self.assertTrue(len(rails.rail_tris))
+        top = rails.rail_tris[:, :, 2].max()
+        self.assertLess(top, 4.0 - tunnel.clearance_m)
+
+    def test_the_old_profile_settings_say_what_replaced_them(self):
+        from src.config import _retired_keys
+
+        warnings = _retired_keys({"structures": {"tunnel_depth_m": 18.0, "tunnel_ramp_m": 350.0}})
+        self.assertEqual(len(warnings), 2)
+
+
+class TestDeckSlab(unittest.TestCase):
+    """A deck is a slab, not a sheet: from the water and from a road under a
+    viaduct a bridge is mostly its edge and its underside."""
+
+    class _Flat:
+        @staticmethod
+        def sample(x, y):
+            return np.zeros(np.shape(np.atleast_1d(x)))
+
+    @staticmethod
+    def _deck(x0, x1, y0=0.0, y1=10.0):
+        return {"type": "Polygon", "coordinates": [[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]]}
+
+    def _build(self, decks, cfg=None, piers=()):
+        import tempfile
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import src.structures as structures
+        from src.geo import BBox
+
+        rows = [
+            {"geometry": self._deck(*d[:2]), "properties": {"type_overbruggingsdeel": "dek", "relatieve_hoogteligging": 1}}
+            for d in decks
+        ] + [
+            {"geometry": self._deck(*p), "properties": {"type_overbruggingsdeel": "pijler", "relatieve_hoogteligging": 1}}
+            for p in piers
+        ]
+        heights = [(d[0], d[1], d[2]) for d in decks]
+
+        def dsm(x, y):
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            out = np.full(x.shape, np.nan)
+            for x0, x1, z in heights:
+                out[(x >= x0) & (x <= x1)] = z
+            return out
+
+        def fetch(collection, _bbox, **_kwargs):
+            return (rows if collection == "overbruggingsdeel" else []), SimpleNamespace(summary=lambda: "")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(structures, "fetch_current", fetch):
+            built = structures.build_structures(
+                BBox(-50.0, -50.0, 150.0, 150.0), Path(tmp),
+                structures_cfg={"tunnels": False, "railings": False, **(cfg or {})},
+                terrain=self._Flat(), dsm_sampler=dsm,
+            )
+        return built
+
+    @staticmethod
+    def _normals(tris):
+        n = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+        return n / np.linalg.norm(n, axis=1)[:, None]
+
+    def test_a_deck_has_a_top_an_underside_and_sides(self):
+        from src.structures import KIND_DECK
+
+        built = self._build([(0.0, 20.0, 4.0)], {"deck_thickness_m": 0.8})
+        deck = built.tris[built.tri_kind == KIND_DECK]
+        self.assertAlmostEqual(float(deck[:, :, 2].max()), 4.05, places=6)
+        self.assertAlmostEqual(float(deck[:, :, 2].min()), 3.25, places=6)
+        n = self._normals(deck)
+        up, down = n[:, 2] > 0.9, n[:, 2] < -0.9
+        self.assertTrue(up.any() and down.any())
+        # The top faces up at the top, the underside down at the bottom.
+        self.assertTrue(np.allclose(deck[up][:, :, 2], 4.05))
+        self.assertTrue(np.allclose(deck[down][:, :, 2], 3.25))
+        # Every side looks away from the middle of the deck.
+        side = ~(up | down)
+        centre = deck[side].mean(axis=1)[:, :2] - [10.0, 5.0]
+        self.assertTrue((np.einsum("ij,ij->i", n[side][:, :2], centre) > 0).all())
+
+    def test_the_slab_is_closed(self):
+        """Every edge belongs to two faces: no slot to see into the deck."""
+        from collections import Counter
+
+        from src.structures import KIND_DECK
+
+        built = self._build([(0.0, 20.0, 4.0)], {"deck_thickness_m": 0.8})
+        deck = np.round(built.tris[built.tri_kind == KIND_DECK], 6)
+        edges = Counter()
+        for tri in deck:
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                edges[tuple(sorted((tuple(tri[a]), tuple(tri[b]))))] += 1
+        # A quad side is split along its diagonal, which the top and bottom
+        # do not share; every outline edge is counted exactly twice.
+        self.assertTrue(all(count == 2 for count in edges.values()))
+
+    def test_two_level_parts_have_no_wall_between_them(self):
+        from src.structures import KIND_DECK
+
+        built = self._build([(0.0, 20.0, 4.0), (20.0, 40.0, 4.0)])
+        deck = built.tris[built.tri_kind == KIND_DECK]
+        vertical = np.abs(self._normals(deck)[:, 2]) < 0.1
+        on_seam = np.all(np.abs(deck[:, :, 0] - 20.0) < 1e-6, axis=1)
+        self.assertFalse((vertical & on_seam).any())
+
+    def test_a_step_between_two_parts_is_drawn(self):
+        from src.structures import KIND_DECK
+
+        built = self._build([(0.0, 20.0, 4.0), (20.0, 40.0, 5.0)])
+        deck = built.tris[built.tri_kind == KIND_DECK]
+        vertical = np.abs(self._normals(deck)[:, 2]) < 0.1
+        on_seam = np.all(np.abs(deck[:, :, 0] - 20.0) < 1e-6, axis=1)
+        self.assertTrue((vertical & on_seam).any())
+
+    def test_a_pier_holds_up_the_underside(self):
+        from src.structures import KIND_PIER
+
+        built = self._build([(0.0, 20.0, 4.0)], {"deck_thickness_m": 0.8}, piers=[(8.0, 12.0, 4.0, 6.0)])
+        pier = built.tris[built.tri_kind == KIND_PIER]
+        self.assertAlmostEqual(float(pier[:, :, 2].max()), 4.05 - 0.8 + 0.05, places=6)
+
+    def test_no_thickness_is_the_old_sheet(self):
+        from src.structures import KIND_DECK
+
+        built = self._build([(0.0, 20.0, 4.0)], {"deck_thickness_m": 0.0})
+        deck = built.tris[built.tri_kind == KIND_DECK]
+        self.assertTrue(np.allclose(deck[:, :, 2], 4.05))
+        self.assertTrue((self._normals(deck)[:, 2] > 0.9).all())
+
+    def test_the_check_reads_the_top_not_the_underside(self):
+        """An abutment's underside is in the ground by design."""
+        from src.validate import CheckReport, check_structures
+
+        built = self._build([(0.0, 20.0, 0.2)], {"deck_thickness_m": 1.5})
+        report = CheckReport()
+        check_structures(report, built, self._Flat())
+        result = {c.name: c for c in report.checks}["decks_above_the_ground_they_cross"]
+        self.assertTrue(result.passed, result.detail)
 
 
 class TestRoadClasses(unittest.TestCase):
@@ -9772,6 +10145,45 @@ class TestCollisionLayer(unittest.TestCase):
         ground_wall = v[np.abs(v[:, 0] - 70) < 1]
         self.assertGreaterEqual(parapet[:, 2].min(), 2.5 - 0.3)
         self.assertLess(ground_wall[:, 2].min(), 0.0)
+
+    def test_a_wall_in_a_tunnel_is_not_drawn_over_it(self):
+        """The Maastunnel's dividing wall is in the BGT below ground; stood on
+        the ground, it ran up over the headwall and across the park."""
+        import tempfile
+
+        import src.barriers as barriers_module
+        from src.geo import BBox
+
+        lines = [
+            {"properties": {"type": "muur", "relatieve_hoogteligging": -1},
+             "geometry": {"type": "LineString", "coordinates": [[40, 20], [40, 80]]}},
+            {"properties": {"type": "muur", "relatieve_hoogteligging": 0},
+             "geometry": {"type": "LineString", "coordinates": [[70, 20], [70, 80]]}},
+        ]
+
+        def fake_fetch(collection, bbox, class_field=None, **kw):
+            return (lines if collection == "scheiding_lijn" else []), {}
+
+        class Terrain:
+            def surface(self, x, y):
+                return np.zeros(np.shape(np.atleast_1d(x)))
+
+        real = barriers_module.fetch_current
+        barriers_module.fetch_current = fake_fetch
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                built = barriers_module.build_barriers(
+                    BBox(0.0, 0.0, 100.0, 100.0), Path(tmp),
+                    barriers_cfg={"page_limit": 10, "timeout_s": 1,
+                                  "max_retries": 1, "max_pages": 1},
+                    terrain=Terrain(),
+                )
+        finally:
+            barriers_module.fetch_current = real
+        v = built.vertices
+        self.assertFalse((np.abs(v[:, 0] - 40) < 1).any())
+        self.assertTrue((np.abs(v[:, 0] - 70) < 1).any())
+        self.assertEqual(built.counts.get("below_ground_left_out"), 1)
 
     def test_the_deck_surface_reaches_the_parapet_on_its_edge(self):
         """A wall is swept on both faces, and a parapet runs along the deck's

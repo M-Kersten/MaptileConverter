@@ -348,6 +348,7 @@ def build_track_geometry(
     *,
     step_m: float = DEFAULT_STEP_M,
     deck_sampler=None,
+    tunnel_floor=None,
 ) -> None:
     """Turn centrelines into ballast and rail geometry, draped on the ground.
 
@@ -371,6 +372,20 @@ def build_track_geometry(
         ground = np.asarray(sampler(points[:, 0], points[:, 1]), dtype=np.float64)
         if line.level > 0 and deck_sampler is not None:
             ground = deck_sampler(points, ground)
+        if line.level < 0:
+            if tunnel_floor is None:
+                continue
+            floor = np.asarray(tunnel_floor(points[:, 0], points[:, 1]), dtype=np.float64)
+            known = np.isfinite(floor)
+            if not known.any():
+                # Below ground, but in no tunnel the BGT draws: under a station
+                # building, say. Left out rather than laid through the street.
+                continue
+            if not known.all():
+                along = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(points, axis=0).T))])
+                floor = np.interp(along, along[known], floor[known])
+            ground = floor
+            rails.counts["tracks_on_a_tunnel_floor"] = rails.counts.get("tracks_on_a_tunnel_floor", 0) + 1
 
         if profile.ballast_half_width > 0.0:
             tris, uv = _ribbon(
@@ -473,8 +488,15 @@ def build_rails(
     *,
     rails_cfg: dict,
     terrain=None,
+    tunnel_floor=None,
 ) -> RailSet:
-    """Fetch the tracks and build them into geometry."""
+    """Fetch the tracks and build them into geometry.
+
+    `tunnel_floor(x, y)`, the floor of the tunnels (`tunnels.TunnelPlan`),
+    NaN outside them, is what track below ground runs on. Without it, such
+    track is left out: drawn on the surface it is a railway through the
+    pavement.
+    """
     result = RailSet()
 
     features, stats = fetch_current(
@@ -504,9 +526,10 @@ def build_rails(
         except (TypeError, ValueError):
             level = 0
         if level < 0:
-            # A tunnel drawn on the surface is a track through the pavement.
             tunnels += 1
-            continue
+            if tunnel_floor is None:
+                # A tunnel drawn on the surface is a track through the pavement.
+                continue
 
         geometry = feature.get("geometry") or {}
         if geometry.get("type") != "LineString":
@@ -553,6 +576,7 @@ def build_rails(
         terrain.surface,
         step_m=float(rails_cfg.get("step_m", DEFAULT_STEP_M)),
         deck_sampler=deck_sampler,
+        tunnel_floor=tunnel_floor,
     )
 
     LOG.info(

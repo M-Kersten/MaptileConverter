@@ -462,10 +462,10 @@ Other knobs worth knowing:
 | `rails.enabled` | `true` | Railway, tram and metro track from BGT `spoor`. |
 | `rails.step_m` | `4.0` | How far apart points along a track may get before the ground under it stops being followed. |
 | `structures.bridges` | `true` | Bridge decks and piers from BGT `overbruggingsdeel`, heights read off the AHN surface model. |
-| `structures.tunnels` | `true` | Tunnels from BGT `tunneldeel`, on a constructed depth profile. |
-| `structures.tunnel_depth_m` | `18.0` | How deep the drawn profile goes. Nothing measures this; see below. |
-| `structures.tunnel_ramp_m` | `350.0` | How long the descent from each portal is. |
-| `structures.tunnel_walls` | `true` | Side walls up to ground level, so a tunnel reads as a cutting. No ceiling: a roofed tunnel is invisible. |
+| `structures.deck_thickness_m` | `0.8` | From a deck's top to its underside, edge beam included. The surface model sees only the top, so this is chosen. `0` is the old flat sheet. |
+| `structures.tunnels` | `true` | Tunnels from BGT `tunneldeel`: mouths read from the survey, the floor drawn between them. |
+| `structures.tunnel_water_depth_m` | `12.0` | The deepest the bed of the water over a tunnel is drawn. Nothing measures it; see below. |
+| `structures.tunnel_walls` | `true` | The tube: walls and a ceiling looking inward, and a headwall, cap and wing walls at each mouth. `false` leaves the floor alone. |
 | `usage.enabled` | `true` | BAG building function, deciding the ground storey. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
 | `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
@@ -501,6 +501,7 @@ src/furniture.py   BGT lampposts, bollards, signs and benches
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
 src/structures.py  bridge decks and piers, and tunnels below ground
+src/tunnels.py     tunnel mouths read from the survey, the floor between them, the ground opened at each mouth
 src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
@@ -1539,8 +1540,7 @@ can take apart.
 
 The parts of the ground that are not the ground. Until now both were dropped:
 tunnels skipped outright, bridges draped onto the surface, which sank the
-Erasmusbrug into the Maas. They need opposite treatment, because the data for
-them is not symmetrical.
+Erasmusbrug into the Maas.
 
 **A bridge can be measured.** BGT `overbruggingsdeel` comes split into `dek` and
 `pijler` — the deck and the piers holding it up, as separate polygons — and a
@@ -1551,6 +1551,16 @@ median over each deck rather than a point sample, because the DSM also caught
 the railings, the gantries and whatever was driving across when it was flown.
 Piers are extruded from the deck down to whatever they stand on.
 
+**A deck is a slab.** It was its top alone, a sheet laid over the canal. From
+the water, from the quay and from a car under a viaduct a bridge is mostly its
+edge and its underside. Each deck now has an underside `deck_thickness_m`
+(0.8 m) below its top, and sides round its outline between the two. The BGT
+splits a bridge into parts, one per carriageway or span; where two parts meet
+level no wall stands between them, and where one is higher the step is drawn.
+The surface model sees only the top, so the depth is chosen: an Amsterdam canal
+bridge is about 0.6 m at its fascia, a concrete viaduct 1 to 1.5 m. Piers stop
+under the slab.
+
 **The road on a bridge rides its deck.** Draping it on the terrain left the deck
 at its real height with its own carriageway lying on the water. Elevated road
 parts (`relatieve_hoogteligging` above zero) now take one robust height per BGT
@@ -1559,17 +1569,71 @@ whatever the lidar hit drove it from 35k triangles to 510k and put one
 carriageway 95 m up. Where no plausible deck reading exists, the part is draped
 on the ground like any other road and the run says how many.
 
-**A tunnel cannot be measured.** Nothing looks down and sees the Maastunnel. The
-BGT gives its footprint and the carriageway inside it, and an ordinal level of
--1, but no depth in metres exists in any open dataset. So the profile here is
-**constructed**: portals at ground level, ramping down over `tunnel_ramp_m` to
-`tunnel_depth_m`, along the tunnel's own long axis — which is the only part of
-it that comes from the data. Over the Maastunnel that puts the road at −22 m NAP
-mid-river against a real figure of about −20. It is the one piece of geometry in
-this pipeline that is drawn rather than measured, and `metadata.json` says so.
+**A tunnel is measured at its mouths.** The BGT draws a tunnel (`tunneldeel`) as
+the part that is covered. Its open approaches are ordinary roads at level 0 in a
+cutting, and the AHN terrain model sees them all the way to the tunnel's edge:
+at the Maastunnel −3.6 m NAP at the south mouth and −5.8 m at the north one,
+with the ground on the tunnel at +4 to +5 m. The first version of this started
+every tunnel at ground level, so the measured ramp ran into an eight metre wall.
+It also drew one depth profile along one axis through every tunnel in the area,
+and a square kilometre of Rotterdam holds thirteen tunnel parts: the car tunnel,
+the cycle tube with its escalator shafts, four underpasses by the Parkhaven, two
+metro sections. An underpass further north became the end of "the tunnel", and
+the Maastunnel's north mouth went 18 m down.
 
-Tunnels get side walls but no ceiling, deliberately: a roofed tunnel is
-invisible in the model it was just added to.
+Now (`src/tunnels.py`):
+
+- Touching parts are one tunnel, and each tunnel is planned on its own, on its
+  whole outline as the BGT has it. Where the area cuts a tunnel is not a mouth:
+  the road carries on underground there.
+- A stretch of a tunnel's edge is a mouth where the survey just outside reads at
+  least 2.7 m below the ground just inside, on a road, path or track bed at
+  ground level. The floor at the mouth is the height read in front of it. A
+  street beside a tunnel can read like that too; beside the Maastunnel's south
+  mouth it lay seven metres higher, three metres along, which no tunnel floor
+  climbs. Of two mouths no floor can join, the higher goes, and a mouth's floor
+  is level across it, so it is never joined round a corner to the street.
+- Between the mouths the floor is drawn. It stays a roof and a clearance under
+  what is over the tunnel: 4.7 m for a road, 6.2 m for a train, 4.6 m for a
+  metro, 2.8 m for a cycle path, and less where the mouths show less room. It
+  runs no steeper than a tunnel is built, 4.5% for a road and 2.5% for a train,
+  and down from each mouth without climbing before the deepest point.
+- Under water, what is over the tunnel is the bed, which nothing here measures.
+  It deepens a quarter metre per metre out from the bank, to
+  `tunnel_water_depth_m`. The Maastunnel comes out at −17.4 m NAP under the
+  Maas, where the real one is at about −20 m. Where a short tunnel cannot reach
+  a guessed bed at its grade, the measured mouths win.
+- Where the terrain model sees nothing over a tunnel, something is built there:
+  the roof of an underpass, or one of the Maastunnel's ventilation buildings.
+  The gridded terrain fills such a hole from the cutting floors either side, four
+  metres too low, and the surface model reads the building's roof 19 m up. The
+  highest ground the survey saw within 20 m stands in for it.
+
+Over the Maastunnel and the eight underpasses near it every mouth is read
+whole, and the floor meets each one within a centimetre
+(`tunnel_floor_meets_its_mouths`).
+
+**A tunnel is a tube.** An asphalt floor along the drawn profile; walls and a
+ceiling that look inward, because from inside the back of the terrain is no
+ceiling (an engine culls it and shows the sky); and at each mouth a concrete
+headwall over the opening, a cap over the roof's edge, an apron on the cutting
+floor and wing walls down both sides of it. `tunnel_walls: false` leaves the
+floor alone.
+
+**The ground opens at each mouth.** A height field cannot have a hole in its
+side. Wherever a cutting meets a tunnel, the ground climbs from the cutting
+floor straight onto the roof, across the opening. So in front of a mouth the
+ground is held down under the apron, behind it the ground is held up over the
+ceiling, and the one row of faces spanning the mouth goes. The hole that leaves
+lies under the headwall and the cap. Both ground styles are opened this way, and
+the survey style's road mesh with them; the terrain check counts the edges round
+a mouth as an opening rather than a crack.
+
+**Track in a tunnel runs on its floor.** Railway, metro and tram track below
+ground used to be left out. It now follows the floor of the tunnel it is in,
+and is left out only where it runs below ground in no tunnel the BGT draws. A
+wall the BGT puts below ground is left out: the Maastunnel's dividing wall,
+stood on the ground, ran up over the headwall and across the park on top.
 
 ## Railways
 

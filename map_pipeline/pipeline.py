@@ -99,6 +99,7 @@ from src.surfaces import (  # noqa: E402
     SurfaceSet,
     blend_surface_detail,
     build_surfaces,
+    save_surfaces,
     write_land_cover,
 )
 from src.relight import remove_cast_shadows  # noqa: E402
@@ -473,6 +474,51 @@ def run_blender_stage(
         f"the Blender stage did not produce {fbx_name}. The traceback above is "
         f"from Blender itself; {error_file} has the full copy."
     )
+
+
+def _open_tunnel_mouths(structures, config, terrain, ground_layers, surfaces, work_dir) -> dict:
+    """Open the ground at every tunnel mouth, and save the ground again."""
+    import shapely
+
+    from src.tunnels import mouths, open_mouths
+
+    openings = mouths(structures.tunnels, area=shapely.box(*config.bbox.as_list()))
+    if not openings:
+        return {"mouths_opened": 0}
+    counts = {"mouths_opened": len(openings), "ground_faces_cut": 0}
+    if ground_layers is not None:
+        cut = open_mouths(
+            ground_layers.mesh, openings,
+            face_arrays=("face_kind", "face_part", (ground_layers, "face_material"),
+                         (ground_layers, "face_object")),
+        )
+        counts["ground_faces_cut"] += cut["faces_cut"]
+        ground_layers.save(work_dir)
+        terrain.save(work_dir)
+    elif getattr(terrain, "mesh", None) is not None:
+        cut = open_mouths(terrain.mesh, openings, face_arrays=("face_kind", "face_part"))
+        counts["ground_faces_cut"] += cut["faces_cut"]
+        terrain.save(work_dir)
+    roads = getattr(surfaces, "road_mesh", None)
+    if roads is not None and len(roads):
+        cut = open_mouths(
+            roads, openings,
+            face_arrays=("face_class", "face_level", "face_object", "face_kind"),
+            loop_arrays=("loop_uv",),
+        )
+        counts["road_faces_cut"] = cut["faces_cut"]
+        if cut["faces_cut"] or cut["vertices_moved"]:
+            # The checks read the roads as triangles; as they are now.
+            tris, owner = roads.triangles()
+            surfaces.road_tris = tris
+            surfaces.road_tri_class = roads.face_class[owner].astype("int32")
+            surfaces.road_tri_level = roads.face_level[owner].astype("int32")
+            save_surfaces(surfaces, config.bbox, work_dir)
+    LOG.info(
+        "tunnel mouths: %d opened, %d ground faces cut",
+        counts["mouths_opened"], counts["ground_faces_cut"],
+    )
+    return counts
 
 
 def _collision_metadata(work_dir: Path) -> dict:
@@ -961,17 +1007,6 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 write_spawn_list(vehicles, config.geo, out_dir)
                 vehicle_texture = generate_vehicle_texture(work_dir)
 
-    rails = RailSet()
-    rail_texture = None
-    if want_rails:
-        with Stage("railways (BGT)", next_step(), total):
-            rails = build_rails(
-                config.bbox, work_dir, rails_cfg=config.rails, terrain=terrain
-            )
-            if len(rails.ballast_tris) or len(rails.rail_tris):
-                save_rails(rails, work_dir / "rails.npz")
-                rail_texture = generate_rail_texture(work_dir)
-
     structures = StructureSet()
     structure_texture = None
     if want_structures:
@@ -1002,6 +1037,28 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             if len(structures.tris):
                 save_structures(structures, work_dir / "structures.npz")
                 structure_texture = generate_structure_texture(work_dir)
+            if len(structures.tunnels):
+                # A height field cannot have a hole in its side: the ground
+                # climbs from the cutting floor onto the roof across every
+                # mouth. Opened here, so the road can drive in.
+                structures.counts.update(
+                    _open_tunnel_mouths(structures, config, terrain, ground_layers, surfaces, work_dir)
+                )
+
+    rails = RailSet()
+    rail_texture = None
+    if want_rails:
+        with Stage("railways (BGT)", next_step(), total):
+            rails = build_rails(
+                config.bbox, work_dir, rails_cfg=config.rails, terrain=terrain,
+                # Track below ground runs on its tunnel's floor.
+                tunnel_floor=(
+                    structures.tunnels.floor_at if len(structures.tunnels) else None
+                ),
+            )
+            if len(rails.ballast_tris) or len(rails.rail_tris):
+                save_rails(rails, work_dir / "rails.npz")
+                rail_texture = generate_rail_texture(work_dir)
 
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
@@ -1084,10 +1141,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 "structures": {
                     **structures.stats(),
                     "deck_heights_from": "AHN DSM, median over each deck",
+                    "deck_thickness": "chosen (structures.deck_thickness_m), not measured",
                     "tunnel_depth": (
-                        "constructed, not surveyed: no open dataset carries "
-                        "Dutch tunnel depths"
+                        "measured at the mouths, from the AHN DTM over the cutting "
+                        "in front of each; drawn between them, under the ground or "
+                        "water over the tunnel: no open dataset carries Dutch "
+                        "tunnel depths"
                     ),
+                    "tunnels": structures.tunnels.stats() if len(structures.tunnels) else [],
                 },
                 "building_function": usage.stats(),
                 # What was taken out of the aerial and what was left in it.
@@ -1142,6 +1203,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_barriers(
             report, barriers if want_barriers else None, terrain.surface,
             deck_at=deck_at,
+            # The ground at a tunnel mouth was reshaped after the barriers
+            # were stood on it; what stands there says nothing about them.
+            mouths=getattr(getattr(terrain, "mesh", None), "mouths", None),
         )
         check_vehicles(
             report, vehicles if want_vehicles else None, config.bbox, surfaces
