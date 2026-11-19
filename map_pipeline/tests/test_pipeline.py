@@ -6495,6 +6495,19 @@ class TestProblemFinder(unittest.TestCase):
         self.assertTrue(found["dense"][:40].all())
         self.assertFalse(found["dense"][40])
 
+    def test_an_upright_wall_is_counted_by_place(self):
+        """A wall's top and bottom corner are one place in the plan: counted
+        twice, every fence was too dense for standing upright."""
+        scan = self._scan()
+        xs = np.linspace(0.5, 4.5, 20)
+        bottom = np.column_stack([xs, np.full(20, 1.0), np.zeros(20)])
+        top = bottom + [0.0, 0.0, 2.0]
+        co = np.vstack([bottom, top])
+        faces = [[k, k + 1, 21 + k, 20 + k] for k in range(19)]
+        found, _ = scan["face_problems"](co, *self._mesh(faces), ground=False,
+                                         cell_m=5.0, max_vertices=30)
+        self.assertFalse(found["dense"].any())
+
     def test_vertices_moved_off_the_survey(self):
         scan = self._scan()
         co = np.array([[0, 0, 0.0], [4, 0, 0.0], [4, 4, 0.9], [0, 4, 0.0]], float)
@@ -10885,10 +10898,33 @@ class TestStreetDetail(unittest.TestCase):
         flat = lambda x, y: np.full(len(np.atleast_1d(x)), 8.0)  # noqa: E731
         self.assertIsNone(_draped_roof(_oriented([ring]), ground, flat, style))
 
+    def test_a_canopy_stops_where_a_building_roofs_it(self):
+        """The station roof's outline runs over the station hall, whose own
+        roof the survey reads at the same height: both drawn, they flicker.
+        The building is cut out of the canopy."""
+        from src.barriers import _footprint_lookup, _off_buildings
+
+        hall = types_namespace(roof_tris=np.array([
+            [[40.0, 0.0, 20.0], [80.0, 0.0, 20.0], [80.0, 40.0, 20.0]],
+            [[40.0, 0.0, 20.0], [80.0, 40.0, 20.0], [40.0, 40.0, 20.0]],
+        ]))
+        lookup = _footprint_lookup(types_namespace(buildings=[hall]))
+        ring = np.array([[0.0, 0.0], [120.0, 0.0], [120.0, 40.0], [0.0, 40.0], [0.0, 0.0]])
+        pieces = _off_buildings([ring], lookup)
+        areas = sorted(
+            0.5 * abs(np.dot(r[0][:, 0], np.roll(r[0][:, 1], -1))
+                      - np.dot(r[0][:, 1], np.roll(r[0][:, 0], -1)))
+            for r in pieces
+        )
+        self.assertEqual(len(pieces), 2)
+        self.assertAlmostEqual(sum(areas), 120 * 40 - 40 * 40, delta=20.0)
+        self.assertIsNone(_footprint_lookup(None))
+
     def test_the_pipeline_hands_the_barriers_the_surface_model(self):
         source = (Path(__file__).resolve().parents[1] / "pipeline.py").read_text()
         start = source.index("barriers = build_barriers(")
-        self.assertIn("surface_at=", source[start:start + 1200])
+        self.assertIn("surface_at=", source[start:start + 1400])
+        self.assertIn("buildings=buildings", source[start:start + 1400])
 
     def test_an_awning_clears_the_ground_at_every_corner(self):
         """An awning is flat, and its footprint can straddle a slope. Taking

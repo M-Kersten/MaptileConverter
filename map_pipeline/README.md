@@ -653,7 +653,7 @@ the mesh, so nothing of it reaches an export:
 | | colour | what |
 |---|---|---|
 | Slivers | red | a triangle more than *Sliver ratio* (10) times longer than it is high, once it is over a metre long; a quad with a corner under 10° |
-| Too dense | orange | more than *Vertices per square* (30) vertices in one *Density square* (5 m) of the plan |
+| Too dense | orange | more than *Vertices per square* (30) vertices in one *Density square* (5 m) of the plan, counted by place: a wall's top and bottom corner are one |
 | N-gons | violet | faces with more than four sides |
 | Flipped | magenta | ground facing down; on anything else, a face wound against its neighbour |
 | Seams | cyan | an open edge of one ground piece with no partner in the next — a crack, a T-junction, or a step in height between two pieces (dots at the vertices) |
@@ -1473,8 +1473,11 @@ Three things about the geometry are worth knowing:
   times longer than wide) is now capped by walking both long sides from one end
   to the other: each step is a rung across, and where one side has a vertex the
   other lacks, the other gets one opposite it (on its side wall too, so nothing
-  hangs off an edge). Every side and every rung is written as a pair of
-  triangles that the Blender stage joins back into one quad.
+  hangs off an edge). Any other top — an L, a curve — is filled the way the
+  ground fills a face, a constrained triangulation paired into quads, rather
+  than by earcut, which clips ears in order and left a fan of slivers on every
+  curved awning. Every side and every rung is written as a pair of triangles
+  that the Blender stage joins back into one quad.
 - **Every barrier faces out.** The survey does not promise which way round it
   drew an outline, and a wall drawn clockwise came out inside out — black in a
   lit viewport, invisible with backface culling. Outlines are now turned
@@ -1495,7 +1498,15 @@ Three things about the geometry are worth knowing:
   platform. The AHN surface model sees the roof: its median reading inside the
   outline, a metre in from the edge, between 2 and 30 m above the ground, is the
   top. Where under 30% of the outline gives such a reading — glass, a mesh roof
-  the laser went through — the fixed lift is kept.
+  the laser went through — the fixed lift is kept. A canopy the survey sees on
+  several levels is not laid flat at all: Utrecht Centraal's is one 3.5 ha
+  outline that the survey reads anywhere from 7 to 26 m NAP, the hall roof high
+  over the tracks and the platform roofs beside it. Where the readings spread by
+  more than 2 m, the roof is a slab draped on the survey on a 4 m lattice — the
+  ground's own constrained fill, quads where they fit — closed all round. And a
+  canopy stops where a building starts: its outline ran over the station hall,
+  whose own roof the survey reads at the same height, and the two flickered
+  through one another. The buildings' footprints are cut out of it first.
 - **Corners are matched to the micrometre.** The survey's own corners were
   found among the draped points with numpy's default *relative* tolerance —
   metres at RD coordinates — so a small wall lost every corner but one and came

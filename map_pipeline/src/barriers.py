@@ -319,6 +319,65 @@ def _without_repeats(ring: np.ndarray, within: float = 1e-3) -> np.ndarray:
     return ring[keep]
 
 
+def _footprint_lookup(buildings):
+    """`f(polygon)`: the buildings' footprints under a polygon, as one
+    geometry, or None for no buildings. Built from each building's roof
+    triangles seen from above."""
+    import shapely
+
+    if buildings is None or not len(getattr(buildings, "buildings", [])):
+        return None
+    shapes = []
+    for building in buildings.buildings:
+        roof = np.asarray(getattr(building, "roof_tris", []), dtype=np.float64)
+        if roof.ndim != 3 or not len(roof):
+            continue
+        triangles = shapely.polygons(roof[:, :, :2])
+        triangles = triangles[shapely.area(triangles) > 1e-6]
+        if len(triangles):
+            shapes.append(shapely.union_all(triangles))
+    if not shapes:
+        return None
+    shapes = np.array(shapes, dtype=object)
+    tree = shapely.STRtree(shapes)
+
+    def under(polygon):
+        hits = tree.query(polygon, predicate="intersects")
+        if not len(hits):
+            return None
+        return shapely.union_all(shapes[hits]).buffer(0.05)
+
+    return under
+
+
+# A canopy left smaller than this once the buildings are cut out of it is a
+# sliver along a facade, not a roof.
+CANOPY_MIN_M2 = 4.0
+
+
+def _off_buildings(rings, footprints_under):
+    """A canopy's outline with the buildings under it cut out, as rings per
+    piece. The roof the survey sees there is the building's."""
+    import shapely
+
+    rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in rings]
+    polygon = shapely.make_valid(shapely.Polygon(rings[0], rings[1:]))
+    covered = footprints_under(polygon)
+    if covered is None or covered.is_empty:
+        return [rings]
+    left = shapely.difference(polygon, covered)
+    pieces = []
+    for part in shapely.get_parts(left):
+        if part.geom_type != "Polygon" or part.area < CANOPY_MIN_M2:
+            continue
+        part = part.simplify(0.02)
+        if part.is_empty or part.geom_type != "Polygon":
+            continue
+        pieces.append([np.asarray(part.exterior.coords)[:, :2]]
+                      + [np.asarray(r.coords)[:, :2] for r in part.interiors])
+    return pieces
+
+
 def _signed_area(ring: np.ndarray) -> float:
     """Positive for an anticlockwise ring, seen from above."""
     x, y = ring[:, 0], ring[:, 1]
@@ -1039,6 +1098,7 @@ def build_barriers(
     skip_styles=(),
     deck_at=None,
     surface_at=None,
+    buildings=None,
 ) -> BarrierSet:
     """Fetch every barrier collection and turn it into draped geometry.
 
@@ -1085,6 +1145,7 @@ def build_barriers(
         return fat if fat != style else None
 
     skipped = set(skip_styles)
+    footprints_under = _footprint_lookup(buildings)
 
     def on_deck(x, y):
         """The deck where there is one, the ground elsewhere."""
@@ -1163,48 +1224,57 @@ def build_barriers(
                     rings = _prepare_rings(group, bbox)
                     if not rings:
                         continue
-                    top = None
-                    if style.top_from_survey and surface_at is not None:
-                        open_rings = [
-                            np.asarray(r, dtype=np.float64)[:, :2] for r in rings
-                        ]
-                        open_rings = [
-                            r[:-1] if np.allclose(r[0], r[-1], rtol=0.0, atol=1e-6) else r
-                            for r in open_rings
-                        ]
-                        draped = _draped_roof(_oriented(open_rings), ground, surface_at, style)
-                        if draped is not None:
-                            chunks.append((*draped, style))
+                    # A canopy over a building is the building's roof: cut the
+                    # buildings out, or the two lie on one another at the same
+                    # height and flicker (the hall at Utrecht Centraal).
+                    pieces = (
+                        _off_buildings(rings, footprints_under)
+                        if style.top_from_survey and footprints_under is not None
+                        else [rings]
+                    )
+                    for rings in pieces:
+                        top = None
+                        if style.top_from_survey and surface_at is not None:
+                            open_rings = [
+                                np.asarray(r, dtype=np.float64)[:, :2] for r in rings
+                            ]
+                            open_rings = [
+                                r[:-1] if np.allclose(r[0], r[-1], rtol=0.0, atol=1e-6) else r
+                                for r in open_rings
+                            ]
+                            draped = _draped_roof(_oriented(open_rings), ground, surface_at, style)
+                            if draped is not None:
+                                chunks.append((*draped, style))
+                                counts[style.name] = counts.get(style.name, 0) + 1
+                                key = f"{style.name}_draped"
+                                counts[key] = counts.get(key, 0) + 1
+                                fat = collider_for(style)
+                                if fat is not None:
+                                    fat_roof = _draped_roof(
+                                        _oriented(open_rings), ground, surface_at, fat
+                                    )
+                                    if fat_roof is not None:
+                                        collision_chunks.append(fat_roof[:2])
+                                continue
+                            top = _measured_top(rings, ground, surface_at)
+                            if top is not None:
+                                key = f"{style.name}_measured"
+                                counts[key] = counts.get(key, 0) + 1
+                        verts, tris, uvs = _extrude_rings(
+                            rings, ground, style, step_m,
+                            tolerance_m=drape_tolerance_m, top_z=top,
+                        )
+                        if len(tris):
+                            chunks.append((verts, tris, uvs, style))
                             counts[style.name] = counts.get(style.name, 0) + 1
-                            key = f"{style.name}_draped"
-                            counts[key] = counts.get(key, 0) + 1
                             fat = collider_for(style)
                             if fat is not None:
-                                fat_roof = _draped_roof(
-                                    _oriented(open_rings), ground, surface_at, fat
+                                c_verts, c_tris, _ = _extrude_rings(
+                                    rings, ground, fat, step_m,
+                                    tolerance_m=drape_tolerance_m, top_z=top,
                                 )
-                                if fat_roof is not None:
-                                    collision_chunks.append(fat_roof[:2])
-                            continue
-                        top = _measured_top(rings, ground, surface_at)
-                        if top is not None:
-                            key = f"{style.name}_measured"
-                            counts[key] = counts.get(key, 0) + 1
-                    verts, tris, uvs = _extrude_rings(
-                        rings, ground, style, step_m,
-                        tolerance_m=drape_tolerance_m, top_z=top,
-                    )
-                    if len(tris):
-                        chunks.append((verts, tris, uvs, style))
-                        counts[style.name] = counts.get(style.name, 0) + 1
-                        fat = collider_for(style)
-                        if fat is not None:
-                            c_verts, c_tris, _ = _extrude_rings(
-                                rings, ground, fat, step_m,
-                                tolerance_m=drape_tolerance_m, top_z=top,
-                            )
-                            if len(c_tris):
-                                collision_chunks.append((c_verts, c_tris))
+                                if len(c_tris):
+                                    collision_chunks.append((c_verts, c_tris))
 
     if not chunks:
         LOG.info("no barriers found")

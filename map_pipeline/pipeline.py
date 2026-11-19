@@ -929,8 +929,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # The layered style builds quay walls as the face of the quay.
                 skip_styles=("quay_wall",) if len(harbour) else (),
                 deck_at=deck_at,
-                # A canopy's roof, where the survey can see it.
+                # A canopy's roof, where the survey can see it and no
+                # building's roof is.
                 surface_at=surface_at,
+                buildings=buildings,
             )
             # Shares the furniture atlas: the same eight flat patches cover a
             # brick wall and a wooden bench, and one texture is one material.
