@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
@@ -2295,6 +2297,514 @@ class TestDeShadowing(unittest.TestCase):
         self.assertIn(
             'config.aerial.get("deshadow"', inspect.getsource(pipeline.run)
         )
+
+    def test_the_roof_atlas_gets_the_grounds_correction(self):
+        """The atlas holds the same flight finer, cut up per building, with
+        no ground of its own to measure a shadow against. It gets the sun,
+        the shadow and the gains fitted on the ground, read at its own
+        pixels' positions, so a roof comes out in the tone of the ground."""
+        from PIL import Image
+
+        from src.relight import remove_cast_shadows
+
+        # A window of the photo at twice its resolution, as the atlas holds
+        # a rectangle: rows north first, with the RD centre of every pixel.
+        r0, r1, c0, c1 = 120, 360, 96, 384
+        metres = self.SPAN / self.PX
+
+        class Atlas:
+            paths = ["roofs_00.png"]
+
+            def map_rects(inner, fn):
+                inner.result = fn(inner.block, inner.xs, inner.ys)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, shadow, roofs, buildings, bbox = self._scene(tmp)
+            before = np.asarray(Image.open(path), dtype=np.float64)
+            atlas = Atlas()
+            atlas.block = before[r0:r1, c0:c1].repeat(2, 0).repeat(2, 1).astype(np.uint8)
+            atlas.xs = c0 * metres + (np.arange(2 * (c1 - c0)) + 0.5) * metres / 2
+            atlas.ys = self.SPAN - r0 * metres - (np.arange(2 * (r1 - r0)) + 0.5) * metres / 2
+            info = remove_cast_shadows(
+                path, bbox, terrain=self._Flat(), buildings=buildings, roofs=atlas
+            )
+            after = np.asarray(Image.open(path), dtype=np.float64)
+
+        ground = after[r0:r1, c0:c1] @ self.WEIGHTS
+        roof = atlas.result.astype(np.float64).reshape(
+            r1 - r0, 2, c1 - c0, 2, 3
+        ).mean(axis=(1, 3)) @ self.WEIGHTS
+        window = shadow[r0:r1, c0:c1]
+        # The two feathers are drawn at different scales, so compare where
+        # neither reaches: seven pixels, about three metres, from any edge.
+        stable = np.ones_like(window)
+        for dr in range(-7, 8):
+            for dc in range(-7, 8):
+                stable &= np.roll(np.roll(window, dr, 0), dc, 1) == window
+        stable[:7], stable[-7:], stable[:, :7], stable[:, -7:] = False, False, False, False
+        self.assertGreater(int(stable.sum()), 1000)
+        difference = np.abs(ground - roof)[stable]
+        self.assertLess(float(np.median(difference)), 2.0)
+        self.assertLess(float(np.percentile(difference, 95)), 6.0)
+
+        lifted = window & stable
+        was = float((before[r0:r1, c0:c1] @ self.WEIGHTS)[lifted].mean())
+        self.assertGreater(float(roof[lifted].mean()), was * 1.3,
+                           "the atlas's shadows were not lifted")
+        self.assertIn("roofs", info)
+        self.assertGreater(info["roofs"]["shadow_fraction"], 0.05)
+
+    def test_the_roof_atlas_is_left_alone_when_the_ground_is(self):
+        """Switched off, or no sun found: the roofs stay as flown, like the
+        ground, or the two would disagree."""
+        from src.relight import remove_cast_shadows
+
+        class Atlas:
+            paths = ["roofs_00.png"]
+            touched = False
+
+            def map_rects(inner, fn):
+                inner.touched = True
+
+        for overcast, strength in ((False, 0.0), (True, 1.0)):
+            atlas = Atlas()
+            with tempfile.TemporaryDirectory() as tmp:
+                path, _, _, buildings, bbox = self._scene(tmp, overcast=overcast)
+                remove_cast_shadows(
+                    path, bbox, terrain=self._Flat(), buildings=buildings,
+                    strength=strength, roofs=atlas,
+                )
+            self.assertFalse(atlas.touched, (overcast, strength))
+
+    def test_the_pipeline_relights_the_roofs_with_the_ground(self):
+        import inspect
+
+        import pipeline
+
+        source = inspect.getsource(pipeline.run)
+        call = source[source.index("remove_cast_shadows("):]
+        self.assertIn("roofs=roof_atlas", call[: call.index("\n        )")])
+
+
+def _box_roof(x0, y0, x1, y1, z=10.0):
+    """Two triangles over a rectangle: a flat roof."""
+    return np.array([
+        [[x0, y0, z], [x1, y0, z], [x1, y1, z]],
+        [[x0, y0, z], [x1, y1, z], [x0, y1, z]],
+    ], dtype=float)
+
+
+class TestRoofAtlas(unittest.TestCase):
+    """Roofs from the 8 cm ortho, only where the roofs are, in a few atlases.
+
+    Everything here is offline: the photo is a stand-in that writes into each
+    pixel which grid pixel it is, so a roof that comes out on the wrong pixel
+    shows up as a wrong number rather than as a slightly wrong colour.
+    """
+
+    ORIGIN = (1000.0, 2200.0)
+    BBOX = (1000.0, 2000.0, 1200.0, 2200.0)
+
+    def _roofs(self):
+        """A terrace, a few detached houses, a rotated one, one hanging over
+        the area's west edge, and a building with no roof at all."""
+        roofs = []
+        # A terrace of six houses sharing party walls.
+        for i in range(6):
+            roofs.append(_box_roof(1020.013 + 5.5 * i, 2150.07, 1025.513 + 5.5 * i, 2160.07))
+        # Detached houses, spread out.
+        for i, (x, y) in enumerate([(1100.31, 2100.17), (1150.53, 2030.29), (1060.77, 2040.41)]):
+            roofs.append(_box_roof(x, y, x + 9.3 + i, y + 7.1))
+        # Rotated 30 degrees.
+        angle = math.radians(30.0)
+        corners = np.array([[0, 0], [14, 0], [14, 6], [0, 6]], dtype=float)
+        turned = corners @ np.array([[math.cos(angle), math.sin(angle)],
+                                     [-math.sin(angle), math.cos(angle)]])
+        turned += (1120.21, 2160.33)
+        roofs.append(np.array([
+            [[*turned[0], 12.0], [*turned[1], 12.0], [*turned[2], 12.0]],
+            [[*turned[0], 12.0], [*turned[2], 12.0], [*turned[3], 12.0]],
+        ]))
+        # Over the west edge: columns left of the grid's origin.
+        roofs.append(_box_roof(995.17, 2080.23, 1004.61, 2090.37))
+        roofs.append(np.zeros((0, 3, 3)))
+        return roofs
+
+    @staticmethod
+    def _coded_fetch(origin, calls):
+        """A stand-in ortho: each pixel says which grid column and row it is."""
+
+        def fetch(window, width, height):
+            metres = window.width / width
+            self_cols = int(round((window.xmin - origin[0]) / metres)) + np.arange(width)
+            self_rows = int(round((origin[1] - window.ymax) / metres)) + np.arange(height)
+            out = np.zeros((height, width, 3), dtype=np.uint8)
+            out[..., 0] = (self_cols % 251)[None, :]
+            out[..., 1] = (self_rows % 251)[:, None]
+            out[..., 2] = 200
+            calls.append((width, height))
+            return out
+
+        return fetch
+
+    def _atlas(self, folder, *, roof_cm=10, budget_mpx=48, page_px=8192,
+               padding=4, request_px=300):
+        from src.geo import BBox
+        from src.roofs import build_roof_atlas
+
+        calls: list = []
+        atlas = build_roof_atlas(
+            BBox(*self.BBOX),
+            Path(folder),
+            roofs=self._roofs(),
+            buildings_cfg={"roof_cm": roof_cm, "roof_max_mpx": budget_mpx,
+                           "roof_atlas_px": page_px, "roof_padding_px": padding},
+            aerial_cfg={"max_request_px": request_px},
+            ground_m_per_px=0.25,
+            layer_name="test",
+            fetch=self._coded_fetch(self.ORIGIN, calls),
+        )
+        return atlas, calls
+
+    def test_rectangles_are_padded_and_on_one_grid(self):
+        from src.roofs import grid_rects
+
+        rects = grid_rects(
+            np.array([[1.0625, 50.0, 3.0, 52.0], [np.nan] * 4]),
+            (0.0, 100.0), 0.125, 4,
+        )
+        # Column 8.5 rounds out to 8, then four of padding; row 0 is north.
+        np.testing.assert_array_equal(rects[0], [4, 380, 28, 404])
+        np.testing.assert_array_equal(rects[1], [0, 0, 0, 0])
+
+    def test_overlapping_rectangles_merge_only_when_it_saves_space(self):
+        from src.roofs import merge_rects
+
+        # Two houses side by side, their padding overlapping: one strip.
+        merged, members = merge_rects(np.array([[0, 0, 60, 40], [52, 0, 112, 40]]), 8192)
+        np.testing.assert_array_equal(merged, [[0, 0, 112, 40]])
+        self.assertEqual(members, [[0, 1]])
+        # Corners just touching diagonally: the joint box would hold far
+        # more than the two, so they stay apart.
+        merged, members = merge_rects(np.array([[0, 0, 50, 50], [45, 45, 95, 95]]), 8192)
+        self.assertEqual(len(merged), 2)
+        # And never past a page, however much it would save.
+        merged, _ = merge_rects(np.array([[0, 0, 60, 40], [52, 0, 112, 40]]), 100)
+        self.assertEqual(len(merged), 2)
+
+    def test_packing_never_overlaps_and_stays_on_its_page(self):
+        from src.roofs import PAGE_ALIGN, pack_rects
+
+        rng = np.random.default_rng(3)
+        for page_px, count in ((512, 300), (2048, 40)):
+            sizes = np.column_stack([rng.integers(8, 120, count), rng.integers(8, 90, count)])
+            placement, pages = pack_rects(sizes, page_px)
+            self.assertTrue((placement[:, 0] >= 0).all(), "a rectangle was not placed")
+            for width, height in pages:
+                self.assertLessEqual(max(width, height), page_px)
+                self.assertEqual((width % PAGE_ALIGN, height % PAGE_ALIGN), (0, 0))
+            painted = [np.zeros((h, w), dtype=np.int32) for w, h in pages]
+            for (page, x, y), (w, h) in zip(placement, sizes):
+                self.assertLessEqual(x + w, pages[page][0])
+                self.assertLessEqual(y + h, pages[page][1])
+                painted[page][y : y + h, x : x + w] += 1
+            self.assertEqual(max(int(p.max()) for p in painted), 1, "two rectangles overlap")
+        # 300 rectangles of up to 120 x 90 cannot share one 512 px page.
+        self.assertGreater(len(pack_rects(
+            np.column_stack([rng.integers(8, 120, 300), rng.integers(8, 90, 300)]), 512
+        )[1]), 1)
+
+    def test_one_page_is_sized_to_what_it_holds(self):
+        from src.roofs import pack_rects
+
+        sizes = np.full((20, 2), 100)
+        placement, pages = pack_rects(sizes, 8192)
+        self.assertEqual(len(pages), 1)
+        width, height = pages[0]
+        self.assertLess(width * height, 1.5 * 20 * 100 * 100)
+
+    def test_the_budget_coarsens_the_roofs_and_says_so(self):
+        from src.roofs import plan_roof_atlas, roof_extents
+
+        extents = roof_extents(self._roofs())
+        full = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                               ground_m_per_px=0.25, budget_px=10**9)
+        self.assertFalse(full.capped)
+        self.assertAlmostEqual(full.metres_per_px, 0.10)
+        budget = full.total_px // 3
+        capped = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                                 ground_m_per_px=0.25, budget_px=budget)
+        self.assertTrue(capped.capped)
+        self.assertLessEqual(capped.total_px, budget)
+        self.assertGreater(capped.metres_per_px, 0.10)
+        # Whole millimetres, so request bounds stay exact.
+        self.assertAlmostEqual(capped.metres_per_px * 1000, round(capped.metres_per_px * 1000))
+        # A budget only the ground's resolution would fit: no atlas at all.
+        self.assertIsNone(plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                                          ground_m_per_px=0.25, budget_px=2000))
+        # Finer than the 8 cm source is the source.
+        fine = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.03,
+                               ground_m_per_px=0.25, budget_px=10**9)
+        self.assertAlmostEqual(fine.metres_per_px, 0.08)
+
+    def test_every_roof_corner_lands_on_the_pixel_it_was_photographed_in(self):
+        """The whole chain at once: rectangles, requests split across tiles,
+        the copy into the pages, and the UVs. A wrong offset anywhere moves
+        a roof by whole pixels, and the stand-in photo says by how many."""
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, calls = self._atlas(tmp)
+            from PIL import Image
+
+            pages = [np.asarray(Image.open(p)) for p in atlas.paths]
+        plan = atlas.plan
+        self.assertTrue(atlas.ok)
+        self.assertGreater(len(calls), 3, "the 300 px requests should split this area")
+        self.assertTrue(all(max(w, h) <= 300 for w, h in calls))
+
+        roofs = [r for r in self._roofs() if len(r)]
+        corners = np.concatenate(roofs).reshape(-1, 3)[:, :2]
+        uv = atlas.roof_uv.reshape(-1, 2).astype(np.float64)
+        page = np.repeat(atlas.roof_page, 3)
+        self.assertTrue((page >= 0).all())
+        r = plan.metres_per_px
+        for (x, y), (u, v), p in zip(corners, uv, page):
+            width, height = plan.pages[p]
+            pixel = pages[p][int((1.0 - v) * height), int(u * width)]
+            want_col = math.floor((x - self.ORIGIN[0]) / r) % 251
+            want_row = math.floor((self.ORIGIN[1] - y) / r) % 251
+            self.assertEqual((int(pixel[0]), int(pixel[1])), (want_col, want_row),
+                             f"corner {x:.2f}, {y:.2f}")
+
+    def test_a_terrace_shares_one_rectangle_and_a_building_without_a_roof_has_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp)
+        plan = atlas.plan
+        terrace = {int(plan.building_rect[i]) for i in range(6)}
+        self.assertEqual(len(terrace), 1)
+        self.assertEqual(int(plan.building_rect[-1]), -1)
+        self.assertEqual(len(atlas.roof_page), 2 * (len(self._roofs()) - 1))
+
+    def test_the_checks_pass_and_catch_a_stray_uv(self):
+        from src.validate import CheckReport, check_roof_atlas
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp)
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=8192)
+            self.assertEqual([c.name for c in report.checks if not c.passed], [])
+            names = {c.name for c in report.checks}
+            self.assertLessEqual(
+                {"roof_atlas_written", "roof_atlas_within_size_cap",
+                 "roof_uvs_inside_their_rectangles", "roof_resolution_as_asked"},
+                names,
+            )
+
+            # One corner moved into the middle of another building's
+            # rectangle: still on the page, on the wrong roof.
+            plan = atlas.plan
+            other = next(k for k in range(len(plan.rects)) if k != atlas.roof_rect[0])
+            page, x, y = plan.placement[other]
+            w, h = plan.size(other)
+            width, height = plan.pages[page]
+            atlas.roof_uv[0, 0] = ((x + w / 2) / width, 1 - (y + h / 2) / height)
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=8192)
+            failed = {c.name for c in report.checks if not c.passed}
+            self.assertIn("roof_uvs_inside_their_rectangles", failed)
+
+            # A page over the cap.
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=256)
+            self.assertIn("roof_atlas_within_size_cap",
+                          {c.name for c in report.checks if not c.passed})
+
+    def test_the_cap_shows_as_a_warning(self):
+        from src.roofs import plan_roof_atlas, roof_extents
+        from src.validate import CheckReport, check_roof_atlas
+
+        extents = roof_extents(self._roofs())
+        full = plan_roof_atlas(extents, self.ORIGIN, metres_per_px=0.10,
+                               ground_m_per_px=0.25, budget_px=10**9)
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp, budget_mpx=full.total_px / 3 / 1e6)
+            self.assertTrue(atlas.plan.capped)
+            report = CheckReport()
+            check_roof_atlas(report, atlas, out_dir=None, work_dir=Path(tmp), page_cap=8192)
+        capped = next(c for c in report.checks if c.name == "roof_resolution_as_asked")
+        self.assertFalse(capped.passed)
+        self.assertEqual(capped.severity, "warning")
+        self.assertTrue(report.ok)
+
+    def test_a_service_that_does_not_answer_leaves_the_roofs_on_the_aerial(self):
+        from src.geo import BBox
+        from src.http_util import ServiceError
+        from src.roofs import build_roof_atlas
+        from src.validate import CheckReport, check_roof_atlas
+
+        def refuse(window, width, height):
+            raise ServiceError("down")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas = build_roof_atlas(
+                BBox(*self.BBOX), Path(tmp), roofs=self._roofs(),
+                buildings_cfg={"roof_cm": 10}, aerial_cfg={},
+                ground_m_per_px=0.25, layer_name="test", fetch=refuse,
+            )
+            self.assertFalse(atlas.ok)
+            self.assertIn("down", atlas.note)
+            self.assertEqual(list(Path(tmp).glob("roofs_*.png")), [])
+        report = CheckReport()
+        check_roof_atlas(report, atlas, out_dir=None, work_dir=Path("."), page_cap=8192)
+        self.assertTrue(report.ok, "a missing atlas is a warning, not a failure")
+        self.assertEqual(report.warnings[0].name, "roof_atlas_written")
+
+    def test_off_is_the_old_behaviour(self):
+        from src.geo import BBox
+        from src.roofs import build_roof_atlas, roof_settings
+
+        self.assertEqual(roof_settings({"roof_cm": 0})["metres_per_px"], 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas = build_roof_atlas(
+                BBox(*self.BBOX), Path(tmp), roofs=self._roofs(),
+                buildings_cfg={"roof_cm": 0}, aerial_cfg={},
+                ground_m_per_px=0.25, layer_name="test",
+                fetch=lambda *a: self.fail("fetched with the roofs switched off"),
+            )
+        self.assertFalse(atlas.ok)
+
+    def test_the_relighting_pass_rewrites_each_rectangle_in_place(self):
+        """`map_rects` hands each rectangle over with the RD centres of its
+        pixels, and writes back what it gets."""
+        from PIL import Image
+
+        seen = []
+
+        def darken(block, xs, ys):
+            seen.append((block.shape, len(xs), len(ys), xs[0], ys[0]))
+            return (block // 2).astype(np.uint8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas, _ = self._atlas(tmp)
+            before = np.asarray(Image.open(atlas.paths[0])).copy()
+            atlas.map_rects(darken)
+            after = np.asarray(Image.open(atlas.paths[0]))
+        plan = atlas.plan
+        self.assertEqual(len(seen), len(plan.rects))
+        for (shape, nx, ny, x0, y0) in seen:
+            self.assertEqual(shape[:2], (ny, nx))
+        k = 0
+        _, x, y = plan.placement[k]
+        w, h = plan.size(k)
+        np.testing.assert_array_equal(after[y : y + h, x : x + w], before[y : y + h, x : x + w] // 2)
+        xs, ys = plan.pixel_centres(k)
+        self.assertAlmostEqual(xs[1] - xs[0], plan.metres_per_px)
+        self.assertLess(ys[1], ys[0], "rows run north to south")
+
+    def test_blender_puts_the_roofs_on_their_pages(self):
+        """process.py, exec'd against stubs: every roof triangle that has a
+        rectangle gets its page's material and the UVs from roofs.npz, and a
+        mismatched file puts them all back on the aerial."""
+        from src.buildings import Building, BuildingSet, save_buildings
+
+        calls = []
+
+        def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
+            calls.append({"uvs": np.asarray(uvs), "mats": np.asarray(mats),
+                          "materials": list(materials)})
+
+        namespace = _stubbed_process(record)
+        roofs = self._roofs()
+        buildings = BuildingSet(buildings=[
+            Building(
+                identifier=f"NL.IMBAG.Pand.{i}",
+                wall_tris=np.array([[[r[0, 0, 0] if len(r) else 1010.0, 2100.0, 0.0],
+                                     [1011.0, 2100.0, 0.0], [1011.0, 2100.0, 8.0]]]),
+                roof_tris=r, ground_z_nap=0.0, roof_max_nap=10.0, floors=3,
+                wall_top_nap=8.0,
+            )
+            for i, r in enumerate(roofs)
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            save_buildings(buildings, folder / "buildings.npz")
+            atlas, _ = self._atlas(tmp)
+            scene = {
+                "buildings": {"file": "buildings.npz"},
+                "roofs": {"file": "roofs.npz", "textures": atlas.files,
+                          "materials": ["M_roof"]},
+                "origin_rd": [1100.0, 2100.0],
+                "ground_z_offset_nap": 0.0,
+                "aerial": {"bbox_local": [-100.0, -100.0, 100.0, 100.0]},
+                "facade": {"floor_height_m": 3.0, "ground_floor_height_m": 3.6},
+            }
+            report = {}
+            namespace["build_buildings"](
+                scene, folder, ["F"], "A", None, roof_materials=["R"], report=report
+            )
+            on_roof = []
+            for call in calls:
+                for p, slot in enumerate(call["mats"]):
+                    if call["materials"][slot] == "R":
+                        on_roof.append(call["uvs"][3 * p : 3 * p + 3].ravel())
+            self.assertEqual(report["atlas_triangles"], len(atlas.roof_page))
+            self.assertEqual(report["aerial_triangles"], 0)
+            self.assertEqual(len(on_roof), len(atlas.roof_page))
+            got = np.array(sorted(map(tuple, np.round(on_roof, 5))))
+            want = np.array(sorted(map(tuple, np.round(atlas.roof_uv.reshape(-1, 6), 5))))
+            np.testing.assert_allclose(got, want, atol=1e-5)
+
+            # A roofs.npz that does not match the buildings: all on the aerial.
+            np.savez(folder / "roofs.npz", roof_uv=np.zeros((3, 2), np.float32),
+                     roof_page=np.zeros(1, np.int16))
+            calls.clear()
+            report = {}
+            namespace["build_buildings"](
+                scene, folder, ["F"], "A", None, roof_materials=["R"], report=report
+            )
+            self.assertEqual(report["atlas_triangles"], 0)
+            self.assertFalse(any("R" in call["materials"] for call in calls))
+
+    def test_the_detail_levels_decide_the_roofs(self):
+        from src.config import DETAIL_PRESETS
+
+        for level, preset in DETAIL_PRESETS.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({
+                    "name": "lvl", "detail": level,
+                    "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                }))
+                loaded = load_config(path)
+            self.assertEqual(loaded.buildings["roof_cm"], preset["roof_cm"], level)
+            self.assertEqual(loaded.buildings["roof_max_mpx"], preset["roof_mpx"], level)
+            # Never coarser than the ground, or there would be no point.
+            if preset["roof_cm"]:
+                self.assertLess(preset["roof_cm"], preset["aerial_cm"], level)
+        self.assertEqual(DETAIL_PRESETS["draft"]["roof_cm"], 0)
+
+    def test_roof_settings_are_cleaned_up_on_load(self):
+        def load(**buildings):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({
+                    "name": "r", "detail": "standard", "buildings": buildings,
+                    "bbox": {"xmin": 136000, "ymin": 455000, "xmax": 137000, "ymax": 456000},
+                }))
+                return load_config(path).buildings
+
+        with self.assertLogs("src.config", level="WARNING") as captured:
+            self.assertEqual(load(roof_cm=4)["roof_cm"], 8.0)
+        self.assertIn("finer than the 8 cm source", " ".join(captured.output))
+        # No finer than the 25 cm ground is the same as off.
+        self.assertEqual(load(roof_cm=30)["roof_cm"], 0.0)
+        self.assertEqual(load(roof_cm=0)["roof_cm"], 0.0)
+        self.assertEqual(load(roof_cm=None)["roof_cm"], 0.0)
+        with self.assertRaises(ValueError):
+            load(roof_cm=-1)
+        with self.assertRaises(ValueError):
+            load(roof_atlas_px=20000)
+        with self.assertRaises(ValueError):
+            load(roof_max_mpx=0)
 
 
 class TestCanopyShade(unittest.TestCase):
@@ -4908,6 +5418,86 @@ class TestBigFacesFollowTheGround(unittest.TestCase):
         self.assertGreater(float((mesh.face_sizes[faces] == 4).mean()), 0.7)
 
 
+class TestRoadFacesFollowAQuayWall(unittest.TestCase):
+    """A road face whose corners straddle a quay wall is cut along the grid.
+
+    Over Utrecht's Vismarkt a ramp down to the Oudegracht wharf and the wharf
+    path along the wall were single faces with the street on one side and the
+    wharf on the other: flat between their corners, they ran up to 2.1 m off
+    the ground in between and failed `road_surface_follows_terrain`.
+    """
+
+    # A street at 5.3 m NAP, a wharf at 1.2 m, and the wall between y = 6
+    # and y = 8: what a 2 m height grid makes of a quay wall.
+    @staticmethod
+    def wall(x, y):
+        return np.interp(np.asarray(y, dtype=float), [6.0, 8.0], [5.3, 1.2]) + 0.0 * np.asarray(x)
+
+    RAMP = _rect(0.0, 0.0, 3.0, 13.0)
+
+    def _mesh(self, ground):
+        from src.nwb import Centreline, Network
+        from src.roads import build_road_mesh
+        from src.surfaces import CLASS_ROAD, RoadPart
+
+        ramp = RoadPart([self.RAMP], CLASS_ROAD, 0)
+        line = Centreline(np.array([[1.5, -5.0], [1.5, 18.0]]), 1, 1, 2, "Oudegracht", "RB")
+        return build_road_mesh(
+            [ramp], Network(lines=[line]), ground=ground, lift_m=0.0, kerb_m=0.0,
+            ground_grid=(0.0, 0.0, 2.0),
+        )
+
+    @staticmethod
+    def _worst_departure(mesh, ground):
+        """How far the ground strays from the surface, at most, inside any triangle."""
+        tris, _ = mesh.triangles()
+        worst = 0.0
+        steps = 10
+        for i in range(steps + 1):
+            for j in range(steps + 1 - i):
+                w = np.array([i, j, steps - i - j], dtype=float) / steps
+                p = np.einsum("k,nkd->nd", w, tris)
+                worst = max(worst, float(np.abs(ground(p[:, 0], p[:, 1]) - p[:, 2]).max()))
+        return worst
+
+    def test_a_face_across_the_wall_is_cut_so_it_follows_it(self):
+        from src.roads import FOLLOW_M, SURFACE
+
+        mesh = self._mesh(self.wall)
+        self.assertGreater(mesh.stats["faces_cut_to_the_ground"], 0)
+        # Uncut, the cross-sections every 2.6 m put one face from y = 5.2 to
+        # 7.8, whose middle hangs 1.1 m below the top of the wall. Cut along
+        # the grid, the piece over the wall lies within one cell of it.
+        self.assertLess(self._worst_departure(mesh, self.wall), FOLLOW_M)
+        faces = [mesh.face(i) for i in range(len(mesh)) if mesh.face_kind[i] == SURFACE]
+        surface = mesh.vertices[np.unique(np.concatenate(faces))]
+        tops = surface[np.isclose(surface[:, 1], 6.0)]
+        # Across the whole road, not one corner.
+        self.assertAlmostEqual(float(np.ptp(tops[:, 0])), 3.0, places=6)
+        self.assertTrue(np.allclose(tops[:, 2], 5.3))
+        # The cuts are shared by the faces either side: no corner of one
+        # face sits part way along an edge of another, where it would open
+        # a crack.
+        corners = mesh.vertices[np.unique(np.concatenate(faces)), :2]
+        for loop in faces:
+            ring = mesh.vertices[loop, :2]
+            for a, b in zip(ring, np.roll(ring, -1, axis=0)):
+                d = b - a
+                t = np.clip((corners - a) @ d / float(d @ d), 0.0, 1.0)
+                off = np.hypot(*(corners - (a + t[:, None] * d)).T)
+                inside = (off < 1e-6) & (t > 1e-6) & (t < 1 - 1e-6)
+                self.assertFalse(inside.any(), f"a T-junction on edge {a} -> {b}")
+
+    def test_a_street_on_even_ground_keeps_its_ladder(self):
+        def flat(x, y):
+            return np.full(np.shape(x), 2.0)
+
+        mesh = self._mesh(flat)
+        self.assertEqual(mesh.stats["faces_cut_to_the_ground"], 0)
+        faces = [i for i in range(len(mesh)) if mesh.face_kind[i] == 0]
+        self.assertTrue((mesh.face_sizes[faces] == 4).all())
+
+
 class TestMedialAxis(unittest.TestCase):
     def test_an_l_shaped_path_gets_one_centreline_without_spurs(self):
         import shapely
@@ -5913,11 +6503,43 @@ def _blender_mesh_calls():
     Blender loop indices for the unwelded buffer, which killed a real run with
     "Array length mismatch (got 210, expected more)".
     """
-    import re
     import tempfile
 
-    source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
     calls: list[dict] = []
+
+    def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
+        extra = kw.get("extra_uvs") or {}
+        calls.append({
+            "object": name,
+            "vertices": len(vertices),
+            "loops": len(loops),
+            "uvs": len(uvs),
+            # Every extra UV map is per loop too.
+            "extra_uvs": [len(values) for values in extra.values()],
+            "polygons": len(starts),
+            "totals": len(totals),
+            "loop_total_sum": int(np.sum(totals)),
+            "material_indices": len(mats),
+            "materials": len(materials),
+            "max_index": int(np.max(loops)) if len(loops) else -1,
+        })
+
+    namespace = _stubbed_process(record)
+
+    rng = np.random.default_rng(11)
+    folder = Path(tempfile.mkdtemp())
+    yield from _run_blender_builders(namespace, calls, rng, folder)
+
+
+def _stubbed_process(record):
+    """blender/process.py's functions, exec'd against stubs instead of bpy.
+
+    `record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw)`
+    stands in for `build_mesh_object` and sees what each builder hands it.
+    """
+    import re
+
+    source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
 
     class FakeAttributes:
         """Mesh attributes: created and filled, never read back here."""
@@ -5945,22 +6567,8 @@ def _blender_mesh_calls():
         def __getitem__(self, key):
             return self.__dict__[key]
 
-    def record(name, vertices, loops, starts, totals, uvs, mats, materials, **kw):
-        extra = kw.get("extra_uvs") or {}
-        calls.append({
-            "object": name,
-            "vertices": len(vertices),
-            "loops": len(loops),
-            "uvs": len(uvs),
-            # Every extra UV map is per loop too.
-            "extra_uvs": [len(values) for values in extra.values()],
-            "polygons": len(starts),
-            "totals": len(totals),
-            "loop_total_sum": int(np.sum(totals)),
-            "material_indices": len(mats),
-            "materials": len(materials),
-            "max_index": int(np.max(loops)) if len(loops) else -1,
-        })
+    def stub(name, *args, **kw):
+        record(name, *args, **kw)
         return Stub(name)
 
     class FakeObject(dict):
@@ -5996,7 +6604,7 @@ def _blender_mesh_calls():
 
     namespace = {
         "np": np, "Path": Path, "log": lambda *a: None, "bpy": FakeBpy,
-        "build_mesh_object": record,
+        "build_mesh_object": stub,
         "make_material": lambda *a, **k: "M",
         "make_textured_material": lambda *a, **k: "M",
         "make_plain_material": lambda *a, **k: "M",
@@ -6010,9 +6618,11 @@ def _blender_mesh_calls():
             exec(match.group(0), namespace)  # noqa: S102 - our own source
         except Exception:  # noqa: BLE001 - helpers needing bpy are not our target
             pass
+    return namespace
 
-    rng = np.random.default_rng(11)
-    folder = Path(tempfile.mkdtemp())
+
+def _run_blender_builders(namespace, calls, rng, folder):
+    """Feed each builder in `namespace` synthetic input; see _blender_mesh_calls."""
     n = 12
     xy = np.column_stack([rng.uniform(0, 200, n), rng.uniform(0, 200, n)])
     # A strip sharing corners along its length, so a weld has something to
@@ -7626,6 +8236,45 @@ class TestTerrainMeshAwkwardShapes(unittest.TestCase):
         ditch = [(10.0, 40.0), (40.0, 41.75), (40.0, 42.25), (10.0, 44.0)]
         self._closed(water=self._water(ditch))
 
+    def test_a_grid_spacing_that_is_not_whole_centimetres(self):
+        """100 m in 33 squares of 3.0303 m, as 250 m at draft detail is 63 of
+        3.968254 m. The grid squares kept their exact corners while the faces
+        beside them, noded on the centimetre grid, had theirs rounded: every
+        edge between the two was a crack (2,818 over Utrecht Vismarkt)."""
+        import types
+
+        from src.elevation import TerrainResult
+        from src.geo import BBox
+        from src.terrain_mesh import CORE
+
+        bbox = BBox(1000.0, 2000.0, 1100.0, 2100.0)
+        axis = np.linspace(0.0, 100.0, 34)
+        gx, gy = np.meshgrid(1000.0 + axis, 2000.0 + axis)
+        heights = (2.0 + 0.3 * np.sin(gx / 7.0) * np.cos(gy / 9.0)).astype(np.float32)
+        terrain = TerrainResult(
+            heights=heights.copy(), xs=1000.0 + axis, ys=2000.0 + axis, bbox=bbox,
+            center_z_nap=2.0, nodata_fraction_raw=0.0, filled_fraction=0.0,
+            geotiff_path=None, coverage_id="t", resolution_m=0.5, measured=heights.copy(),
+        )
+        corners = np.array([[1030.0, 2030.0], [1055.0, 2032.0], [1052.0, 2061.0], [1028.0, 2058.0]])
+        roof = np.concatenate([corners, np.full((4, 1), 8.0)], axis=1)
+        house = types.SimpleNamespace(roof_tris=roof[[[0, 1, 2], [0, 2, 3]]])
+        pond = [(1070.0, 2070.0), (1090.0, 2072.0), (1088.0, 2090.0), (1072.0, 2088.0)]
+        saved, self.terrain = self.terrain, terrain
+        try:
+            mesh = self._closed(
+                buildings=types.SimpleNamespace(buildings=[house]),
+                water=self._water([(x + 0.0, y + 0.0) for x, y in pond]),
+            )
+        finally:
+            self.terrain = saved
+        self.assertTrue((mesh.face_part == CORE).any())
+        # A grid node, rounded to the centimetre, still has the node's height.
+        node = np.argmin(np.hypot(mesh.vertices[:, 0] - 1000.0 - axis[11],
+                                  mesh.vertices[:, 1] - 2000.0 - axis[5]))
+        self.assertLess(abs(mesh.vertices[node, 0] - 1000.0 - axis[11]), 0.006)
+        self.assertAlmostEqual(float(mesh.measured_z[node]), float(heights[5, 11]), places=5)
+
 
 def types_namespace(**kwargs):
     import types
@@ -8062,6 +8711,28 @@ class TestQuadTerrain(unittest.TestCase):
         self.assertEqual(count, 1)
         wet = [p for p, c in folded if c == 15]
         self.assertAlmostEqual(wet[0].area, 50 * 100, places=3)
+
+    def test_a_thin_strip_goes_to_a_walkway_last(self):
+        """A walkway is kerbed along its outline, so a strip of anything else
+        folded into it gets a kerb, needle tips and all (TestKerbsInBlender);
+        it goes to the street beside it, though it shares less with that."""
+        import shapely
+
+        from src.layered_mesh import _without_thin
+
+        walkway = shapely.Polygon([(0, 0), (50, 0), (50, 100), (0, 100)])
+        strip = shapely.Polygon([(50, 0), (50.4, 0), (50.4, 100), (50, 100)])
+        lawn = shapely.Polygon([(50.4, 0), (52, 0), (52, 40), (50.4, 40)])
+        street = shapely.Polygon([(50.4, 40), (52, 40), (52, 100), (50.4, 100)])
+        pieces = [(walkway, 84), (strip, 0), (lawn, 102), (street, 17)]
+        folded, count = _without_thin(pieces, 0.5, kerbed_codes={84})
+        self.assertEqual(count, 1)
+        self.assertAlmostEqual(next(p for p, c in folded if c == 17).area, 1.6 * 60 + 0.4 * 100, places=3)
+        self.assertAlmostEqual(next(p for p, c in folded if c == 84).area, 50 * 100, places=3)
+        # Beside walkways only, it still goes into one.
+        folded, _ = _without_thin([(walkway, 84), (strip, 0), (lawn.union(street), 84)], 0.5,
+                                  kerbed_codes={84})
+        self.assertAlmostEqual(sum(p.area for p, c in folded if c == 84), 52 * 100, places=3)
 
     def test_a_loose_piece_of_mesh_on_the_sheet_goes(self):
         from src.layered_mesh import _floating
@@ -9697,6 +10368,439 @@ class TestHarbour(unittest.TestCase):
         self.assertEqual({"harbour_built", "quay_faces_reach_under_water", "decks_above_water"},
                          set(verdicts))
         self.assertTrue(all(v.passed for v in verdicts.values()))
+
+
+def _grid_ground(xs, ys, kind, z=None):
+    """A layered ground of quads on the grid `xs` by `ys`, as built.
+
+    `kind(x, y)` gives the ``(layer, material)`` of the quad whose middle is
+    there (material None for bare terrain); `z(x, y)` the ground's height.
+    Faces run counter-clockwise from above, as `TerrainMesh` has them.
+    """
+    from src.layered import GRASS, MATERIAL_NAMES, MOTORWAY, ROAD, WALKWAY, LayeredGround
+    from src.terrain_mesh import TerrainMesh
+
+    xs, ys = np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+    gx, gy = np.meshgrid(xs, ys)
+    z = z or (lambda x, y: 3.0 + 0.0 * x)
+    vertices = np.column_stack([gx.ravel(), gy.ravel(), z(gx.ravel(), gy.ravel())])
+    nx = len(xs)
+    loops, layers, materials = [], [], []
+    for j in range(len(ys) - 1):
+        for i in range(nx - 1):
+            a = j * nx + i
+            loops += [a, a + 1, a + 1 + nx, a + nx]
+            layer, material = kind(0.5 * (xs[i] + xs[i + 1]), 0.5 * (ys[j] + ys[j + 1]))
+            layers.append(layer)
+            materials.append(MATERIAL_NAMES.index(material) if material else -1)
+    count = len(layers)
+    mesh = TerrainMesh(
+        vertices=vertices, measured_z=vertices[:, 2].copy(),
+        face_sizes=np.full(count, 4, dtype=np.int32), face_loops=np.array(loops, dtype=np.int64),
+        face_kind=np.array(layers, dtype=np.int8), face_part=np.zeros(count, dtype=np.int8),
+        vertex_on=np.zeros(len(vertices), dtype=np.int32), edges=np.zeros((0, 2), dtype=np.int64),
+        edge_on=np.zeros(0, dtype=np.int32), grid_m=2.0, locator_cell=8.0,
+    )
+    flat = {ROAD: 0.0, MOTORWAY: 0.0, WALKWAY: 0.0, GRASS: 0.0}
+    return LayeredGround(
+        mesh=mesh, face_material=np.array(materials, dtype=np.int64),
+        face_object=np.full(count, -1, dtype=np.int64), object_names=[], object_layer=[],
+        terrain_name="T_Terrein", lift=dict(flat), top={**flat, WALKWAY: 0.13},
+    )
+
+
+def _band_rows(*edges):
+    """Grid rows every couple of metres, with a row edge on every band edge."""
+    rows = set(np.arange(0.0, max(edges) + 1e-9, 2.5).round(6).tolist()) | set(edges)
+    return np.array(sorted(rows))
+
+
+class TestGuardrails(unittest.TestCase):
+    """Steel guardrails along the motorway, on synthetic ground.
+
+    A 120 x 60 m square on a slope with a dual carriageway across it: a
+    verge to the south, a 4 m central reservation, a verge to the north with
+    a road leaving it at x 80 to 90, and a BGT fence along the south verge
+    at x 30 to 50.
+    """
+
+    @staticmethod
+    def _z(x, y):
+        return 3.0 + 0.02 * np.asarray(x) + 0.3 * np.sin(np.asarray(y) / 5.0)
+
+    @classmethod
+    def setUpClass(cls):
+        import shapely
+
+        from src.geo import BBox
+        from src.guardrails import build_guardrails
+        from src.layered import GRASS, MOTORWAY, ROAD
+
+        def kind(x, y):
+            if 20.0 < y < 31.0 or 35.0 < y < 46.0:
+                return MOTORWAY, "Asfalt"
+            if y > 46.0 and 80.0 < x < 90.0:
+                return ROAD, "Asfalt"
+            return GRASS, "Gras"
+
+        cls.ground = _grid_ground(np.arange(0.0, 120.1, 2.0),
+                                  _band_rows(0, 20, 31, 35, 46, 60), kind, cls._z)
+        cls.fence = shapely.LineString([(30.0, 19.6), (50.0, 19.6)])
+        cls.bbox = BBox(0.0, 0.0, 120.0, 60.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            cls.built = build_guardrails(
+                cls.ground, [], bbox=cls.bbox, guarded=cls.fence.buffer(0.6),
+                collision_thickness_m=0.3, work_dir=Path(tmp),
+            )
+            data = np.load(Path(tmp) / "guardrails.npz")  # allow_pickle defaults to False
+            cls.saved = {key: data[key] for key in data.files}
+
+    def _rails_at(self, y, within=0.05):
+        """Every rail line point within `within` of the line y = `y`."""
+        points = [p for line in self.built.lines for p in line if abs(p[1] - y) < within]
+        return np.array(points).reshape(-1, 2)
+
+    def test_a_rail_down_each_verge_and_each_side_of_the_reservation(self):
+        from src.guardrails import SETBACK_M
+
+        for y in (20.0 - SETBACK_M, 31.0 + SETBACK_M, 35.0 - SETBACK_M, 46.0 + SETBACK_M):
+            with self.subTest(y=y):
+                self.assertGreater(len(self._rails_at(y)), 1)
+        # Nowhere else: every rail point is its setback from a carriageway.
+        for line in self.built.lines:
+            gaps = np.min(np.abs(line[:, 1][:, None] - np.array([20.0, 31.0, 35.0, 46.0])), axis=1)
+            np.testing.assert_allclose(gaps, SETBACK_M, atol=1e-6)
+        self.assertGreater(self.built.counts["between_carriageways_m"], 150.0)
+
+    def test_the_carriageway_is_on_the_left_of_every_rail(self):
+        """The profile's face, and the posts behind it, are laid out by it."""
+        for line in self.built.lines:
+            step = line[-1] - line[0]
+            left = line[0] + 0.5 * step + 1.0 * np.array([-step[1], step[0]]) / np.hypot(*step)
+            y = left[1]
+            self.assertTrue(20.0 < y < 31.0 or 35.0 < y < 46.0, f"verge on the left at y {y:.2f}")
+
+    def test_no_rail_across_a_junction_mouth(self):
+        """The road leaving the north verge at x 80 to 90: the rail stops
+        `CLEAR_M` short of it either side and does not cross."""
+        from src.guardrails import CLEAR_M, SETBACK_M
+
+        north = self._rails_at(46.0 + SETBACK_M)
+        self.assertFalse(((north[:, 0] > 80.0 - CLEAR_M + 1e-6)
+                          & (north[:, 0] < 90.0 + CLEAR_M - 1e-6)).any())
+        self.assertAlmostEqual(float(north[north[:, 0] < 85, 0].max()), 80.0 - CLEAR_M, places=6)
+        self.assertAlmostEqual(float(north[north[:, 0] > 85, 0].min()), 90.0 + CLEAR_M, places=6)
+        # Nothing runs across the end of the area, or across the mouth.
+        for line in self.built.lines:
+            self.assertLess(float(np.ptp(line[:, 1])), 1e-6)
+
+    def test_no_rail_where_a_barrier_already_stands(self):
+        from src.guardrails import GUARDED_M, SETBACK_M
+
+        south = self._rails_at(20.0 - SETBACK_M)
+        # Where the rail line passes within GUARDED_M of the fence's ends; the
+        # buffer's round ends are drawn a little inside the circle.
+        reach = np.sqrt(GUARDED_M ** 2 - (19.6 - (20.0 - SETBACK_M)) ** 2)
+        self.assertFalse(((south[:, 0] > 30.0 - reach + 0.05)
+                          & (south[:, 0] < 50.0 + reach - 0.05)).any())
+        self.assertTrue((south[:, 0] < 29.0).any() and (south[:, 0] > 51.0).any())
+
+    def test_rails_end_inside_the_area(self):
+        from src.guardrails import FRAME_CLEAR_M
+
+        points = np.vstack(self.built.lines)
+        self.assertAlmostEqual(float(points[:, 0].min()), FRAME_CLEAR_M, places=6)
+        self.assertAlmostEqual(float(points[:, 0].max()), 120.0 - FRAME_CLEAR_M, places=6)
+        feet = self.built.post_foot
+        self.assertTrue(((feet[:, 0] > 0) & (feet[:, 0] < 120)).all())
+
+    def test_posts_stand_on_the_ground_and_the_rail_at_its_height(self):
+        from src.guardrails import (
+            POST_EMBED_M, POST_EVERY_M, RAIL_HEIGHT_M, RAIL_TOP_M, guardrail,
+        )
+
+        # Each foot goes POST_EMBED_M in under the lowest of its corners and
+        # its middle; the others deeper, on the slope.
+        feet, corners = self.built.post_foot, self.built.post_corners
+        self.assertEqual(corners.shape, (len(feet), 4, 3))
+        self.assertLess(float(np.abs(corners[:, :, 2] - feet[:, 2:3]).max()), 1e-12)
+        under = np.column_stack([
+            self.ground.surface_at(feet[:, 0], feet[:, 1]),
+            self.ground.surface_at(corners[:, :, 0].ravel(), corners[:, :, 1].ravel()).reshape(-1, 4),
+        ])
+        depth = under - feet[:, 2:3]
+        np.testing.assert_allclose(depth.min(axis=1), POST_EMBED_M, atol=1e-9)
+        self.assertGreater(float(depth.max()), POST_EMBED_M + 1e-4)
+        line = self.built.lines[0]
+        vertices, _, _, kind, foot, _, top = guardrail(line, self.ground.surface_at)
+        stations = len(top)
+        rail = vertices[: stations * 5].reshape(stations, 5, 3)
+        under = self.ground.surface_at(top[:, 0], top[:, 1])
+        np.testing.assert_allclose(top[:, 2] - under, RAIL_TOP_M, atol=1e-9)
+        np.testing.assert_allclose(rail[:, 0], top, atol=1e-12)
+        np.testing.assert_allclose(rail[:, :, 2].max(axis=1) - under, RAIL_TOP_M, atol=1e-9)
+        np.testing.assert_allclose(rail[:, :, 2].min(axis=1) - under,
+                                   RAIL_TOP_M - RAIL_HEIGHT_M, atol=1e-9)
+        spacing = np.linalg.norm(np.diff(foot[:, :2], axis=0), axis=1)
+        self.assertLessEqual(float(spacing.max()), POST_EVERY_M + 1e-6)
+        self.assertGreater(float(spacing.min()), 0.9 * POST_EVERY_M)
+        # Every post on the verge, behind the rail: never on the carriageway.
+        self.assertTrue(((foot[:, 1] < 20.0) | (foot[:, 1] > 46.0)
+                         | ((foot[:, 1] > 31.0) & (foot[:, 1] < 35.0))).all())
+
+    def test_the_rail_is_a_closed_solid_facing_out(self):
+        """Closed, so it is not a hole from behind; turned out, so an engine
+        culling back faces draws its face. About 10 triangles a metre."""
+        from src.guardrails import RAIL, guardrail
+
+        line = np.array([[0.0, 0.0], [40.0, 0.0]])
+        vertices, triangles, uv, kind, _, _, _ = guardrail(line, lambda x, y: np.zeros(np.shape(x)))
+        self.assertEqual(len(uv), len(vertices))
+        rail = triangles[kind == RAIL]
+        # Closed and consistently wound: every edge once each way round.
+        directed = np.vstack([rail[:, [0, 1]], rail[:, [1, 2]], rail[:, [2, 0]]])
+        _, counts = np.unique(directed, axis=0, return_counts=True)
+        self.assertEqual(set(counts.tolist()), {1})
+        flipped = {tuple(e) for e in directed[:, ::-1].tolist()}
+        self.assertEqual(flipped, {tuple(e) for e in directed.tolist()})
+        # ...and outwards: the volume it encloses comes out positive, and is
+        # the profile's area along the 40 m.
+        corner = vertices[rail]
+        volume = float(np.einsum(
+            "ij,ij->i", corner[:, 0], np.cross(corner[:, 1], corner[:, 2])).sum()) / 6.0
+        self.assertAlmostEqual(volume, 40.0 * (0.08 * 0.31 - 0.5 * 0.04 * 0.31), places=6)
+        # Rail and posts on the verge side, right of the line: south of it.
+        self.assertTrue((vertices[:, 1] <= 1e-9).all())
+        self.assertLess(len(triangles) / 40.0, 11.0)
+
+    def test_the_end_of_a_carriageway_at_a_bridge_has_no_rail_across_it(self):
+        """The carriageway runs onto a bridge at x 60, which the structures
+        stage builds: no rail across the end. A road bridge over the verges
+        at x 20 to 30 leaves their rails where they are."""
+        import shapely
+
+        from src.geo import BBox
+        from src.guardrails import SETBACK_M, build_guardrails
+        from src.layered import GRASS, MOTORWAY, TERRAIN, GroundArea
+
+        def kind(x, y):
+            if 20.0 < y < 31.0:
+                return (MOTORWAY, "Asfalt") if x < 60.0 else (TERRAIN, None)
+            return GRASS, "Gras"
+
+        ground = _grid_ground(np.arange(0.0, 120.1, 2.0), _band_rows(0, 20, 31, 60), kind)
+        bridge = GroundArea([_rect_ring(60.0, 20.0, 120.0, 31.0)], MOTORWAY, "Asfalt", level=1)
+        over = GroundArea([_rect_ring(20.0, 0.0, 30.0, 60.0)], 1, "Asfalt", level=1)
+        bbox = BBox(0.0, 0.0, 120.0, 60.0)
+        built = build_guardrails(ground, [bridge, over], bbox=bbox)
+        points = np.vstack(built.lines)
+        self.assertFalse(((points[:, 0] > 60.0 + 1e-6) & (points[:, 1] > 20.0)
+                          & (points[:, 1] < 31.0)).any())
+        for y in (20.0 - SETBACK_M, 31.0 + SETBACK_M):
+            under = points[(np.abs(points[:, 1] - y) < 1e-6)]
+            self.assertTrue(shapely.LineString(under).length > 55.0)
+            self.assertAlmostEqual(float(under[:, 0].max()), 60.0, places=6)
+        # Without the bridge's part in the BGT, the end is just verge.
+        plain = np.vstack(build_guardrails(ground, [], bbox=bbox).lines)
+        self.assertTrue((np.abs(plain[:, 0] - (60.0 + SETBACK_M)) < 1e-6).any())
+
+    def test_a_strip_too_narrow_for_two_rails_gets_one(self):
+        """Two carriageways with 1.2 m of grass between them: two rails would
+        stand in each other's posts. Under a metre, none fits at all."""
+        from src.geo import BBox
+        from src.guardrails import build_guardrails
+        from src.layered import GRASS, MOTORWAY
+
+        for width, want in ((4.0, 2), (1.2, 1), (0.8, 0)):
+            def kind(x, y, width=width):
+                inside = 20.0 < y < 31.0 or 31.0 + width < y < 42.0 + width
+                return (MOTORWAY, "Asfalt") if inside else (GRASS, "Gras")
+
+            ground = _grid_ground(np.arange(0.0, 60.1, 2.0),
+                                  _band_rows(0, 20, 31, 31 + width, 42 + width, 60), kind)
+            built = build_guardrails(ground, [], bbox=BBox(0.0, 0.0, 60.0, 60.0))
+            between = [line for line in built.lines if 31.0 < line[:, 1].mean() < 31.0 + width]
+            with self.subTest(width=width):
+                self.assertEqual(len(between), want)
+                self.assertEqual(len(built.lines), 2 + want)
+
+    def test_the_two_sides_of_a_gore_stop_before_they_meet(self):
+        """Offset into a gore, the rails of its two sides join at its tip
+        into one line folded back on itself; cut there, the shorter side
+        stops where the two come within `APART_M`."""
+        from src.guardrails import APART_M, _back_to_back, _split_at_turns
+
+        v = np.array([[0.0, 0.0], [40.0, 1.0], [0.0, 2.0]])
+        sides = _split_at_turns(v)
+        self.assertEqual(len(sides), 2)
+        kept = _back_to_back(sides + [np.array([[0.0, -20.0], [40.0, -20.0]])], 5.0)
+        self.assertEqual(len(kept), 3)
+        import shapely
+
+        lines = [shapely.LineString(k) for k in kept]
+        for i, a in enumerate(lines):
+            for b in lines[i + 1:]:
+                self.assertGreaterEqual(a.distance(b), APART_M - 1e-3)
+        # The longer side whole, to the tip; the other stops short of it.
+        self.assertAlmostEqual(max(line.length for line in lines[:2]), np.hypot(40.0, 1.0))
+        self.assertLess(min(line.length for line in lines[:2]), np.hypot(40.0, 1.0) - 5.0)
+
+    def test_the_physics_block_holds_the_rail_and_cannot_be_flown_through(self):
+        from src.guardrails import POST_EMBED_M, POST_SIZE_M, RAIL_DEPTH_M, RAIL_TOP_M
+        from src.guardrails import collision_solid, guardrail
+
+        flat = lambda x, y: np.zeros(np.shape(x))  # noqa: E731
+        line = np.array([[0.0, 0.0], [20.0, 0.0]])
+        drawn = guardrail(line, flat)[0]
+        for asked, deep in ((0.30, 0.30), (0.05, RAIL_DEPTH_M + POST_SIZE_M)):
+            block, triangles = collision_solid(line, flat, asked)
+            with self.subTest(asked=asked):
+                self.assertAlmostEqual(float(-block[:, 1].min()), deep, places=6)
+                self.assertAlmostEqual(float(block[:, 1].max()), 0.0, places=6)
+                self.assertAlmostEqual(float(block[:, 2].max()), RAIL_TOP_M, places=6)
+                self.assertLess(float(block[:, 2].min()), -POST_EMBED_M)
+                self.assertTrue((drawn[:, 1] >= block[:, 1].min() - 1e-9).all())
+                self.assertTrue((drawn[:, 1] <= 1e-9).all())
+                self.assertTrue((drawn[:, 2] >= block[:, 2].min()).all())
+        self.assertGreater(len(self.built.collision_triangles), 0)
+        self.assertEqual(self.built.collision_thickness_m, 0.3)
+
+    def test_the_checks_read_it(self):
+        import copy
+
+        from src.validate import CheckReport, check_guardrails
+
+        report = CheckReport()
+        check_guardrails(report, self.built, self.ground)
+        verdicts = {c.name: c for c in report.checks}
+        self.assertEqual(set(verdicts), {"guardrails_present", "guardrails_on_the_verge",
+                                         "guardrails_stand_on_the_ground"})
+        self.assertTrue(all(v.passed for v in verdicts.values()), [str(v) for v in verdicts.values()])
+
+        # A post on the carriageway is caught by the faces under it.
+        moved = copy.deepcopy(self.built)
+        moved.post_foot[3, 1] = 25.0
+        report = CheckReport()
+        check_guardrails(report, moved, self.ground)
+        self.assertFalse({c.name: c for c in report.checks}["guardrails_on_the_verge"].passed)
+
+        # Read back from Blender's summary where it ran: a foot corner in the
+        # air, a rail too low, a post missing from the object.
+        good = {"object": "T_Geleiderail", "posts": 3, "posts_found": 3,
+                "rail_points": 3, "rail_points_found": 3,
+                "foot_depth_min_m": 0.1, "foot_depth_max_m": 0.3,
+                "rail_top_min_m": 0.749, "rail_top_max_m": 0.751}
+        for change, passed in (({}, True), ({"foot_depth_min_m": 0.03}, False),
+                               ({"rail_top_min_m": 0.6}, False), ({"posts_found": 2}, False)):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                summary = {"layered": {"guardrail": {**good, **change}}}
+                (Path(tmp) / "blender_summary.json").write_text(json.dumps(summary))
+                report = CheckReport()
+                check_guardrails(report, self.built, self.ground, work_dir=Path(tmp))
+                standing = {c.name: c for c in report.checks}["guardrails_stand_on_the_ground"]
+                self.assertEqual(standing.passed, passed, standing.detail)
+                self.assertIn("T_Geleiderail", standing.detail)
+
+    def test_no_motorway_no_guardrails(self):
+        from src.geo import BBox
+        from src.guardrails import build_guardrails
+        from src.layered import GRASS, ROAD
+        from src.validate import CheckReport, check_guardrails
+
+        ground = _grid_ground(np.arange(0.0, 40.1, 2.0), _band_rows(0, 10, 20, 40),
+                              lambda x, y: (ROAD, "Asfalt") if 10 < y < 20 else (GRASS, "Gras"))
+        built = build_guardrails(ground, [], bbox=BBox(0.0, 0.0, 40.0, 40.0))
+        self.assertEqual(len(built), 0)
+        report = CheckReport()
+        check_guardrails(report, built, ground)
+        self.assertEqual([(c.name, c.passed) for c in report.checks], [("guardrails_present", True)])
+        self.assertIn("no motorway", report.checks[0].detail)
+
+    def test_the_file_for_blender(self):
+        """No pickles, and the post feet the summary measures."""
+        for key, value in self.saved.items():
+            self.assertNotEqual(value.dtype, object, key)
+        self.assertEqual(len(self.saved["triangles"]), len(self.built))
+        self.assertEqual([str(n) for n in self.saved["kind_names"]], ["rail", "post"])
+        np.testing.assert_allclose(self.saved["post_foot"], self.built.post_foot)
+        np.testing.assert_allclose(self.saved["post_corners"],
+                                   self.built.post_corners.reshape(-1, 3))
+        np.testing.assert_allclose(self.saved["rail_top"], self.built.rail_top)
+        # Every corner and every rail top is a vertex Blender can find.
+        vertices = {tuple(np.round(v, 9)) for v in self.built.vertices}
+        for point in np.vstack([self.saved["post_corners"], self.saved["rail_top"]]):
+            self.assertIn(tuple(np.round(point, 9)), vertices)
+
+    def test_blender_makes_one_steel_object_of_it(self):
+        made = []
+
+        def build_mesh_object(name, vertices, loops, starts, sizes, uvs, slots, materials, **kw):
+            obj = _FakeMeshObject(name, vertices, loops, starts, sizes, uvs, slots, materials)
+            made.append(obj)
+            return obj
+
+        bpy = types_namespace(data=types_namespace(materials=types_namespace(get=lambda n: None)))
+        namespace = _process_namespace(
+            {"build_guardrails", "_GUARDRAIL_POINTS", "RAILING_MATERIAL"},
+            {"build_mesh_object": build_mesh_object, "bpy": bpy,
+             "make_plain_material": lambda name, rgb, rough: f"material {name}"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.built.save(Path(tmp) / "guardrails.npz")
+            scene = {"origin_rd": [60.0, 30.0], "ground_z_offset_nap": 3.0,
+                     "layered": {"guardrails": "guardrails.npz"}}
+            obj = namespace["build_guardrails"](scene, Path(tmp), "T")
+            # The foot corners and rail tops, local, for the summary to measure.
+            points = namespace["_GUARDRAIL_POINTS"]
+            self.assertEqual(len(points["corners"]), 4 * len(self.built.post_foot))
+            np.testing.assert_allclose(points["tops"] + [60.0, 30.0, 3.0], self.built.rail_top)
+            self.assertIsNone(namespace["build_guardrails"](
+                {**scene, "layered": {"guardrails": ""}}, Path(tmp), "T"))
+            self.assertEqual(namespace["_GUARDRAIL_POINTS"], {})
+        self.assertEqual(obj.name, "T_Geleiderail")
+        self.assertEqual(obj["maptile_role"], "guardrail")
+        self.assertEqual(obj.materials, ["material Staal"])
+        self.assertEqual(obj.uvs, len(obj.data.loops))
+        self.assertEqual(len(obj.data.co), len(self.built.vertices))
+        # In the scene's local frame, centred on the area and its height.
+        self.assertLess(float(np.abs(obj.data.co[:, 0]).max()), 61.0)
+
+    def test_the_physics_proxy_lands_in_local_coordinates(self):
+        seen = {}
+        namespace = TestCollisionLayer._collision_ns(
+            on_build=lambda name, vertices, *a, **k: seen.setdefault(name, np.asarray(vertices))
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.built.save(Path(tmp) / "guardrails.npz")
+            scene = {"origin_rd": [60.0, 30.0], "ground_z_offset_nap": 3.0,
+                     "layered": {"guardrails": "guardrails.npz"},
+                     "export": {"collision": True}}
+            built = namespace["build_collision"](scene, Path(tmp))
+        self.assertEqual(set(built), {"Collision_Guardrails"})
+        self.assertEqual(built["Collision_Guardrails"], len(self.built.collision_triangles))
+        self.assertLess(float(np.abs(seen["Collision_Guardrails"][:, 0]).max()), 61.0)
+
+    def test_the_setting(self):
+        from src.config import DEFAULTS
+
+        self.assertTrue(DEFAULTS["layered"]["guardrails"])
+        raw = {"name": "g", "bbox": {"crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
+                                     "xmax": 137000, "ymax": 456000},
+               "layered": {"guardrails": False}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps(raw))
+            self.assertFalse(load_config(path).layered["guardrails"])
+
+    def test_the_scene_names_the_file_only_when_there_is_one(self):
+        import pipeline
+        from src.guardrails import GuardrailSet
+
+        config = load_config(REPO_ROOT / "config.json")
+        self.assertEqual(pipeline.layered_scene(config, self.ground, None, self.built)["guardrails"],
+                         "guardrails.npz")
+        self.assertEqual(pipeline.layered_scene(config, self.ground, None, GuardrailSet())[
+            "guardrails"], "")
 
 
 class TestPathsOverWater(unittest.TestCase):
@@ -11746,10 +12850,14 @@ class TestUIServer(unittest.TestCase):
         # The Utrecht runs predate the terrain mesh stage, so its own measured
         # cost -- 48 s a square kilometre over Bronbeek -- is added to them.
         mesh = 48.0
+        # And the roof page, fetched and relit: 16 s measured over the Utrecht
+        # Dom quarter square kilometre, 30 s over the square kilometre of
+        # config.json, where the 48 Mpx budget caps it.
+        roofs_km, roofs_quarter = 30.0, 16.0
         measured = [
-            (seconds(1000, 4096, preview=True), 468 + mesh),
-            (seconds(1000, 4096, preview=False), 218 + mesh),
-            (seconds(500, 2048, preview=False), 75 + mesh / 4),
+            (seconds(1000, 4096, preview=True), 468 + mesh + roofs_km),
+            (seconds(1000, 4096, preview=False), 218 + mesh + roofs_km),
+            (seconds(500, 2048, preview=False), 75 + mesh / 4 + roofs_quarter),
         ]
         for predicted, actual in measured:
             self.assertLess(
@@ -11976,9 +13084,10 @@ class TestUIPage(unittest.TestCase):
         self.assertNotIn('type="range"', self.html)
         controls = set(re.findall(r'<(?:input|select)[^>]*\bid="(\w+)"', self.html))
         groups = set(re.findall(r'<input type="radio" name="(\w+)"', self.html))
-        # The model list's own search and style filter are not build settings.
+        # The model list's own search and style filter are not build
+        # settings, and neither are the 3D view's search and wireframe choice.
         self.assertEqual(
-            (controls | groups) - {"modelStyle", "modelFilter"},
+            (controls | groups) - {"modelStyle", "modelFilter", "viewerSearch", "wireMode"},
             {"q", "size", "name", "style", "detail", "mesher", "preview", "collision"},
         )
 
@@ -12029,7 +13138,7 @@ class TestUIPage(unittest.TestCase):
     def test_the_3d_view_is_there_and_starts_hidden(self):
         """Opened from a model's card, its dialog and a finished run."""
         for wanted in ("view3d", "viewerCanvas", "viewerLayers", "viewerInfo",
-                       "viewerStatus", "viewerBack", "open3dModel", "open3dResult"):
+                       "viewerStatus", "viewerBack", "open3dModel", "open3dResult", "viewWire"):
             self.assertIn(wanted, self.page.ids, f"the page lost #{wanted}")
         self.assertRegex(self.html, r'<section id="view3d"[^>]*\bhidden\b',
                          "the 3D view should start hidden behind Modellen")
@@ -12047,17 +13156,16 @@ class TestUIPage(unittest.TestCase):
         """The layers list says "Bomen", not "Trees". A collection added in
         process.py without a name here would show up in English."""
         source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
-        exporter = (REPO_ROOT / "blender" / "web_export.py").read_text(encoding="utf-8")
         made = set(re.findall(r'_Layer\("([^"]+)"', source))
         prefixed = set(re.findall(r'_Layer\(f"\{prefix\}(_\w+)"', source))
         self.assertTrue(made and prefixed, "found no collections; the pattern moved")
-        skipped = set(re.findall(r'"([^"]+)"', re.search(
-            r"SKIPPED_COLLECTIONS = frozenset\(\{(.*?)\}\)", exporter).group(1)))
+        # The physics proxies too: they come in switched off, to be checked.
+        self.assertIn("Collision", made)
         named = set(re.findall(r'"([^"]+)":', re.search(
             r"const LAYER_NAME = \{(.*?)\n\};", self.html, re.S).group(1)))
         suffixes = set(re.findall(r'"(_\w+)":', re.search(
             r"const LAYER_SUFFIX = \{(.*?)\n\};", self.html, re.S).group(1)))
-        self.assertEqual(made - skipped - named, set())
+        self.assertEqual(made - named, set())
         self.assertEqual(prefixed - suffixes, set())
 
     def test_every_property_a_model_carries_has_a_label(self):
@@ -12230,6 +13338,31 @@ class TestWebView(unittest.TestCase):
         face = np.cross(b - a, c - a)
         self.assertGreater(float(np.dot(face, out["normals"][0].astype(float))), 0.0)
 
+    def test_the_wireframe_leaves_out_the_diagonals(self):
+        """A quad cut in two for the export shows as a quad: its diagonal is
+        a side of both triangles and an edge of neither."""
+        # Vertices 0-1-2-3 round a quad, cut along 0-2; triangle 2 is a lone
+        # triangle 3-2-4 sharing the quad's edge 2-3.
+        corners = np.array([[0, 1, 2], [0, 2, 3], [3, 2, 4]])
+        edges = np.array(sorted(a * 5 + b for a, b in ((0, 1), (1, 2), (2, 3), (0, 3), (2, 4), (3, 4))))
+        mask = self.web.edge_mask(corners, edges, 5)
+        # Sides run corner k to corner k+1: 0-1, 1-2 real and 2-0 not; then
+        # 0-2 not, 2-3 and 3-0 real; every side of the lone triangle real.
+        np.testing.assert_array_equal(mask, [0b011, 0b110, 0b111])
+
+    def test_a_mirrored_triangle_keeps_its_edges_marked(self):
+        """Turning a mirrored triangle round reorders its sides, and which of
+        them are edges has to turn with them."""
+        tris = self._triangles([[0, 0, 0], [1, 0, 0], [1, 1, 0]], [[0, 1, 2]])
+        tris["edges"] = np.array([0b001], dtype=np.uint8)  # only the side 0-1
+        out = self.web.triangles_as_vertices(tris, np.diag([-1.0, 1.0, 1.0, 1.0]))
+        corners = out["triangles"][0]
+        marked = [k for k in range(3) if out["edges"][0] >> k & 1]
+        self.assertEqual(len(marked), 1)
+        # The marked side still joins the corners that came from 0 and 1.
+        side = {tuple(out["points"][corners[marked[0]]]), tuple(out["points"][corners[(marked[0] + 1) % 3]])}
+        self.assertEqual(side, {(0.0, 0.0, 0.0), (-1.0, 0.0, 0.0)})
+
     def test_instances_come_apart_into_translation_rotation_and_scale(self):
         """What EXT_mesh_gpu_instancing stores, and what the page puts back
         together: every tree where Blender has it."""
@@ -12267,11 +13400,14 @@ class TestWebView(unittest.TestCase):
             [[0, 1, 2], [0, 2, 3], [0, 1, 4]], slots=[0, 0, 1])
         box["materials"] = ["brick", "roof"]
         merged = {}
-        for object_id, offset in ((0, 0.0), (1, 30.0)):
+        # Two buildings side by side and one 900 m east: that one is in
+        # another tile, so the page can leave it out when it is not in view.
+        for object_id, offset in ((0, 0.0), (1, 30.0), (5, 900.0)):
             matrix = np.eye(4)
             matrix[0, 3] = offset
             for slot, part in web.split_by_slot(web.triangles_as_vertices(box, matrix), box["slots"]):
                 part["object"] = object_id
+                part["centre"] = (offset + 5.0, -3.0)
                 merged.setdefault((0, slot), []).append(part)
         tree = web.triangles_as_vertices(self._triangles([[0, 0, 0], [1, 0, 0], [0, 0, 1]], [[0, 1, 2]]), None)
         tree_parts = [(2, part) for _, part in web.split_by_slot(tree, np.zeros(1))]
@@ -12283,10 +13419,10 @@ class TestWebView(unittest.TestCase):
         material = {"name": "", "color": [0.5, 0.5, 0.5, 1.0], "texture": None,
                     "normal_texture": None, "roughness": 0.8, "metallic": 0.0, "cutout": False}
         data = {
-            "layers": [{"name": "Buildings", "objects": 2, "triangles": 6},
+            "layers": [{"name": "Buildings", "objects": 3, "triangles": 9},
                        {"name": "Trees", "objects": 3, "triangles": 3}],
             "objects": [["Pand_1", 0, {"bag_id": "NL.IMBAG.Pand.1"}], ["Pand_2", 0, {}],
-                        ["Tree_1", 1, {}], ["Tree_2", 1, {}], ["Tree_3", 1, {}]],
+                        ["Tree_1", 1, {}], ["Tree_2", 1, {}], ["Tree_3", 1, {}], ["Pand_3", 0, {}]],
             "materials": [dict(material, name="brick", texture="facade.png"),
                           dict(material, name="roof"),
                           dict(material, name="fence", texture="fence.png", cutout=True)],
@@ -12321,6 +13457,14 @@ class TestWebView(unittest.TestCase):
                 if "_OBJECT" in attributes:
                     ids = _accessor(document, binary, attributes["_OBJECT"])
                     self.assertTrue(((ids >= 0) & (ids < objects)).all())
+                # One byte per triangle saying which sides the wireframe draws.
+                edges = _accessor(document, binary, primitive["extras"]["edges"])
+                self.assertEqual(len(edges), len(indices) // 3)
+                self.assertTrue((edges <= 7).all())
+
+        # The far building drawn apart from the near two, per material.
+        brick = [m["name"] for m in document["meshes"] if m["name"].startswith("Buildings / brick")]
+        self.assertEqual(len(brick), 2, brick)
 
         instanced = [n for n in document["nodes"] if "extensions" in n]
         self.assertEqual(len(instanced), 1)
@@ -12329,6 +13473,236 @@ class TestWebView(unittest.TestCase):
         self.assertEqual(set(counts.values()), {3})
         np.testing.assert_allclose(_accessor(document, binary, parts["TRANSLATION"])[0], [50.0, 0.0, -7.0])
         np.testing.assert_array_equal(_accessor(document, binary, parts["_OBJECT"]).ravel(), [2, 3, 4])
+
+
+class TestBuildQueue(unittest.TestCase):
+    """Runs wait their turn, survive the server stopping, and models can be
+    removed and handed over whole. The pipeline itself is stood in for."""
+
+    def setUp(self):
+        import threading
+        from unittest import mock
+
+        sys.path.insert(0, str(REPO_ROOT / "ui"))
+        import server
+
+        self.server = server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ran: list[str] = []
+        self.busy = 0
+        self.most = 0
+        self.gate = threading.Event()
+        self.gate.set()
+        lock = threading.Lock()
+
+        def fake_run(job, preview):
+            with lock:
+                self.busy += 1
+                self.most = max(self.most, self.busy)
+            job.status = "running"
+            self.gate.wait(10)
+            time.sleep(0.05)
+            with lock:
+                self.ran.append(job.name)
+                self.busy -= 1
+            job.status = "done"
+            job.finished = time.time()
+            job.save()
+
+        self.patches = [mock.patch.object(server, "REPO_ROOT", self.root),
+                        mock.patch.object(server, "run_job", fake_run)]
+        for patch in self.patches:
+            patch.start()
+        self.before = set(server.JOBS)
+
+    def tearDown(self):
+        self.gate.set()
+        for job_id in set(self.server.JOBS) - self.before:
+            job = self.server.JOBS[job_id]
+            self._wait(lambda j=job: j.status in self.server.FINISHED)
+        for patch in self.patches:
+            patch.stop()
+        with self.server.JOBS_LOCK:
+            for job_id in set(self.server.JOBS) - self.before:
+                self.server.JOBS.pop(job_id, None)
+                if job_id in self.server.JOBS_ORDER:
+                    self.server.JOBS_ORDER.remove(job_id)
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _wait(condition, seconds=10.0):
+        end = time.time() + seconds
+        while time.time() < end:
+            if condition():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _job(self, name):
+        bbox = {"xmin": 136000, "ymin": 455000, "xmax": 136500, "ymax": 455500}
+        return self.server.Job(f"q-{name}", name, {"name": name, "bbox": bbox}, 60.0)
+
+    def test_runs_wait_their_turn_one_at_a_time(self):
+        jobs = [self._job(n) for n in ("first", "second", "third")]
+        for job in jobs:
+            self.server.submit(job)
+        self.assertTrue(self._wait(lambda: len(self.ran) == 3))
+        self.assertEqual(self.ran, ["first", "second", "third"])
+        self.assertEqual(self.most, 1, "two builds ran at once")
+        # Each kept its record beside its work files.
+        record = json.loads((self.root / "work" / "second" / "run.json").read_text())
+        self.assertEqual(record["status"], "done")
+
+    def test_a_waiting_run_can_be_taken_out(self):
+        self.gate.clear()
+        running, waiting = self._job("running"), self._job("waiting")
+        self.server.submit(running)
+        self.assertTrue(self._wait(lambda: running.status == "running"))
+        self.server.submit(waiting)
+        self.assertEqual(self.server.active_job("waiting"), waiting)
+        self.server.cancel(waiting)
+        self.gate.set()
+        self.assertTrue(self._wait(lambda: running.status == "done"))
+        time.sleep(0.2)
+        self.assertEqual(self.ran, ["running"])
+        self.assertEqual(waiting.status, "cancelled")
+
+    def test_a_restarted_server_finds_its_runs(self):
+        """What was running is shown as interrupted, with its log; what was
+        waiting is built."""
+        for name, status in (("cut_off", "running"), ("next_up", "queued")):
+            folder = self.root / "work" / name
+            folder.mkdir(parents=True)
+            (folder / "ui_config.json").write_text(json.dumps({"name": name, "bbox": {"xmin": 1}}))
+            (folder / "run.json").write_text(json.dumps({
+                "id": f"r-{name}", "name": name, "status": status, "queued_at": time.time(),
+                "estimate": 60, "preview": False, "step": 4, "total_steps": 15}))
+        (self.root / "work" / "cut_off" / "run.log").write_text("Step 4/15  buildings\n")
+        self.assertEqual(self.server.restore_jobs(), 1)
+        cut = self.server.JOBS["r-cut_off"]
+        self.assertEqual(cut.status, "interrupted")
+        self.assertIn("Step 4/15  buildings", cut.lines)
+        self.assertEqual(cut.snapshot(0)["fraction"], 1.0)
+        self.assertTrue(self._wait(lambda: self.ran == ["next_up"]))
+        saved = json.loads((self.root / "work" / "cut_off" / "run.json").read_text())
+        self.assertEqual(saved["status"], "interrupted")
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX")
+    def test_stopping_a_run_stops_what_it_started(self):
+        """Blender runs as the pipeline's child: stopping the pipeline alone
+        left Blender building on."""
+        import subprocess
+
+        pid_file = self.root / "grandchild.pid"
+        script = (
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(60)\n"
+        )
+        process = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
+        self.assertTrue(self._wait(lambda: pid_file.is_file() and pid_file.read_text().strip()))
+        grandchild = int(pid_file.read_text())
+        self.server.stop_process(process)
+        self.assertIsNotNone(process.poll())
+
+        def gone():
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                return True
+            # Still a zombie until init reaps it: dead all the same.
+            try:
+                with open(f"/proc/{grandchild}/stat") as stat:
+                    return stat.read().split(") ")[1].startswith("Z")
+            except OSError:
+                return True
+            return False
+
+        self.assertTrue(self._wait(gone, 5), "the grandchild outlived the stop")
+
+    def test_a_server_that_stops_marks_its_run_interrupted(self):
+        self.gate.clear()
+        job = self._job("cut_short")
+        self.server.submit(job)
+        self.assertTrue(self._wait(lambda: job.status == "running"))
+        self.server.stop_running()
+        self.assertEqual(job.status, "interrupted")
+        record = json.loads((self.root / "work" / "cut_short" / "run.json").read_text())
+        self.assertEqual(record["status"], "interrupted")
+        # The stand-in finishes by itself; give the record back its end.
+        self.gate.set()
+
+    def test_a_model_is_removed_with_its_work_files(self):
+        for root in ("output", "work"):
+            (self.root / root / "old_area").mkdir(parents=True)
+            (self.root / root / "old_area" / "file.txt").write_text("x")
+        self.assertIsNone(self.server.delete_area("old_area"))
+        self.assertFalse((self.root / "output" / "old_area").exists())
+        self.assertFalse((self.root / "work" / "old_area").exists())
+        self.assertEqual(self.server.delete_area("old_area")[0], 404)
+        self.assertEqual(self.server.delete_area("..")[0], 400)
+
+    def test_a_model_being_built_is_not_removed(self):
+        self.gate.clear()
+        job = self._job("busy_area")
+        (self.root / "output" / "busy_area").mkdir(parents=True)
+        self.server.submit(job)
+        self.assertEqual(self.server.delete_area("busy_area")[0], 409)
+        self.assertTrue((self.root / "output" / "busy_area").is_dir())
+
+    def test_a_model_zips_whole_with_pictures_stored(self):
+        import io
+        import zipfile
+
+        folder = self.root / "output" / "zipped"
+        (folder / "preview").mkdir(parents=True)
+        (folder / "model.fbx").write_bytes(b"FBX " * 1000)
+        (folder / "aerial.png").write_bytes(b"\x89PNG" + bytes(500))
+        (folder / "preview" / "preview_top.png").write_bytes(b"\x89PNG")
+        buffer = io.BytesIO()
+        self.assertEqual(self.server.write_zip(folder, "zipped", buffer), 3)
+        with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+            info = {i.filename: i for i in archive.infolist()}
+            self.assertEqual(set(info), {"zipped/model.fbx", "zipped/aerial.png",
+                                         "zipped/preview/preview_top.png"})
+            self.assertEqual(info["zipped/aerial.png"].compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(info["zipped/model.fbx"].compress_type, zipfile.ZIP_DEFLATED)
+            self.assertEqual(archive.read("zipped/model.fbx"), b"FBX " * 1000)
+
+    def test_the_unity_package_downloads_whole(self):
+        """The ? dialog hands out the package as a zip: every script with its
+        .meta, or Unity gives the components new ids on each machine."""
+        import io
+        import zipfile
+
+        folder = REPO_ROOT / "unity" / self.server.UNITY_PACKAGE
+        on_disk = {p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()}
+        buffer = io.BytesIO()
+        self.assertEqual(self.server.write_zip(folder, self.server.UNITY_PACKAGE, buffer), len(on_disk))
+        with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+            names = archive.namelist()
+        self.assertTrue(all(n.startswith(f"{self.server.UNITY_PACKAGE}/") for n in names))
+        inside = {n.split("/", 1)[1] for n in names}
+        self.assertEqual(inside, on_disk)
+        self.assertIn("package.json", inside)
+        self.assertIn("Editor.meta", inside)
+        for name in inside:
+            if name.endswith(".cs"):
+                self.assertIn(f"{name}.meta", inside)
+
+    def test_a_name_of_dots_or_slashes_builds_nowhere(self):
+        """".." passed the old character check and put a build in the project
+        folder itself."""
+        for name in ("..", ".", "a/b"):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "c.json"
+                path.write_text(json.dumps({"name": name, "bbox": {
+                    "crs": "EPSG:28992", "xmin": 136000, "ymin": 455000,
+                    "xmax": 137000, "ymax": 456000}}))
+                with self.assertRaises(ValueError, msg=name):
+                    load_config(path)
 
 
 # A small model, saved by Blender itself: a building with a render-only
@@ -12374,6 +13748,8 @@ for i in range(10):
     trees.objects.link(tree)
 
 layer("Collision").objects.link(bpy.data.objects.new("Collision_box", box.copy()))
+# Hidden in the viewport, as process.py leaves it.
+bpy.context.view_layer.layer_collection.children["Collision"].hide_viewport = True
 bpy.ops.wm.save_as_mainfile(filepath=sys.argv[-1])
 """
 
@@ -12407,20 +13783,33 @@ class TestWebViewInBlender(unittest.TestCase):
         # Stamped with the save it shows, which is how the page knows it.
         self.assertEqual(stamp["source"], "model.blend")
         self.assertEqual((stamp["source_size"], stamp["source_mtime_ns"]), (saved.st_size, saved.st_mtime_ns))
-        self.assertEqual(stamp["triangles"], 12 + 10 * 4)
+        # The building, ten trees, and the collision proxy of the building.
+        self.assertEqual(stamp["triangles"], 12 + 10 * 4 + 12)
         tables = document["extras"]["terreinlab"]
-        # The physics proxies are never drawn, so they are not in the view.
-        self.assertEqual([layer["name"] for layer in tables["layers"]], ["Buildings", "Trees"])
-        self.assertEqual(len(tables["objects"]), 11)
+        # The physics proxies are in, switched off until asked for.
+        self.assertEqual([layer["name"] for layer in tables["layers"]], ["Buildings", "Trees", "Collision"])
+        self.assertTrue(tables["layers"][2]["hidden"] and tables["layers"][2]["collision"])
+        self.assertNotIn("hidden", tables["layers"][0])
+        self.assertEqual(len(tables["objects"]), 12)
         building = next(o for o in tables["objects"] if o[0] == "Pand_1")
         self.assertEqual(building[2], {"bag_id": "NL.IMBAG.Pand.1", "build_year": 1900})
+        # Counted as Blender shows it: six quads, before the render-only
+        # triangulation cuts them.
+        self.assertEqual(building[3], [8, 0, 6, 0])
+        # Its box, in glTF axes, for the page's search to fly to.
+        np.testing.assert_allclose(building[4], [0, 0, -6, 10, 9, 0], atol=0.01)
 
         # The building, merged, in glTF axes: north is -Z.
         merged = [n for n in document["nodes"] if "mesh" in n and "extensions" not in n]
-        position = document["accessors"][
-            document["meshes"][merged[0]["mesh"]]["primitives"][0]["attributes"]["POSITION"]]
+        primitive = document["meshes"][merged[0]["mesh"]]["primitives"][0]
+        position = document["accessors"][primitive["attributes"]["POSITION"]]
         np.testing.assert_allclose(position["min"], [0, 0, -6], atol=1e-5)
         np.testing.assert_allclose(position["max"], [10, 9, 0], atol=1e-5)
+        # Its wireframe: twelve triangles, and of their 36 sides the 24 that
+        # are the quads' edges; the six diagonals, each twice, are not.
+        edges = _accessor(document, binary, primitive["extras"]["edges"]).ravel()
+        self.assertEqual(len(edges), 12)
+        self.assertEqual(int(np.unpackbits(edges[:, None], axis=1).sum()), 24)
 
         # The trees, one mesh drawn ten times, each where Blender put it.
         instanced = [n for n in document["nodes"] if "extensions" in n]
@@ -12430,6 +13819,134 @@ class TestWebViewInBlender(unittest.TestCase):
         self.assertEqual(len(translation), 10)
         np.testing.assert_allclose(sorted(translation[:, 0]), [20 + 3 * i for i in range(10)], atol=1e-4)
         np.testing.assert_allclose(translation[:, 2], -40.0, atol=1e-4)
+
+
+# Each walkway given (points, faces) kerbed as process.py kerbs it, and how
+# far the furthest point of the result stands outside the walkway's outline.
+_KERB_RUN = r"""
+import importlib.util
+import json
+import math
+import sys
+
+import bpy
+import numpy as np
+import shapely
+
+source, cases, out = sys.argv[-3:]
+spec = importlib.util.spec_from_file_location("process", source)
+process = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(process)
+curb = process.load_curb_generator()
+settings = {
+    "Width": 0.3, "Height": 0.15, "Height Offset Curb": 0.02, "Curb Slant": 0.6,
+    "Bevel": 0.02, "Bevel Inner": 0.015, "Walkway Height Offset": 0.05,
+    "Bevel Curb Outer": True, "Bevel Curb Inner": True,
+    "Smooth by Angle": math.radians(46.0),
+}
+result = {}
+for name, case in json.loads(open(cases).read()).items():
+    if curb is None:
+        result[name] = None
+        continue
+    points = np.column_stack([case["points"], np.zeros(len(case["points"]))])
+    faces = case["faces"]
+    sizes = np.array([len(f) for f in faces])
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    points, loops = process.split_pinches(points, [i for f in faces for i in f], starts, sizes)
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(points.tolist(), [], [loops[s:s + n].tolist() for s, n in zip(starts, sizes)])
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    modifier = obj.modifiers.new("CurbGenerator", "NODES")
+    modifier.node_group = process._kerb_group(curb)
+    for key, value in settings.items():
+        process.set_modifier_input(modifier, key, value)
+    held = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    built = held.to_mesh()
+    outline = shapely.union_all([shapely.Polygon(points[f, :2]) for f in faces])
+    result[name] = max(outline.distance(shapely.Point(v.co.x, v.co.y)) for v in built.vertices)
+    held.to_mesh_clear()
+open(out, "w").write(json.dumps(result))
+"""
+
+
+@unittest.skipUnless(HAVE_BPY, "needs the pip bpy module")
+class TestKerbsInBlender(unittest.TestCase):
+    """The curb generator on walkways the layered ground hands it."""
+
+    @staticmethod
+    def _faces(polygon):
+        """The polygon as triangles sharing their corners, facing up as the
+        layered ground's faces do: the curb generator kerbs a face turned
+        over on its outside."""
+        import shapely
+
+        triangles = shapely.orient_polygons(shapely.constrained_delaunay_triangles(polygon)).geoms
+        corners = np.round([t.exterior.coords[:3] for t in triangles], 6)
+        points, index = np.unique(corners.reshape(-1, 2), axis=0, return_inverse=True)
+        return {"points": points.tolist(), "faces": index.reshape(-1, 3).tolist()}
+
+    def _kerbed(self, cases):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "run.py").write_text(_KERB_RUN, encoding="utf-8")
+            (folder / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(folder / "run.py"), str(REPO_ROOT / "blender" / "process.py"),
+                 str(folder / "cases.json"), str(folder / "out.json")],
+                capture_output=True, text=True, timeout=600,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            return json.loads((folder / "out.json").read_text(encoding="utf-8"))
+
+    def test_a_thin_strip_of_bare_ground_does_not_become_a_kerbed_needle(self):
+        """Over Delft a needle of bare ground 5 degrees across, thinner than a
+        row, lay along a footpath. Folded into the footpath, the one it shared
+        most outline with, its tip met the rest of the footpath at one point
+        round a lawn, and the curb generator threw the kerb mitred round that
+        tip 6.7 m, past the edge of the area. The strip goes to a neighbour
+        without kerbs instead, and the kerb stays on the path."""
+        import shapely
+
+        from src.layered import GRASS, ROAD, TERRAIN, WALKWAY, _code
+        from src.layered_mesh import THIN_M, _without_thin
+
+        walk = _code(WALKWAY, "Beton_Geel")
+        # A 3 degree needle 4 m long ending on a street, the footpath along
+        # both its sides; a lawn and a patch of bare ground either side of its
+        # tip.
+        needle = shapely.Polygon([(0, 0), (4, 0), (4, 0.21)])
+        lawn = shapely.Polygon([(0, 0), (2, 0.105), (0, 3)])
+        ground = shapely.Polygon([(0, 0), (1, 0), (1, -2), (-4, -2), (-4, 0)])
+        street = shapely.box(4, -6, 10, 6)
+        path = shapely.box(-6, -6, 4, 6).difference(shapely.union_all([needle, lawn, ground]))
+        pieces = [(path, walk), (needle, TERRAIN * 16), (lawn, _code(GRASS, "Gras")),
+                  (ground, TERRAIN * 16), (street, _code(ROAD, "Asfalt"))]
+
+        def walkway(**kw):
+            folded, count = _without_thin(pieces, THIN_M, **kw)
+            self.assertEqual(count, 1)
+            return shapely.union_all([p for p, c in folded if c == walk])
+
+        before = walkway()
+        after = walkway(kerbed_codes={walk})
+        # As it was: the needle went to the footpath, its tip touching the
+        # rest of it at one point.
+        self.assertAlmostEqual(before.area, path.area + needle.area, places=2)
+        # Now the footpath is as the BGT drew it.
+        self.assertTrue(after.equals(path))
+
+        past = self._kerbed({"before": self._faces(before), "after": self._faces(after)})
+        if past["after"] is None:
+            self.skipTest("the curb generator needs Blender 5")
+        # The shape the defect needs: kerbed, the needle throws its kerb
+        # metres (4.9 m when this was written).
+        self.assertGreater(past["before"], 1.0)
+        # Without it nothing stands outside the footpath.
+        self.assertLess(past["after"], 0.01)
 
 
 class TestUIViewer(unittest.TestCase):
@@ -12598,6 +14115,226 @@ class TestUIViewer(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class TestUnityPackage(unittest.TestCase):
+    """The Unity package in unity/ recognises a model by names the pipeline
+    writes, and nothing else ties the two together.
+
+    Unity is not available here, so the C# is not run. What can drift without
+    anyone noticing is the names: rename a texture or a property on this side
+    and every model would import as if the package were not installed. So the
+    names are read out of the C# constants and checked against the code that
+    writes them.
+    """
+
+    PACKAGE = REPO_ROOT / "unity" / "com.terreinlab.importer"
+
+    @classmethod
+    def _constants(cls, relative: str) -> dict[str, str]:
+        text = (cls.PACKAGE / relative).read_text(encoding="utf-8")
+        return dict(re.findall(r'public const string (\w+) = "([^"\\]*)";', text))
+
+    def _json(self, relative: str) -> dict:
+        return json.loads((self.PACKAGE / relative).read_text(encoding="utf-8"))
+
+    def test_the_manifest_is_one_package_manager_accepts(self):
+        manifest = self._json("package.json")
+        self.assertEqual(manifest["name"], "com.terreinlab.importer")
+        # Reverse-domain and lower case, or Package Manager refuses it.
+        self.assertRegex(manifest["name"], r"^[a-z0-9_-]+(\.[a-z0-9_-]+){2,}$")
+        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
+        # The oldest Unity it is written for: the APIs used are all in 2021.3.
+        self.assertEqual(manifest["unity"], "2021.3")
+        for field in ("displayName", "description"):
+            self.assertIsInstance(manifest[field], str)
+            self.assertTrue(manifest[field].strip(), field)
+        self.assertEqual(manifest.get("dependencies", {}), {})
+        # The README sends people to this file.
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("unity/com.terreinlab.importer/package.json", readme)
+
+    def test_the_editor_assembly_references_the_runtime_one(self):
+        runtime = self._json("Runtime/TerreinLab.Importer.asmdef")
+        editor = self._json("Editor/TerreinLab.Importer.Editor.asmdef")
+        self.assertEqual(runtime["name"], "TerreinLab.Importer")
+        self.assertEqual(editor["name"], "TerreinLab.Importer.Editor")
+        # Editor code in a player build breaks the build.
+        self.assertEqual(editor["includePlatforms"], ["Editor"])
+        self.assertEqual(editor.get("excludePlatforms", []), [])
+        self.assertIn(runtime["name"], editor["references"])
+        # The components ship in builds, so the runtime assembly is for every
+        # platform and depends on nothing of the editor's.
+        self.assertEqual(runtime.get("includePlatforms", []), [])
+        self.assertEqual(runtime.get("excludePlatforms", []), [])
+        self.assertEqual(runtime.get("references", []), [])
+
+        asmdefs = sorted(
+            p.relative_to(self.PACKAGE).as_posix() for p in self.PACKAGE.rglob("*.asmdef")
+        )
+        self.assertEqual(
+            asmdefs,
+            ["Editor/TerreinLab.Importer.Editor.asmdef", "Runtime/TerreinLab.Importer.asmdef"],
+        )
+        scripts = list(self.PACKAGE.rglob("*.cs"))
+        self.assertTrue(scripts)
+        for script in scripts:
+            self.assertIn(script.relative_to(self.PACKAGE).parts[0], ("Editor", "Runtime"), script.name)
+        # Unity only attaches a MonoBehaviour that sits in a file of its own name.
+        for component in ("TerreinLabModel", "TerreinLabProperties"):
+            source = (self.PACKAGE / "Runtime" / f"{component}.cs").read_text(encoding="utf-8")
+            self.assertIn(f"public sealed class {component} : MonoBehaviour", source)
+
+    def test_every_file_has_a_meta_with_a_guid_of_its_own(self):
+        """A package installed from git is read-only, so Unity cannot write the
+        .meta files it lacks and skips those assets. A script's GUID is also
+        how a scene refers to its component, so it must be the same on every
+        machine rather than made up by each one."""
+        guids: dict[str, str] = {}
+        for path in sorted(self.PACKAGE.rglob("*")):
+            name = path.relative_to(self.PACKAGE).as_posix()
+            if path.suffix == ".meta":
+                self.assertTrue(path.with_suffix("").exists(), f"{name} belongs to nothing")
+                continue
+            meta = path.with_name(path.name + ".meta")
+            self.assertTrue(meta.is_file(), f"{name} has no .meta")
+            found = re.search(r"^guid: ([0-9a-f]{32})$", meta.read_text(encoding="utf-8"), re.M)
+            self.assertIsNotNone(found, f"{name}.meta has no GUID")
+            guid = found.group(1)
+            self.assertNotIn(guid, guids, f"{name} has the GUID of {guids.get(guid)}")
+            guids[guid] = name
+
+    def test_the_file_names_are_the_ones_the_pipeline_writes(self):
+        from types import SimpleNamespace
+
+        from src.config import DEFAULTS
+        from src.export import write_attribution
+        from src.facade import generate_facade_textures
+        from src.surfaces import write_land_cover
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        export = DEFAULTS["export"]
+        self.assertEqual(names["MetadataFile"], export["metadata_name"])
+        self.assertEqual(names["AerialFile"], export["aerial_name"])
+        self.assertTrue(export["fbx_name"].endswith(names["ModelExtension"]))
+        # The aerial lands beside the FBX under that export name.
+        process = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        self.assertIn('aerial_dst = out_dir / scene["export"]["aerial_name"]', process)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self.assertEqual(write_attribution(out).name, names["AttributionFile"])
+            land_cover = write_land_cover(
+                SimpleNamespace(class_grid=np.zeros((4, 4), dtype=np.uint8)), BBox(0, 0, 8, 8), out
+            )
+            self.assertEqual(land_cover[0].name, names["LandCoverFile"])
+            cfg = dict(
+                DEFAULTS["facade"], texture_px=32, variants=1, looks_per_era=1,
+                photo_textures=False, normal_map=True, ground_floor=False,
+            )
+            textures = generate_facade_textures(out, facade_cfg=cfg)
+
+        normals = [normal.name for _, normal in textures if normal is not None]
+        self.assertTrue(normals, "no normal maps written to check")
+        for name in normals:
+            self.assertTrue(name.endswith(names["NormalMapSuffix"]), name)
+        # And no colour texture would be imported as one.
+        for colour, _ in textures:
+            self.assertFalse(colour.name.endswith(names["NormalMapSuffix"]), colour.name)
+
+    def test_the_roof_pages_are_known_by_the_name_they_get(self):
+        """A page is sized to what it holds; imported as a colour texture it
+        would be scaled to a power of two and the roofs blurred again."""
+        from src import roofs
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        self.assertEqual(names["RoofPagePrefix"], f"{roofs.FILE_STEM}_")
+        settings = (self.PACKAGE / "Editor" / "TerreinLabImportSettings.cs").read_text(encoding="utf-8")
+        case = settings.split("case TextureRole.RoofPage:", 1)[1].split("break;", 1)[0]
+        self.assertIn("TextureImporterNPOTScale.None", case)
+        self.assertIn("SetLargeMaxSize", case)
+
+    def test_the_tree_material_is_the_one_blender_hands_the_trees(self):
+        import ast
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        tree = ast.parse((REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8"))
+
+        def makes(node, material):
+            return (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") == "make_textured_material"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == material
+            )
+
+        handed = [
+            arg
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call) and getattr(call.func, "id", "") == "build_trees"
+            for arg in call.args
+        ]
+        self.assertTrue(
+            any(makes(arg, names["TreeMaterial"]) for arg in handed),
+            f"build_trees is no longer given {names['TreeMaterial']}",
+        )
+
+    def test_the_metadata_carries_what_marks_a_model(self):
+        from types import SimpleNamespace
+
+        from src.config import DEFAULTS
+        from src.export import build_metadata
+
+        names = self._constants("Editor/TerreinLabNames.cs")
+        metadata = build_metadata(
+            name="area",
+            geo=GeoContext.from_bbox(BBox(136650, 455600, 137150, 456100)),
+            terrain=SimpleNamespace(
+                center_z_nap=5.1864, coverage_id="dtm_05m", resolution_m=0.5,
+                grid_m=2.0, stats=lambda: {},
+            ),
+            aerial=SimpleNamespace(layer_title="Luchtfoto", to_dict=lambda: {"file": "aerial.png"}),
+            buildings=SimpleNamespace(stats=lambda: {}),
+            facade_cfg=DEFAULTS["facade"],
+            lod="2.2",
+            ahn_model="DTM",
+        )
+        # Through JSON, as the importer reads it.
+        metadata = json.loads(json.dumps(metadata))
+        self.assertEqual(metadata[names["JsonName"]], "area")
+        self.assertEqual(metadata[names["JsonCrs"]], names["RdCrs"])
+        self.assertEqual(metadata[names["JsonOriginRd"]], [136900.0, 455850.0])
+        self.assertEqual(metadata[names["JsonGroundZOffsetNap"]], 5.1864)
+        self.assertEqual(metadata[names["JsonBboxRd"]], [136650.0, 455600.0, 137150.0, 456100.0])
+        self.assertEqual(metadata[names["JsonUnityAxis"]], names["UnityAxis"])
+
+        # TerreinLabModel converts with the formulas the metadata documents.
+        self.assertEqual(
+            metadata["unity_import"]["local_to_rd"],
+            "rd_x = local_x + origin_rd[0], rd_y = local_z + origin_rd[1]",
+        )
+        self.assertEqual(metadata["unity_import"]["local_to_nap"], "nap = local_y + ground_z_offset_nap")
+        model = (self.PACKAGE / "Runtime" / "TerreinLabModel.cs").read_text(encoding="utf-8")
+        self.assertIn(
+            "localPosition.x + originRdX,\n"
+            "                localPosition.z + originRdY,\n"
+            "                localPosition.y + groundZOffsetNap",
+            model,
+        )
+
+    def test_the_property_names_are_the_ones_blender_writes(self):
+        keys = self._constants("Runtime/TerreinLabProperties.cs")
+        self.assertEqual(
+            set(keys),
+            {"BagIdKey", "BuildYearKey", "HeightMKey", "KindKey", "DetectedKey",
+             "MaptileRoleKey", "MaptileGroundKey"},
+        )
+        process = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        for key in keys.values():
+            self.assertRegex(
+                process, rf'\w+\["{re.escape(key)}"\] = ', f"process.py no longer sets {key}"
+            )
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

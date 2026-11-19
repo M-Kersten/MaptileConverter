@@ -25,6 +25,10 @@ What the page needs, and what this writes for it:
 * Every object still findable. Each vertex carries the number of its object
   (`_OBJECT`) and the file lists the objects with their properties, so a
   click in the view can say "Pand_0344100000000011, built 1450".
+* The wireframe as Blender shows it. A byte per triangle says which of its
+  sides are edges of the mesh rather than diagonals of the export
+  triangulation, so the page draws quads as quads; each object carries its
+  vertex and face counts as Blender has them.
 * Small. Normals are bytes (KHR_mesh_quantization), and a primitive without
   a texture has no texture coordinates.
 
@@ -49,7 +53,7 @@ import numpy as np
 # The layout of the file. The page asks for this number and the server holds
 # the same one (VIEWER_FORMAT in ui/server.py; a test keeps them equal), so a
 # change here makes every cached view be written again rather than misread.
-FORMAT = 1
+FORMAT = 3
 
 FILE_NAME = "viewer.glb"
 STAMP_NAME = "viewer.json"
@@ -58,8 +62,18 @@ STAMP_NAME = "viewer.json"
 # draw for two benches costs more than the vertices it saves.
 INSTANCE_MIN_USERS = 8
 
-# Present in the file, never drawn: the physics proxies.
-SKIPPED_COLLECTIONS = frozenset({"Collision"})
+# In the file, and switched off when the page opens it: the physics proxies,
+# which are there to be checked, not looked at.
+HIDDEN_COLLECTIONS = frozenset({"Collision"})
+
+# Small things the page leaves out far off, where they would be a pixel.
+DETAIL_COLLECTIONS = frozenset({"Street furniture", "Barriers", "Vehicles"})
+
+# Geometry is merged per layer and material within square tiles, so the page
+# can leave out what is not in view: at least this big, and no more than
+# this many across the area, which holds the number of draws down.
+TILE_MIN_M = 250.0
+TILES_ACROSS = 6
 
 GEOMETRY_TYPES = frozenset({"MESH", "CURVE", "SURFACE", "FONT", "META"})
 
@@ -74,6 +88,7 @@ CHUNK_BIN = 0x004E4942
 ARRAY_BUFFER = 34962
 ELEMENT_ARRAY_BUFFER = 34963
 BYTE = 5120
+UNSIGNED_BYTE = 5121
 UNSIGNED_SHORT = 5123
 UNSIGNED_INT = 5125
 FLOAT = 5126
@@ -125,8 +140,8 @@ class GlbBuilder:
     ) -> int:
         """An accessor over a fresh view of `array`, one element per row."""
         width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[kind]
-        dtype = {BYTE: np.int8, UNSIGNED_SHORT: np.uint16, UNSIGNED_INT: np.uint32,
-                 FLOAT: np.float32}[component]
+        dtype = {BYTE: np.int8, UNSIGNED_BYTE: np.uint8, UNSIGNED_SHORT: np.uint16,
+                 UNSIGNED_INT: np.uint32, FLOAT: np.float32}[component]
         rows = np.ascontiguousarray(np.asarray(array, dtype=dtype).reshape(-1, width))
         stride = None
         if component == BYTE and width == 3:
@@ -211,14 +226,76 @@ def weld_corners(
     return first, np.asarray(inverse).reshape(-1)
 
 
-def object_triangles(obj) -> dict | None:
-    """An evaluated object's triangles, corner by corner, in its own space."""
+def polygon_edges(mesh) -> dict:
+    """The edges and faces of a mesh as Blender shows them: quads as quads.
+
+    Edges are numbered as low vertex * vertex count + high vertex, sorted,
+    so a triangle's sides can be looked up among them.
+    """
+    n_vertices = len(mesh.vertices)
+    pairs = np.empty(len(mesh.edges) * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", pairs)
+    pairs = np.sort(pairs.reshape(-1, 2), axis=1)
+    sizes = np.empty(len(mesh.polygons), dtype=np.int64)
+    mesh.polygons.foreach_get("loop_total", sizes)
+    return {
+        "edges": np.unique(pairs[:, 0] * max(n_vertices, 1) + pairs[:, 1]),
+        "vertices": n_vertices,
+        # Triangles, quads and anything with more corners.
+        "faces": [int((sizes == 3).sum()), int((sizes == 4).sum()), int((sizes > 4).sum())],
+    }
+
+
+def edge_mask(corner_vertex: np.ndarray, edges: np.ndarray, n_vertices: int) -> np.ndarray:
+    """Per triangle, which of its sides is an edge of the mesh rather than a
+    diagonal the triangulation added: bit k for the side from corner k to the
+    next. The page draws the wireframe from these."""
+    corners = np.asarray(corner_vertex, dtype=np.int64).reshape(-1, 3)
+    mask = np.zeros(len(corners), dtype=np.uint8)
+    for k in range(3):
+        a, b = corners[:, k], corners[:, (k + 1) % 3]
+        keys = np.minimum(a, b) * max(n_vertices, 1) + np.maximum(a, b)
+        mask |= np.isin(keys, edges).astype(np.uint8) << k
+    return mask
+
+
+def viewport_outlines(depsgraph) -> dict[str, dict]:
+    """The edges and faces of every object whose modifiers differ between the
+    viewport and the render, as the viewport has them.
+
+    The export triangulation is render-only, so only the viewport still has
+    the quads; it keeps every vertex and its number, so these edges name the
+    vertices of the triangulated mesh too.
+    """
+    found = {}
+    for obj in bpy.context.scene.objects:
+        if obj.type not in GEOMETRY_TYPES:
+            continue
+        if not any(m.show_viewport != m.show_render for m in getattr(obj, "modifiers", ())):
+            continue
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh()
+        try:
+            found[obj.name] = polygon_edges(mesh)
+        finally:
+            evaluated.to_mesh_clear()
+    return found
+
+
+def object_triangles(obj, outline: dict | None = None) -> dict | None:
+    """An evaluated object's triangles, corner by corner, in its own space.
+
+    `outline` is its edges and faces from the viewport, where those differ
+    from what this evaluation holds; otherwise this mesh's own are used.
+    """
     mesh = obj.to_mesh()
     try:
         mesh.calc_loop_triangles()
         n_triangles = len(mesh.loop_triangles)
         if not n_triangles:
             return None
+        if outline is None or outline["vertices"] != len(mesh.vertices):
+            outline = polygon_edges(mesh)
         corners = np.empty(n_triangles * 3, dtype=np.int32)
         mesh.loop_triangles.foreach_get("loops", corners)
         slots = np.empty(n_triangles, dtype=np.int32)
@@ -248,13 +325,16 @@ def object_triangles(obj) -> dict | None:
     finally:
         obj.to_mesh_clear()
 
+    corner_vertex = loop_vertex[corners]
     return {
         "points": points.reshape(-1, 3),
-        "corner_vertex": loop_vertex[corners],
+        "corner_vertex": corner_vertex,
         "corner_normal": normals.reshape(-1, 3)[corners],
         "corner_uv": uvs.reshape(-1, 2)[corners],
         "slots": slots,
         "materials": materials,
+        "edges": edge_mask(corner_vertex, outline["edges"], outline["vertices"]),
+        "stats": [outline["vertices"], *outline["faces"]],
     }
 
 
@@ -266,6 +346,7 @@ def triangles_as_vertices(tris: dict, matrix: np.ndarray | None) -> dict:
     points = tris["points"][tris["corner_vertex"][first]].astype(np.float64)
     normals = tris["corner_normal"][first].astype(np.float64)
     triangles = inverse.reshape(-1, 3)
+    edges = np.asarray(tris.get("edges", np.full(len(triangles), 7)), dtype=np.uint8)
     if matrix is not None:
         linear = matrix[:3, :3]
         points = points @ linear.T + matrix[:3, 3]
@@ -277,8 +358,10 @@ def triangles_as_vertices(tris: dict, matrix: np.ndarray | None) -> dict:
             pass
         if np.linalg.det(linear) < 0:
             # A mirrored object turns its triangles inside out; turn them back
-            # so their winding still agrees with their normals.
+            # so their winding still agrees with their normals. Their sides
+            # turn round with them: the first is now the old third.
             triangles = triangles[:, [0, 2, 1]]
+            edges = ((edges >> 2) & 1) | (edges & 2) | ((edges & 1) << 2)
 
     uv = tris["corner_uv"][first].astype(np.float32)
     # glTF reads an image top row first, Blender bottom row first.
@@ -288,19 +371,22 @@ def triangles_as_vertices(tris: dict, matrix: np.ndarray | None) -> dict:
         "normals": quantize_normals(normals @ TO_GLTF.T),
         "uv": uv,
         "triangles": triangles,
+        "edges": edges.astype(np.uint8),
     }
 
 
 def split_by_slot(vertices: dict, slots: np.ndarray):
     """Yield each material slot's triangles with just the vertices they use."""
     for slot in np.unique(slots):
-        triangles = vertices["triangles"][slots == slot]
+        chosen = slots == slot
+        triangles = vertices["triangles"][chosen]
         used, remapped = np.unique(triangles, return_inverse=True)
         yield int(slot), {
             "points": vertices["points"][used],
             "normals": vertices["normals"][used],
             "uv": vertices["uv"][used],
             "triangles": np.asarray(remapped).reshape(-1, 3).astype(np.uint32),
+            "edges": vertices["edges"][chosen],
         }
 
 
@@ -450,8 +536,13 @@ def _properties(obj) -> dict:
     return found
 
 
-def collect(depsgraph, texture_dir: Path) -> dict:
-    """Everything the file holds, gathered from the evaluated scene."""
+def collect(depsgraph, texture_dir: Path, outlines: dict[str, dict] | None = None) -> dict:
+    """Everything the file holds, gathered from the evaluated scene.
+
+    `outlines` are the viewport's edges and faces for the objects whose
+    render evaluation differs, from viewport_outlines.
+    """
+    outlines = outlines or {}
     scene = bpy.context.scene
     order, top = layer_names(scene)
     layers = {name: index for index, name in enumerate(order)}
@@ -486,9 +577,14 @@ def collect(depsgraph, texture_dir: Path) -> dict:
             return
         vertices = triangles_as_vertices(tris, matrix)
         triangles_in[layer] += len(vertices["triangles"])
+        bounds = point_bounds(vertices["points"])
+        # Where it is, for the page's search and to fly to it.
+        objects[object_id].append(bounds)
+        centre = ((bounds[0] + bounds[3]) / 2, (bounds[2] + bounds[5]) / 2)
         for slot, part in split_by_slot(vertices, tris["slots"]):
             material = tris["materials"][slot] if slot < len(tris["materials"]) else None
             part["object"] = object_id
+            part["centre"] = centre
             merged.setdefault((layer, material_slot(material)), []).append(part)
 
     for instance in depsgraph.object_instances:
@@ -502,8 +598,6 @@ def collect(depsgraph, texture_dir: Path) -> dict:
         if instance.is_instance and instance.parent is not None:
             owner = instance.parent.original
         layer_name = _layer_of(owner, top)
-        if layer_name in SKIPPED_COLLECTIONS:
-            continue
         matrix = np.array(instance.matrix_world, dtype=np.float64)
         layer = layer_for(layer_name)
         object_id = len(objects)
@@ -518,7 +612,12 @@ def collect(depsgraph, texture_dir: Path) -> dict:
                 shared_triangles[key] = object_triangles(evaluated)
             shared.setdefault(key, []).append((object_id, matrix))
         else:
-            merge(object_id, layer, object_triangles(evaluated), matrix)
+            outline = None if instance.is_instance else outlines.get(original.name)
+            tris = object_triangles(evaluated, outline)
+            if tris is not None:
+                # Its vertices and faces as Blender counts them, for the page.
+                objects[object_id].append(tris["stats"])
+            merge(object_id, layer, tris, matrix)
 
     groups = []
     for key, members in shared.items():
@@ -526,11 +625,20 @@ def collect(depsgraph, texture_dir: Path) -> dict:
         layer = key[0]
         if tris is None:
             continue
+        for object_id, _ in members:
+            objects[object_id].append(tris["stats"])
         if len(members) < INSTANCE_MIN_USERS:
             for object_id, matrix in members:
                 merge(object_id, layer, tris, matrix)
             continue
         vertices = triangles_as_vertices(tris, None)
+        local = point_bounds(vertices["points"])
+        convert = np.eye(4)
+        convert[:3, :3] = TO_GLTF
+        for object_id, matrix in members:
+            objects[object_id].append(
+                transformed_bounds(local, convert @ matrix @ np.linalg.inv(convert))
+            )
         parts = []
         for slot, part in split_by_slot(vertices, tris["slots"]):
             material = tris["materials"][slot] if slot < len(tris["materials"]) else None
@@ -544,16 +652,46 @@ def collect(depsgraph, texture_dir: Path) -> dict:
     renumber = {old: new for new, old in enumerate(kept)}
     return {
         "layers": [
-            {"name": order[i], "objects": objects_in[i], "triangles": triangles_in[i]}
+            {"name": order[i], "objects": objects_in[i], "triangles": triangles_in[i],
+             **({"hidden": True, "collision": True} if order[i] in HIDDEN_COLLECTIONS else {}),
+             **({"detail": True} if order[i] in DETAIL_COLLECTIONS else {})}
             for i in kept
         ],
-        "objects": [[name, renumber[layer], props] for name, layer, props in objects],
+        "objects": [[entry[0], renumber[entry[1]], *entry[2:]] for entry in objects],
         "materials": materials,
         "merged": {
             (renumber[layer], material): parts for (layer, material), parts in merged.items()
         },
         "instanced": [dict(group, layer=renumber[group["layer"]]) for group in groups],
     }
+
+
+def point_bounds(points: np.ndarray) -> list[float]:
+    """[min x, min y, min z, max x, max y, max z], to the centimetre."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    return [round(float(v), 2) for v in (*points.min(axis=0), *points.max(axis=0))]
+
+
+def transformed_bounds(bounds: list[float], matrix: np.ndarray) -> list[float]:
+    """The box around a box moved by `matrix`."""
+    lo, hi = np.array(bounds[:3]), np.array(bounds[3:])
+    corners = np.array([[(hi if i >> k & 1 else lo)[k] for k in range(3)] for i in range(8)])
+    return point_bounds(corners @ matrix[:3, :3].T + matrix[:3, 3])
+
+
+def tile_grid(centres: np.ndarray) -> tuple[float, float, float]:
+    """Where the tiles start, in X and Z, and how big they are."""
+    centres = np.asarray(centres, dtype=np.float64).reshape(-1, 2)
+    if not len(centres):
+        return 0.0, 0.0, TILE_MIN_M
+    extent = float(np.max(centres.max(axis=0) - centres.min(axis=0)))
+    size = max(TILE_MIN_M, extent / TILES_ACROSS)
+    return float(centres[:, 0].min()), float(centres[:, 1].min()), size
+
+
+def tile_of(centre, grid: tuple[float, float, float]) -> tuple[int, int]:
+    x0, z0, size = grid
+    return int((centre[0] - x0) // size), int((centre[1] - z0) // size)
 
 
 def rotation_quaternion(r: np.ndarray) -> np.ndarray:
@@ -635,8 +773,15 @@ def assemble(data: dict) -> tuple[dict, bytes]:
             attributes["TEXCOORD_0"] = builder.accessor(part["uv"], FLOAT, "VEC2", target=ARRAY_BUFFER)
         if object_ids is not None:
             attributes["_OBJECT"] = builder.accessor(object_ids, FLOAT, "SCALAR", target=ARRAY_BUFFER)
-        return {"attributes": attributes, "indices": builder.indices(part["triangles"]),
-                "material": material, "mode": 4}
+        return {
+            "attributes": attributes,
+            "indices": builder.indices(part["triangles"]),
+            "material": material,
+            "mode": 4,
+            # One byte per triangle: which of its sides are edges of the
+            # mesh, so the page's wireframe shows quads, not the diagonals.
+            "extras": {"edges": builder.accessor(part["edges"], UNSIGNED_BYTE, "SCALAR")},
+        }
 
     meshes: list[dict] = []
     nodes: list[dict] = [
@@ -644,47 +789,68 @@ def assemble(data: dict) -> tuple[dict, bytes]:
         for index, layer in enumerate(data["layers"])
     ]
 
-    for (layer, material), parts in sorted(data["merged"].items()):
-        offsets = np.cumsum([0] + [len(p["points"]) for p in parts])
-        combined = {
-            "points": np.concatenate([p["points"] for p in parts]),
-            "normals": np.concatenate([p["normals"] for p in parts]),
-            "uv": np.concatenate([p["uv"] for p in parts]),
-            "triangles": np.concatenate(
-                [p["triangles"] + offsets[i] for i, p in enumerate(parts)]
-            ),
-        }
-        object_ids = np.concatenate(
-            [np.full(len(p["points"]), p["object"], dtype=np.float32) for p in parts]
-        )
-        meshes.append({
-            "name": f"{data['layers'][layer]['name']} / {data['materials'][material]['name']}",
-            "primitives": [primitive(material, combined, object_ids)],
-        })
-        nodes.append({"name": meshes[-1]["name"], "mesh": len(meshes) - 1})
+    # One grid of tiles over everything, from where each object stands.
+    centres = [p["centre"] for parts in data["merged"].values() for p in parts]
+    placed = {}
+    for index, group in enumerate(data["instanced"]):
+        placed[index] = instance_transforms([m for _, m in group["members"]])
+        centres.extend(placed[index][0][:, [0, 2]].tolist())
+    grid = tile_grid(np.array(centres, dtype=np.float64).reshape(-1, 2))
+
+    def add_node(name: str, layer: int, mesh: int, extensions: dict | None = None) -> None:
+        node = {"name": name, "mesh": mesh}
+        if extensions:
+            node["extensions"] = extensions
+        nodes.append(node)
         nodes[layer]["children"].append(len(nodes) - 1)
 
-    for group in data["instanced"]:
+    for (layer, material), all_parts in sorted(data["merged"].items()):
+        by_tile: dict[tuple[int, int], list[dict]] = {}
+        for part in all_parts:
+            by_tile.setdefault(tile_of(part["centre"], grid), []).append(part)
+        for tile, parts in sorted(by_tile.items()):
+            offsets = np.cumsum([0] + [len(p["points"]) for p in parts])
+            combined = {
+                "points": np.concatenate([p["points"] for p in parts]),
+                "normals": np.concatenate([p["normals"] for p in parts]),
+                "uv": np.concatenate([p["uv"] for p in parts]),
+                "triangles": np.concatenate(
+                    [p["triangles"] + offsets[i] for i, p in enumerate(parts)]
+                ),
+                "edges": np.concatenate([p["edges"] for p in parts]),
+            }
+            object_ids = np.concatenate(
+                [np.full(len(p["points"]), p["object"], dtype=np.float32) for p in parts]
+            )
+            name = (f"{data['layers'][layer]['name']} / {data['materials'][material]['name']}"
+                    f" / {tile[0]},{tile[1]}")
+            meshes.append({"name": name, "primitives": [primitive(material, combined, object_ids)]})
+            add_node(name, layer, len(meshes) - 1)
+
+    for index, group in enumerate(data["instanced"]):
         members = group["members"]
-        translation, rotation, scale = instance_transforms([m for _, m in members])
+        translation, rotation, scale = placed[index]
         meshes.append({
             "name": group["mesh"],
             "primitives": [primitive(material, part, None) for material, part in group["parts"]],
         })
-        attributes = {
-            "TRANSLATION": builder.accessor(translation, FLOAT, "VEC3"),
-            "ROTATION": builder.accessor(rotation, FLOAT, "VEC4"),
-            "SCALE": builder.accessor(scale, FLOAT, "VEC3"),
-            "_OBJECT": builder.accessor(
-                np.array([object_id for object_id, _ in members], dtype=np.float32), FLOAT, "SCALAR"
-            ),
-        }
-        nodes.append({
-            "name": group["mesh"],
-            "mesh": len(meshes) - 1,
-            "extensions": {"EXT_mesh_gpu_instancing": {"attributes": attributes}},
-        })
-        nodes[group["layer"]]["children"].append(len(nodes) - 1)
+        mesh = len(meshes) - 1
+        # The mesh once; a node per tile, each placing its own instances.
+        by_tile: dict[tuple[int, int], list[int]] = {}
+        for row, position in enumerate(translation):
+            by_tile.setdefault(tile_of((position[0], position[2]), grid), []).append(row)
+        for tile, rows in sorted(by_tile.items()):
+            rows = np.array(rows)
+            attributes = {
+                "TRANSLATION": builder.accessor(translation[rows], FLOAT, "VEC3"),
+                "ROTATION": builder.accessor(rotation[rows], FLOAT, "VEC4"),
+                "SCALE": builder.accessor(scale[rows], FLOAT, "VEC3"),
+                "_OBJECT": builder.accessor(
+                    np.array([members[r][0] for r in rows], dtype=np.float32), FLOAT, "SCALAR"
+                ),
+            }
+            add_node(f"{group['mesh']} / {tile[0]},{tile[1]}", group["layer"], mesh,
+                     {"EXT_mesh_gpu_instancing": {"attributes": attributes}})
 
     for node in nodes[: len(data["layers"])]:
         if not node["children"]:
@@ -707,7 +873,10 @@ def assemble(data: dict) -> tuple[dict, bytes]:
             "terreinlab": {
                 "format": FORMAT,
                 "layers": data["layers"],
-                # [name, layer, properties], indexed by the _OBJECT values.
+                # [name, layer, properties, [vertices, triangles, quads,
+                # n-gons], [min x, y, z, max x, y, z]], indexed by the
+                # _OBJECT values; the counts as Blender shows the object, so
+                # before the export triangulation, and the box in glTF axes.
                 "objects": data["objects"],
             }
         },
@@ -744,8 +913,11 @@ def write(out_path: Path, texture_dir: Path, source: Path | None = None,
     if source is not None and source_stat is None:
         source_stat = Path(source).stat()
 
+    # The quads first, from the viewport; then the triangles, as rendered.
+    bpy.context.view_layer.update()
+    outlines = viewport_outlines(bpy.context.evaluated_depsgraph_get())
     with render_settings():
-        data = collect(bpy.context.evaluated_depsgraph_get(), Path(texture_dir))
+        data = collect(bpy.context.evaluated_depsgraph_get(), Path(texture_dir), outlines)
     document, binary = assemble(data)
     blob = pack_glb(document, binary)
 

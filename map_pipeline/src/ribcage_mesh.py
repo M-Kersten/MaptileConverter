@@ -333,7 +333,7 @@ def _rib_fill(cell, *, kind, near_m, size, height_at, tolerance_m, quay_zone=Non
 
 def ribcage_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
                     paved_codes, narrow_codes=(), near_m: float = NEAR_CELL_M, quays=(),
-                    tolerance_m: float = 0.5):
+                    tolerance_m: float = 0.5, kerbed_codes=()):
     """The terrain mesh as a ribcage, conforming to every piece's outline.
 
     The same inputs and outputs as `layered_mesh.quad_terrain`, so the two
@@ -371,7 +371,8 @@ def ribcage_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
     pieces = [(part, code) for polygon, (_, code) in zip(filled, pieces)
               for part in _parts(polygon)]
     pieces, overlaps = _without_overlaps(pieces)
-    pieces, thin = _without_thin(pieces, THIN_M, wet_code=codes_wet)
+    pieces, thin = _without_thin(pieces, THIN_M, wet_code=codes_wet,
+                                 kerbed_codes=kerbed_codes)
 
     parts, codes = [], []
     for polygon, code in pieces:

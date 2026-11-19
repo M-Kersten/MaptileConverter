@@ -16,15 +16,19 @@ from __future__ import annotations
 import argparse
 import email.utils
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -45,7 +49,7 @@ MAX_JOBS = 24
 # The 3D view. Its file is written by blender/web_export.py into the area's
 # work folder; FORMAT there and this number are held equal by a test, so a
 # view written for an older page is written again rather than misread.
-VIEWER_FORMAT = 1
+VIEWER_FORMAT = 3
 VIEWER_FILE = "viewer.glb"
 VIEWER_STAMP = "viewer.json"
 # Writing a view from a saved model takes seconds; this only stops a Blender
@@ -70,7 +74,15 @@ TILE_CACHE_LOCK = threading.Lock()
 STAGE_COSTS: dict[str, dict[str, float]] = {
     #                      constant  per km2  per megapixel
     "terrain":            {"c": 1.0, "a": 8.0,  "m": 0.0},
-    "aerial":             {"c": 1.0, "a": 0.0,  "m": 0.75},
+    # The ground's photo, plus the roofs' own (the "roof textures" stage and
+    # its share of the relighting). Kept on this line because estimate_seconds
+    # only counts the stages it lists as enabled, and the roofs are the same
+    # PDOK imagery. Measured over the Utrecht Dom quarter square kilometre at
+    # Standard: 16 s for a 28.6 Mpx roof page, 6 s to fetch and write it and
+    # 10 s to relight it, most of both writing PNG; over the square kilometre
+    # of config.json, capped at 48 Mpx, 30 s. Draft has no roof page, so this
+    # overestimates Draft by a few per cent.
+    "aerial":             {"c": 4.0, "a": 12.0, "m": 1.5},
     "surfaces":           {"c": 1.0, "a": 30.0, "m": 2.5},
     "usage":              {"c": 0.5, "a": 5.0,  "m": 0.0},
     "buildings":          {"c": 2.0, "a": 75.0, "m": 0.0},
@@ -229,17 +241,32 @@ def measured_speed_factor() -> tuple[float, int]:
     return max(0.25, min(4.0, median)), len(ratios)
 
 
-class Job:
-    """One pipeline run."""
+FINISHED = ("done", "failed", "cancelled", "interrupted")
+# How much of a run's log a restarted server reads back.
+RESTORED_LOG_LINES = 5000
 
-    def __init__(self, job_id: str, name: str, config: dict, estimate: float) -> None:
+
+class Job:
+    """One pipeline run.
+
+    A run the page started is also kept on disk, in work/<name>/run.json and
+    run.log, so a server started again finds it: one that was running is
+    marked interrupted, one that was waiting in the queue is run.
+    """
+
+    def __init__(
+        self, job_id: str, name: str, config: dict, estimate: float, *, preview: bool = False
+    ) -> None:
         self.id = job_id
         self.name = name
         self.config = config
         self.estimate = estimate
+        self.preview = preview
         self.lines: list[str] = []
-        self.status = "starting"  # starting | running | done | failed | cancelled
+        # queued | starting | running | done | failed | cancelled | interrupted
+        self.status = "starting"
         self.returncode: int | None = None
+        self.queued_at = time.time()
         self.started = time.time()
         self.finished: float | None = None
         self.process: subprocess.Popen | None = None
@@ -247,11 +274,61 @@ class Job:
         self.step = 0
         self.total_steps = 0
         self.stage = "starting"
+        # Set for runs the page started; a Job made in a test stays in memory.
+        self.persist = False
+        self._log_file = None
+
+    @property
+    def folder(self) -> Path:
+        return REPO_ROOT / "work" / self.name
+
+    def save(self) -> None:
+        """Write the run's record beside its work files."""
+        if not self.persist:
+            return
+        with self.lock:
+            record = {
+                "id": self.id, "name": self.name, "status": self.status,
+                "returncode": self.returncode, "estimate": self.estimate,
+                "preview": self.preview, "queued_at": self.queued_at,
+                "started": self.started, "finished": self.finished,
+                "step": self.step, "total_steps": self.total_steps, "stage": self.stage,
+            }
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            partial = self.folder / "run.json.part"
+            partial.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            partial.replace(self.folder / "run.json")
+        except OSError:
+            pass
+
+    def open_log(self) -> None:
+        if self.persist:
+            try:
+                self.folder.mkdir(parents=True, exist_ok=True)
+                self._log_file = (self.folder / "run.log").open("w", encoding="utf-8")
+            except OSError:
+                self._log_file = None
+
+    def close_log(self) -> None:
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
 
     def log(self, line: str) -> None:
         with self.lock:
             self.lines.append(line)
+            step = self.step
             self._track_progress(line)
+            changed = self.step != step
+            if self._log_file is not None:
+                try:
+                    self._log_file.write(line + "\n")
+                    self._log_file.flush()
+                except OSError:
+                    pass
+        if changed:
+            self.save()
 
     def _track_progress(self, line: str) -> None:
         """Follow the run by the step headers it already prints.
@@ -279,7 +356,9 @@ class Job:
             step, total_steps, stage = self.step, self.total_steps, self.stage
 
         elapsed = (self.finished or time.time()) - self.started
-        if self.status in ("done", "failed", "cancelled"):
+        if self.status == "queued":
+            elapsed = 0.0
+        if self.status in FINISHED:
             fraction = 1.0
         elif total_steps:
             fraction = min(0.99, step / (total_steps + 1))
@@ -294,6 +373,9 @@ class Job:
             "id": self.id,
             "name": self.name,
             "status": self.status,
+            "style": self.config.get("style"),
+            "detail": self.config.get("detail"),
+            "queued_at": self.queued_at,
             "returncode": self.returncode,
             "lines": lines,
             "offset": total,
@@ -316,9 +398,195 @@ def register(job: Job) -> None:
     with JOBS_LOCK:
         JOBS[job.id] = job
         JOBS_ORDER.append(job.id)
+        # Forget the oldest finished runs; a waiting or running one stays.
         while len(JOBS_ORDER) > MAX_JOBS:
-            old = JOBS_ORDER.pop(0)
+            old = next(
+                (i for i in JOBS_ORDER if JOBS.get(i) is None or JOBS[i].status in FINISHED),
+                None,
+            )
+            if old is None:
+                break
+            JOBS_ORDER.remove(old)
             JOBS.pop(old, None)
+
+
+# The build queue: one run at a time, in the order they were asked for. Each
+# build loads a whole model into memory and Blender, and two at once would
+# only both go slower.
+QUEUE: list[str] = []
+QUEUE_LOCK = threading.Condition()
+_WORKER: threading.Thread | None = None
+
+
+def active_job(name: str) -> Job | None:
+    """A run of this area that is waiting or going, if there is one."""
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+    return next(
+        (j for j in jobs if j.name == name and j.status in ("queued", "starting", "running")), None
+    )
+
+
+def submit(job: Job) -> None:
+    """Put a run in the queue; the worker starts it when its turn comes."""
+    job.persist = True
+    job.status = "queued"
+    job.queued_at = time.time()
+    job.folder.mkdir(parents=True, exist_ok=True)
+    (job.folder / "ui_config.json").write_text(json.dumps(job.config, indent=2), encoding="utf-8")
+    register(job)
+    job.save()
+    with QUEUE_LOCK:
+        QUEUE.append(job.id)
+        QUEUE_LOCK.notify()
+    ensure_worker()
+
+
+def ensure_worker() -> None:
+    global _WORKER
+    with QUEUE_LOCK:
+        if _WORKER is not None and _WORKER.is_alive():
+            return
+        _WORKER = threading.Thread(target=_work, name="build-queue", daemon=True)
+        _WORKER.start()
+
+
+def _work() -> None:
+    while True:
+        with QUEUE_LOCK:
+            while not QUEUE:
+                QUEUE_LOCK.wait()
+            job_id = QUEUE.pop(0)
+        job = JOBS.get(job_id)
+        if job is None or job.status != "queued":
+            continue
+        try:
+            run_job(job, job.preview)
+        except Exception as exc:  # noqa: BLE001 - one bad run must not stop the queue
+            job.log(f"the run stopped: {type(exc).__name__}: {exc}")
+            job.status = "failed"
+            job.finished = time.time()
+            job.save()
+
+
+def cancel(job: Job) -> None:
+    """Stop a run, or take it out of the queue before it starts."""
+    with QUEUE_LOCK:
+        waiting = job.id in QUEUE
+        if waiting:
+            QUEUE.remove(job.id)
+    previous = job.status
+    job.status = "cancelled"
+    if waiting or previous == "queued":
+        job.finished = time.time()
+        job.save()
+        return
+    if job.process:
+        stop_process(job.process)
+
+
+def stop_process(process: subprocess.Popen) -> None:
+    """Stop a pipeline and what it started.
+
+    Blender runs as the pipeline's child, so stopping the pipeline alone
+    would leave Blender building on, into the folder the next run of that
+    area writes to. The pipeline runs in a process group of its own (see
+    run_job), and the whole group is stopped.
+    """
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True, check=False
+            )
+    except (ProcessLookupError, PermissionError, OSError):
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        process.kill()
+
+
+def stop_running() -> None:
+    """On the way out: stop the run that is building and mark it interrupted.
+
+    The next server offers it again with *Opnieuw starten*; runs still
+    waiting stay queued on disk and start by themselves.
+    """
+    with JOBS_LOCK:
+        running = [job for job in JOBS.values() if job.status == "running"]
+    for job in running:
+        job.status = "interrupted"
+        job.finished = time.time()
+        job.save()
+        if job.process:
+            stop_process(job.process)
+
+
+def restore_jobs() -> int:
+    """Pick up the runs a previous server left on disk.
+
+    A run that was going when the server stopped did not finish: its
+    pipeline was the server's child and lost its output, so it is marked
+    interrupted, with its log kept. A run still waiting is queued again.
+    Returns how many were queued again.
+    """
+    records = []
+    for path in sorted((REPO_ROOT / "work").glob("*/run.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and record.get("id") and record.get("name") == path.parent.name:
+            records.append(record)
+    records.sort(key=lambda r: r.get("queued_at") or 0)
+
+    requeued = 0
+    for record in records[-MAX_JOBS:]:
+        if record["id"] in JOBS:
+            continue
+        folder = REPO_ROOT / "work" / record["name"]
+        try:
+            config = json.loads((folder / "ui_config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+        job = Job(record["id"], record["name"], config, float(record.get("estimate") or 0),
+                  preview=bool(record.get("preview")))
+        job.persist = True
+        for key in ("returncode", "queued_at", "started", "finished", "step", "total_steps", "stage"):
+            if record.get(key) is not None:
+                setattr(job, key, record[key])
+        try:
+            with (folder / "run.log").open(encoding="utf-8", errors="replace") as handle:
+                job.lines = [line.rstrip("\n") for line in handle][-RESTORED_LOG_LINES:]
+        except OSError:
+            pass
+        status = record.get("status", "failed")
+        if status in ("starting", "running"):
+            job.status = "interrupted"
+            job.finished = job.finished or time.time()
+            job.lines.append("interrupted: the server stopped while this model was being built")
+        else:
+            job.status = status
+        register(job)
+        if job.status == "queued":
+            with QUEUE_LOCK:
+                QUEUE.append(job.id)
+                QUEUE_LOCK.notify()
+            requeued += 1
+        else:
+            job.save()
+    if requeued:
+        ensure_worker()
+    return requeued
 
 
 def _facade_variety(payload: dict) -> dict:
@@ -425,8 +693,11 @@ def run_job(job: Job, preview: bool) -> None:
     if preview:
         command.append("--preview")
 
-    job.log(f"$ {' '.join(command)}")
+    job.started = time.time()
     job.status = "running"
+    job.open_log()
+    job.log(f"$ {' '.join(command)}")
+    job.save()
 
     try:
         process = subprocess.Popen(
@@ -436,11 +707,17 @@ def run_job(job: Job, preview: bool) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            # A group of its own, so stopping the run stops Blender too, and
+            # Ctrl+C on the server reaches the run only through stop_running.
+            **({"start_new_session": True} if os.name == "posix"
+               else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}),
         )
     except Exception as exc:  # noqa: BLE001 - surfaced in the UI
         job.log(f"failed to start pipeline: {exc}")
         job.status = "failed"
         job.finished = time.time()
+        job.close_log()
+        job.save()
         return
 
     job.process = process
@@ -452,14 +729,16 @@ def run_job(job: Job, preview: bool) -> None:
     job.returncode = process.returncode
     job.finished = time.time()
 
-    if job.status == "cancelled":
-        job.log("cancelled")
+    if job.status in ("cancelled", "interrupted"):
+        job.log(job.status)
     elif process.returncode == 0:
         job.status = "done"
         job.log("finished")
     else:
         job.status = "failed"
         job.log(f"pipeline exited with code {process.returncode}")
+    job.close_log()
+    job.save()
 
 
 def area_summary(name: str) -> dict | None:
@@ -575,6 +854,62 @@ def list_areas() -> list[dict]:
             if summary:
                 areas.append(summary)
     return areas
+
+
+# ---------------------------------------------------------------------------
+# Removing a model, and handing one over whole.
+# ---------------------------------------------------------------------------
+
+# Already compressed: deflating them again costs time and saves nothing.
+STORED_SUFFIXES = {".png", ".jpg", ".jpeg", ".blend", ".zip", ".glb"}
+UNITY_PACKAGE = "com.terreinlab.importer"
+
+
+def delete_area(name: str) -> tuple[int, str] | None:
+    """Remove an area's model and its work files.
+
+    Returns the HTTP status and why not, or None when it is gone.
+    """
+    if not area_name_ok(name):
+        return 400, "bad model name"
+    if active_job(name):
+        return 409, "this model is being built or waits in the queue"
+    with VIEWER_LOCK:
+        if VIEWER_PREP.get(name, {}).get("status") == "running":
+            return 409, "its 3D view is being written; try again in a moment"
+    removed = False
+    for root in ("output", "work"):
+        base = (REPO_ROOT / root).resolve()
+        folder = (REPO_ROOT / root / name).resolve()
+        if folder.parent != base or not folder.is_dir():
+            continue
+        shutil.rmtree(folder)
+        removed = True
+    with JOBS_LOCK:
+        for job_id in [i for i in JOBS_ORDER if JOBS.get(i) and JOBS[i].name == name]:
+            JOBS_ORDER.remove(job_id)
+            JOBS.pop(job_id, None)
+    with VIEWER_LOCK:
+        VIEWER_PREP.pop(name, None)
+    return None if removed else (404, "there is no model called " + name)
+
+
+def write_zip(folder: Path, top: str, handle) -> int:
+    """Every file under `folder` into a zip on `handle`, under `top/`."""
+    count = 0
+    with zipfile.ZipFile(handle, "w") as archive:
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file():
+                continue
+            stored = path.suffix.lower() in STORED_SUFFIXES
+            archive.write(
+                path,
+                f"{top}/{path.relative_to(folder).as_posix()}",
+                compress_type=zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED,
+                compresslevel=None if stored else 6,
+            )
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -944,7 +1279,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "unknown job"}, status=404)
                 return
             payload = job.snapshot(offset)
-            if job.status in ("done", "failed", "cancelled"):
+            if job.status in FINISHED:
                 payload["area"] = area_summary(job.name)
             self.send_json(payload)
             return
@@ -996,6 +1331,24 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/jobs":
             self.send_json({"jobs": list_jobs()})
+            return
+
+        if route == "/api/zip":
+            # A whole model as one download, folder and all, to pass on.
+            name = (query.get("name") or [""])[0]
+            folder = REPO_ROOT / "output" / name
+            if not area_name_ok(name) or not folder.is_dir():
+                self.send_json({"error": "no such model"}, status=404)
+                return
+            self.send_zip(folder, name, f"{name}.zip")
+            return
+
+        if route == "/api/unity-package.zip":
+            folder = REPO_ROOT / "unity" / UNITY_PACKAGE
+            if not (folder / "package.json").is_file():
+                self.send_json({"error": "the Unity package is not in this copy"}, status=404)
+                return
+            self.send_zip(folder, UNITY_PACKAGE, f"{UNITY_PACKAGE}.zip")
             return
 
         if route in ("/api/sources", "/api/health"):
@@ -1121,15 +1474,21 @@ class Handler(BaseHTTPRequestHandler):
                 name = str(payload.get("name", "")).strip()
                 if not name:
                     raise ValueError("give the area a name")
-                # Keep the name safe as a directory component.
-                if not all(c.isalnum() or c in "._-" for c in name):
+                # Keep the name safe as a directory component: one folder in
+                # output/ and work/, never ".." or "." either.
+                if not area_name_ok(name):
                     raise ValueError(
                         "the name may only contain letters, digits, dot, dash "
-                        "and underscore"
+                        "and underscore, and may not be only dots"
                     )
                 config = build_config(payload)
             except (ValueError, KeyError, TypeError) as exc:
                 self.send_json({"error": str(exc)}, status=400)
+                return
+            if active_job(name):
+                self.send_json(
+                    {"error": f"{name} is already being built or waits in the queue"}, status=409
+                )
                 return
 
             speed, _ = measured_speed_factor()
@@ -1138,14 +1497,28 @@ class Handler(BaseHTTPRequestHandler):
                 name,
                 config,
                 estimate_seconds(payload, speed)["seconds"],
+                preview=bool(payload.get("preview", True)),
             )
-            register(job)
-            threading.Thread(
-                target=run_job,
-                args=(job, bool(payload.get("preview", True))),
-                daemon=True,
-            ).start()
-            self.send_json({"id": job.id, "name": job.name})
+            submit(job)
+            self.send_json({"id": job.id, "name": job.name, "status": job.status})
+            return
+
+        if route == "/api/rerun":
+            # A run again with what it was asked for: after an interruption,
+            # or a failure worth another go.
+            payload = self.read_json()
+            old = JOBS.get(str(payload.get("id", "")))
+            if old is None or not old.config.get("bbox"):
+                self.send_json({"error": "unknown job"}, status=404)
+                return
+            if active_job(old.name):
+                self.send_json(
+                    {"error": f"{old.name} is already being built or waits in the queue"}, status=409
+                )
+                return
+            job = Job(uuid.uuid4().hex[:12], old.name, old.config, old.estimate, preview=old.preview)
+            submit(job)
+            self.send_json({"id": job.id, "name": job.name, "status": job.status})
             return
 
         if route == "/api/cancel":
@@ -1154,13 +1527,37 @@ class Handler(BaseHTTPRequestHandler):
             if job is None:
                 self.send_json({"error": "unknown job"}, status=404)
                 return
-            job.status = "cancelled"
-            if job.process and job.process.poll() is None:
-                job.process.terminate()
+            cancel(job)
+            self.send_json({"ok": True})
+            return
+
+        if route == "/api/delete":
+            payload = self.read_json()
+            refused = delete_area(str(payload.get("name", "")))
+            if refused:
+                self.send_json({"error": refused[1]}, status=refused[0])
+                return
             self.send_json({"ok": True})
             return
 
         self.send_json({"error": "not found"}, status=404)
+
+    def send_zip(self, folder: Path, top: str, filename: str) -> None:
+        """A folder as one zip download, written aside first so the browser
+        knows its size and can show how far it is."""
+        with tempfile.TemporaryFile() as handle:
+            write_zip(folder, top, handle)
+            size = handle.tell()
+            handle.seek(0)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.end_headers()
+            try:
+                shutil.copyfileobj(handle, self.wfile, 1 << 20)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
 
 def check_environment() -> list[str]:
@@ -1200,6 +1597,9 @@ def main(argv: list[str] | None = None) -> int:
 
     for note in check_environment():
         print(f"warning: {note}", file=sys.stderr)
+    requeued = restore_jobs()
+    if requeued:
+        print(f"{requeued} model(s) still in the queue from before; building them now")
 
     # Bind before opening the browser, or the page races the socket and the
     # first thing a new user sees is a connection error.
@@ -1212,11 +1612,18 @@ def main(argv: list[str] | None = None) -> int:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     print(f"TerreinLab on {url}")
     print("press Ctrl+C to stop")
+
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    # A plain `kill` stops the server the way Ctrl+C does, run included.
+    signal.signal(signal.SIGTERM, stop)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nstopping")
     finally:
+        stop_running()
         server.server_close()
     return 0
 

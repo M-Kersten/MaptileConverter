@@ -1,0 +1,19 @@
+{
+  "name": "com.terreinlab.importer",
+  "version": "1.0.0",
+  "displayName": "TerreinLab Importer",
+  "description": "Imports TerreinLab models with the right settings by itself: an .fbx with metadata.json and ATTRIBUTION.txt beside it arrives in metres with clean axes, without lightmap UVs over RoadUV, with 32-bit indices where needed, a full-size aerial, normal maps and GPU instancing. The FBX custom properties land on a TerreinLabProperties component, and the model root gets a TerreinLabModel component that converts Unity positions to RD and NAP and back.",
+  "unity": "2021.3",
+  "author": {
+    "name": "TerreinLab"
+  },
+  "keywords": [
+    "terreinlab",
+    "fbx",
+    "import",
+    "rd",
+    "nap",
+    "netherlands"
+  ],
+  "dependencies": {}
+}
