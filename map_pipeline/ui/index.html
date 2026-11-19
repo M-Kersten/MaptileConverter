@@ -52,11 +52,26 @@
   a { color: var(--signal-bright); }
   a:hover { color: var(--text-primary); }
   :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-  .overline { font-size: 16px; line-height: 20px; font-weight: 700; letter-spacing: .04em;
-              text-transform: uppercase; color: var(--signal-bright); }
+  /* A section heading inside a panel: quiet, so the orange stays for what you act on. */
+  .overline { font-size: 12px; line-height: 16px; font-weight: 700; letter-spacing: .1em;
+              text-transform: uppercase; color: var(--text-muted); }
   /* The identity first, then the page, then what is on it. */
-  .topbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px 24px;
-            padding-bottom: 24px; border-bottom: 1px solid var(--line); }
+  /* The app menu, the same on every view: who this is, where you are, help.
+     Under it, the page: its title, what it holds, and what you can do there. */
+  .appbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 32px; }
+  .topbar { padding-bottom: 24px; border-bottom: 1px solid var(--line); }
+  .appbar .tabs { margin-right: auto; }
+  .tabs { display: inline-flex; gap: 2px; padding: 4px; border-radius: 999px;
+          background: var(--bg-000); box-shadow: inset 0 0 0 1px var(--line); }
+  .tab { display: inline-flex; align-items: center; gap: 8px; border: 0; cursor: pointer; padding: 8px 18px;
+         border-radius: 999px; background: transparent; color: var(--text-muted);
+         font: 600 15px/20px var(--font-text); transition: color .15s, background .15s; }
+  .tab:hover { color: var(--text-primary); }
+  .tab[aria-current="page"] { background: var(--bg-300); color: var(--text-primary); cursor: default;
+                              box-shadow: inset 0 0 0 1px var(--line), 0 1px 2px rgba(0, 0, 0, .3); }
+  .tab .count { min-width: 22px; padding: 0 7px; border-radius: 999px; font-size: 12px; line-height: 20px;
+                text-align: center; background: var(--bg-200); color: var(--text-secondary); }
+  .tab .count:empty { display: none; }
   .brand { display: inline-flex; align-items: center; gap: 16px; text-decoration: none; color: var(--text-primary); }
   .brand:hover { color: var(--text-primary); }
   .brand img { border-radius: 15px; flex: none; box-shadow: 0 0 0 1px var(--line); }
@@ -134,12 +149,17 @@
   .wrap { max-width: 1344px; margin: 0 auto; padding: 40px 48px 64px; display: flex; flex-direction: column; gap: 32px; }
   @media (max-width: 700px) {
     .wrap { padding: 24px 16px 48px; }
-    .brand img { width: 48px; height: 48px; border-radius: 11px; }
-    .brand .name { font-size: 26px; line-height: 30px; }
+    .topbar .brand img { width: 44px; height: 44px; border-radius: 11px; }
+    .topbar .brand .name { font-size: 24px; line-height: 28px; }
+    .topbar .brand .tagline { display: none; }
+    .tab { padding: 6px 14px; font-size: 14px; }
+    #topNav .brand .wordmark { display: none; }
+    #searchCard { top: 76px; }
   }
-  .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; }
-  .head h1 { font-family: var(--font-heading); font-size: 28px; line-height: 36px; }
-  .topbar .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+  .head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px 24px; }
+  .title { display: flex; flex-direction: column; gap: 2px; }
+  .title h1 { font-family: var(--font-heading); font-size: 28px; line-height: 36px; }
+  .head .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
   #modelFilter { width: 260px; }
 
   .run { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; padding: 20px 24px;
@@ -202,18 +222,21 @@
 
   .float { position: absolute; background: var(--glass); border: 1px solid var(--line);
            border-radius: var(--radius-lg); box-shadow: var(--shadow-panel); }
-  #searchCard { top: 16px; left: 16px; width: 420px; max-width: calc(100% - 32px); padding: 16px;
-                display: flex; flex-direction: column; gap: 10px; }
-  #searchCard h1 { font-family: var(--font-heading); font-size: 20px; line-height: 26px; }
+  #searchCard { top: 92px; left: 16px; width: 400px; max-width: calc(100% - 32px); padding: 20px;
+                display: flex; flex-direction: column; gap: 12px; }
+  #searchCard .title h1 { font-size: 24px; line-height: 30px; }
   #searchWrap { position: relative; }
   #results { position: absolute; left: 0; right: 0; top: 44px; z-index: 10; display: none; max-height: 320px; overflow: auto;
              background: var(--bg-000); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-panel); }
   #results div { padding: 8px 12px; cursor: pointer; font-size: 15px; line-height: 20px; }
   #results div:hover { background: var(--bg-200); }
   #results .t { color: var(--text-muted); font-size: 12px; line-height: 16px; padding: 0; }
-  #topNav { top: 16px; right: 16px; padding: 8px; display: flex; gap: 8px; }
+  #topNav { top: 16px; left: 16px; right: 16px; padding: 8px 8px 8px 12px; gap: 8px 24px; }
+  #topNav .brand { gap: 12px; }
+  #topNav .brand img { border-radius: 10px; }
+  #topNav .brand .name { font-size: 22px; line-height: 28px; }
 
-  #layers { top: 88px; right: 16px; width: 340px; max-width: calc(100% - 32px); max-height: calc(100% - 270px);
+  #layers { top: 92px; right: 16px; width: 340px; max-width: calc(100% - 32px); max-height: calc(100% - 290px);
             overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
   .lhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .lhead .overline { display: flex; align-items: center; gap: 6px; }
@@ -351,11 +374,22 @@
 <!-- ===================================================================== -->
 <main id="viewModels">
   <div class="wrap">
-    <header class="topbar">
+    <header class="appbar topbar">
       <a class="brand" href="/" aria-label="TerreinLab, van locatie naar 3D-demo">
-        <img src="/icon.svg" width="64" height="64" alt="">
+        <img src="/icon.svg" width="56" height="56" alt="">
         <span class="wordmark"><span class="name">Terrein<b>Lab</b></span><span class="tagline">van locatie naar 3D-demo</span></span>
       </a>
+      <nav class="tabs" aria-label="Hoofdmenu">
+        <button class="tab" aria-current="page" id="navModels">Modellen <span class="count" id="navCount"></span></button>
+        <button class="tab" id="navNew">Nieuw gebied</button>
+      </nav>
+      <button class="btn ghost icon" id="openAboutTop" aria-label="Wat je krijgt en hoe je het opent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg></button>
+    </header>
+    <div class="head">
+      <div class="title">
+        <h1>Modellen</h1>
+        <p class="muted" id="modelsCount">Modellen laden&hellip;</p>
+      </div>
       <div class="actions">
         <input id="modelFilter" class="field" type="search" placeholder="Zoek een model" aria-label="Zoek een model">
         <button class="btn primary" id="newArea">
@@ -363,10 +397,6 @@
           Nieuw gebied
         </button>
       </div>
-    </header>
-    <div class="head">
-      <h1>Modellen</h1>
-      <p class="muted" id="modelsCount">Modellen laden&hellip;</p>
     </div>
 
     <section class="run" id="runCard" aria-label="Bouwen" hidden>
@@ -436,9 +466,9 @@
   </div>
 
   <div class="float" id="searchCard">
-    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px">
+    <div class="title">
       <h1>Nieuw gebied</h1>
-      <span class="muted caption">Een echte Nederlandse plek als 3D-model</span>
+      <p class="muted small">Een echte Nederlandse plek als 3D-model</p>
     </div>
     <label class="flabel" for="q">Zoek een plaats
       <span class="help" tabindex="0" role="button" aria-label="Over zoeken"
@@ -451,16 +481,18 @@
     <p class="muted small">Of werk op de kaart: klik om het vierkant te verplaatsen, sleep om te schuiven, scroll om te zoomen.</p>
   </div>
 
-  <nav class="float" id="topNav" aria-label="Algemeen">
-    <button class="btn ghost" id="backToModels">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
-      Modellen
-    </button>
+  <header class="float appbar" id="topNav">
+    <a class="brand" href="/" aria-label="TerreinLab, van locatie naar 3D-demo">
+      <img src="/icon.svg" width="40" height="40" alt="">
+      <span class="wordmark"><span class="name">Terrein<b>Lab</b></span></span>
+    </a>
+    <nav class="tabs" aria-label="Hoofdmenu">
+      <button class="tab" id="backToModels">Modellen <span class="count" id="navCount2"></span></button>
+      <button class="tab" aria-current="page">Nieuw gebied</button>
+    </nav>
     <button class="btn ghost" id="toggleLayers" aria-controls="layers">Lagen</button>
-    <button class="btn ghost icon" id="openAbout" aria-label="Wat je krijgt en hoe je het opent">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg>
-    </button>
-  </nav>
+    <button class="btn ghost icon" id="openAbout" aria-label="Wat je krijgt en hoe je het opent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg></button>
+  </header>
 
   <aside class="float" id="layers" aria-label="Lagen">
     <div class="lhead">
@@ -732,6 +764,8 @@ function showBuild() {
 }
 
 $("newArea").onclick = () => showBuild();
+$("navNew").onclick = () => showBuild();
+$("openAboutTop").onclick = () => $("aboutDialog").showModal();
 $("emptyNew").onclick = () => showBuild();
 $("backToModels").onclick = () => showModels();
 $("toggleLayers").onclick = () => $("layers").classList.toggle("shown");
@@ -1327,6 +1361,7 @@ function renderAreas() {
   $("modelsCount").textContent =
     `${areas.length} ${areas.length === 1 ? "gebied" : "gebieden"} gebouwd` +
     (building ? " · 1 bezig" : "");
+  $("navCount").textContent = $("navCount2").textContent = areas.length || "";
   $("modelsEmpty").hidden = areas.length > 0;
 
   const grid = $("modelGrid");
