@@ -131,7 +131,10 @@ SOURCES: tuple[Source, ...] = (
         contributes=(
             "lampposts, bollards, sign posts, benches, bus shelters, "
             "advertising columns, art and monuments, playgrounds, cabinets, "
-            "waste points, flagpoles and catenary masts"
+            "waste points, flagpoles and catenary masts, litter bins, "
+            "containers, cameras, direction signs, billboards, parking "
+            "meters, toilets, fountains and lamps on facades; bicycle racks, "
+            "post boxes and the rest from OpenStreetMap where the BGT has none"
         ),
         toggles=(("furniture", "enabled"),),
         url_path=("trees", "api_url"),
@@ -189,6 +192,18 @@ SOURCES: tuple[Source, ...] = (
         contributes="manhole lids and gully grates, flat on the road",
         toggles=(("traffic", "covers"),),
         url_path=("trees", "api_url"),
+    ),
+    Source(
+        id="chargers",
+        label="Charging points (NDW)",
+        provider="NDW",
+        contributes="public charging points, one pillar per two connectors",
+        toggles=(("furniture", "chargers"),),
+        fallback_url="https://opendata.ndw.nu/charging_point_locations.geojson.gz",
+        # The file is five megabytes; the directory listing answers the same
+        # question in a few kilobytes.
+        probe_url="https://opendata.ndw.nu/",
+        optional=True,
     ),
     Source(
         id="barriers",

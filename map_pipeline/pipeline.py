@@ -83,11 +83,13 @@ from src.facade import (  # noqa: E402
     generate_water_texture,
 )
 from src.barriers import BarrierSet, build_barriers  # noqa: E402
-from src.furniture import FurnitureSet, build_furniture  # noqa: E402
+from src.furniture import FurnitureSet, build_furniture, fetch_chargers  # noqa: E402
+from src.osm import fetch_osm  # noqa: E402
 from src.traffic import (  # noqa: E402
     TrafficSet,
     build_traffic,
     generate_traffic_texture,
+    road_index,
     write_traffic_list,
 )
 from src.imagery import build_aerial  # noqa: E402
@@ -950,13 +952,39 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     furniture = FurnitureSet()
     furniture_texture = None
     if want_furniture:
-        with Stage("street furniture (BGT)", next_step(), total):
+        with Stage("street furniture (BGT, NDW, OSM)", next_step(), total):
+            cache_dir = work_dir / "_bgt"
+            # The traffic stage's reads when it ran; cached reads otherwise.
+            osm = traffic.osm
+            if osm is None and bool(config.furniture.get("osm", True)):
+                osm = fetch_osm(config.bbox.buffered(30.0), cache_dir=cache_dir)
+            roads = traffic.roads
+            if roads is None:
+                roads = road_index(
+                    fetch_centrelines(
+                        config.bbox,
+                        url=str(config.surfaces.get("nwb_url", NWB_URL)),
+                        timeout=float(config.surfaces["timeout_s"]),
+                        max_retries=int(config.surfaces["max_retries"]),
+                        cache_dir=cache_dir,
+                    ),
+                    osm,
+                )
             furniture = build_furniture(
                 config.bbox,
                 work_dir,
                 furniture_cfg=config.furniture,
                 terrain=terrain,
                 skip_types=traffic.replaces,
+                roads=roads,
+                buildings=buildings,
+                osm=osm,
+                chargers=(
+                    fetch_chargers(config.bbox, cache_dir=cache_dir)
+                    if bool(config.furniture.get("chargers", True))
+                    else None
+                ),
+                carriageway=traffic.carriageway,
             )
             if len(furniture):
                 furniture_texture = generate_furniture_texture(work_dir)
@@ -1155,7 +1183,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
-        write_attribution(out_dir, osm=traffic.used_osm, signs=bool(traffic.signs))
+        write_attribution(
+            out_dir,
+            osm=traffic.used_osm or bool(furniture.sources.get("osm")),
+            signs=bool(traffic.signs),
+            chargers=bool(furniture.sources.get("ndw")),
+        )
 
         report = CheckReport()
         check_bbox(report, config.bbox)

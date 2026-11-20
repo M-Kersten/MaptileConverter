@@ -1040,7 +1040,7 @@ def generate_rail_texture(
     return path
 
 
-# The furniture atlas is a 4x2 grid of flat patches, addressed by the UV centre
+# The furniture atlas is a 4x4 grid of flat patches, addressed by the UV centre
 # of a cell rather than by a real mapping: every piece of street detail is a
 # handful of boxes and none of them wants a unique texture. One atlas means one
 # material, and one material means a couple of thousand objects cost one draw
@@ -1057,10 +1057,20 @@ FURNITURE_PATCHES = (
     ("paint", (96, 112, 104), 0.14, 8),      # railings and fences
     ("stone", (150, 146, 138), 0.18, 5),     # monuments and art
     ("glass", (128, 150, 160), 0.10, 10),    # shelters, ad columns
+    # The second half is colour, for the things a street is recognised by:
+    # the orange post box, the green toilet, the black bicycle.
+    ("black", (30, 30, 32), 0.08, 6),        # bicycles, cameras, bollard heads
+    ("white", (226, 226, 222), 0.05, 6),     # sign blades, chargers, boards
+    ("red", (178, 34, 30), 0.08, 6),         # bicycle frames, warning paint
+    ("green", (32, 84, 58), 0.10, 6),        # fir-green bins and toilets
+    ("blue", (30, 70, 140), 0.06, 6),        # bicycle frames, info boards
+    ("yellow", (226, 182, 40), 0.08, 6),     # hydrant marks
+    ("grey", (120, 124, 126), 0.10, 6),      # cabinets, meters, lockers
+    ("orange", (238, 112, 22), 0.06, 6),     # post boxes
 )
 
 FURNITURE_COLUMNS = 4
-FURNITURE_ROWS = 2
+FURNITURE_ROWS = 4
 
 
 def furniture_uv(name: str) -> tuple[float, float]:

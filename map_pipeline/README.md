@@ -32,8 +32,8 @@ output/<area_name>/
 ├── facade*.png      generated facade textures, referenced by the FBX
 ├── tree.png         bark and foliage atlas
 ├── water.png        canal water
-├── furniture.png    metal and wood atlas
-├── traffic.png      traffic sign faces, road paint and signal lamps
+├── furniture.png    materials and colours atlas for street furniture
+├── traffic.png      traffic sign faces, road paint, symbols and signal lamps
 ├── vehicle.png      car paint, hull and timber atlas
 ├── rail.png         ballast with sleepers, and rail steel
 ├── structure.png    concrete for decks, piers and tunnel walls
@@ -454,11 +454,15 @@ Other knobs worth knowing:
 | `surfaces.land_cover` | `true` | Classify the ground and export the class map. |
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
-| `furniture.enabled` | `true` | Lampposts, bollards, sign posts and benches. |
+| `furniture.enabled` | `true` | Lampposts, bollards, sign posts, benches and the rest of the BGT's street furniture. |
+| `furniture.osm` | `true` | Fill in from OpenStreetMap what the BGT does not register: bicycle racks, litter bins, post boxes. |
+| `furniture.chargers` | `true` | Public charging points from NDW. |
+| `furniture.max_bicycles` | `1500` | The most bicycles drawn in racks. |
 | `traffic.signs` | `true` | Traffic signs from NDW, and the give-way teeth and stop lines they require. See [Signs, lights and road markings](#signs-lights-and-road-markings). |
 | `traffic.markings` | `true` | Lane lines, zebras and speed-hump blocks from OpenStreetMap. |
 | `traffic.signals` | `true` | Traffic lights on the BGT's signal poles. |
-| `traffic.covers` | `true` | Manhole lids and gully grates from the BGT. |
+| `traffic.covers` | `true` | Manhole lids, gully grates and hydrant lids from the BGT. |
+| `traffic.parking_bays` | `true` | White lines between the stalls of every BGT parking bay. |
 | `traffic.marking_lift_m` | `0.03` | How far paint lies above the road. Raise it if markings flicker at long range in your renderer. |
 | `export.collision` | `false` | Add invisible `Collision_*` shapes for physics. See [Collision shapes](#collision-shapes). |
 | `export.collision_tree_crowns` | `true` | Whether a tree's collider includes its canopy. `false` leaves the trunk alone, at a quarter of the triangles. |
@@ -1423,8 +1427,8 @@ deck.
 None of this is structurally important, which is exactly the point. A street
 with nothing on it reads as a model; the same street with lampposts along the
 kerb, a wall between the plots and a hedge behind it reads as a place. Everything
-here shares one 8-patch atlas and one material, so a few thousand objects cost
-one draw call. Its patches are addressed with V counted up from the bottom of
+here shares one 16-patch atlas (eight materials, eight colours) and one
+material, so a few thousand objects cost one draw call. Its patches are addressed with V counted up from the bottom of
 the image, as Blender reads it; counted from the top, as the image is written,
 every lookup read the patch from the other row — metal came out hedge green, a
 green roof on every station canopy, hedges dark metal and quay walls glass.
@@ -1449,6 +1453,38 @@ Bold is what was being fetched and thrown away. The walls and fences are the
 bulk of it — three thousand objects that divide one plot from the next, without
 which a street is a row of buildings standing in a field. The quay walls matter
 more still: an Utrecht canal without its wall is a trench.
+
+### More than one municipality registers
+
+What a municipality puts in the BGT differs a great deal. Rotterdam registers
+litter bins, roll containers, parking meters, cameras, direction signs and 245
+lights hung on facades in one 600 m square; Utrecht registers none of those.
+All of them are drawn now where they exist, with a shape of their own, and two
+more sources fill in behind the BGT:
+
+| Source | What it adds | Utrecht centre km² |
+|---|---|---|
+| NDW charging point register (CC0) | public charging points, one pillar per two connectors | 39 locations |
+| OpenStreetMap (ODbL) | bicycle racks with their capacity, litter bins, post boxes, artworks, bus stops, cameras, information boards, fountains | 166 bins, 37 racks with 500 bicycles, 20 cameras, 10 bus stops |
+
+An OpenStreetMap object is kept only where the BGT has nothing of the same kind
+within a few metres (`furniture.OSM_WANTED` gives the radius per kind), and only
+outdoors: one inside a building footprint is in a station hall or a garage. A
+mural is an artwork but not one that stands in the street; an underground
+bicycle garage is bicycle parking but not one you see. Positions from NDW and
+OpenStreetMap are an address or a mapper's click, so one that lands on the
+carriageway is moved to the kerb.
+
+**Every piece faces its street.** The nearest NWB section or OpenStreetMap road
+within 25 m decides it: a bench runs along the road with its back to the
+houses, a lamppost's arm reaches out over the carriageway, a bicycle rack runs
+along the kerb with the bicycles across it, a sign's face looks along the road.
+A BGT light point within 1.5 m of a facade hangs on it as a wall lamp. Where no
+road is near, a piece is turned at random, as everything used to be.
+
+Bicycles are capped at `furniture.max_bicycles` (1500): near a station
+OpenStreetMap counts racks by the thousand, and every bicycle is about eighty
+triangles.
 
 **Nothing here carries a height.** The BGT surveys where a wall is and never how
 tall, so heights come from a table by type in `barriers.LINE_STYLES` and
@@ -1597,7 +1633,26 @@ for two directions that is the right-hand half.
 which used to be drawn as one more blank sign post, and face the traffic that
 has the pole on its right. Not every municipality surveys them, so a junction
 OpenStreetMap tags `highway=traffic_signals` with no surveyed pole within 30 m
-gets one pole per approach, on the kerb.
+gets one pole per approach, on the kerb, six metres back from the middle of
+the junction. An approach is a way bringing traffic in: a road that ends at
+the junction brings it one way only. Every approach gets a solid stop line
+across its lanes, a metre and a half before the light.
+
+**Parking bays** get white lines between their stalls. The BGT draws a row of
+bays as one polygon, so the stalls are cut the way the vehicle stage parks its
+cars: nose to tail in a strip by the kerb, side by side across a deeper bay,
+back to back in a car park. 1616 stall lines in 219 bays over the Utrecht
+square.
+
+**Road symbols** are textured quads with transparent surroundings, in their
+own object `RoadSymbols` with an alpha-cut material: a bicycle every 50 m on
+each BGT cycle track that NWB or OpenStreetMap runs a cycle path along, and
+"BUS" on bus lanes. A track wide enough for both directions gets one each way,
+on the right-hand half.
+
+**Hydrants** are under the pavement in the Netherlands: a small lid with a
+yellow frame round it, from the BGT's `brandkraan / -put` points, 188 of them
+over the Utrecht square.
 
 **Manholes and gullies** lie flat on the road where the BGT has them, the
 gullies turned along the nearest road.
@@ -2350,7 +2405,9 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
   Rijkswaterstaat, via PDOK (CC0)
 - **Traffic signs** — NDW (Nationaal Dataportaal Wegverkeer) traffic sign
   register (CC0)
-- **Lane counts, crossings, speed humps and signalled junctions** —
+- **Public charging points** — NDW charging point register (CC0)
+- **Lane counts, crossings, speed humps, signalled junctions, bicycle parking
+  and street furniture the BGT lacks** —
   © OpenStreetMap contributors (ODbL). Credited in `ATTRIBUTION.txt` only when
   a model actually contains OpenStreetMap data; the ODbL asks that you keep
   that credit with the model.

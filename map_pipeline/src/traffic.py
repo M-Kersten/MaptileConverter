@@ -58,7 +58,7 @@ RD_URI = "http://www.opengis.net/def/crs/EPSG/0/28992"
 # The atlas
 # --------------------------------------------------------------------------
 
-ATLAS_GRID = 8
+ATLAS_GRID = 16
 ATLAS_CELL_PX = 128
 # How much of a cell a sign face fills. The rest is a border in the face's own
 # colour, so a mip level that bleeds across the edge bleeds nothing visible.
@@ -166,6 +166,25 @@ SIGN_FACES: dict[str, tuple[str, str, str]] = {
     "L": ("square", "blue", ""),
 }
 _FACE_ORDER = list(SIGN_FACES)
+
+
+# Road symbols, white on a transparent cell, read through an alpha-cut
+# material: a symbol drawn opaque would cover the asphalt round it with a
+# square of grey.
+SYMBOLS = ("bike", "bus", "arrow")
+
+
+def symbol_cell(name: str) -> int:
+    return FIRST_FACE_CELL + len(SIGN_FACES) + SYMBOLS.index(name)
+
+
+def symbol_uv(name: str) -> np.ndarray:
+    """Per-corner UVs for a symbol quad, in `GroundPaint.quad`'s corner order:
+    near right, far right, far left, near left."""
+    u0, v0, u1, v1 = cell_rect(symbol_cell(name))
+    inset = 0.5 / (ATLAS_GRID * ATLAS_CELL_PX)
+    u0, v0, u1, v1 = u0 + inset, v0 + inset, u1 - inset, v1 - inset
+    return np.array([[u1, v0], [u1, v1], [u0, v1], [u0, v0]])
 
 
 def face_key(code: str, speed: str = "") -> str | None:
@@ -374,14 +393,52 @@ def _draw_face(draw, key: str, x0: float, y0: float, size: float) -> None:
         poly(0.66, ORANGE)
 
 
+def _draw_symbol(draw, name: str, x0: float, y0: float, size: float) -> None:
+    """One road symbol, white, its top towards the far end of the paint.
+
+    Painted symbols are stretched along the road, because the driver sees
+    them foreshortened. The bicycle lies along the lane, front wheel ahead.
+    """
+    cx = x0 + size / 2.0
+    white = (250, 250, 250, 255)
+    w = max(3, int(size * 0.045))
+    if name == "bike":
+        r = size * 0.17
+        for wy in (y0 + size * 0.24, y0 + size * 0.76):
+            draw.ellipse([cx - r, wy - r, cx + r, wy + r], outline=white, width=w)
+        top, bottom = y0 + size * 0.24, y0 + size * 0.76
+        draw.line([(cx, top), (cx - size * 0.12, y0 + size * 0.42),
+                   (cx - size * 0.12, y0 + size * 0.62), (cx, bottom)], fill=white, width=w)
+        draw.line([(cx - size * 0.12, y0 + size * 0.42), (cx, y0 + size * 0.62)],
+                  fill=white, width=w)
+        draw.line([(cx - size * 0.2, y0 + size * 0.3), (cx + size * 0.08, y0 + size * 0.3)],
+                  fill=white, width=w)
+    elif name == "bus":
+        font = _font(int(size * 0.42))
+        box = draw.textbbox((0, 0), "BUS", font=font)
+        draw.text(
+            (cx - (box[0] + box[2]) / 2.0, y0 + size / 2.0 - (box[1] + box[3]) / 2.0),
+            "BUS", fill=white, font=font,
+        )
+    elif name == "arrow":
+        shaft = size * 0.12
+        draw.rectangle([cx - shaft / 2, y0 + size * 0.4, cx + shaft / 2, y0 + size * 0.95],
+                       fill=white)
+        draw.polygon([(cx, y0 + size * 0.05), (cx - size * 0.28, y0 + size * 0.42),
+                      (cx + size * 0.28, y0 + size * 0.42)], fill=white)
+
+
 def generate_traffic_texture(work_dir: Path, cell_px: int = ATLAS_CELL_PX) -> Path:
-    """The atlas: flat paints in the top rows, one sign face per cell below."""
+    """The atlas: flat paints in the top rows, one sign face per cell below,
+    then the road symbols on transparent cells."""
     from PIL import Image, ImageDraw
 
     # Drawn large and reduced, which is all the anti-aliasing a disc needs.
     over = 4
     big = cell_px * over
-    image = Image.new("RGB", (ATLAS_GRID * big, ATLAS_GRID * big), FLAT_CELLS["back"][1])
+    image = Image.new(
+        "RGBA", (ATLAS_GRID * big, ATLAS_GRID * big), (*FLAT_CELLS["back"][1], 255)
+    )
     draw = ImageDraw.Draw(image)
     for cell, colour in FLAT_CELLS.values():
         col, row = cell % ATLAS_GRID, cell // ATLAS_GRID
@@ -392,6 +449,16 @@ def generate_traffic_texture(work_dir: Path, cell_px: int = ATLAS_CELL_PX) -> Pa
         cell = face_cell(key)
         col, row = cell % ATLAS_GRID, cell // ATLAS_GRID
         _draw_face(draw, key, col * big, row * big, big)
+    for name in SYMBOLS:
+        cell = symbol_cell(name)
+        col, row = cell % ATLAS_GRID, cell // ATLAS_GRID
+        # Transparent, with the colour of the paint under it, so the edge a
+        # mip level blends in is white rather than black.
+        draw.rectangle(
+            [col * big, row * big, (col + 1) * big - 1, (row + 1) * big - 1],
+            fill=(250, 250, 250, 0),
+        )
+        _draw_symbol(draw, name, col * big, row * big, big)
     image = image.resize(
         (ATLAS_GRID * cell_px, ATLAS_GRID * cell_px), Image.LANCZOS
     )
@@ -471,7 +538,8 @@ class GroundPaint:
 
     def __init__(self) -> None:
         self._polygons: list[np.ndarray] = []
-        self._uv: list[tuple[float, float]] = []
+        # A flat colour's one UV, or a UV per corner for a textured symbol.
+        self._uv: list[np.ndarray] = []
 
     def quad(self, centre, along, half_length: float, half_width: float, uv) -> None:
         centre = np.asarray(centre, dtype=np.float64)
@@ -489,7 +557,19 @@ class GroundPaint:
     def polygon(self, xy: np.ndarray, uv) -> None:
         """A convex polygon, counter-clockwise seen from above."""
         self._polygons.append(np.asarray(xy, dtype=np.float64))
-        self._uv.append((float(uv[0]), float(uv[1])))
+        self._uv.append(np.asarray(uv, dtype=np.float64))
+
+    def symbol(self, centre, along, half_length: float, half_width: float, name: str) -> None:
+        """A road symbol, its top towards `along`. One quad, not pieces: the
+        texture is laid over all of it."""
+        centre = np.asarray(centre, dtype=np.float64)
+        along = np.asarray(along, dtype=np.float64)
+        b = np.array([-along[1], along[0]]) * half_width
+        a = along * half_length
+        self.polygon(
+            np.array([centre - a - b, centre + a - b, centre + a + b, centre - a + b]),
+            symbol_uv(name),
+        )
 
     def __len__(self) -> int:
         return len(self._polygons)
@@ -503,7 +583,7 @@ class GroundPaint:
         start = 0
         for polygon, uv in zip(self._polygons, self._uv):
             n = len(polygon)
-            out.fan(np.column_stack([polygon, z[start:start + n]]), np.asarray(uv))
+            out.fan(np.column_stack([polygon, z[start:start + n]]), uv)
             start += n
         return out
 
@@ -588,6 +668,25 @@ class Carriageway:
                 continue
             lo[k], hi[k] = best[1], best[2]
         return lo, hi
+
+    def push_off(self, xy, margin: float = 0.6, reach: float = 4.0):
+        """A point on the road moved to the kerb and `margin` past it, or None
+        when it is not on the road, or further in than `reach`."""
+        import shapely
+
+        if self.geometry is None:
+            return None
+        point = shapely.Point(float(xy[0]), float(xy[1]))
+        if not self.geometry.contains(point):
+            return None
+        edge = shapely.get_coordinates(
+            shapely.shortest_line(self.geometry.boundary, point)
+        )[0]
+        out = edge - np.asarray(xy, dtype=np.float64)
+        distance = float(np.linalg.norm(out))
+        if distance > reach or distance < 1e-9:
+            return None
+        return edge + out / distance * margin
 
     def section(self, point, normal, **kwargs) -> tuple[float, float] | None:
         lo, hi = self.sections(np.asarray(point)[None], np.asarray(normal)[None], **kwargs)
@@ -832,6 +931,25 @@ class RoadIndex:
         return p[0], t[0]
 
 
+def road_index(network=None, osm=None) -> RoadIndex:
+    """The NWB sections and OpenStreetMap's roads and cycle paths, as one index.
+
+    NWB carries the section ids the sign register refers to; OpenStreetMap
+    has the estate lanes and cycle paths NWB leaves out.
+    """
+    lines = [
+        w.points for w in (getattr(osm, "ways", None) or [])
+        if w.highway in DRIVABLE or w.highway == "cycleway"
+    ]
+    sections: dict[int, np.ndarray] = {}
+    for line in getattr(network, "lines", None) or []:
+        if getattr(line, "kind", "") == "skeleton":
+            continue
+        sections[int(line.section_id)] = np.asarray(line.points, dtype=np.float64)
+        lines.append(sections[int(line.section_id)])
+    return RoadIndex(lines, sections)
+
+
 def travel_direction(sign: Sign, roads: RoadIndex, reach: float = 15.0):
     """Which way the traffic a sign speaks to is driving.
 
@@ -1017,23 +1135,37 @@ def _node_on_way(way, node_id: int) -> tuple[np.ndarray, np.ndarray] | None:
     return points[index], tangent / norm
 
 
+# A signal OpenStreetMap puts on the junction itself stops its traffic this
+# far back from the middle: half the road it crosses and the crossing before it.
+SIGNAL_SETBACK_M = 6.0
+
+
 def place_signals(
-    poles: np.ndarray, osm, roads: RoadIndex, road: Carriageway, *, lone_m: float = 30.0
+    poles: np.ndarray, osm, roads: RoadIndex, road: Carriageway, *, lone_m: float = 30.0,
+    stops: list | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Where the lights stand and which way their traffic drives.
 
     Surveyed poles first. A junction OpenStreetMap tags as signalled with no
-    surveyed pole near it gets one per approach, on the kerb to the right.
+    surveyed pole near it gets one per approach -- not per way through it: a
+    way that leaves the junction has no traffic arriving that the light is
+    for -- on the kerb to the right, set back from the middle of the junction.
+
+    `stops`, when given, is filled with the point on the road where each
+    light's traffic stops, or None where no road was found, in the same order.
     """
     positions: list[np.ndarray] = []
     directions: list[np.ndarray] = []
+    stopping: list = []
     for xy in np.asarray(poles, dtype=np.float64).reshape(-1, 2):
         found = roads.nearest(xy, 25.0)
         if found is None:
             direction = np.array([0.0, 1.0])
+            stopping.append(None)
         else:
             point, tangent = found
             direction = tangent if _left(tangent) @ (xy - point) < 0 else -tangent
+            stopping.append(np.asarray(point, dtype=np.float64))
         positions.append(xy)
         directions.append(direction)
     surveyed = len(positions)
@@ -1045,26 +1177,37 @@ def place_signals(
         xy = np.asarray(node.xy)
         if surveyed and np.min(np.linalg.norm(np.asarray(positions[:surveyed]) - xy, axis=1)) < lone_m:
             continue
-        for way in through.get(node.id, []):
-            if way.highway not in DRIVABLE:
-                continue
+        drivable = [w for w in through.get(node.id, []) if w.highway in DRIVABLE]
+        junction = len(drivable) > 1
+        for way in drivable:
             found = _node_on_way(way, node.id)
             if found is None:
                 continue
             point, tangent = found
+            index = way.node_ids.index(node.id)
             wanted = node.tags.get("traffic_signals:direction", "")
             headings = []
-            if wanted != "backward":
+            # Forward traffic arrives from the node before; backward traffic
+            # from the node after. A way that starts or ends here brings
+            # traffic in one way only.
+            if wanted != "backward" and index > 0:
                 headings.append(tangent)
-            if wanted != "forward" and not _is_oneway(way.tags):
+            if (
+                wanted != "forward" and not _is_oneway(way.tags)
+                and index < len(way.node_ids) - 1
+            ):
                 headings.append(-tangent)
             for heading in headings:
+                stop = point - heading * (SIGNAL_SETBACK_M if junction else 0.0)
                 rightward = -_left(heading)
-                cut = road.section(point, rightward)
+                cut = road.section(stop, rightward)
                 reach = (cut[1] if cut else 3.2) + 0.7
-                positions.append(point + rightward * reach)
+                positions.append(stop + rightward * reach)
                 directions.append(heading)
+                stopping.append(stop)
 
+    if stops is not None:
+        stops[:] = stopping
     stats = {"surveyed": surveyed, "from_osm": len(positions) - surveyed}
     if not positions:
         return np.zeros((0, 2)), np.zeros((0, 2)), stats
@@ -1326,16 +1469,215 @@ def paint_give_way(
     return stats
 
 
+STOP_LINE_M = 0.3
+# A light stands a little past the line its traffic stops at.
+STOP_BEFORE_M = 1.5
+
+
+def paint_stop_lines(
+    paint: GroundPaint, stops: list, directions: np.ndarray, road: Carriageway,
+    cycle: Carriageway,
+) -> dict:
+    """A solid line across the lanes each traffic light stops.
+
+    One per approach: a light on either kerb, or a repeat head over the lane,
+    stops the same traffic at the same line.
+    """
+    stats = {"stop_lines_at_lights": 0}
+    white = flat_uv("white")
+    done: list[tuple[np.ndarray, np.ndarray]] = []
+    for stop, direction in zip(stops, directions):
+        if stop is None:
+            continue
+        direction = np.asarray(direction, dtype=np.float64)
+        point = np.asarray(stop, dtype=np.float64) - direction * STOP_BEFORE_M
+        if any(np.linalg.norm(p - point) < 8.0 and d @ direction > 0.7 for p, d in done):
+            continue
+        normal = _left(direction)
+        cut = road.section(point, normal) or cycle.section(point, normal)
+        if cut is None:
+            continue
+        lo, hi = cut
+        if hi - lo > 18.0:
+            continue
+        if hi - lo >= TWO_WAY_MIN_M:
+            hi = (lo + hi) / 2.0
+        lo += KERB_INSET_M
+        span = hi - lo
+        if span < 1.0:
+            continue
+        done.append((point, direction))
+        paint.quad(point + normal * (lo + span / 2.0), normal, span / 2.0, STOP_LINE_M / 2.0, white)
+        stats["stop_lines_at_lights"] += 1
+    return stats
+
+
+# Parking stalls, laid out the way the vehicle stage parks its cars in them.
+STALL_LINE_M = 0.1
+
+
+def paint_parking_bays(paint: GroundPaint, features: list[dict], bbox: BBox) -> dict:
+    """White lines between the stalls of every BGT parking bay.
+
+    The BGT draws a row of bays as one polygon, and says nothing of where one
+    stall ends. The stalls are cut the way the vehicle stage parks its cars,
+    so a car stands between two lines rather than on one: nose to tail in a
+    strip by the kerb, side by side across a deeper bay, back to back in a
+    car park.
+    """
+    import shapely
+    from shapely.geometry import shape
+
+    from .vehicles import (
+        BAY_MAX_W, PARALLEL_MAX_W, PARALLEL_PITCH, PERPENDICULAR_PITCH, principal_axes,
+    )
+
+    stats = {"parking_bays": 0, "stall_lines": 0}
+    white = flat_uv("white")
+    for feature in features:
+        props = feature.get("properties") or {}
+        if not str(props.get("functie") or "").lower().startswith("parkeervlak"):
+            continue
+        try:
+            geometry = shape(feature.get("geometry") or {})
+        except Exception:  # noqa: BLE001
+            continue
+        for polygon in shapely.get_parts(geometry):
+            if polygon.geom_type != "Polygon" or polygon.is_empty:
+                continue
+            ring = np.asarray(polygon.exterior.coords)[:, :2]
+            centre = ring.mean(axis=0)
+            if not (bbox.xmin <= centre[0] <= bbox.xmax and bbox.ymin <= centre[1] <= bbox.ymax):
+                continue
+            long_axis, short_axis, along, across = principal_axes(ring)
+            if along < 4.0 or across < 1.6:
+                continue
+            if across <= PARALLEL_MAX_W:
+                pitch, rows = PARALLEL_PITCH, [(0.0, across)]
+            elif across <= BAY_MAX_W:
+                pitch, rows = PERPENDICULAR_PITCH, [(0.0, across)]
+            else:
+                n_rows = max(1, int(across // 5.0))
+                depth = across / n_rows
+                pitch = PERPENDICULAR_PITCH
+                rows = [((k - (n_rows - 1) / 2.0) * depth, depth) for k in range(n_rows)]
+            count = int(along // pitch)
+            if count < 1:
+                continue
+            # Centred on the bay's middle, like the cars.
+            middle = centre + long_axis * float(
+                ((ring - centre) @ long_axis).max() + ((ring - centre) @ long_axis).min()
+            ) / 2.0
+            inner = polygon.buffer(-0.1)
+            if inner.is_empty:
+                continue
+            stats["parking_bays"] += 1
+            for offset, depth in rows:
+                for k in range(count + 1):
+                    b = (k - count / 2.0) * pitch
+                    mid = middle + long_axis * b + short_axis * offset
+                    line = shapely.LineString(
+                        [mid - short_axis * depth / 2.0, mid + short_axis * depth / 2.0]
+                    )
+                    piece = line.intersection(inner)
+                    parts = [p for p in shapely.get_parts(piece) if p.geom_type == "LineString"]
+                    if not parts:
+                        continue
+                    part = max(parts, key=lambda p: p.length)
+                    if part.length < 1.0:
+                        continue
+                    ends = np.asarray(part.coords)[:, :2]
+                    paint.quad(
+                        ends.mean(axis=0), short_axis, part.length / 2.0,
+                        STALL_LINE_M / 2.0, white,
+                    )
+                    stats["stall_lines"] += 1
+    return stats
+
+
+SYMBOL_EVERY_M = 50.0
+BIKE_SYMBOL_M = (0.9, 1.6)   # across, along
+BUS_SYMBOL_M = (2.2, 3.4)
+
+
+def paint_symbols(
+    paint: GroundPaint, osm, network, road: Carriageway, cycle: Carriageway,
+    bbox: BBox | None = None,
+) -> dict:
+    """A bicycle on every cycle track, "BUS" on every bus lane, now and again.
+
+    Cycle tracks are the BGT's own, found along NWB's cycle path sections
+    and OpenStreetMap's cycleways; bus lanes along OpenStreetMap's busways.
+    A track wide enough for both directions gets a symbol each way.
+    """
+    stats = {"bike_symbols": 0, "bus_symbols": 0}
+    placed: list[tuple[np.ndarray, np.ndarray]] = []
+    lines: list[tuple[np.ndarray, str, bool]] = []
+    for line in getattr(network, "lines", None) or []:
+        if getattr(line, "kind", "") == "FP":
+            lines.append((np.asarray(line.points, dtype=np.float64), "bike", False))
+    for way in getattr(osm, "ways", None) or []:
+        if way.highway == "cycleway":
+            lines.append((way.points, "bike", _is_oneway(way.tags)))
+        elif way.highway == "busway":
+            lines.append((way.points, "bus", _is_oneway(way.tags)))
+
+    for points, name, oneway in lines:
+        length = polyline_length(points)
+        if length < SYMBOL_EVERY_M / 2.0:
+            continue
+        surface = cycle if name == "bike" else road
+        across_m, along_m = BIKE_SYMBOL_M if name == "bike" else BUS_SYMBOL_M
+        stations = np.arange(SYMBOL_EVERY_M / 4.0, length, SYMBOL_EVERY_M)
+        centres, tangents = along(points, stations)
+        for centre, tangent in zip(centres, tangents):
+            if bbox is not None and not (
+                bbox.xmin <= centre[0] <= bbox.xmax and bbox.ymin <= centre[1] <= bbox.ymax
+            ):
+                continue
+            normal = _left(tangent)
+            cut = surface.section(centre, normal)
+            if cut is None:
+                continue
+            lo, hi = cut
+            width = hi - lo
+            if width < across_m + 0.3 or width > (8.0 if name == "bus" else 6.0):
+                continue
+            middle = centre + normal * (lo + hi) / 2.0
+            if any(np.linalg.norm(p - middle) < SYMBOL_EVERY_M * 0.4 for p, _ in placed):
+                continue
+            two_way = not oneway and width >= 2.0 * across_m + 0.6
+            if two_way:
+                # Keep right: the half on the right of each direction.
+                quarter = width / 4.0
+                for heading, side in ((tangent, -1.0), (-tangent, 1.0)):
+                    paint.symbol(middle + normal * side * quarter, heading,
+                                 along_m / 2.0, across_m / 2.0, name)
+                    stats[f"{name}_symbols"] += 1
+            else:
+                paint.symbol(middle, tangent, along_m / 2.0, across_m / 2.0, name)
+                stats[f"{name}_symbols"] += 1
+            placed.append((middle, tangent))
+    return stats
+
+
 COVER_TYPES = {
     "inspectie- / rioolput": "cover",
     "waterleidingput": "cover",
+    "drainageput": "cover",
     "kolk": "grate",
+    # Dutch hydrants are under the pavement: a small lid, and a yellow frame
+    # round it so the fire brigade finds it.
+    "brandkraan / -put": "hydrant",
 }
+
+HYDRANT_LID_M = (0.3, 0.45)
+HYDRANT_FRAME_M = 0.08
 
 
 def paint_covers(paint: GroundPaint, features: list[dict], bbox: BBox, roads: RoadIndex) -> dict:
-    """Manhole lids and gully grates from the BGT."""
-    stats = {"manholes": 0, "gullies": 0}
+    """Manhole lids, gully grates and hydrant lids from the BGT."""
+    stats = {"manholes": 0, "gullies": 0, "hydrants": 0}
     lid = SHAPES["octagon"] * 0.35
     for feature in features:
         kind = COVER_TYPES.get(str((feature.get("properties") or {}).get("plus_type") or ""))
@@ -1348,6 +1690,26 @@ def paint_covers(paint: GroundPaint, features: list[dict], bbox: BBox, roads: Ro
         if kind == "cover":
             paint.polygon(lid + np.array([x, y]), flat_uv("cover"))
             stats["manholes"] += 1
+        elif kind == "hydrant":
+            found = roads.nearest((x, y), 20.0)
+            along_road = found[1] if found is not None else np.array([1.0, 0.0])
+            across_road = np.array([-along_road[1], along_road[0]])
+            half_w, half_l = HYDRANT_LID_M[0] / 2.0, HYDRANT_LID_M[1] / 2.0
+            frame = HYDRANT_FRAME_M
+            centre = np.array([x, y])
+            paint.quad(centre, along_road, half_l, half_w, flat_uv("cover"))
+            # The frame as four strips round the lid, not a plate under it:
+            # two coplanar faces fight over every pixel in a depth buffer.
+            for side in (-1.0, 1.0):
+                paint.quad(
+                    centre + along_road * side * (half_l + frame / 2.0),
+                    along_road, frame / 2.0, half_w + frame, flat_uv("yellow"),
+                )
+                paint.quad(
+                    centre + across_road * side * (half_w + frame / 2.0),
+                    along_road, half_l, frame / 2.0, flat_uv("yellow"),
+                )
+            stats["hydrants"] += 1
         else:
             # A gully lies along its kerb, which runs the way the road does.
             found = roads.nearest((x, y), 20.0)
@@ -1361,7 +1723,7 @@ def paint_covers(paint: GroundPaint, features: list[dict], bbox: BBox, roads: Ro
 # The stage
 # --------------------------------------------------------------------------
 
-OBJECTS = ("signs", "signals", "markings", "covers")
+OBJECTS = ("signs", "signals", "markings", "symbols", "covers")
 
 
 @dataclass
@@ -1376,6 +1738,11 @@ class TrafficSet:
     used_osm: bool = False
     # BGT pole types this stage drew, for the furniture stage to leave alone.
     replaces: set[str] = field(default_factory=set)
+    # What it read, for the furniture stage to turn its pieces by and fill in
+    # from, so neither is read twice. Not saved.
+    osm: object = None
+    roads: object = None
+    carriageway: object = None
 
     def __len__(self) -> int:
         return sum(len(faces) for _, faces, _ in self.meshes.values())
@@ -1396,8 +1763,13 @@ def build_traffic(
     deck_at: Callable | None = None,
     network=None,
     fetch_bgt: Callable | None = None,
+    osm=None,
 ) -> TrafficSet:
-    """Fetch what is switched on and build the meshes."""
+    """Fetch what is switched on and build the meshes.
+
+    `osm` is an OpenStreetMap read already made; without one the stage reads
+    its own when lines or lights need it.
+    """
     from .bgt import CACHE_DIRNAME, fetch_current
     from .osm import OSM_API_URL, OsmData, fetch_osm
 
@@ -1432,36 +1804,41 @@ def build_traffic(
             LOG.warning("could not read BGT %s: %s", collection, short_error(exc))
             return []
 
-    osm = OsmData()
-    if want_markings or want_signals:
-        osm = fetch_osm(
-            bbox.buffered(30.0),
-            url=str(traffic_cfg.get("osm_url", OSM_API_URL)),
-            timeout=float(traffic_cfg.get("timeout_s", 180)),
-            cache_dir=cache_dir,
-        )
-        inside = [
+    if osm is None:
+        osm = OsmData()
+        if want_markings or want_signals:
+            osm = fetch_osm(
+                bbox.buffered(30.0),
+                url=str(traffic_cfg.get("osm_url", OSM_API_URL)),
+                timeout=float(traffic_cfg.get("timeout_s", 180)),
+                cache_dir=cache_dir,
+            )
+    result.osm = osm
+    # The nodes this stage paints or lights; the read itself stays whole.
+    osm = OsmData(
+        ways=osm.ways,
+        nodes=[
             n for n in osm.nodes
             if bbox.xmin <= n.xy[0] <= bbox.xmax and bbox.ymin <= n.xy[1] <= bbox.ymax
-        ]
-        osm.nodes = inside
+        ],
+        areas=osm.areas,
+        source=osm.source,
+    )
 
     road, cycle = Carriageway(), Carriageway()
+    wegdeel: list[dict] = []
     if want_markings or want_signals:
-        road, cycle = carriageways(bgt("wegdeel"))
+        wegdeel = bgt("wegdeel")
+        road, cycle = carriageways(wegdeel)
 
-    lines = [w.points for w in osm.ways if w.highway in DRIVABLE or w.highway == "cycleway"]
-    sections: dict[int, np.ndarray] = {}
-    for line in getattr(network, "lines", None) or []:
-        if getattr(line, "kind", "") == "skeleton":
-            continue
-        sections[int(line.section_id)] = np.asarray(line.points, dtype=np.float64)
-        lines.append(sections[int(line.section_id)])
-    roads = RoadIndex(lines, sections)
+    roads = road_index(network, osm)
+    result.roads = roads
+    result.carriageway = road
 
     signs: list[Sign] = []
     directions = np.zeros((0, 2))
     road_points: list = []
+    signal_stops: tuple = ([], np.zeros((0, 2)))
     if want_signs:
         signs = fetch_signs(
             bbox,
@@ -1477,7 +1854,7 @@ def build_traffic(
         xy = np.array([s.xy for s in signs])
         mesh, result.signs = sign_mesh(signs, directions, height_at(xy[:, 0], xy[:, 1]))
         result.meshes["signs"] = mesh.arrays()
-        result.replaces.add("verkeersbordpaal")
+        result.replaces.update({"verkeersbordpaal", "verkeersbord"})
         result.counts["signs"] = len(result.signs)
 
     if want_signals:
@@ -1492,12 +1869,17 @@ def build_traffic(
             ],
             dtype=np.float64,
         ).reshape(-1, 2)
-        positions, headings, signal_stats = place_signals(poles, osm, roads, road)
+        stop_points: list = []
+        positions, headings, signal_stats = place_signals(
+            poles, osm, roads, road, stops=stop_points
+        )
         keep = (
             (positions[:, 0] >= bbox.xmin) & (positions[:, 0] <= bbox.xmax)
             & (positions[:, 1] >= bbox.ymin) & (positions[:, 1] <= bbox.ymax)
         ) if len(positions) else np.zeros(0, dtype=bool)
         positions, headings = positions[keep], headings[keep]
+        stop_points = [s for s, k in zip(stop_points, keep) if k]
+        signal_stops = (stop_points, headings)
         # The surveyed poles are drawn here now, whether or not any stand in
         # this square.
         result.replaces.add("verkeersregelinstallatiepaal")
@@ -1522,11 +1904,25 @@ def build_traffic(
         crossing_stats, result.crossings = paint_crossings(paint, osm, road, cycle)
         lane_stats = paint_lanes(paint, osm, road, bbox, result.crossings)
         give_way = paint_give_way(paint, signs, directions, road_points, road, cycle)
+        stop_stats = paint_stop_lines(paint, *signal_stops, road, cycle)
+        bay_stats = (
+            paint_parking_bays(paint, wegdeel, bbox)
+            if bool(traffic_cfg.get("parking_bays", True)) else {}
+        )
         if len(paint):
             result.meshes["markings"] = paint.mesh(
                 height_at, float(traffic_cfg.get("marking_lift_m", 0.03))
             ).arrays()
-        result.counts.update({**lane_stats, **crossing_stats, **give_way})
+        symbols = GroundPaint()
+        symbol_stats = paint_symbols(symbols, osm, network, road, cycle, bbox)
+        if len(symbols):
+            result.meshes["symbols"] = symbols.mesh(
+                height_at, float(traffic_cfg.get("marking_lift_m", 0.03))
+            ).arrays()
+        result.counts.update({
+            **lane_stats, **crossing_stats, **give_way, **stop_stats, **bay_stats,
+            **symbol_stats,
+        })
         if lane_stats["laned_ways"] or result.crossings or crossing_stats["humps"]:
             result.used_osm = True
 
@@ -1616,8 +2012,12 @@ __all__ = [
     "paint_crossings",
     "paint_give_way",
     "paint_lanes",
+    "paint_parking_bays",
+    "paint_stop_lines",
+    "paint_symbols",
     "parse_signs",
     "place_signals",
+    "road_index",
     "save_traffic",
     "sign_mesh",
     "signal_mesh",

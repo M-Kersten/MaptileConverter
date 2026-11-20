@@ -333,6 +333,15 @@ DEFAULTS: dict[str, Any] = {
     },
     "furniture": {
         "enabled": True,
+        # OpenStreetMap fills in what the municipality did not register:
+        # bicycle racks, litter bins, post boxes. Only where the BGT has no
+        # object of the same kind close by.
+        "osm": True,
+        # Public charging points from NDW's national register.
+        "chargers": True,
+        # A ceiling on bicycles in racks, which are the one piece of
+        # furniture that comes by the thousand near a station.
+        "max_bicycles": 1500,
         "page_limit": 1000,
         "timeout_s": 180,
         "max_retries": 4,

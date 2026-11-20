@@ -34,8 +34,9 @@ LOG = logging.getLogger(__name__)
 
 OSM_API_URL = "https://api.openstreetmap.org/api/0.6/map.json"
 
-# Node tags worth carrying. Everything else on a node -- and the great
-# majority of nodes carry nothing at all -- is dropped at parse time.
+# A node carrying any of these is kept, with all of its tags: a bicycle
+# rack's capacity and whether it is under cover are tags of their own. The
+# great majority of nodes carry nothing and are only geometry for the ways.
 NODE_KEYS = (
     "highway",
     "crossing",
@@ -44,7 +45,29 @@ NODE_KEYS = (
     "traffic_signals",
     "amenity",
     "emergency",
+    "man_made",
+    "barrier",
+    "leisure",
+    "tourism",
 )
+
+# Ways that are not roads but are street detail: a bicycle parking drawn as
+# an area, a planter. Everything else -- buildings above all, four fifths of a
+# city download -- is the registers' business and is dropped.
+AREA_TAGS = {
+    "amenity": {"bicycle_parking"},
+    "man_made": {"planter"},
+}
+
+# Bumped when what is kept changes, so an older cache is not read as if it
+# held everything a newer run expects.
+CACHE_VERSION = "osm2"
+
+
+def keep_way(tags: dict) -> bool:
+    if "highway" in tags:
+        return True
+    return any(tags.get(key) in values for key, values in AREA_TAGS.items())
 
 
 @dataclass
@@ -74,10 +97,12 @@ class OsmNode:
 class OsmData:
     ways: list[OsmWay] = field(default_factory=list)
     nodes: list[OsmNode] = field(default_factory=list)
+    # Closed ways that are street detail rather than road (`AREA_TAGS`).
+    areas: list[OsmWay] = field(default_factory=list)
     source: str = ""
 
     def __bool__(self) -> bool:
-        return bool(self.ways or self.nodes)
+        return bool(self.ways or self.nodes or self.areas)
 
     def ways_through(self) -> dict[int, list[OsmWay]]:
         """Which highways pass through each node."""
@@ -106,12 +131,11 @@ def parse_elements(elements: list[dict], bbox: BBox | None = None) -> OsmData:
             except (KeyError, TypeError, ValueError):
                 continue
             tags = element.get("tags") or {}
-            kept = {k: str(tags[k]) for k in NODE_KEYS if k in tags}
-            if kept:
-                tagged[node_id] = kept
+            if any(k in tags for k in NODE_KEYS):
+                tagged[node_id] = {str(k): str(v) for k, v in tags.items()}
         elif kind == "way":
             tags = element.get("tags") or {}
-            if "highway" in tags and element.get("nodes"):
+            if keep_way(tags) and element.get("nodes"):
                 raw_ways[int(element["id"])] = element
 
     data = OsmData(source="OpenStreetMap")
@@ -135,7 +159,8 @@ def parse_elements(elements: list[dict], bbox: BBox | None = None) -> OsmData:
         )
         if keep.sum() < 2:
             continue
-        data.ways.append(
+        target = data.ways if "highway" in (element.get("tags") or {}) else data.areas
+        target.append(
             OsmWay(
                 id=way_id,
                 points=points[keep],
@@ -216,13 +241,13 @@ def fetch_osm(
     cache = None
     if cache_dir is not None:
         key = f"{bbox.xmin:.1f}_{bbox.ymin:.1f}_{bbox.xmax:.1f}_{bbox.ymax:.1f}"
-        cache = Path(cache_dir) / f"osm_{key}.json.gz"
+        cache = Path(cache_dir) / f"{CACHE_VERSION}_{key}.json.gz"
         if cache.is_file():
             with gzip.open(cache, "rt", encoding="utf-8") as handle:
                 data = parse_elements(json.load(handle), bbox)
             LOG.info(
-                "OpenStreetMap: %d highways, %d tagged nodes (cached)",
-                len(data.ways), len(data.nodes),
+                "OpenStreetMap: %d highways, %d areas, %d tagged nodes (cached)",
+                len(data.ways), len(data.areas), len(data.nodes),
             )
             return data
 
@@ -235,7 +260,7 @@ def fetch_osm(
                 kind = element.get("type")
                 # Buildings are four fifths of a city download and none of
                 # it is used; dropping them here keeps the cache small.
-                if kind == "way" and "highway" not in (element.get("tags") or {}):
+                if kind == "way" and not keep_way(element.get("tags") or {}):
                     continue
                 if kind not in ("node", "way"):
                     continue
@@ -263,8 +288,8 @@ def fetch_osm(
 
     data = parse_elements(kept, bbox)
     LOG.info(
-        "OpenStreetMap: %d highways, %d tagged nodes",
-        len(data.ways), len(data.nodes),
+        "OpenStreetMap: %d highways, %d areas, %d tagged nodes",
+        len(data.ways), len(data.areas), len(data.nodes),
     )
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -276,7 +301,9 @@ def fetch_osm(
 
 
 __all__ = [
+    "AREA_TAGS",
     "NODE_KEYS",
+    "keep_way",
     "OSM_API_URL",
     "OsmData",
     "OsmNode",

@@ -81,7 +81,9 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     # sampling it at the registered points costs about three seconds a square
     # kilometre, measured.
     "trees":              {"c": 1.0, "a": 26.0, "m": 0.0},
-    "furniture":          {"c": 0.5, "a": 3.0,  "m": 0.0},
+    # Seven BGT collections, and the national charging point file, five
+    # megabytes whatever the area. 4 s over a 300 m square, measured.
+    "furniture":          {"c": 3.0, "a": 6.0,  "m": 0.0},
     # Mostly the sign register, which comes a whole municipality at a time:
     # 18 MB for Utrecht whatever the size of the square. Measured at 41 s for
     # the demo square and 9 s for a 300 m one, nothing cached.

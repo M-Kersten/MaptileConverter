@@ -2123,7 +2123,52 @@ def _box(cx, cy, cz, sx, sy, sz, spin=0.0):
     return corners, faces
 
 
-def _furniture_pieces(kind, x, y, base, spin, uv, cfg):
+def _ring_solid(cx, cy, cz, axis, side, radius, half, sides=8, rim=0.0):
+    """A closed n-sided prism: a post, a bin, a bicycle wheel.
+
+    `axis` is the unit vector it runs along and `side` a unit vector across
+    it; the prism spans `half` either way of (cx, cy, cz) along `axis`. With
+    `axis` straight up it is a post standing on cz - half. A `rim` makes it a
+    ring that thick instead, open in the middle: a wheel, not a disc.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    side = np.asarray(side, dtype=np.float64)
+    third = np.cross(axis, side)
+    angles = np.linspace(0.0, 2.0 * np.pi, sides, endpoint=False)
+    ring = np.cos(angles)[:, None] * side + np.sin(angles)[:, None] * third
+    centre = np.array([cx, cy, cz], dtype=np.float64)
+    low = centre - axis * half + ring * radius
+    high = centre + axis * half + ring * radius
+    faces = []
+    for k in range(sides):
+        n = (k + 1) % sides
+        faces.append([k, n, sides + n])
+        faces.append([k, sides + n, sides + k])
+    if rim <= 0.0:
+        vertices = np.vstack([low, high])
+        for k in range(1, sides - 1):
+            faces.append([sides, sides + k, sides + k + 1])
+            faces.append([0, k + 1, k])
+        return vertices, np.asarray(faces, dtype=np.int64)
+    inner = max(radius - rim, 0.01)
+    low_in = centre - axis * half + ring * inner
+    high_in = centre + axis * half + ring * inner
+    vertices = np.vstack([low, high, low_in, high_in])
+    a, b, c = sides, 2 * sides, 3 * sides
+    for k in range(sides):
+        n = (k + 1) % sides
+        # The inside of the ring faces the middle.
+        faces.append([b + k, c + n, b + n])
+        faces.append([b + k, c + k, c + n])
+        # The two faces of the ring, between its outer and inner edges.
+        faces.append([a + k, a + n, c + n])
+        faces.append([a + k, c + n, c + k])
+        faces.append([k, b + n, n])
+        faces.append([k, b + k, b + n])
+    return vertices, np.asarray(faces, dtype=np.int64)
+
+
+def _furniture_pieces(kind, x, y, base, spin, uv, cfg, size=0.0):
     """The boxes one piece of street furniture is made of.
 
     A proxy, not a model: three or four boxes that read correctly at the
@@ -2131,100 +2176,252 @@ def _furniture_pieces(kind, x, y, base, spin, uv, cfg):
     flagpole is tall and thin with something at the top, a bus shelter is a
     roof on posts -- because that is all the eye gets at street scale, and
     anything more would be a thousand objects nobody asked to be detailed.
+
+    Local X runs along `spin`. The Python side turns each kind so that X runs
+    along the street with the front (+Y) towards it, or so that X reaches out
+    over it: a lamp's arm, a sign's edge. `size` is how many, where a kind has
+    a count: bicycles in a rack, connectors on a charging point.
     """
-    metal, wood = uv["metal"], uv["wood"]
-    stone, glass, paint = uv["stone"], uv["glass"], uv["paint"]
+    cos_s, sin_s = np.cos(spin), np.sin(spin)
+    up = np.array([0.0, 0.0, 1.0])
+    along = np.array([cos_s, sin_s, 0.0])
+    across = np.array([-sin_s, cos_s, 0.0])
+
+    def at(dx, dy):
+        return x + dx * cos_s - dy * sin_s, y + dx * sin_s + dy * cos_s
+
+    def box(dx, dy, z, sx, sy, sz, patch, turn=0.0):
+        px, py = at(dx, dy)
+        return (_box(px, py, base + z, sx, sy, sz, spin + turn), uv[patch])
+
+    def post(dx, dy, z0, z1, radius, patch, sides=8):
+        px, py = at(dx, dy)
+        half = (z1 - z0) / 2.0
+        return (
+            _ring_solid(px, py, base + z0 + half, up, along, radius, half, sides),
+            uv[patch],
+        )
+
+    def wheel(dx, dy, radius, patch):
+        px, py = at(dx, dy)
+        return (
+            _ring_solid(px, py, base + radius, along, across, radius, 0.02, 6, 0.05),
+            uv[patch],
+        )
+
     lamp_h = float(cfg.get("lamp_height_m", 5.0))
     bollard_h = float(cfg.get("bollard_height_m", 0.9))
     bench_l = float(cfg.get("bench_length_m", 1.8))
 
-    if kind == 0:  # lamppost: column plus a short arm
+    if kind == 0:  # lamppost: a column, and an arm out over the road
         return [
-            (_box(x, y, base + lamp_h / 2, 0.14, 0.14, lamp_h, spin), metal),
-            (_box(x, y, base + lamp_h + 0.08, 0.7, 0.24, 0.16, spin), metal),
+            post(0.0, 0.0, 0.0, lamp_h, 0.07, "metal"),
+            box(0.45, 0.0, lamp_h + 0.04, 0.9, 0.08, 0.08, "metal"),
+            box(0.85, 0.0, lamp_h - 0.03, 0.45, 0.22, 0.12, "metal"),
         ]
     if kind == 1:  # bollard
+        return [post(0.0, 0.0, 0.0, bollard_h, 0.08, "metal")]
+    if kind == 2:  # bench: seat, back away from the street, two legs
+        leg = bench_l / 2.0 - 0.15
         return [
-            (_box(x, y, base + bollard_h / 2, 0.16, 0.16, bollard_h, spin), metal),
-        ]
-    if kind == 2:  # bench: seat on two legs
-        return [
-            (_box(x, y, base + 0.45, bench_l, 0.5, 0.08, spin), wood),
-            (_box(x, y, base + 0.22, bench_l * 0.8, 0.1, 0.44, spin), metal),
+            box(0.0, 0.05, 0.45, bench_l, 0.45, 0.06, "wood"),
+            box(0.0, -0.2, 0.72, bench_l, 0.06, 0.4, "wood"),
+            box(-leg, 0.0, 0.22, 0.08, 0.45, 0.44, "metal"),
+            box(leg, 0.0, 0.22, 0.08, 0.45, 0.44, "metal"),
         ]
     if kind == 3:  # sign post
         return [
-            (_box(x, y, base + 1.1, 0.09, 0.09, 2.2, spin), metal),
-            (_box(x, y, base + 2.1, 0.5, 0.05, 0.4, spin), metal),
+            post(0.0, 0.0, 0.0, 2.2, 0.045, "metal"),
+            box(0.0, 0.0, 2.1, 0.5, 0.05, 0.4, "metal"),
         ]
     if kind == 4:  # flagpole: tall, thin, and a flag hanging off the top
         pole = float(cfg.get("flagpole_height_m", 7.0))
         return [
-            (_box(x, y, base + pole / 2, 0.12, 0.12, pole, spin), metal),
-            (_box(x, y, base + pole - 0.9, 0.06, 0.06, 0.3, spin), metal),
+            post(0.0, 0.0, 0.0, pole, 0.06, "metal"),
+            box(0.0, 0.0, pole - 0.9, 0.06, 0.06, 0.3, "metal"),
             # Hung against the pole rather than flying: a flag modelled flat
             # and horizontal reads as a mistake on a still day.
-            (_box(x + 0.5 * np.cos(spin), y + 0.5 * np.sin(spin),
-                  base + pole - 1.1, 1.0, 0.04, 0.7, spin), glass),
+            box(0.5, 0.0, pole - 1.1, 1.0, 0.04, 0.7, "glass"),
         ]
-    if kind == 5:  # bus shelter: roof on four posts, one glazed side
+    if kind == 5:  # bus shelter: roof, glazed back and side, a bench inside
         return [
-            (_box(x, y, base + 2.45, 3.6, 1.6, 0.12, spin), metal),
-            (_box(x, y, base + 1.2, 3.4, 0.06, 2.4, spin), glass),
-            (_box(x, y, base + 0.5, 2.4, 0.4, 0.08, spin), wood),
+            box(0.0, 0.0, 2.45, 3.6, 1.6, 0.12, "metal"),
+            box(0.0, -0.72, 1.2, 3.4, 0.05, 2.3, "glass"),
+            box(1.72, -0.1, 1.2, 0.05, 1.2, 2.3, "glass"),
+            box(-1.75, -0.72, 1.2, 0.08, 0.08, 2.4, "metal"),
+            box(0.0, -0.5, 0.48, 2.0, 0.35, 0.06, "wood"),
         ]
-    if kind == 6:  # advertising column: a drum on a plinth
+    if kind == 6:  # advertising column: a drum on a plinth, under a cap
         return [
-            (_box(x, y, base + 0.1, 1.3, 1.3, 0.2, spin), stone),
-            (_box(x, y, base + 1.5, 1.2, 1.2, 2.6, spin), glass),
-            (_box(x, y, base + 2.9, 1.34, 1.34, 0.16, spin), metal),
+            post(0.0, 0.0, 0.0, 0.2, 0.66, "stone", 12),
+            post(0.0, 0.0, 0.2, 2.8, 0.6, "glass", 12),
+            post(0.0, 0.0, 2.8, 2.95, 0.68, "metal", 12),
         ]
     if kind == 7:  # art object: a plinth and something on it
         return [
-            (_box(x, y, base + 0.2, 1.6, 1.6, 0.4, spin), stone),
-            (_box(x, y, base + 1.5, 0.7, 0.7, 2.2, spin + 0.6), stone),
+            box(0.0, 0.0, 0.2, 1.6, 1.6, 0.4, "stone"),
+            box(0.0, 0.0, 1.5, 0.7, 0.7, 2.2, "stone", 0.6),
         ]
     if kind == 8:  # memorial: a wider plinth, a slab, and a step
         return [
-            (_box(x, y, base + 0.15, 3.0, 2.2, 0.3, spin), stone),
-            (_box(x, y, base + 0.5, 2.2, 1.4, 0.4, spin), stone),
-            (_box(x, y, base + 1.7, 1.4, 0.5, 2.0, spin), stone),
+            box(0.0, 0.0, 0.15, 3.0, 2.2, 0.3, "stone"),
+            box(0.0, 0.0, 0.5, 2.2, 1.4, 0.4, "stone"),
+            box(0.0, 0.0, 1.7, 1.4, 0.5, 2.0, "stone"),
         ]
     if kind == 9:  # playground: a frame with a crossbar and a slide
         return [
-            (_box(x - 1.4 * np.cos(spin), y - 1.4 * np.sin(spin),
-                  base + 1.1, 0.12, 0.12, 2.2, spin), paint),
-            (_box(x + 1.4 * np.cos(spin), y + 1.4 * np.sin(spin),
-                  base + 1.1, 0.12, 0.12, 2.2, spin), paint),
-            (_box(x, y, base + 2.2, 3.0, 0.14, 0.14, spin), paint),
-            (_box(x + 1.0 * np.sin(spin), y - 1.0 * np.cos(spin),
-                  base + 0.6, 1.2, 0.7, 0.1, spin), paint),
+            box(-1.4, 0.0, 1.1, 0.12, 0.12, 2.2, "paint"),
+            box(1.4, 0.0, 1.1, 0.12, 0.12, 2.2, "paint"),
+            box(0.0, 0.0, 2.2, 3.0, 0.14, 0.14, "paint"),
+            box(0.0, -1.0, 0.6, 1.2, 0.7, 0.1, "paint"),
         ]
     if kind == 10:  # picnic table: top and two benches
         return [
-            (_box(x, y, base + 0.74, 1.8, 0.8, 0.07, spin), wood),
-            (_box(x + 0.72 * np.sin(spin), y - 0.72 * np.cos(spin),
-                  base + 0.45, 1.8, 0.3, 0.06, spin), wood),
-            (_box(x - 0.72 * np.sin(spin), y + 0.72 * np.cos(spin),
-                  base + 0.45, 1.8, 0.3, 0.06, spin), wood),
-            (_box(x, y, base + 0.35, 0.2, 0.7, 0.7, spin), metal),
+            box(0.0, 0.0, 0.74, 1.8, 0.8, 0.07, "wood"),
+            box(0.0, -0.72, 0.45, 1.8, 0.3, 0.06, "wood"),
+            box(0.0, 0.72, 0.45, 1.8, 0.3, 0.06, "wood"),
+            box(0.0, 0.0, 0.35, 0.2, 0.7, 0.7, "metal"),
         ]
     if kind == 11:  # electrical cabinet: a box with a lid
         return [
-            (_box(x, y, base + 0.6, 0.9, 0.45, 1.2, spin), paint),
-            (_box(x, y, base + 1.23, 0.96, 0.5, 0.06, spin), metal),
+            box(0.0, 0.0, 0.6, 0.9, 0.45, 1.2, "grey"),
+            box(0.0, 0.0, 1.23, 0.96, 0.5, 0.06, "metal"),
         ]
     if kind == 12:  # waste collection point: a below-ground container's head
         return [
-            (_box(x, y, base + 0.05, 1.5, 1.5, 0.1, spin), stone),
-            (_box(x, y, base + 0.6, 0.8, 0.8, 1.0, spin), metal),
+            box(0.0, 0.0, 0.05, 1.5, 1.5, 0.1, "stone"),
+            box(0.0, 0.0, 0.6, 0.8, 0.8, 1.0, "grey"),
+            box(0.0, 0.2, 1.0, 0.3, 0.1, 0.12, "black"),
         ]
     if kind == 13:  # catenary mast: a tapered post with a bracket arm
         mast = float(cfg.get("catenary_height_m", 7.5))
         return [
-            (_box(x, y, base + mast / 2, 0.24, 0.24, mast, spin), paint),
-            (_box(x + 0.8 * np.cos(spin), y + 0.8 * np.sin(spin),
-                  base + mast - 0.4, 1.6, 0.1, 0.1, spin), paint),
+            box(0.0, 0.0, mast / 2, 0.24, 0.24, mast, "paint"),
+            box(0.8, 0.0, mast - 0.4, 1.6, 0.1, 0.1, "paint"),
+        ]
+    if kind == 14:  # litter bin: a drum on a short post
+        return [
+            post(0.0, 0.0, 0.0, 0.4, 0.04, "grey", 6),
+            post(0.0, 0.0, 0.35, 1.0, 0.22, "green", 10),
+            post(0.0, 0.0, 1.0, 1.05, 0.24, "black", 10),
+        ]
+    if kind == 15:  # roll container: a box with a lid
+        return [
+            box(0.0, 0.0, 0.62, 1.37, 1.07, 1.0, "grey"),
+            box(0.0, 0.04, 1.16, 1.4, 1.12, 0.08, "green"),
+            box(0.0, 0.0, 0.06, 1.2, 0.9, 0.12, "black"),
+        ]
+    if kind == 16:  # camera: a pole, an arm, a white housing over the street
+        return [
+            post(0.0, 0.0, 0.0, 4.8, 0.06, "grey"),
+            box(0.3, 0.0, 4.7, 0.6, 0.06, 0.06, "grey"),
+            box(0.62, 0.0, 4.6, 0.34, 0.14, 0.15, "white"),
+        ]
+    if kind == 17:  # direction sign: two white blades on a post
+        return [
+            post(0.0, 0.0, 0.0, 2.6, 0.05, "grey"),
+            box(0.65, 0.0, 2.35, 1.2, 0.05, 0.32, "white"),
+            box(-0.55, 0.0, 1.95, 1.0, 0.05, 0.3, "white"),
+        ]
+    if kind == 18:  # billboard: a lit panel on a foot
+        return [
+            box(0.0, 0.0, 0.15, 1.4, 0.32, 0.3, "grey"),
+            box(0.0, 0.0, 1.3, 1.3, 0.25, 2.0, "white"),
+            box(0.0, 0.0, 2.33, 1.36, 0.3, 0.06, "grey"),
+        ]
+    if kind == 19:  # information board: a board on two posts
+        return [
+            box(-0.55, 0.0, 0.9, 0.08, 0.08, 1.8, "wood"),
+            box(0.55, 0.0, 0.9, 0.08, 0.08, 1.8, "wood"),
+            box(0.0, 0.0, 1.45, 1.2, 0.05, 0.8, "green"),
+        ]
+    if kind == 20:  # parking meter: a grey pillar with a blue head
+        return [
+            box(0.0, 0.0, 0.75, 0.38, 0.3, 1.5, "grey"),
+            box(0.0, 0.02, 1.55, 0.42, 0.34, 0.12, "blue"),
+            box(0.0, 0.16, 1.2, 0.22, 0.02, 0.18, "black"),
+        ]
+    if kind == 21:  # public toilet: a green drum under a cap
+        return [
+            post(0.0, 0.0, 0.0, 2.1, 0.9, "green", 10),
+            post(0.0, 0.0, 2.1, 2.25, 1.0, "green", 10),
+        ]
+    if kind == 22:  # bicycle locker: a long box with a rounded back
+        return [
+            box(0.0, 0.0, 0.65, 2.0, 1.2, 1.3, "grey"),
+            box(0.0, 0.0, 1.36, 1.9, 0.9, 0.12, "grey"),
+        ]
+    if kind == 23:  # mooring bollard: short, wide, cast iron
+        return [
+            post(0.0, 0.0, 0.0, 0.5, 0.14, "black"),
+            post(0.0, 0.0, 0.5, 0.6, 0.19, "black"),
+        ]
+    if kind == 24:  # fountain: a stone basin, water in it, a column
+        return [
+            post(0.0, 0.0, 0.0, 0.45, 1.6, "stone", 12),
+            post(0.0, 0.0, 0.3, 0.47, 1.45, "glass", 12),
+            post(0.0, 0.0, 0.0, 1.3, 0.18, "stone"),
+            post(0.0, 0.0, 1.3, 1.42, 0.6, "stone", 10),
+        ]
+    if kind == 25:  # wall lamp: a bracket on the facade, a lantern on it
+        return [
+            box(0.02, 0.0, 4.85, 0.04, 0.12, 0.3, "black"),
+            box(0.4, 0.0, 4.9, 0.8, 0.06, 0.06, "black"),
+            box(0.8, 0.0, 4.72, 0.3, 0.3, 0.4, "black"),
+            box(0.8, 0.0, 4.58, 0.24, 0.24, 0.16, "glass"),
+        ]
+    if kind == 26:  # hectometre post: a white post and a green plate
+        return [
+            box(0.0, 0.0, 0.55, 0.08, 0.08, 1.1, "white"),
+            box(0.0, 0.0, 1.2, 0.3, 0.04, 0.35, "green"),
+        ]
+    if kind == 27:  # charging point: pillars, one for every two connectors
+        pillars = int(min(4, max(1, np.ceil(float(size or 2) / 2.0))))
+        out = []
+        for k in range(pillars):
+            dx = (k - (pillars - 1) / 2.0) * 1.4
+            out += [
+                box(dx, 0.0, 0.65, 0.4, 0.25, 1.3, "white"),
+                box(dx, 0.0, 1.33, 0.42, 0.27, 0.06, "green"),
+                box(dx, 0.13, 1.0, 0.24, 0.02, 0.2, "black"),
+            ]
+        return out
+    if kind == 28:  # bicycle rack: a rail, and the bicycles in it
+        count = int(max(1, size or 10))
+        length = count * 0.7
+        out = [
+            box(0.0, 0.0, 0.35, length, 0.05, 0.05, "metal"),
+            box(-length / 2.0, 0.0, 0.18, 0.05, 0.05, 0.36, "metal"),
+            box(length / 2.0, 0.0, 0.18, 0.05, 0.05, 0.36, "metal"),
+        ]
+        frames = ("black", "black", "blue", "black", "red", "grey", "green", "white")
+        for k in range(count):
+            # A rack is never full, and the gaps are not all at one end.
+            if (k * 7 + int(abs(x) * 3.0) + int(abs(y) * 5.0)) % 4 == 0:
+                continue
+            dx = (k - (count - 1) / 2.0) * 0.7
+            face = 1.0 if k % 2 else -1.0
+            frame = frames[(k * 3 + int(abs(x))) % len(frames)]
+            out += [
+                wheel(dx, 0.53 * face, 0.33, "black"),
+                wheel(dx, -0.53 * face, 0.33, "black"),
+                box(dx, 0.05 * face, 0.6, 0.04, 0.85, 0.05, frame),
+                box(dx, -0.25 * face, 0.86, 0.1, 0.24, 0.06, "black"),
+                box(dx, 0.42 * face, 0.98, 0.5, 0.04, 0.04, "black"),
+            ]
+        return out
+    if kind == 29:  # post box: orange, on a short post
+        return [
+            box(0.0, 0.0, 0.5, 0.1, 0.1, 1.0, "grey"),
+            box(0.0, 0.0, 1.25, 0.5, 0.4, 0.6, "orange"),
+            box(0.0, 0.0, 1.58, 0.46, 0.36, 0.08, "orange"),
+        ]
+    if kind == 30:  # bus stop: a pole with its sign, the timetable below
+        return [
+            post(0.0, 0.0, 0.0, 2.9, 0.05, "grey"),
+            box(0.25, 0.0, 2.55, 0.5, 0.04, 0.55, "white"),
+            box(0.25, 0.0, 2.88, 0.5, 0.045, 0.1, "blue"),
+            box(0.0, 0.06, 1.4, 0.35, 0.06, 0.5, "white"),
         ]
     # Anything unmapped would be a guess. Drawing nothing is the honest answer.
     return []
@@ -2362,12 +2559,16 @@ def build_furniture(scene: dict, work_dir: Path, material):
 
     ground = data["ground_z_nap"]
     kinds = data["kind"]
+    # Which way each piece faces, where the street says; NaN where it does
+    # not, and the dice decide. An older furniture.npz has neither array.
+    spins = data["spin"] if "spin" in data.files else np.full(len(xy), np.nan)
+    sizes = data["size"] if "size" in data.files else np.zeros(len(xy))
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
     cfg = scene.get("furniture", {})
 
     # Where each material sits in the atlas, from the scene file rather than
-    # duplicated here. Falls back to the old two-patch split so an older
+    # duplicated here. Falls back to the built-in table so an older
     # scene.json still renders.
     table = cfg.get("atlas_uv") or {}
     uv = {
@@ -2375,12 +2576,26 @@ def build_furniture(scene: dict, work_dir: Path, material):
         for name, default in (
             # V from the bottom of the image: the first row is written at
             # the top. See `furniture_uv`.
-            ("metal", (0.125, 0.75)), ("wood", (0.375, 0.75)),
-            ("brick", (0.625, 0.75)), ("concrete", (0.875, 0.75)),
-            ("hedge", (0.125, 0.25)), ("paint", (0.375, 0.25)),
-            ("stone", (0.625, 0.25)), ("glass", (0.875, 0.25)),
+            ("metal", (0.125, 0.875)), ("wood", (0.375, 0.875)),
+            ("brick", (0.625, 0.875)), ("concrete", (0.875, 0.875)),
+            ("hedge", (0.125, 0.625)), ("paint", (0.375, 0.625)),
+            ("stone", (0.625, 0.625)), ("glass", (0.875, 0.625)),
+            ("black", (0.125, 0.375)), ("white", (0.375, 0.375)),
+            ("red", (0.625, 0.375)), ("green", (0.875, 0.375)),
+            ("blue", (0.125, 0.125)), ("yellow", (0.375, 0.125)),
+            ("grey", (0.625, 0.125)), ("orange", (0.875, 0.125)),
         )
     }
+    # A patch the scene names and this table does not.
+    for name, value in table.items():
+        uv.setdefault(name, np.asarray(value, dtype=np.float64))
+    # An atlas from before the colour patches: stand the nearest old patch in.
+    for name, stand_in in (
+        ("black", "metal"), ("white", "glass"), ("red", "brick"), ("green", "hedge"),
+        ("blue", "glass"), ("yellow", "wood"), ("grey", "concrete"), ("orange", "brick"),
+    ):
+        if table and name not in table:
+            uv[name] = uv[stand_in]
 
     vertices: list[np.ndarray] = []
     faces: list[np.ndarray] = []
@@ -2394,9 +2609,13 @@ def build_furniture(scene: dict, work_dir: Path, material):
         y = float(xy[index, 1]) - origin_y
         base = float(ground[index]) - z_offset
         kind = int(kinds[index])
+        # Drawn whether or not it is used, so one piece facing its street
+        # does not turn every random piece after it.
         spin = float(rng.random()) * np.pi
+        if np.isfinite(spins[index]):
+            spin = float(spins[index])
 
-        pieces = _furniture_pieces(kind, x, y, base, spin, uv, cfg)
+        pieces = _furniture_pieces(kind, x, y, base, spin, uv, cfg, float(sizes[index]))
         if pieces:
             drawn += 1
 
@@ -2438,16 +2657,20 @@ TRAFFIC_OBJECTS = (
     ("signs", "TrafficSigns"),
     ("signals", "TrafficLights"),
     ("markings", "RoadMarkings"),
+    ("symbols", "RoadSymbols"),
     ("covers", "StreetCovers"),
 )
+# Drawn through the alpha-cut material: a symbol is white paint on a cell
+# that is otherwise transparent.
+CUTOUT_TRAFFIC = ("symbols",)
 
 
-def build_traffic(scene: dict, work_dir: Path, material) -> list:
+def build_traffic(scene: dict, work_dir: Path, material, cutout_material=None) -> list:
     """Signs, lights, road paint and covers, one object each.
 
     The meshes arrive finished from `src/traffic.py`, in RD and NAP: all that
     is left to do here is move them to the model's origin. They share one
-    atlas and one material, so the four objects are four draw calls at most.
+    atlas, and all but the symbols one material.
     """
     traffic_file = scene.get("traffic", {}).get("file")
     if not traffic_file or not (work_dir / traffic_file).is_file():
@@ -2460,6 +2683,8 @@ def build_traffic(scene: dict, work_dir: Path, material) -> list:
     objects = []
     for prefix, name in TRAFFIC_OBJECTS:
         if f"{prefix}_faces" not in data.files:
+            continue
+        if prefix in CUTOUT_TRAFFIC and cutout_material is None:
             continue
         faces = np.asarray(data[f"{prefix}_faces"], dtype=np.int64)
         if not len(faces):
@@ -2477,7 +2702,7 @@ def build_traffic(scene: dict, work_dir: Path, material) -> list:
                 np.full(n_triangles, 3),
                 uv[loops],
                 np.zeros(n_triangles),
-                [material],
+                [cutout_material if prefix in CUTOUT_TRAFFIC else material],
                 shade_smooth=False,
             )
         )
@@ -3388,6 +3613,9 @@ def main() -> int:
                 work_dir,
                 make_textured_material(
                     "M_traffic", extra_textures["traffic"], roughness=0.6
+                ),
+                make_cutout_material(
+                    "M_traffic_symbols", extra_textures["traffic"], roughness=0.7
                 ),
             )
 

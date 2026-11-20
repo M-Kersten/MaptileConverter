@@ -47,9 +47,14 @@ ATTRIBUTION = {
         "Dataportaal Wegverkeer), CC0. https://www.ndw.nu"
     ),
     "osm": (
-        "Lane counts, crossings, speed humps and signalled junctions "
+        "Lane counts, crossings, speed humps, signalled junctions, bicycle "
+        "parking and street furniture the BGT does not register "
         "\u00a9 OpenStreetMap contributors, ODbL 1.0. "
         "https://www.openstreetmap.org/copyright"
+    ),
+    "chargers": (
+        "Public charging points from the NDW charging point register, CC0. "
+        "https://opendata.ndw.nu"
     ),
     "textures": (
         "Wall surfaces under the generated facades from Poly Haven (CC0, no "
@@ -361,7 +366,9 @@ def write_scene_description(
     return path
 
 
-def write_attribution(out_dir: Path, *, osm: bool = False, signs: bool = False) -> Path:
+def write_attribution(
+    out_dir: Path, *, osm: bool = False, signs: bool = False, chargers: bool = False
+) -> Path:
     """Drop the source credits next to the model.
 
     3DBAG asks for a copyright notice on reuse, and the AHN and aerial layers
@@ -381,6 +388,7 @@ def write_attribution(out_dir: Path, *, osm: bool = False, signs: bool = False) 
         f"BAG:       {ATTRIBUTION['bag']}",
         f"NWB:       {ATTRIBUTION['roads']}",
         *([f"Signs:     {ATTRIBUTION['signs']}"] if signs else []),
+        *([f"Chargers:  {ATTRIBUTION['chargers']}"] if chargers else []),
         *([f"OSM:       {ATTRIBUTION['osm']}"] if osm else []),
         f"Textures:  {ATTRIBUTION['textures']}",
         "",

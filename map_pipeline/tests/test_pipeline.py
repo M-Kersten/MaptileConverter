@@ -10474,19 +10474,26 @@ class TestStreetDetail(unittest.TestCase):
 
         from src.furniture import KIND_NAMES, WANTED
 
+        from src.facade import FURNITURE_PATCHES
+        from src.furniture import MOUNTED_KINDS
+
         source = (REPO_ROOT / "blender" / "process.py").read_text()
         namespace = {"np": np}
-        for name in ("_box", "_furniture_pieces"):
+        for name in ("_box", "_ring_solid", "_furniture_pieces"):
             body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
             self.assertIsNotNone(body, f"{name} moved")
             exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
 
-        uv = {n: np.array([0.5, 0.5]) for n in
-              ("metal", "wood", "brick", "concrete", "hedge", "paint", "stone", "glass")}
+        uv = {n: np.array([0.5, 0.5]) for n, *_rest in FURNITURE_PATCHES}
         for kind in sorted(KIND_NAMES):
             pieces = namespace["_furniture_pieces"](kind, 0.0, 0.0, 0.0, 0.3, uv, {})
             self.assertTrue(pieces, f"{KIND_NAMES[kind]} has no proxy shape")
             corners = np.vstack([p[0][0] for p in pieces])
+            if kind in MOUNTED_KINDS:
+                # Hung on a facade: off the ground, and below the gutter.
+                self.assertGreater(float(corners[:, 2].min()), 3.0, KIND_NAMES[kind])
+                self.assertLess(float(corners[:, 2].max()), 6.0, KIND_NAMES[kind])
+                continue
             self.assertAlmostEqual(
                 float(corners[:, 2].min()), 0.0, places=6,
                 msg=f"{KIND_NAMES[kind]} does not stand on the ground",
@@ -10506,14 +10513,15 @@ class TestStreetDetail(unittest.TestCase):
         "unknown" is how a model ends up with seventy identical sheds."""
         import re
 
+        from src.facade import FURNITURE_PATCHES
+
         source = (REPO_ROOT / "blender" / "process.py").read_text()
         namespace = {"np": np}
-        for name in ("_box", "_furniture_pieces"):
+        for name in ("_box", "_ring_solid", "_furniture_pieces"):
             body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
             exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
 
-        uv = {n: np.array([0.5, 0.5]) for n in
-              ("metal", "wood", "brick", "concrete", "hedge", "paint", "stone", "glass")}
+        uv = {n: np.array([0.5, 0.5]) for n, *_rest in FURNITURE_PATCHES}
         self.assertEqual(namespace["_furniture_pieces"](99, 0, 0, 0, 0, uv, {}), [])
 
     def test_the_atlas_has_a_patch_for_every_material_in_use(self):
@@ -12223,8 +12231,10 @@ class TestTraffic(unittest.TestCase):
         self.assertLess(abs(way.points[1, 1] - way.points[0, 1]), 2.0)
         self.assertTrue(130000 < way.points[0, 0] < 140000)
         self.assertEqual(len(data.nodes), 1)
+        # Kept whole: a rack's capacity is a tag of its own.
         self.assertEqual(
-            data.nodes[0].tags, {"highway": "crossing", "crossing:markings": "zebra"}
+            data.nodes[0].tags,
+            {"highway": "crossing", "crossing:markings": "zebra", "name": "x"},
         )
         self.assertEqual([w.id for w in data.ways_through()[2]], [9])
 
@@ -12303,7 +12313,7 @@ class TestTraffic(unittest.TestCase):
             return image[int((1.0 - v) * height), int(u * width)]
 
         for name, (_, colour) in FLAT_CELLS.items():
-            np.testing.assert_allclose(pixel(*flat_uv(name)), colour, atol=3, err_msg=name)
+            np.testing.assert_allclose(pixel(*flat_uv(name))[:3], colour, atol=3, err_msg=name)
         # No entry: red at the rim, the white bar through the middle.
         rim = face_uv("C2", SHAPES["disc"] * 0.85)
         self.assertGreater(pixel(*rim[4])[0], 150)
@@ -12374,7 +12384,13 @@ class TestTraffic(unittest.TestCase):
         # The front of the top plate: its triangles' normals point west.
         tri = vertices[faces]
         normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-        plate = (uv[faces[:, 0], 1] < 0.75) & (np.abs(normals[:, 2]) < 1e-9) & (np.abs(normals[:, 0]) > 1e-6)
+        from src.traffic import ATLAS_GRID
+
+        # Sign faces sit below the first row of the atlas, the flat paints in it.
+        plate = (
+            (uv[faces[:, 0], 1] < 1.0 - 1.0 / ATLAS_GRID)
+            & (np.abs(normals[:, 2]) < 1e-9) & (np.abs(normals[:, 0]) > 1e-6)
+        )
         front = plate & (tri[:, :, 0].mean(axis=1) < 50.0 - 0.04)
         self.assertTrue(front.any())
         self.assertTrue((normals[front, 0] < 0).all())
@@ -12569,7 +12585,7 @@ class TestTraffic(unittest.TestCase):
             BBox(0, -10, 100, 10),
             RoadIndex([np.array([[0.0, 0.0], [0.0, 100.0]])]),
         )
-        self.assertEqual(stats, {"manholes": 1, "gullies": 1})
+        self.assertEqual(stats, {"manholes": 1, "gullies": 1, "hydrants": 0})
         vertices = paint.mesh(self._flat, 0.015).arrays()[0]
         gully = vertices[vertices[:, 0] > 15]
         # Lengthways along the road, which here runs north.
@@ -12623,7 +12639,10 @@ class TestTraffic(unittest.TestCase):
         self.assertEqual(result.counts["give_way_lines"], 1)
         self.assertEqual(result.counts["gullies"], 1)
         self.assertTrue(result.used_osm)
-        self.assertEqual(result.replaces, {"verkeersbordpaal", "verkeersregelinstallatiepaal"})
+        self.assertEqual(
+            result.replaces,
+            {"verkeersbordpaal", "verkeersbord", "verkeersregelinstallatiepaal"},
+        )
         markings = result.meshes["markings"][0]
         # On the ground at 5 m, on the bridge deck at 9 m beyond x = 150.
         np.testing.assert_allclose(markings[markings[:, 0] < 150, 2], 5.03)
@@ -12717,6 +12736,366 @@ class TestTraffic(unittest.TestCase):
         for name in OBJECTS:
             self.assertIn(f'("{name}", ', source)
         self.assertIn('("traffic", "traffic")', source, "the atlas is copied beside the FBX")
+
+
+class TestStreetFurniture(unittest.TestCase):
+    """The furniture stage's sources, merging and facing, without a service."""
+
+    @staticmethod
+    def _blender(*names):
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text()
+        namespace = {"np": np}
+        for name in ("_box", "_ring_solid", "_furniture_pieces", *names):
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
+        return namespace
+
+    def test_ring_solids_face_outwards(self):
+        """Posts, bins and wheels are seen from outside; a face wound the
+        wrong way is a hole in Unity, which culls back faces."""
+        ring = self._blender()["_ring_solid"]
+        for axis, side in (((0, 0, 1), (1, 0, 0)), ((1, 0, 0), (0, 1, 0))):
+            vertices, faces = ring(2.0, 3.0, 4.0, np.array(axis, float), np.array(side, float),
+                                   0.5, 0.25, 8)
+            centre = vertices.mean(axis=0)
+            tri = vertices[faces]
+            normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            outward = tri.mean(axis=1) - centre
+            self.assertTrue(((normals * outward).sum(axis=1) > 0).all(), axis)
+            self.assertEqual(len(faces), 8 * 2 + 6 * 2)
+
+    def test_a_wheel_is_a_ring_seen_from_outside(self):
+        ring = self._blender()["_ring_solid"]
+        axis = np.array([1.0, 0.0, 0.0])
+        vertices, faces = ring(0.0, 0.0, 0.5, axis, np.array([0.0, 1.0, 0.0]), 0.33, 0.02, 6, 0.05)
+        self.assertEqual(len(faces), 6 * 8)
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        centres = tri.mean(axis=1) - np.array([0.0, 0.0, 0.5])
+        along = centres @ axis
+        radial = centres - along[:, None] * axis
+        distance = np.linalg.norm(radial, axis=1)
+        unit = normals / np.linalg.norm(normals, axis=1)[:, None]
+        cap = np.abs(unit @ axis) > 0.9
+        # Centroids of the outer faces sit at 0.29 m, of the inner at 0.25.
+        outer = ~cap & (distance > 0.27)
+        inner = ~cap & (distance <= 0.27)
+        self.assertEqual((int(outer.sum()), int(inner.sum()), int(cap.sum())), (12, 12, 24))
+        self.assertTrue(((normals[outer] * radial[outer]).sum(axis=1) > 0).all())
+        self.assertTrue(((normals[inner] * radial[inner]).sum(axis=1) < 0).all())
+        self.assertTrue(((normals[cap] @ axis) * along[cap] > 0).all())
+
+    def test_points_on_the_road_go_to_the_kerb(self):
+        from src.traffic import carriageways
+
+        road, _ = carriageways([{
+            "properties": {"functie": "rijbaan lokale weg"},
+            "geometry": {"type": "Polygon",
+                         "coordinates": [[[0, -3.5], [100, -3.5], [100, 3.5], [0, 3.5], [0, -3.5]]]},
+        }])
+        moved = road.push_off((50.0, 2.5))
+        self.assertAlmostEqual(float(moved[1]), 3.5 + 0.6, delta=0.05)
+        self.assertAlmostEqual(float(moved[0]), 50.0, delta=0.05)
+        self.assertIsNone(road.push_off((50.0, 10.0)), "already off the road")
+
+    def test_furniture_faces_its_street(self):
+        from src.furniture import (
+            KIND_BENCH, KIND_FLAGPOLE, KIND_LAMP, facing_spin,
+        )
+        from src.traffic import RoadIndex
+
+        roads = RoadIndex([np.array([[0.0, 0.0], [100.0, 0.0]])])
+        # A bench north of an east-west road runs along it, its front south.
+        spin = facing_spin(KIND_BENCH, (50.0, 4.0), roads)
+        x_axis = np.array([np.cos(spin), np.sin(spin)])
+        front = np.array([-x_axis[1], x_axis[0]])
+        self.assertAlmostEqual(abs(x_axis[0]), 1.0, places=6)
+        np.testing.assert_allclose(front, [0.0, -1.0], atol=1e-9)
+        # The same bench south of the road turns round.
+        spin = facing_spin(KIND_BENCH, (50.0, -4.0), roads)
+        np.testing.assert_allclose(
+            [-np.sin(spin), np.cos(spin)], [0.0, 1.0], atol=1e-9
+        )
+        # A lamp's arm reaches over the road.
+        spin = facing_spin(KIND_LAMP, (50.0, 4.0), roads)
+        np.testing.assert_allclose([np.cos(spin), np.sin(spin)], [0.0, -1.0], atol=1e-9)
+        # Nothing says which way a flagpole faces, or a bench in a park.
+        self.assertTrue(np.isnan(facing_spin(KIND_FLAGPOLE, (50.0, 4.0), roads)))
+        self.assertTrue(np.isnan(facing_spin(KIND_BENCH, (50.0, 400.0), roads)))
+        self.assertTrue(np.isnan(facing_spin(KIND_BENCH, (50.0, 4.0), None)))
+
+    def test_openstreetmap_tags_and_what_they_refuse(self):
+        from src.furniture import (
+            KIND_ART, KIND_BIKE_RACK, KIND_BIN, KIND_CAMERA, KIND_INFO_BOARD,
+            KIND_PARKING_METER, osm_kind,
+        )
+
+        self.assertEqual(osm_kind({"amenity": "waste_basket"})[0], KIND_BIN)
+        self.assertEqual(osm_kind({"tourism": "artwork", "artwork_type": "statue"})[0], KIND_ART)
+        self.assertIsNone(osm_kind({"tourism": "artwork", "artwork_type": "mural"}))
+        self.assertEqual(osm_kind({"amenity": "bicycle_parking"})[0], KIND_BIKE_RACK)
+        self.assertIsNone(osm_kind({"amenity": "bicycle_parking", "bicycle_parking": "underground"}))
+        self.assertIsNone(osm_kind({"amenity": "bicycle_parking", "level": "-1"}))
+        self.assertEqual(osm_kind({"tourism": "information", "information": "board"})[0], KIND_INFO_BOARD)
+        self.assertIsNone(osm_kind({"tourism": "information", "information": "office"}))
+        self.assertEqual(
+            osm_kind({"amenity": "vending_machine", "vending": "parking_tickets"})[0],
+            KIND_PARKING_METER,
+        )
+        self.assertIsNone(osm_kind({"amenity": "vending_machine", "vending": "drinks"}))
+        self.assertEqual(osm_kind({"man_made": "surveillance"})[0], KIND_CAMERA)
+        self.assertIsNone(osm_kind({"man_made": "surveillance", "camera:mount": "wall"}))
+        self.assertIsNone(osm_kind({"shop": "bakery"}))
+
+    def test_other_sources_fill_in_behind_the_bgt(self):
+        from src.furniture import KIND_BENCH, KIND_BIN, _Item, merge_sources
+
+        bgt = [_Item(0.0, 0.0, KIND_BENCH, "bgt")]
+        extra = [
+            _Item(2.0, 0.0, KIND_BENCH, "osm"),    # the same bench, mapped twice
+            _Item(30.0, 0.0, KIND_BENCH, "osm"),   # a bench the BGT lacks
+            _Item(1.0, 0.0, KIND_BIN, "osm"),      # a bin beside the bench
+            _Item(1.5, 0.0, KIND_BIN, "osm"),      # and the same bin again
+        ]
+        kept = merge_sources(bgt, extra)
+        self.assertEqual(
+            sorted((i.kind, i.x) for i in kept),
+            sorted([(KIND_BENCH, 0.0), (KIND_BENCH, 30.0), (KIND_BIN, 1.0)]),
+        )
+
+    def test_chargers_are_read_with_their_connectors(self):
+        from src.furniture import KIND_CHARGER, parse_chargers
+
+        def location(lon, lat, *totals):
+            return {
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {"availabilities": [{"total": t} for t in totals]},
+            }
+
+        items = parse_chargers(
+            [location(5.11, 52.085, 2, 1), location(5.11, 52.086), location(4.0, 51.0, 2)],
+            BBox(130000, 450000, 140000, 460000),
+        )
+        self.assertEqual([i.kind for i in items], [KIND_CHARGER, KIND_CHARGER])
+        self.assertEqual([i.size for i in items], [3.0, 1.0])
+        self.assertTrue(all(130000 < i.x < 140000 for i in items))
+
+    def test_light_points_hang_on_facades(self):
+        import shapely
+
+        from src.furniture import (
+            KIND_LAMP, KIND_WALL_LAMP, Footprints, _hang_on_walls, _Item,
+        )
+
+        house = shapely.box(0.0, 0.0, 10.0, 8.0)
+        footprints = Footprints(polygons=[house])
+        self.assertTrue(footprints.inside((5.0, 4.0)))
+        self.assertFalse(footprints.inside((5.0, 9.0)))
+        items = [
+            _Item(5.0, 8.6, KIND_LAMP, "bgt_light_point"),    # on the north facade
+            _Item(5.0, 30.0, KIND_LAMP, "bgt_light_point"),   # out in the street
+            _Item(40.0, 40.0, KIND_LAMP, "bgt"),              # a mast
+            _Item(40.3, 40.0, KIND_LAMP, "bgt_light_point"),  # the same light again
+        ]
+        hung = _hang_on_walls(items, footprints)
+        self.assertEqual(hung, 1)
+        self.assertEqual(len(items), 3)
+        wall = [i for i in items if i.kind == KIND_WALL_LAMP][0]
+        # The arm reaches out of the house: north.
+        np.testing.assert_allclose([np.cos(wall.spin), np.sin(wall.spin)], [0.0, 1.0], atol=1e-6)
+        self.assertEqual(
+            sorted(i.kind for i in items), sorted([KIND_WALL_LAMP, KIND_LAMP, KIND_LAMP])
+        )
+
+    def test_a_bicycle_parking_area_becomes_racks(self):
+        from src.furniture import KIND_BIKE_RACK, _osm_items
+        from src.osm import OsmData, OsmWay
+
+        ring = np.array([[0.0, 0.0], [21.0, 0.0], [21.0, 4.5], [0.0, 4.5], [0.0, 0.0]])
+        osm = OsmData(areas=[OsmWay(1, ring, (1, 2, 3, 4, 1),
+                                    {"amenity": "bicycle_parking", "capacity": "40"})])
+        items = _osm_items(osm, BBox(-10, -10, 40, 40))
+        self.assertTrue(items)
+        self.assertTrue(all(i.kind == KIND_BIKE_RACK for i in items))
+        self.assertEqual(sum(i.size for i in items), 40)
+        # Two rows of racks across the 4.5 m, running the long way.
+        self.assertEqual(len({round(i.y, 3) for i in items}), 2)
+        self.assertTrue(all(abs(np.cos(i.spin)) > 0.99 for i in items))
+
+    def test_a_rack_holds_its_bicycles(self):
+        from src.facade import FURNITURE_PATCHES
+
+        pieces = self._blender()["_furniture_pieces"]
+        uv = {n: np.array([0.5, 0.5]) for n, *_rest in FURNITURE_PATCHES}
+        few = pieces(28, 0.0, 0.0, 0.0, 0.0, uv, {}, 4.0)
+        many = pieces(28, 0.0, 0.0, 0.0, 0.0, uv, {}, 20.0)
+        self.assertGreater(len(many), len(few))
+        corners = np.vstack([p[0][0] for p in many])
+        # The rack runs along local X, about 0.7 m per bicycle.
+        self.assertAlmostEqual(float(np.ptp(corners[:, 0])), 20 * 0.7 + 0.05, delta=0.5)
+        self.assertLess(float(corners[:, 2].max()), 1.2)
+
+    def test_hydrant_lids_get_a_yellow_frame(self):
+        from src.traffic import GroundPaint, RoadIndex, flat_uv, paint_covers
+
+        paint = GroundPaint()
+        stats = paint_covers(
+            paint,
+            [{"properties": {"plus_type": "brandkraan / -put"},
+              "geometry": {"type": "Point", "coordinates": [10.0, 0.0]}}],
+            BBox(0, -10, 100, 10),
+            RoadIndex([np.array([[0.0, 0.0], [100.0, 0.0]])]),
+        )
+        self.assertEqual(stats["hydrants"], 1)
+        vertices, _faces, uv = paint.mesh(lambda x, y: np.zeros(np.shape(x)), 0.0).arrays()
+        yellow = np.abs(uv - flat_uv("yellow")).sum(axis=1) < 1e-9
+        self.assertTrue(yellow.any() and (~yellow).any())
+        # The frame goes round the lid, it does not lie under it.
+        self.assertLess(float(vertices[yellow, 0].min()), float(vertices[~yellow, 0].min()))
+
+
+class TestRoadPaint(unittest.TestCase):
+    """Stop lines, parking stalls and road symbols, from fixtures."""
+
+    @staticmethod
+    def _surface(ring, function="rijbaan lokale weg"):
+        return {
+            "properties": {"functie": function, "relatieve_hoogteligging": 0},
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+        }
+
+    def _road(self, width=7.0, length=200.0, function="rijbaan lokale weg"):
+        h = width / 2.0
+        return self._surface(
+            [[0, -h], [length, -h], [length, h], [0, h], [0, -h]], function
+        )
+
+    @staticmethod
+    def _flat(x, y):
+        return np.zeros(np.broadcast(np.asarray(x), np.asarray(y)).shape)
+
+    def test_a_signalled_junction_lights_its_approaches_only(self):
+        from src.osm import OsmData, OsmNode, OsmWay
+        from src.traffic import SIGNAL_SETBACK_M, RoadIndex, carriageways, place_signals
+
+        # An east-west road through the junction at (100, 0), and a road
+        # from the south that ends there.
+        through = OsmWay(1, np.array([[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]]), (1, 2, 3),
+                         {"highway": "tertiary"})
+        ending = OsmWay(2, np.array([[100.0, -100.0], [100.0, 0.0]]), (4, 2),
+                        {"highway": "residential"})
+        osm = OsmData(ways=[through, ending],
+                      nodes=[OsmNode(2, (100.0, 0.0), {"highway": "traffic_signals"})])
+        road, _ = carriageways([self._road(7.0)])
+        stops: list = []
+        positions, directions, stats = place_signals(
+            np.zeros((0, 2)), osm, RoadIndex([through.points]), road, stops=stops
+        )
+        # Two ways in from the east-west road, one from the south; none for
+        # traffic leaving southwards.
+        self.assertEqual(stats["from_osm"], 3)
+        self.assertEqual(len(stops), 3)
+        for stop, direction in zip(stops, directions):
+            np.testing.assert_allclose(
+                stop + direction * SIGNAL_SETBACK_M, [100.0, 0.0], atol=1e-9
+            )
+        self.assertTrue(any(np.allclose(d, [0.0, 1.0]) for d in directions))
+        self.assertFalse(any(np.allclose(d, [0.0, -1.0]) for d in directions))
+
+    def test_stop_lines_cross_the_lanes_the_light_stops(self):
+        from src.traffic import (
+            KERB_INSET_M, STOP_BEFORE_M, GroundPaint, carriageways, paint_stop_lines,
+        )
+
+        road, cycle = carriageways([self._road(7.0)])
+        east = np.array([1.0, 0.0])
+        paint = GroundPaint()
+        stats = paint_stop_lines(
+            paint, [np.array([60.0, 0.0]), np.array([61.0, 0.0]), None],
+            np.array([east, east, east]), road, cycle,
+        )
+        self.assertEqual(stats["stop_lines_at_lights"], 1, "two heads, one line")
+        vertices = paint.mesh(self._flat, 0.0).arrays()[0]
+        self.assertAlmostEqual(float(vertices[:, 0].mean()), 60.0 - STOP_BEFORE_M, places=6)
+        # The right-hand half of the road, short of the kerb.
+        self.assertAlmostEqual(float(vertices[:, 1].min()), -3.5 + KERB_INSET_M, delta=0.03)
+        self.assertAlmostEqual(float(vertices[:, 1].max()), 0.0, delta=0.03)
+
+    def test_parking_bays_are_cut_into_stalls(self):
+        from src.traffic import GroundPaint, paint_parking_bays
+
+        strip = self._surface(
+            [[0, 10], [22.4, 10], [22.4, 12], [0, 12], [0, 10]], "parkeervlak"
+        )
+        deep = self._surface(
+            [[0, 20], [13, 20], [13, 25], [0, 25], [0, 20]], "parkeervlak"
+        )
+        paint = GroundPaint()
+        stats = paint_parking_bays(paint, [strip, deep, self._road()], BBox(-10, -10, 100, 100))
+        self.assertEqual(stats["parking_bays"], 2)
+        # Four stalls nose to tail: three lines between them. Five side by
+        # side: four.
+        self.assertEqual(stats["stall_lines"], 3 + 4)
+        vertices = paint.mesh(self._flat, 0.0).arrays()[0]
+        in_strip = vertices[vertices[:, 1] < 15]
+        self.assertTrue(set(np.round(np.unique(np.round(in_strip[:, 0], 1)), 0)) >= {6.0, 11.0, 17.0})
+        self.assertGreater(float(in_strip[:, 1].min()), 10.0)
+        self.assertLess(float(in_strip[:, 1].max()), 12.0)
+
+    def test_cycle_tracks_get_bicycles_pointing_the_way_they_ride(self):
+        from src.osm import OsmData, OsmWay
+        from src.traffic import (
+            GroundPaint, carriageways, cell_rect, paint_symbols, symbol_cell,
+        )
+
+        track = self._road(2.0, function="fietspad")
+        road, cycle = carriageways([track])
+        osm = OsmData(ways=[OsmWay(1, np.array([[0.0, 0.0], [200.0, 0.0]]), (1, 2),
+                                   {"highway": "cycleway", "oneway": "yes"})])
+        paint = GroundPaint()
+        stats = paint_symbols(paint, osm, None, road, cycle)
+        self.assertEqual(stats["bike_symbols"], 4)
+        vertices, faces, uv = paint.mesh(self._flat, 0.0).arrays()
+        u0, v0, u1, v1 = cell_rect(symbol_cell("bike"))
+        self.assertTrue(((uv[:, 0] >= u0) & (uv[:, 0] <= u1)).all())
+        # The top of the symbol is at the far end: east, the way it is ridden.
+        top = uv[:, 1] > (v0 + v1) / 2.0
+        first = vertices[:4]
+        self.assertGreater(float(first[top[:4], 0].mean()), float(first[~top[:4], 0].mean()))
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        self.assertTrue((normals[:, 2] > 0).all())
+        # Wide enough and two-way: one each way.
+        _, wide = carriageways([self._road(3.0, function="fietspad")])
+        osm.ways[0].tags["oneway"] = "no"
+        paint = GroundPaint()
+        self.assertEqual(paint_symbols(paint, osm, None, road, wide)["bike_symbols"], 8)
+
+    def test_symbols_are_white_on_nothing(self):
+        from PIL import Image
+
+        from src.traffic import (
+            ATLAS_GRID, FLAT_CELLS, cell_rect, generate_traffic_texture, symbol_cell,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = np.asarray(Image.open(generate_traffic_texture(Path(tmp))))
+        self.assertEqual(image.shape[2], 4)
+        size = image.shape[0]
+
+        def pixel(u, v):
+            return image[min(size - 1, int((1.0 - v) * size)), min(size - 1, int(u * size))]
+
+        u0, v0, u1, v1 = cell_rect(symbol_cell("arrow"))
+        self.assertEqual(int(pixel(u0 + 0.002, v0 + 0.002)[3]), 0, "the corner is clear")
+        shaft = pixel((u0 + u1) / 2.0, v0 + (v1 - v0) * 0.3)
+        self.assertEqual(int(shaft[3]), 255)
+        self.assertGreater(int(shaft[:3].min()), 240)
+        cell = FLAT_CELLS["white"][0]
+        self.assertEqual(int(pixel(*[(a + b) / 2 for a, b in zip(cell_rect(cell)[:2], cell_rect(cell)[2:])])[3]), 255)
+        self.assertEqual(size, ATLAS_GRID * 128)
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")
