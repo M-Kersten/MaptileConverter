@@ -12937,6 +12937,20 @@ class TestStreetFurniture(unittest.TestCase):
         self.assertAlmostEqual(float(np.ptp(corners[:, 0])), 20 * 0.7 + 0.05, delta=0.5)
         self.assertLess(float(corners[:, 2].max()), 1.2)
 
+    def test_cars_are_the_colours_dutch_cars_are(self):
+        from src.facade import CAR_PAINT
+        from src.vehicles import CAR_COLOUR_SHARE, CAR_COLOURS
+
+        self.assertEqual(len(CAR_COLOUR_SHARE), CAR_COLOURS)
+        self.assertEqual(len(CAR_PAINT), CAR_COLOURS)
+        self.assertAlmostEqual(float(CAR_COLOUR_SHARE.sum()), 1.0, places=9)
+        silver, white, black, blue, red, green = CAR_COLOUR_SHARE
+        # Grey, then black, then white, then blue; red and green trail.
+        self.assertGreater(silver, black)
+        self.assertGreater(black, white)
+        self.assertGreater(white, blue)
+        self.assertGreater(blue, max(red, green))
+
     def test_hydrant_lids_get_a_yellow_frame(self):
         from src.traffic import GroundPaint, RoadIndex, flat_uv, paint_covers
 

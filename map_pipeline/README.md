@@ -1843,6 +1843,12 @@ pitch, tested against the polygon rather than its bounding box — bays bend rou
 corners and step around trees, and a car placed on the box ends up in the road.
 Not every bay is full, so `vehicles.car_occupancy` leaves gaps.
 
+**Colours** are drawn as often as the country's cars have them: the RDW
+register counts 3.6 million grey passenger cars, 2.7 million black, 1.7 million
+white, 1.4 million blue and under a million red, with green, brown and beige
+together fewer still (`vehicles.CAR_COLOUR_SHARE`). Drawn evenly, as they used
+to be, one car in six was dark green.
+
 **Mooring posts.** `waterinrichtingselement_punt` carries `plus_type =
 meerpaal`. The median gap between neighbouring posts over the same area is
 6.7 m, which is a boat, because that is exactly what the spacing is for. Each

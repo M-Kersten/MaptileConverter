@@ -430,10 +430,11 @@ def build_vehicles(
         result.length = result.length[inside]
         result.width = result.width[inside]
         result.kind = result.kind[inside]
-    # Cars get a colour each; boats and posts have one look apiece.
+    # Cars get a colour each, as often as the country's cars have it; boats
+    # and posts have one look apiece.
     result.colour = np.where(
         result.kind == KIND_CAR,
-        rng.integers(0, CAR_COLOURS, len(result.xy)),
+        rng.choice(CAR_COLOURS, size=len(result.xy), p=CAR_COLOUR_SHARE),
         0,
     ).astype(np.int32)
 
@@ -443,6 +444,15 @@ def build_vehicles(
 
 # How many car colours the atlas carries.
 CAR_COLOURS = 6
+
+# How often each of the atlas's six colours is a Dutch car's, in its order
+# (silver, white, near-black, blue, dark red, dark green): the RDW register of
+# passenger cars counted by first colour, November 2026. Grey 3.61 million,
+# black 2.65, white 1.66, blue 1.38, red 0.65; green, brown and beige together
+# 0.66. The rest (yellow, orange, purple, pink) is under 2% and goes to red.
+# Drawn evenly, as they used to be, a street was one car in six dark green.
+CAR_COLOUR_SHARE = np.array([3.61, 1.66, 2.65, 1.38, 0.88, 0.66])
+CAR_COLOUR_SHARE = CAR_COLOUR_SHARE / CAR_COLOUR_SHARE.sum()
 
 
 def _ground_heights(
@@ -540,6 +550,7 @@ def write_spawn_list(
 
 __all__ = [
     "CAR_COLOURS",
+    "CAR_COLOUR_SHARE",
     "KIND_BOAT",
     "KIND_CAR",
     "KIND_NAMES",
