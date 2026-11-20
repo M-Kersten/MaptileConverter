@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from .geo import BBox
+from .kinds import TOP10NL_KINDS
 
 LOG = logging.getLogger(__name__)
 
@@ -45,11 +46,9 @@ SHEDS = frozenset({
     "parkeerdak, parkeerdek, parkeergarage", "fabriek", "kas, warenhuis",
     "loods", "silo", "gemaal", "elektriciteitscentrale", "werf",
 })
-SPECIAL = WORSHIP | TOWERS | SHEDS | frozenset({"stationsgebouw", "gemeentehuis"})
-
-# Monument categories that are never a stack of storeys.
-MONUMENTAL_CATEGORIES = ("Religieuze gebouwen",)
-OLD_CATEGORIES = ("Kastelen, landhuizen en parken", "Bestuursgebouwen")
+# Every type that says something: those, and every type src/kinds.py names a
+# kind for (school, windmill, greenhouse, tank).
+SPECIAL = WORSHIP | TOWERS | SHEDS | frozenset({"stationsgebouw", "gemeentehuis"}) | frozenset(TOP10NL_KINDS)
 
 # A building has to be at least this much of a TOP10NL polygon to take its
 # type: a church inside a block polygon is not the whole block.
@@ -341,7 +340,7 @@ def landmark_meshes(buildings, landmarks: Landmarks, terrain) -> dict[str, np.nd
     """Windmill sails and wind turbines, as triangles in RD and NAP."""
     sails, turbines = [], []
     for building in getattr(buildings, "buildings", None) or []:
-        if "molen" in (getattr(building, "monument_subcategory", "") or "").lower():
+        if getattr(building, "kind", "") == "windmill":
             sails.append(windmill_sails(building))
     for turbine in landmarks.turbines if landmarks else []:
         ground = float(np.asarray(terrain.sample(np.array([turbine.xy[0]]), np.array([turbine.xy[1]])))[0])
@@ -369,30 +368,61 @@ def footprint(building):
     return None if shape.is_empty else shape
 
 
-def apply_landmarks(buildings, landmarks: Landmarks) -> dict:
+def apply_landmarks(buildings, landmarks: Landmarks | None, osm=None) -> dict:
     """Tell each building what the registers say it is.
 
-    Sets `landmark` (the TOP10NL type, or "monument") and `monument`
-    (the rijksmonument number) on the buildings that have one.
+    Sets `kind` and `ground_kind` (src/kinds.py), `landmark` and
+    `landmark_name` (what TOP10NL calls it), and `monument` (the rijksmonument
+    number). The sources are read most exact first, each filling in only what
+    an earlier one left empty: an OpenStreetMap building joined on its BAG id,
+    a TOP10NL polygon, a monument point. Points of interest inside a building
+    give its ground floor.
     """
     import shapely
 
-    stats = {"typed": 0, "monuments": 0}
-    if not landmarks:
+    from .kinds import (
+        bag_key, ground_kind_from_osm, kind_from_monument, kind_from_osm,
+        kind_from_top10, stronger_ground,
+    )
+
+    stats = {"typed": 0, "monuments": 0, "from_osm": 0, "from_top10nl": 0,
+             "from_monuments": 0, "ground_floors": 0}
+    owners = list(getattr(buildings, "buildings", None) or [])
+    if not owners:
         return stats
-    shapes = []
-    owners = []
-    for building in getattr(buildings, "buildings", None) or []:
+
+    # OpenStreetMap buildings, joined on their BAG id: exact, so first.
+    tagged = {
+        bag_key(way.tags["ref:bag"]): way.tags
+        for way in (getattr(osm, "buildings", None) or [])
+        if way.tags.get("ref:bag")
+    }
+    for building in owners:
+        tags = tagged.get(bag_key(building.identifier))
+        if not tags:
+            continue
+        kind = kind_from_osm(tags)
+        if kind and not building.kind:
+            building.kind = kind
+            stats["from_osm"] += 1
+        ground = ground_kind_from_osm(tags)
+        if ground:
+            building.ground_kind = stronger_ground(building.ground_kind, ground)
+        if tags.get("name") and not building.landmark_name and kind:
+            building.landmark_name = str(tags["name"])[:64]
+
+    shapes, kept = [], []
+    for building in owners:
         shape = footprint(building)
         if shape is not None:
             shapes.append(shape)
-            owners.append(building)
+            kept.append(building)
     if not shapes:
         return stats
     tree = shapely.STRtree(np.array(shapes, dtype=object))
 
-    for area in landmarks.areas:
-        special = [t for t in area.types if t in SPECIAL]
+    for area in (landmarks.areas if landmarks else []):
+        special = [t for t in area.types if t in SPECIAL or kind_from_top10([t])]
         if not special:
             continue
         for index in tree.query(area.polygon, predicate="intersects"):
@@ -403,19 +433,24 @@ def apply_landmarks(buildings, landmarks: Landmarks) -> dict:
             if overlap >= SHARE_OF_POLYGON * area.polygon.area or (
                 len(area.types) == len(special) and overlap >= 0.6 * shape.area
             ):
-                building = owners[int(index)]
+                building = kept[int(index)]
                 if not getattr(building, "landmark", ""):
                     building.landmark = special[0]
-                    building.landmark_name = area.name
+                    building.landmark_name = building.landmark_name or area.name
                     stats["typed"] += 1
+                if not building.kind:
+                    kind = kind_from_top10(special)
+                    if kind:
+                        building.kind = kind
+                        stats["from_top10nl"] += 1
 
-    for monument in landmarks.monuments:
+    for monument in (landmarks.monuments if landmarks else []):
         point = shapely.Point(*monument.xy)
         hits = tree.query(point, predicate="dwithin", distance=0.5)
         if not len(hits):
             continue
         index = min(hits, key=lambda i: shapes[int(i)].distance(point))
-        building = owners[int(index)]
+        building = kept[int(index)]
         if getattr(building, "monument", None) is None:
             building.monument = monument.number
             building.monument_category = monument.category
@@ -425,12 +460,32 @@ def apply_landmarks(buildings, landmarks: Landmarks) -> dict:
                 # A monument the BAG has no year for is old; the historic
                 # wall is the right guess.
                 building.build_year = 1850
-            if any(monument.category.startswith(c) for c in MONUMENTAL_CATEGORIES):
-                if not getattr(building, "landmark", ""):
-                    building.landmark = "kerk"
+            kind = kind_from_monument(monument.category, monument.subcategory)
+            if kind and not building.kind:
+                building.kind = kind
+                stats["from_monuments"] += 1
+
+    # What the points inside a building say about its ground floor.
+    for node in (getattr(osm, "nodes", None) or []):
+        ground = ground_kind_from_osm(node.tags)
+        if not ground:
+            continue
+        point = shapely.Point(*node.xy)
+        hits = tree.query(point, predicate="within")
+        if not len(hits):
+            continue
+        building = kept[int(hits[0])]
+        before = building.ground_kind
+        building.ground_kind = stronger_ground(building.ground_kind, ground)
+        if building.ground_kind != before:
+            stats["ground_floors"] += 1
+
     LOG.info(
-        "landmarks: %d buildings typed by TOP10NL, %d rijksmonumenten placed",
-        stats["typed"], stats["monuments"],
+        "building kinds: %d from OpenStreetMap, %d from TOP10NL, %d from the "
+        "monument register; %d rijksmonumenten placed; %d ground floors from "
+        "points inside",
+        stats["from_osm"], stats["from_top10nl"], stats["from_monuments"],
+        stats["monuments"], stats["ground_floors"],
     )
     return stats
 

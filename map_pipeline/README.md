@@ -462,6 +462,7 @@ Other knobs worth knowing:
 | `furniture.enabled` | `true` | Lampposts, bollards, sign posts, benches and the rest of the BGT's street furniture. |
 | `furniture.osm` | `true` | Fill in from OpenStreetMap what the BGT does not register: bicycle racks, litter bins, post boxes. |
 | `furniture.chargers` | `true` | Public charging points from NDW. |
+| `furniture.terraces` | `true` | Tables, chairs and parasols in front of every cafe OpenStreetMap seats outside. |
 | `furniture.max_bicycles` | `1500` | The most bicycles drawn in racks. |
 | `traffic.signs` | `true` | Traffic signs from NDW, and the give-way teeth and stop lines they require. See [Signs, lights and road markings](#signs-lights-and-road-markings). |
 | `traffic.markings` | `true` | Lane lines, zebras and speed-hump blocks from OpenStreetMap. |
@@ -472,7 +473,7 @@ Other knobs worth knowing:
 | `structures.deck_thickness_m` | `0.9` | How deep the slab under a deck is, where nothing measured it. |
 | `structures.water_boards` | `true` | Read the water boards' register for bridge clearances, locks and weirs. |
 | `structures.locks_and_weirs` | `true` | Build lock gates and weirs from that register. |
-| `facade.landmarks` | `true` | Read TOP10NL, the monument register and the wind turbine register. |
+| `facade.landmarks` | `true` | Read what each building is from OpenStreetMap, TOP10NL and the monument register, and the wind turbine register. See [What a building is](#what-a-building-is). |
 | `facade.shop_signs` | `true` | A name board over every shop OpenStreetMap names. |
 | `traffic.marking_lift_m` | `0.03` | How far paint lies above the road. Raise it if markings flicker at long range in your renderer. |
 | `export.collision` | `false` | Add invisible `Collision_*` shapes for physics. See [Collision shapes](#collision-shapes). |
@@ -605,7 +606,7 @@ outliner and an empty that everything in it hangs from:
 | `Terrain Cutout` | layered style: the grass object |
 | `Terrain` | survey style: one object, the ground; its edges follow the outlines (see [Terrain](#terrain)) |
 | `Roads` | survey style: one object per street, junction and paving area (see [Roads](#roads)) |
-| `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
+| `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year`, `height_m` and `kind` as custom properties; `Doors`, `SteelDoors` and `DoorFrames` |
 | `Water` | water surfaces and beds |
 | `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
 | `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named |
@@ -1484,6 +1485,7 @@ more sources fill in behind the BGT:
 |---|---|---|
 | NDW charging point register (CC0) | public charging points, one pillar per two connectors | 39 locations |
 | OpenStreetMap (ODbL) | bicycle racks with their capacity, litter bins, post boxes, artworks, bus stops, cameras, information boards, fountains | 166 bins, 37 racks with 500 bicycles, 20 cameras, 10 bus stops |
+| OpenStreetMap cafes and restaurants with `outdoor_seating` | a terrace in front of the facade: tables, chairs, a parasol each | 22 terraces round the Neude alone |
 
 An OpenStreetMap object is kept only where the BGT has nothing of the same kind
 within a few metres (`furniture.OSM_WANTED` gives the radius per kind), and only
@@ -1870,34 +1872,88 @@ Four checks cover the part that could silently go wrong: that boats are inside a
 water polygon, that their heights match a real water level, that cars are on
 ground, and that nothing landed outside the area.
 
-## What the registers say a building is
+## What a building is
 
 3DBAG gives every building its shape and the BAG its use; neither says that
-one of them is a church. Two registers do, and both are read before the facades
-are chosen (`src/landmarks.py`):
+one of them is a church. Four sources say more, and `src/kinds.py` reads them
+into a `kind` per building ("church", "school", "barn", "garages"), each filling
+in only what an earlier one left empty:
 
-- **TOP10NL** types its buildings: church, chapel, tower, bell tower, water
-  tower, car park, station, town hall. Its polygons are generalised, and a
-  church in a terrace is often one polygon with the block ("huizenblok|kerk"),
-  so a type only passes to a building that is most of its polygon.
+- **OpenStreetMap** tags the building itself. Its Dutch buildings were imported
+  from the BAG with the building id as `ref:bag`, so a tag joins to a 3DBAG
+  building on its key, exactly: `building=church`, `building=garages`,
+  `man_made=water_tower`, a mosque as `amenity=place_of_worship` with
+  `religion=muslim`, the roof over a petrol station's pumps as
+  `building=roof` with `amenity=fuel`.
+- **TOP10NL** types its buildings: church, mosque, tower, water tower,
+  windmill, greenhouse, car park, school, hospital, sports hall, station, town
+  hall, silo, tank. Its polygons are generalised, and a church in a terrace is
+  often one polygon with the block ("huizenblok|kerk"), so a type only passes
+  to a building that is most of its polygon.
 - **The national monument register** places every rijksmonument with its
-  category. A monument point inside a footprint is exact where TOP10NL is not:
-  162 of the 179 along the Oudegracht stretch land on a building.
+  category: a religious monument is a church, a mill a windmill. A monument
+  point inside a footprint is exact where TOP10NL is not: 162 of the 179 along
+  the Oudegracht stretch land on a building.
+- **The BAG** for the rest, by its purposes and its empty buildings; see
+  [Building function](#building-function).
 
-A church gets the monumental wall whatever its storey count or BAG function,
-and so does a religious monument; an old tower, station or town hall too. A
-car park gets the industrial wall. Every rijksmonument carries its number
-into the model as the custom property `rijksmonument`, next to `bag_id`, and a
-named landmark its name as `landmark`, so a postprocessor can swap the Domtoren
-for a modelled one by name. A monument the BAG gives no year gets a historic
-wall.
+The points OpenStreetMap places inside a building say what its ground floor
+is: a cafe, a hotel lobby, a supermarket, a fire station's doors. A hotel's
+lobby outranks the bar in it.
 
-**Windmills and wind turbines** are drawn from the registers too. A
-rijksmonument in the category "Industrie- en poldermolen" gets four sails on
-its cap, facing the prevailing south-westerly, sized to the body 3DBAG has. Every
-wind turbine in RIVM's register gets a tower to its registered hub height and a
-three-bladed rotor of its registered diameter. They are in the `Landmarks`
-collection, as `WindmillSails` and `WindTurbines`.
+Each kind is built with a wall of its own (`src/facade.py`):
+
+| Kind | Wall |
+| --- | --- |
+| church | brick, tall pointed lancets, buttresses between the bays, no shopfront at its foot |
+| mosque | pale render, round-headed windows |
+| synagogue, and an old tower, station, town hall, museum or castle | the monumental wall |
+| school, hospital | bands of windows, three mullions to a pane |
+| sports hall, swimming pool, stadium, riding hall | cladding, a high band of glass |
+| greenhouse | glass in a light frame, from the ground to the eaves |
+| car park | open decks where the windows would be |
+| water tower, lighthouse, chimney, windmill, fort, prison | closed brick |
+| silo, bunker, transformer house, pumping station | closed concrete panels |
+| barn, stable | vertical boards, small windows high up |
+| shed | boards, nothing else |
+| garages | a roller door to every box |
+
+A church, a mosque or a hall is laid out in bays of its own height rather than
+in storeys, so a lancet is one tall window and not three stacked ones; a school
+and a car park keep their storeys.
+
+**A petrol station's canopy is open.** The BAG registers the roof over the
+pumps as a building, and 3DBAG extrudes it from the ground into a closed box.
+Its walls are cut back to a fascia, a soffit closes it underneath, and posts
+hold it up.
+
+**Doors.** A closed wall reads as a block, and one door says what it is.
+Drawn into the wall texture it would repeat every few metres all the way
+round, so every shed, barn, kiosk and closed tower gets one of geometry
+instead (`src/doors.py`): on the wall that looks at the nearest road, on a
+barn's gable, never on a wall another building stands against. A wooden door
+has a pale frame, a barn's is two leaves, a kiosk's is flush steel. They are
+part of `Buildings`, as `Doors`, `SteelDoors` and `DoorFrames`.
+
+**Ground floors follow what is inside.** A cafe or restaurant gets an open
+front, a hotel a lobby band of glass, a supermarket a closed front with its
+entrance, a fire station red roller doors. A cafe's name board has an awning
+reaching out over the pavement, and a cafe OpenStreetMap seats outside
+(`outdoor_seating`) gets a terrace in front of its facade: tables, chairs and
+a parasol each, in `Street furniture`.
+
+Every building carries its kind into the model in Dutch as the custom property
+`kind` ("kerk", "schuur of stal", "garageboxen"), every rijksmonument its
+number as `rijksmonument`, and a named landmark its name as `landmark`, next to
+`bag_id`, so a postprocessor can swap the Domtoren for a modelled one by name.
+A monument the BAG gives no year gets a historic wall.
+
+**Windmills and wind turbines** are drawn from the registers too. A building
+whose kind is windmill gets four sails on its cap, facing the prevailing
+south-westerly, sized to the body 3DBAG has. Every wind turbine in RIVM's
+register gets a tower to its registered hub height and a three-bladed rotor of
+its registered diameter. They are in the `Landmarks` collection, as
+`WindmillSails` and `WindTurbines`.
 
 ## Shop names
 
@@ -1914,12 +1970,25 @@ colour picked from the name, so a chain wears the same board everywhere.
 ## Building function
 
 3DBAG says how tall a building is and when it was built, but not what it is for.
-The BAG does: every verblijfsobject carries a `gebruiksdoel` and a
-`pandidentificatie`, which is the same building id 3DBAG uses, so the two join
-on a key rather than by geometry. Over the demo area that resolves a function
-for about 2200 buildings from 6500 units.
+The BAG does. Its `pand` layer carries, per building, the purposes of every
+unit in it (`gebruiksdoel`) and how many units it has
+(`aantal_verblijfsobjecten`), under the same building id 3DBAG uses, so the two
+join on a key rather than by geometry.
 
-It decides which ground storey a building gets. Shopfronts along a residential
+The eleven purposes are kept apart. They used to be six: assembly, education,
+health care, sport, lodging and detention were all "public", which made a
+school, a hospital and a restaurant the same building. Now a school gets the
+school wall, so does a big hospital, a big low sports building the hall, and a
+prison the closed wall.
+
+**A building with no units** has nothing anyone lives, works or shops in: a
+garden shed, a garage, a transformer kiosk, a barn. It used to fall back on the
+housing facade, so every shed had a front door and bay windows, and there are
+hundreds of them in a model. Now one under 120 m² with walls under 5 m is a
+shed, long and low a row of garages, and anything bigger up to 2500 m² and
+14 m high a barn. Bigger than that, it keeps the wall its shape gives it.
+
+The function also decides which ground storey a building gets. Shopfronts along a residential
 street look as wrong as a blank wall along a shopping street, so only retail and
 public buildings get them; housing gets doors and windows. Where a building holds
 several uses, the most street-facing one wins — a shop under flats is a shop at

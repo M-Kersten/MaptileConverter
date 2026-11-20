@@ -1601,16 +1601,27 @@ def build_buildings(
     )
     # Matches src/buildings.py.
     ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
-    special = (archetype == ARCH_MONUMENTAL) | (archetype == ARCH_INDUSTRIAL)
+    # The Python side says per building how high one tile is (0: a storey)
+    # and where it cut the ground storey off. An older buildings.npz has
+    # neither, and only the two archetypes that were special then.
+    bay_from_scene = data["bay_height_m"] if "bay_height_m" in data.files else None
+    if bay_from_scene is not None:
+        special = bay_from_scene > 0
+    else:
+        special = (archetype == ARCH_MONUMENTAL) | (archetype == ARCH_INDUSTRIAL)
 
     # Which buildings actually had a ground storey taken off them. A church and
     # a warehouse keep their wall whole, so their base is still the ground.
-    was_split = (
-        has_ground & ~special & (wall_height_m > ground_floor_m * 1.2)
-        if has_ground
-        else np.zeros(len(ground_z_nap), dtype=bool)
-    )
-    cut_m = np.where(was_split, ground_floor_m, 0.0)
+    if "ground_cut_m" in data.files and has_ground:
+        cut_m = np.asarray(data["ground_cut_m"], dtype=np.float64)
+        was_split = cut_m > 0
+    else:
+        was_split = (
+            has_ground & ~special & (wall_height_m > ground_floor_m * 1.2)
+            if has_ground
+            else np.zeros(len(ground_z_nap), dtype=bool)
+        )
+        cut_m = np.where(was_split, ground_floor_m, 0.0)
     wall_base_z = ground_z_local + cut_m
     # What is left for the storeys above the shopfront.
     upper_height = np.maximum(wall_height_m - cut_m, 0.1)
@@ -1633,11 +1644,12 @@ def build_buildings(
     # few tall bays instead. Dividing its height by three is what turned the
     # Dom into thirty-six rows of domestic windows.
     if special.any():
-        bay_height = np.where(
+        bay_height = bay_from_scene if bay_from_scene is not None else np.where(
             archetype == ARCH_INDUSTRIAL,
             float(facade_cfg.get("industrial_bay_m", 6.0)),
             float(facade_cfg.get("monumental_bay_m", 9.0)),
         )
+        bay_height = np.where(bay_height > 0, bay_height, 1.0)
         # One tile per bay, with the bay count rounded so the top of the wall
         # lands on a tile edge.
         bays = np.maximum(1.0, np.round(wall_height_m / bay_height))
@@ -1709,6 +1721,7 @@ def build_buildings(
     heights = data["height_m"] if "height_m" in data.files else None
     landmarks = data["landmark"] if "landmark" in data.files else None
     monuments = data["monument"] if "monument" in data.files else None
+    kind_labels = data["kind_label"] if "kind_label" in data.files else None
 
     # One object per building, so a building is something you click on, move,
     # delete or swap, and its own GameObject in Unity. The triangles of each
@@ -1759,6 +1772,10 @@ def build_buildings(
             obj["landmark"] = str(landmarks[index])
         if monuments is not None and int(monuments[index]):
             obj["rijksmonument"] = int(monuments[index])
+        # What kind of building it is (kerk, school, schuur), from the
+        # registers, OpenStreetMap or the BAG's empty units.
+        if kind_labels is not None and str(kind_labels[index]):
+            obj["kind"] = str(kind_labels[index])
         objects.append(obj)
 
     log(
@@ -2431,6 +2448,24 @@ def _furniture_pieces(kind, x, y, base, spin, uv, cfg, size=0.0):
             box(0.0, 0.0, 1.25, 0.5, 0.4, 0.6, "orange"),
             box(0.0, 0.0, 1.58, 0.46, 0.36, 0.08, "orange"),
         ]
+    if kind == 31:  # terrace: tables with chairs round them, a parasol each
+        count = int(max(1, min(4, size or 2)))
+        out = []
+        for k in range(count):
+            dx = (k - (count - 1) / 2.0) * 2.6
+            out += [
+                post(dx, 0.0, 0.0, 0.72, 0.04, "metal", 6),
+                box(dx, 0.0, 0.74, 0.7, 0.7, 0.04, "wood"),
+                box(dx - 0.55, 0.0, 0.45, 0.42, 0.42, 0.05, "black"),
+                box(dx - 0.74, 0.0, 0.7, 0.05, 0.42, 0.5, "black"),
+                post(dx - 0.55, 0.0, 0.0, 0.43, 0.025, "metal", 4),
+                box(dx + 0.55, 0.0, 0.45, 0.42, 0.42, 0.05, "black"),
+                box(dx + 0.74, 0.0, 0.7, 0.05, 0.42, 0.5, "black"),
+                post(dx + 0.55, 0.0, 0.0, 0.43, 0.025, "metal", 4),
+                post(dx, 0.0, 0.76, 2.3, 0.025, "metal", 6),
+                post(dx, 0.0, 2.2, 2.35, 1.1, "white", 8),
+            ]
+        return out
     if kind == 30:  # bus stop: a pole with its sign, the timetable below
         return [
             post(0.0, 0.0, 0.0, 2.9, 0.05, "grey"),
@@ -2730,10 +2765,17 @@ LANDMARK_OBJECTS = {
     "sails": ("WindmillSails", ("Wieken", (0.12, 0.09, 0.07), 0.8)),
     "turbines": ("WindTurbines", ("Windturbine", (0.86, 0.87, 0.88), 0.4)),
 }
+# The doors of sheds, barns and kiosks (src/doors.py): part of the buildings.
+DOOR_OBJECTS = {
+    "doors": ("Doors", ("Deur", (0.16, 0.13, 0.1), 0.7)),
+    "steel_doors": ("SteelDoors", ("Staaldeur", (0.3, 0.32, 0.31), 0.45)),
+    "door_frames": ("DoorFrames", ("Kozijn", (0.82, 0.81, 0.77), 0.55)),
+}
 
 
-def build_landmarks(scene: dict, work_dir: Path) -> list:
-    """Windmill sails and wind turbines, built in RD by `src/landmarks.py`."""
+def build_landmarks(scene: dict, work_dir: Path, objects_by_key: dict | None = None) -> list:
+    """Windmill sails and wind turbines, built in RD by `src/landmarks.py`;
+    with `objects_by_key`, the other meshes the same file carries."""
     landmark_file = scene.get("landmarks", {}).get("file")
     if not landmark_file or not (work_dir / landmark_file).is_file():
         return []
@@ -2741,7 +2783,7 @@ def build_landmarks(scene: dict, work_dir: Path) -> list:
     origin_x, origin_y = scene["origin_rd"]
     shift = np.array([origin_x, origin_y, float(scene["ground_z_offset_nap"])])
     objects = []
-    for key, (name, plain) in LANDMARK_OBJECTS.items():
+    for key, (name, plain) in (objects_by_key or LANDMARK_OBJECTS).items():
         if key not in data.files or not len(data[key]):
             continue
         triangles = np.asarray(data[key], dtype=np.float64) - shift
@@ -2778,7 +2820,7 @@ def build_signage(scene: dict, work_dir: Path, material) -> list:
         np.full(n_triangles, 3), uv[loops], np.zeros(n_triangles), [material],
         shade_smooth=False,
     )
-    log(f"shop signs: {n_triangles // 12} boards")
+    log(f"shop signs: {n_triangles} triangles, boards and awnings")
     return [obj]
 
 
@@ -3645,6 +3687,7 @@ def main() -> int:
         build_buildings(
             scene, work_dir, facade_materials, aerial_material, ground_materials
         )
+        build_landmarks(scene, work_dir, DOOR_OBJECTS)
 
     if layered is not None and scene["layered"].get("water_surface", True):
         # The modellers' ground in flat colours, its water too: one object,

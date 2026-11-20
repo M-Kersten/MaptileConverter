@@ -64,11 +64,23 @@ AREA_TAGS = {
 
 # Bumped when what is kept changes, so an older cache is not read as if it
 # held everything a newer run expects.
-CACHE_VERSION = "osm3"
+CACHE_VERSION = "osm4"
+
+
+def telling_building(tags: dict) -> bool:
+    """A building way worth keeping: joined to the BAG on ref:bag, and saying
+    more than "building=yes" (see `kinds.kind_from_osm`)."""
+    from .kinds import ground_kind_from_osm, kind_from_osm
+
+    if "building" not in tags or "ref:bag" not in tags:
+        return False
+    return bool(kind_from_osm(tags) or ground_kind_from_osm(tags))
 
 
 def keep_way(tags: dict) -> bool:
     if "highway" in tags:
+        return True
+    if telling_building(tags):
         return True
     return any(tags.get(key) in values for key, values in AREA_TAGS.items())
 
@@ -102,10 +114,12 @@ class OsmData:
     nodes: list[OsmNode] = field(default_factory=list)
     # Closed ways that are street detail rather than road (`AREA_TAGS`).
     areas: list[OsmWay] = field(default_factory=list)
+    # Buildings whose tags say what they are, with their BAG id.
+    buildings: list[OsmWay] = field(default_factory=list)
     source: str = ""
 
     def __bool__(self) -> bool:
-        return bool(self.ways or self.nodes or self.areas)
+        return bool(self.ways or self.nodes or self.areas or self.buildings)
 
     def ways_through(self) -> dict[int, list[OsmWay]]:
         """Which highways pass through each node."""
@@ -162,7 +176,12 @@ def parse_elements(elements: list[dict], bbox: BBox | None = None) -> OsmData:
         )
         if keep.sum() < 2:
             continue
-        target = data.ways if "highway" in (element.get("tags") or {}) else data.areas
+        tags = element.get("tags") or {}
+        target = (
+            data.ways if "highway" in tags
+            else data.buildings if telling_building(tags)
+            else data.areas
+        )
         target.append(
             OsmWay(
                 id=way_id,
@@ -249,8 +268,9 @@ def fetch_osm(
             with gzip.open(cache, "rt", encoding="utf-8") as handle:
                 data = parse_elements(json.load(handle), bbox)
             LOG.info(
-                "OpenStreetMap: %d highways, %d areas, %d tagged nodes (cached)",
-                len(data.ways), len(data.areas), len(data.nodes),
+                "OpenStreetMap: %d highways, %d areas, %d telling buildings, "
+                "%d tagged nodes (cached)",
+                len(data.ways), len(data.areas), len(data.buildings), len(data.nodes),
             )
             return data
 
@@ -291,8 +311,8 @@ def fetch_osm(
 
     data = parse_elements(kept, bbox)
     LOG.info(
-        "OpenStreetMap: %d highways, %d areas, %d tagged nodes",
-        len(data.ways), len(data.areas), len(data.nodes),
+        "OpenStreetMap: %d highways, %d areas, %d telling buildings, %d tagged nodes",
+        len(data.ways), len(data.areas), len(data.buildings), len(data.nodes),
     )
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -307,6 +327,7 @@ __all__ = [
     "AREA_TAGS",
     "NODE_KEYS",
     "keep_way",
+    "telling_building",
     "OSM_API_URL",
     "OsmData",
     "OsmNode",

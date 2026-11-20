@@ -27,6 +27,7 @@ from typing import Any, Callable, Iterator, Sequence
 import numpy as np
 import requests
 
+from .facade import ARCHETYPE_STYLE, EXTRA_STYLES, STOREY_SPECIALS
 from .facade_uv import fit_wall_u, tile_widths
 from .geo import BBox
 from .http_util import (
@@ -78,6 +79,15 @@ class Building:
     monument: int | None = None
     monument_category: str = ""
     monument_subcategory: str = ""
+    # Every BAG function group in the building, and how many units it holds:
+    # None when the BAG was not read, 0 for a building with nothing in it.
+    functions: frozenset = frozenset()
+    units: int | None = None
+    # What the building is, from OpenStreetMap, TOP10NL, the monument
+    # register, the BAG and its shape (src/kinds.py): "church", "barn".
+    kind: str = ""
+    # What its ground floor is, from the points inside it: "horeca", "hotel".
+    ground_kind: str = ""
     # Filled in when the ground storey is split off; carries its own material.
     ground_wall_tris: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float64)
@@ -743,6 +753,17 @@ ARCH_OFFICE = 2
 ARCH_RETAIL = 3
 ARCH_INDUSTRIAL = 4
 ARCH_MONUMENTAL = 5
+ARCH_CHURCH = 6
+ARCH_MOSQUE = 7
+ARCH_SCHOOL = 8
+ARCH_HALL = 9
+ARCH_GLASSHOUSE = 10
+ARCH_PARKING = 11
+ARCH_CLOSED = 12
+ARCH_TECHNICAL = 13
+ARCH_BARN = 14
+ARCH_OUTBUILDING = 15
+ARCH_GARAGES = 16
 
 ARCHETYPE_NAMES = {
     ARCH_HOUSE: "house",
@@ -751,10 +772,71 @@ ARCHETYPE_NAMES = {
     ARCH_RETAIL: "retail",
     ARCH_INDUSTRIAL: "industrial",
     ARCH_MONUMENTAL: "monumental",
+    ARCH_CHURCH: "church",
+    ARCH_MOSQUE: "mosque",
+    ARCH_SCHOOL: "school",
+    ARCH_HALL: "hall",
+    ARCH_GLASSHOUSE: "glasshouse",
+    ARCH_PARKING: "parking",
+    ARCH_CLOSED: "closed",
+    ARCH_TECHNICAL: "technical",
+    ARCH_BARN: "barn",
+    ARCH_OUTBUILDING: "outbuilding",
+    ARCH_GARAGES: "garages",
 }
 
 # BAG function groups, matching src/usage.py.
 _FN_HOME, _FN_RETAIL, _FN_OFFICE, _FN_INDUSTRY, _FN_PUBLIC = 0, 1, 2, 3, 4
+_FN_EDUCATION, _FN_HEALTH, _FN_SPORT, _FN_LODGING, _FN_CELL, _FN_NONE = 6, 7, 8, 9, 10, 11
+
+# What each kind (src/kinds.py) is built as.
+KIND_ARCHETYPE = {
+    "church": ARCH_CHURCH,
+    "mosque": ARCH_MOSQUE,
+    "synagogue": ARCH_MONUMENTAL,
+    "school": ARCH_SCHOOL,
+    "hospital": ARCH_SCHOOL,
+    "hall": ARCH_HALL,
+    "greenhouse": ARCH_GLASSHOUSE,
+    "parking": ARCH_PARKING,
+    "water_tower": ARCH_CLOSED,
+    "lighthouse": ARCH_CLOSED,
+    "chimney": ARCH_CLOSED,
+    "windmill": ARCH_CLOSED,
+    "fort": ARCH_CLOSED,
+    "prison": ARCH_CLOSED,
+    "silo": ARCH_TECHNICAL,
+    "tank": ARCH_TECHNICAL,
+    "bunker": ARCH_TECHNICAL,
+    "technical": ARCH_TECHNICAL,
+    "fuel_canopy": ARCH_TECHNICAL,
+    "canopy": ARCH_TECHNICAL,
+    "barn": ARCH_BARN,
+    "shed": ARCH_OUTBUILDING,
+    "garages": ARCH_GARAGES,
+    "industrial": ARCH_INDUSTRIAL,
+}
+# Kinds that are monumental when old and ordinary when new: a 1900 station
+# is a monument, a 1990 one an office block.
+OLD_KINDS = frozenset({"tower", "castle", "town_hall", "museum", "station"})
+# Kinds whose wall is a modern building type: a school of bands of glass, a
+# hall of cladding, a shed of concrete. An old building the registers call a
+# school or a warehouse is a canal house used as one: OpenStreetMap tags
+# forty medieval houses round the Neude in Utrecht building=industrial and the
+# university's seventeenth-century houses on the Drift building=university.
+# Those keep the wall of their era.
+MODERN_KINDS = frozenset({"school", "hospital", "hall", "parking", "industrial"})
+MODERN_FROM_YEAR = 1940
+
+# A building with no units that is smaller than this is a shed or a garage.
+SHED_MAX_M2 = 120.0
+SHED_MAX_WALL_M = 5.0
+# A row of garages: long and low.
+GARAGES_MIN_ASPECT = 2.8
+# Bigger than a shed, lower than this, and still with nothing in it: a barn,
+# a stable, a storage hall.
+BARN_MAX_M2 = 2500.0
+BARN_MAX_HEIGHT_M = 14.0
 
 
 def classify_archetype(building: Building) -> int:
@@ -775,19 +857,26 @@ def classify_archetype(building: Building) -> int:
 
     # What the registers say outranks every guess below: a church that is
     # low, has a storey count and is registered as a meeting place is still
-    # a church. See src/landmarks.py.
-    from .landmarks import SHEDS, TOWERS, WORSHIP
-
-    landmark = getattr(building, "landmark", "")
+    # a church. See src/kinds.py.
+    kind = getattr(building, "kind", "")
     old = not building.build_year or building.build_year < 1940
-    if landmark in WORSHIP:
+    historic = is_historic(building)
+    if kind in KIND_ARCHETYPE and not (kind in MODERN_KINDS and historic):
+        return KIND_ARCHETYPE[kind]
+    if kind in OLD_KINDS and old and height >= 8.0:
         return ARCH_MONUMENTAL
-    if landmark in TOWERS and old:
-        return ARCH_MONUMENTAL
-    if landmark in ("stationsgebouw", "gemeentehuis") and old and height >= 10.0:
-        return ARCH_MONUMENTAL
-    if landmark in SHEDS and landmark != "kas, warenhuis":
-        return ARCH_INDUSTRIAL
+
+    # The BAG's purposes, kept apart now: a school is not a restaurant. Not
+    # for an old building, which is a house the school moved into.
+    if not historic:
+        if function == _FN_EDUCATION:
+            return ARCH_SCHOOL
+        if function == _FN_HEALTH and footprint >= 1000.0:
+            return ARCH_SCHOOL
+        if function == _FN_SPORT and footprint >= 600.0 and building.floors <= 3:
+            return ARCH_HALL
+    if function == _FN_CELL:
+        return ARCH_CLOSED
 
     # No recorded storeys and real height means a building a storey grid does
     # not describe: a tower, spire, church or hall. That catches modern
@@ -808,8 +897,18 @@ def classify_archetype(building: Building) -> int:
     ):
         return ARCH_MONUMENTAL
 
-    if function == _FN_INDUSTRY:
+    if function == _FN_INDUSTRY and not historic:
         return ARCH_INDUSTRIAL
+
+    # Registered, and with nothing in it: no one lives, works or shops here.
+    # Housing windows on these were the commonest wrong facade in a model. A
+    # listed building with no units is a gate, a tower or a chapel, not a shed.
+    if (function == _FN_NONE or getattr(building, "units", None) == 0) and not getattr(
+        building, "monument", None
+    ):
+        unitless = unitless_archetype(building)
+        if unitless is not None:
+            return unitless
 
     # Big and low is a shed, whatever it is registered as: sports halls,
     # depots and supermarkets all read the same way from outside.
@@ -830,6 +929,123 @@ def classify_archetype(building: Building) -> int:
     if tower_like or height >= 25.0 or building.floors >= 8:
         return ARCH_APARTMENT
     return ARCH_HOUSE
+
+
+def is_historic(building: Building) -> bool:
+    """Built before the modern building types, or listed: a building whose
+    wall comes from its era whatever it is used for now."""
+    if getattr(building, "monument", None):
+        return True
+    return bool(building.build_year) and building.build_year < MODERN_FROM_YEAR
+
+
+def footprint_shape(building: Building):
+    """Length and width of a building's footprint, from its roof triangles."""
+    import shapely
+
+    roof = np.asarray(building.roof_tris, dtype=np.float64)
+    if roof.ndim != 3 or not len(roof):
+        return None
+    shape = shapely.union_all(shapely.polygons(roof[:, :, :2]))
+    if shape.is_empty:
+        return None
+    box = np.asarray(shapely.minimum_rotated_rectangle(shape).exterior.coords)[:4]
+    sides = np.linalg.norm(np.diff(np.vstack([box, box[:1]]), axis=0), axis=1)[:2]
+    return float(max(sides)), float(min(sides))
+
+
+def unitless_archetype(building: Building) -> int | None:
+    """A shed, a row of garages or a barn, for a building with no units; None
+    when it is too big or too tall to be any of them."""
+    footprint = building.footprint_m2
+    wall = building.wall_height_m or building.height_m
+    if footprint <= SHED_MAX_M2 and wall <= SHED_MAX_WALL_M:
+        dims = footprint_shape(building)
+        if dims is not None and footprint >= 30.0:
+            length, width = dims
+            if width > 0 and length / width >= GARAGES_MIN_ASPECT and wall <= 3.5:
+                return ARCH_GARAGES
+        return ARCH_OUTBUILDING
+    if footprint <= BARN_MAX_M2 and building.height_m <= BARN_MAX_HEIGHT_M:
+        return ARCH_BARN
+    return None
+
+
+# A canopy's roof edge, the only wall it has.
+CANOPY_FASCIA_M = 0.9
+CANOPY_POST_M = 0.4
+CANOPY_POST_EVERY_M = 9.0
+
+
+def _post(x: float, y: float, z0: float, z1: float, side: float) -> np.ndarray:
+    h = side / 2.0
+    corners = np.array([[x - h, y - h], [x + h, y - h], [x + h, y + h], [x - h, y + h]])
+    triangles = []
+    for k in range(4):
+        a, b = corners[k], corners[(k + 1) % 4]
+        triangles.append([[*a, z0], [*b, z0], [*b, z1]])
+        triangles.append([[*a, z0], [*b, z1], [*a, z1]])
+    return np.asarray(triangles, dtype=np.float64)
+
+
+def open_canopy(building: Building) -> bool:
+    """Turn a canopy 3DBAG modelled as a closed box into a roof on posts.
+
+    The BAG registers a petrol station's canopy as a building, and 3DBAG
+    extrudes it from the ground to its roof: a closed box over the pumps. The
+    walls are cut back to the fascia, a soffit closes it underneath, and posts
+    hold it up.
+    """
+    import shapely
+
+    from .landmarks import footprint as _footprint
+
+    if not len(building.wall_tris) or not len(building.roof_tris):
+        return False
+    top = float(building.wall_top_nap or building.roof_max_nap)
+    cut = top - CANOPY_FASCIA_M
+    if cut - building.ground_z_nap < 2.2:
+        return False
+    _below, fascia = split_walls_at_height(building.wall_tris, np.full(len(building.wall_tris), cut))
+    shape = _footprint(building)
+    if shape is None:
+        return False
+    # The soffit: the outline at the fascia's foot, facing down.
+    soffit = []
+    for polygon in shapely.get_parts(shape):
+        if polygon.geom_type != "Polygon":
+            continue
+        triangles = shapely.get_parts(shapely.delaunay_triangles(polygon))
+        for triangle in triangles:
+            if not polygon.contains(triangle.representative_point()):
+                continue
+            ring = np.asarray(triangle.exterior.coords)[:3]
+            area = (ring[1, 0] - ring[0, 0]) * (ring[2, 1] - ring[0, 1]) - (
+                ring[1, 1] - ring[0, 1]) * (ring[2, 0] - ring[0, 0])
+            if area > 0:
+                ring = ring[::-1]
+            soffit.append(np.column_stack([ring, np.full(3, cut)]))
+    # Posts along the long axis, set in from the edges.
+    box = np.asarray(shapely.minimum_rotated_rectangle(shape).exterior.coords)[:4]
+    edges = [box[1] - box[0], box[2] - box[1]]
+    long_index = 0 if np.linalg.norm(edges[0]) >= np.linalg.norm(edges[1]) else 1
+    along = edges[long_index] / max(np.linalg.norm(edges[long_index]), 1e-6)
+    across = edges[1 - long_index] / max(np.linalg.norm(edges[1 - long_index]), 1e-6)
+    centre = box.mean(axis=0)
+    length = float(np.linalg.norm(edges[long_index]))
+    width = float(np.linalg.norm(edges[1 - long_index]))
+    count = max(2, int(np.ceil(max(length - 2.0, 1.0) / CANOPY_POST_EVERY_M)) + 1)
+    rows = (-1.0, 1.0) if width > 6.0 else (0.0,)
+    posts = []
+    for t in np.linspace(-(length / 2.0 - 1.0), length / 2.0 - 1.0, count):
+        for row in rows:
+            p = centre + along * t + across * row * (width / 2.0 - 1.0)
+            if shape.contains(shapely.Point(*p)):
+                posts.append(_post(float(p[0]), float(p[1]), building.ground_z_nap, cut, CANOPY_POST_M))
+    pieces = [fascia] + ([np.asarray(soffit)] if soffit else []) + posts
+    building.wall_tris = np.concatenate([p for p in pieces if len(p)])
+    building.ground_wall_tris = np.zeros((0, 3, 3), dtype=np.float64)
+    return True
 
 
 def assign_archetypes(buildings: BuildingSet) -> dict[str, int]:
@@ -939,8 +1155,10 @@ def apply_ground_skirt(
         base_z = float(points[:, 2].min())
 
         # Sample terrain on a small grid over the footprint and take the lowest.
-        xs = np.linspace(points[:, 0].min(), points[:, 0].max(), 4)
-        ys = np.linspace(points[:, 1].min(), points[:, 1].max(), 4)
+        # Five a side, so the middle lines are sampled too: on a building by a
+        # canal they cross the bank, and four a side stepped over it.
+        xs = np.linspace(points[:, 0].min(), points[:, 0].max(), 5)
+        ys = np.linspace(points[:, 1].min(), points[:, 1].max(), 5)
         grid_x, grid_y = np.meshgrid(xs, ys)
         terrain_min = float(np.min(terrain_sampler(grid_x, grid_y)))
 
@@ -1040,8 +1258,10 @@ def apply_ground_floor_split(
             continue
         # A church does not have a shopfront and a warehouse does not have a
         # front door with a bay window beside it. Both are one tall volume, so
-        # they keep their wall in one piece and get their own composition.
-        if building.archetype in (ARCH_MONUMENTAL, ARCH_INDUSTRIAL):
+        # they keep their wall in one piece and get their own composition, as
+        # does every archetype with a style of its own: a school's ribbons of
+        # glass run down to the ground.
+        if building.archetype in ARCHETYPE_STYLE:
             kept_whole += 1
             continue
         # Nothing to split on a single-storey building: it is all ground floor.
@@ -1066,6 +1286,53 @@ def apply_ground_floor_split(
         kept_whole,
     )
     return split_count
+
+
+def ground_style_for(building: Building) -> int:
+    """The ground storey a building gets, as an index into GROUND_STYLES."""
+    from .facade import (
+        GROUND_CLOSED, GROUND_DOORS, GROUND_HOME, GROUND_HORECA, GROUND_LOBBY, GROUND_RETAIL,
+    )
+
+    by_kind = {
+        "fire_station": GROUND_DOORS, "hotel": GROUND_LOBBY,
+        "supermarket": GROUND_CLOSED, "horeca": GROUND_HORECA, "shop": GROUND_RETAIL,
+    }
+    for kind in (getattr(building, "ground_kind", ""), getattr(building, "kind", "")):
+        if kind in by_kind:
+            return by_kind[kind]
+    if building.function in (_FN_RETAIL, _FN_PUBLIC):
+        return GROUND_RETAIL
+    if building.function == _FN_LODGING:
+        return GROUND_LOBBY
+    return GROUND_HOME
+
+
+# A building no register names, by the archetype its shape gave it.
+_ARCHETYPE_LABELS = {
+    ARCH_BARN: "schuur of stal", ARCH_OUTBUILDING: "bijgebouw", ARCH_GARAGES: "garageboxen",
+}
+
+
+def kind_label(building: Building) -> str:
+    from .kinds import KIND_LABELS
+
+    kind = getattr(building, "kind", "")
+    if kind:
+        return KIND_LABELS.get(kind, kind)
+    return _ARCHETYPE_LABELS.get(getattr(building, "archetype", None), "")
+
+
+def bay_height_for(building: Building, facade_cfg: dict) -> float:
+    """Metres of wall one tile covers vertically, or 0 for one per storey."""
+    name = ARCHETYPE_STYLE.get(building.archetype)
+    if name is None or building.archetype in STOREY_SPECIALS:
+        return 0.0
+    if building.archetype == ARCH_INDUSTRIAL:
+        return float(facade_cfg.get("industrial_bay_m", 6.0))
+    if building.archetype == ARCH_MONUMENTAL:
+        return float(facade_cfg.get("monumental_bay_m", 9.0))
+    return float(EXTRA_STYLES[name].tile_height_m or 4.0)
 
 
 def save_buildings(
@@ -1150,16 +1417,32 @@ def save_buildings(
         storeys_known=np.array(
             [1 if b.storeys_known else 0 for b in buildings.buildings], dtype=np.int32
         ),
-        # 1 selects the shopfront ground storey, 0 the residential one. Only
-        # retail and public buildings get a shopfront; everything else, and
-        # anything the BAG does not cover, gets doors and windows.
+        # Which ground storey: an index into facade.GROUND_STYLES. Shops and
+        # assembly get a shopfront, a cafe its own, a hotel its lobby, a fire
+        # station its doors; everything else doors and windows.
         ground_style=np.array(
+            [ground_style_for(b) for b in buildings.buildings], dtype=np.int32,
+        ),
+        # How high one tile of wall is, per building: 0 to divide it into
+        # storeys, a bay's height for the archetypes laid out in bays.
+        bay_height_m=np.array(
+            [bay_height_for(b, facade_cfg or {}) for b in buildings.buildings],
+            dtype=np.float64,
+        ),
+        # Where the ground storey was cut off, above the ground; 0 where it
+        # was not, so the storeys above start from the right line.
+        ground_cut_m=np.array(
             [
-                1 if b.function in (1, 4) else 0
+                float((facade_cfg or {}).get("ground_floor_height_m", 3.6))
+                if len(b.ground_wall_tris) and len(b.wall_tris) else 0.0
                 for b in buildings.buildings
             ],
-            dtype=np.int32,
+            dtype=np.float64,
         ),
+        kind=np.array([getattr(b, "kind", "") for b in buildings.buildings], dtype="U32"),
+        # The same in words, for whoever clicks on it; a shed the BAG gives
+        # no unit is a shed even when no register says so.
+        kind_label=np.array([kind_label(b) for b in buildings.buildings], dtype="U32"),
         function=np.array(
             [-1 if b.function is None else b.function for b in buildings.buildings],
             dtype=np.int32,
@@ -1257,6 +1540,7 @@ def build_buildings(
     usage=None,
     facade_cfg: dict | None = None,
     landmarks=None,
+    osm=None,
 ) -> BuildingSet:
     """Fetch, clean, ground, and cache the buildings for `bbox`.
 
@@ -1296,22 +1580,34 @@ def build_buildings(
     if usage is not None and len(usage):
         matched = 0
         for building in result.buildings:
-            group = usage.group_for(building.identifier)
+            use = usage.use_for(building.identifier) if hasattr(usage, "use_for") else None
+            group = use.group if use is not None else usage.group_for(building.identifier)
             if group is not None:
                 building.function = group
                 matched += 1
+            if use is not None:
+                building.functions = use.groups
+                building.units = use.units
         LOG.info(
-            "matched BAG function to %d of %d buildings", matched, len(result.buildings)
+            "matched BAG function to %d of %d buildings, %d of them with no units",
+            matched, len(result.buildings),
+            sum(1 for b in result.buildings if b.units == 0),
         )
 
-    if landmarks:
+    if landmarks or osm:
         from .landmarks import apply_landmarks
 
-        result.landmark_stats = apply_landmarks(result, landmarks)
+        result.landmark_stats = apply_landmarks(result, landmarks, osm=osm)
 
     # Archetypes are needed before the split, because they decide which
     # buildings get one at all.
     assign_archetypes(result)
+    opened = sum(
+        open_canopy(b) for b in result.buildings
+        if getattr(b, "kind", "") in ("fuel_canopy", "canopy")
+    )
+    if opened:
+        LOG.info("opened %d canopies onto their posts", opened)
 
     # Split before saving: the ground storey has to be its own geometry to
     # carry its own material.

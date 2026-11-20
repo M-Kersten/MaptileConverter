@@ -285,7 +285,8 @@ def check_buildings_on_terrain(
             f"all {len(buildings)} building bases reach the terrain"
             if not floating
             else f"{len(floating)} buildings float, worst by "
-            f"{max(gap for _, gap in floating):.2f} m"
+            f"{max(gap for _, gap in floating):.2f} m "
+            f"({max(floating, key=lambda f: f[1])[0]})"
         ),
     )
 
@@ -1185,6 +1186,11 @@ def check_layered(
                 False,
                 "the curb generator needs Blender 5, so the walkways are flat",
                 severity="warning",
+            )
+        elif not int(built.get("kerbed_objects", 0)) and not int(built.get("walkway_faces", 0)):
+            # Greenhouses and fields: a road with a verge and no pavement.
+            report.add(
+                "walkways_have_kerbs", True, "no walkways in this area", severity="warning",
             )
         else:
             raw = int(built.get("walkway_faces", 0))

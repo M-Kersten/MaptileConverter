@@ -48,6 +48,12 @@ BOARDS = (
 )
 BOARD_HEIGHT_M = 0.55
 BOARD_DEPTH_M = 0.08
+# A cafe's awning: out from the wall under its board, sloping down.
+AWNING_OUT_M = 1.4
+AWNING_DROP_M = 0.55
+HORECA_KINDS = frozenset({
+    "restaurant", "cafe", "bar", "pub", "fast_food", "ice_cream", "biergarten",
+})
 # The bottom of the board, above the pavement: over a shop window.
 BOARD_BOTTOM_M = 2.9
 # The furthest a named point may be from its facade.
@@ -132,13 +138,43 @@ def _colours(name: str):
     return BOARDS[digest % len(BOARDS)]
 
 
+# Bold sans faces with the accented letters a Dutch street needs: Pillow's own
+# font has none, and "Café Carël" came out with a box for each accent.
+FONT_FILES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "C:/Windows/Fonts/arialbd.ttf",
+    "DejaVuSans-Bold.ttf",
+    "arialbd.ttf",
+)
+
+
 def _font(size: int):
+    """A bold face with accents, or Pillow's own and a flag saying it has none."""
     from PIL import ImageFont
 
+    for path in FONT_FILES:
+        try:
+            return ImageFont.truetype(path, size=size), True
+        except OSError:
+            continue
     try:
-        return ImageFont.load_default(size=size)
+        return ImageFont.load_default(size=size), False
     except TypeError:
-        return ImageFont.load_default()
+        return ImageFont.load_default(), False
+
+
+def plain_letters(text: str) -> str:
+    """The name without its accents, for a font that has none: Carel rather
+    than a box where the ë should be."""
+    import unicodedata
+
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)
+    )
 
 
 def atlas_layout(n_cells: int) -> tuple[int, int, int]:
@@ -176,15 +212,16 @@ def generate_sign_texture(names: list[str], work_dir: Path) -> tuple[Path, dict[
         background, letters = _colours(name)
         draw.rectangle([x0, y0, x0 + CELL_W - 1, y0 + CELL_H - 1], fill=background)
         size = 42
-        font = _font(size)
-        box = draw.textbbox((0, 0), name, font=font)
+        font, accents = _font(size)
+        text = name if accents else plain_letters(name)
+        box = draw.textbbox((0, 0), text, font=font)
         while (box[2] - box[0] > CELL_W - 20 or box[3] - box[1] > CELL_H - 14) and size > 10:
             size -= 2
-            font = _font(size)
-            box = draw.textbbox((0, 0), name, font=font)
+            font, _ = _font(size)
+            box = draw.textbbox((0, 0), text, font=font)
         draw.text(
             (x0 + (CELL_W - (box[0] + box[2])) / 2.0, y0 + (CELL_H - (box[1] + box[3])) / 2.0),
-            name, fill=letters, font=font,
+            text, fill=letters, font=font,
         )
         cells[name] = index
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -223,6 +260,37 @@ def board_mesh(boards: list[Board], cells: dict[str, int], layout) -> tuple[np.n
             ("bottom", [("rbl", z0), ("rbr", z0), ("fbr", z0), ("fbl", z0)]),
         ]
         rect = cell_rect(cells[board.shop.name], columns, width, height)
+        if board.shop.kind in HORECA_KINDS:
+            # The awning, in the board's own colour: sampled from the cell's
+            # margin, where there is no lettering.
+            u0, v0, u1, v1 = rect
+            canvas = np.array([u0 + (u1 - u0) * 0.02, (v0 + v1) / 2.0])
+            wall = np.asarray(board.point, dtype=np.float64) + out * 0.02
+            half = board.width / 2.0 + 0.3
+            top = z0 - 0.05
+            near_l, near_r = wall - right * half, wall + right * half
+            far_l, far_r = near_l + out * AWNING_OUT_M, near_r + out * AWNING_OUT_M
+            low = top - AWNING_DROP_M
+            canopy = np.array([
+                [*near_l, top], [*near_r, top], [*far_r, low], [*far_l, low],
+            ])
+            # Up and down, so it is seen from the street and from under it.
+            vertices.append(canopy)
+            faces.append(np.array([[0, 2, 1], [0, 3, 2]]) + count)
+            uvs.append(np.tile(canvas, (4, 1)))
+            count += 4
+            vertices.append(canopy)
+            faces.append(np.array([[0, 1, 2], [0, 2, 3]]) + count)
+            uvs.append(np.tile(canvas, (4, 1)))
+            count += 4
+            # The valance hanging off its front edge.
+            valance = np.array([
+                [*far_l, low - 0.22], [*far_r, low - 0.22], [*far_r, low], [*far_l, low],
+            ])
+            vertices.append(valance)
+            faces.append(np.array([[0, 1, 2], [0, 2, 3]]) + count)
+            uvs.append(np.tile(canvas, (4, 1)))
+            count += 4
         for kind, quad in quads:
             points = np.array([[*corners[c], z] for c, z in quad])
             vertices.append(points)

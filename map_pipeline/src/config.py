@@ -345,6 +345,9 @@ DEFAULTS: dict[str, Any] = {
         "osm": True,
         # Public charging points from NDW's national register.
         "chargers": True,
+        # Tables, chairs and parasols in front of every cafe OpenStreetMap
+        # says has seats outside.
+        "terraces": True,
         # A ceiling on bicycles in racks, which are the one piece of
         # furniture that comes by the thousand near a station.
         "max_bicycles": 1500,

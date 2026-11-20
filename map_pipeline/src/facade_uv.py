@@ -131,10 +131,16 @@ def tile_widths(archetype: np.ndarray, facade_cfg: dict) -> np.ndarray:
     A church bay, a warehouse bay and a house front are all different widths,
     and giving them one spacing is most of why the first two looked wrong.
     """
+    from .facade import ARCHETYPE_STYLE, EXTRA_STYLES
+
     # Matches src/buildings.py.
     ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
 
+    archetype = np.asarray(archetype)
     width = np.full(len(archetype), float(facade_cfg["tile_width_m"]))
+    # Every special style knows how wide one of its bays is.
+    for code, name in ARCHETYPE_STYLE.items():
+        width = np.where(archetype == code, float(EXTRA_STYLES[name].tile_width_m), width)
     width = np.where(
         archetype == ARCH_MONUMENTAL,
         float(facade_cfg.get("monumental_tile_m", 7.0)),

@@ -76,6 +76,7 @@ KIND_CHARGER = 27
 KIND_BIKE_RACK = 28
 KIND_POST_BOX = 29
 KIND_BUS_STOP = 30
+KIND_TERRACE = 31
 
 KIND_NAMES = {
     KIND_LAMP: "lamppost",
@@ -109,6 +110,7 @@ KIND_NAMES = {
     KIND_BIKE_RACK: "bicycle rack",
     KIND_POST_BOX: "post box",
     KIND_BUS_STOP: "bus stop",
+    KIND_TERRACE: "terrace",
 }
 
 # Kinds that hang off something rather than standing on the ground.
@@ -206,6 +208,12 @@ OSM_WANTED: tuple[tuple[str, str, int, float], ...] = (
     ("highway", "bus_stop", KIND_BUS_STOP, 10.0),
     ("barrier", "bollard", KIND_BOLLARD, 1.5),
 )
+
+# A cafe that OpenStreetMap says has seats outside gets a terrace in front of
+# its facade: this many metres out, a table per this many metres of front.
+TERRACE_OUT_M = 2.4
+TERRACE_TABLE_M = 2.2
+HORECA_AMENITIES = frozenset({"restaurant", "cafe", "bar", "pub", "fast_food", "ice_cream"})
 
 # Artwork painted on or set into a wall; there is nothing to stand in the street.
 FLAT_ARTWORK = frozenset({"mural", "graffiti", "relief", "mosaic", "painting"})
@@ -630,6 +638,34 @@ def _osm_items(osm, bbox: BBox) -> list[_Item]:
     return items
 
 
+def terraces(osm, footprints: "Footprints", bbox: BBox) -> list[_Item]:
+    """A terrace in front of every cafe OpenStreetMap seats outside."""
+    out: list[_Item] = []
+    if not footprints:
+        return out
+    for node in getattr(osm, "nodes", None) or []:
+        tags = node.tags
+        if tags.get("amenity") not in HORECA_AMENITIES:
+            continue
+        if tags.get("outdoor_seating") not in ("yes", "sidewalk", "street", "terrace", "pedestrian_zone"):
+            continue
+        x, y = node.xy
+        if not (bbox.xmin <= x <= bbox.xmax and bbox.ymin <= y <= bbox.ymax):
+            continue
+        facade = footprints.street_facade((x, y), 10.0)
+        if facade is None:
+            continue
+        point, outward = facade
+        spot = point + outward * TERRACE_OUT_M
+        if footprints.inside(spot) or footprints.inside(point + outward * (TERRACE_OUT_M + 1.0)):
+            continue
+        along = np.array([-outward[1], outward[0]])
+        # Local +Y towards the street, the way the tables are set.
+        spin = float(np.arctan2(along[1], along[0]))
+        out.append(_Item(float(spot[0]), float(spot[1]), KIND_TERRACE, "osm", spin, 2.0))
+    return out
+
+
 def _near(items: list[_Item], kind: int, xy, radius: float) -> bool:
     for item in items:
         if item.kind == kind and (item.x - xy[0]) ** 2 + (item.y - xy[1]) ** 2 <= radius * radius:
@@ -724,6 +760,8 @@ def build_furniture(
     extra: list[_Item] = list(chargers or [])
     if osm is not None and bool(furniture_cfg.get("osm", True)):
         found = _osm_items(osm, bbox)
+        if bool(furniture_cfg.get("terraces", True)):
+            found.extend(terraces(osm, footprints, bbox))
         # Anything OpenStreetMap places inside a building is indoors: a bench
         # in a station hall, a bicycle rack in a garage. A camera against a
         # facade is on the facade, and drawn on a pole it would stand in
@@ -741,6 +779,12 @@ def build_furniture(
                 item.x, item.y = float(pushed[0]), float(pushed[1])
                 moved += 1
     items = merge_sources(items, extra)
+    # Pushed off the road or set out from a facade, a few can end up over the
+    # edge of the area, where there is no ground to stand on.
+    items = [
+        i for i in items
+        if bbox.xmin <= i.x <= bbox.xmax and bbox.ymin <= i.y <= bbox.ymax
+    ]
 
     cap = int(furniture_cfg.get("max_bicycles", 3000))
     bikes = 0
@@ -819,6 +863,7 @@ __all__ = [
     "KIND_PLAYGROUND",
     "KIND_SHELTER",
     "KIND_SIGN",
+    "KIND_TERRACE",
     "KIND_WALL_LAMP",
     "KIND_WASTE",
     "MOUNTED_KINDS",
@@ -833,5 +878,6 @@ __all__ = [
     "merge_sources",
     "osm_kind",
     "parse_chargers",
+    "terraces",
     "save_furniture",
 ]

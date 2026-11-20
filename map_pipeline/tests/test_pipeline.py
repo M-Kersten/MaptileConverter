@@ -339,16 +339,19 @@ class TestArchetypes(unittest.TestCase):
         self.assertEqual(classify_archetype(block), ARCH_APARTMENT)
 
     def test_the_special_archetypes_get_their_own_style_slots(self):
-        from src.facade import style_for_archetype, wall_styles
+        from src.facade import ARCHETYPE_STYLE, SPECIAL_ORDER, style_for_archetype, wall_styles
 
         self.assertIsNone(style_for_archetype(0, 5))  # house: era decides
         self.assertEqual(style_for_archetype(5, 5), 5)  # monumental
         self.assertEqual(style_for_archetype(4, 5), 6)  # industrial
 
         styles = wall_styles(5)
-        self.assertEqual(len(styles), 7)
+        self.assertEqual(len(styles), 5 + len(SPECIAL_ORDER))
         self.assertEqual(styles[5].name, "monumental")
         self.assertEqual(styles[6].name, "industrial")
+        # Every archetype with a wall of its own finds that wall.
+        for archetype, name in ARCHETYPE_STYLE.items():
+            self.assertEqual(styles[style_for_archetype(archetype, 5)].name, name)
 
     def test_slots_stay_put_when_the_era_count_changes(self):
         """Blender addresses these by index, so they cannot shift about."""
@@ -2788,13 +2791,13 @@ class TestFacadeLooks(unittest.TestCase):
         """Blender addresses a style by index, so the layout is a contract:
         era * looks + look, then the two specials. An extra look must not move
         an era, and an extra era must not move the specials."""
-        from src.facade import style_for_archetype, wall_styles
+        from src.facade import SPECIAL_ORDER, style_for_archetype, wall_styles
 
         ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
         for variants in (1, 3, 5):
             for looks in (1, 2, 4):
                 styles = wall_styles(variants, looks)
-                self.assertEqual(len(styles), variants * looks + 2)
+                self.assertEqual(len(styles), variants * looks + len(SPECIAL_ORDER))
                 monumental = style_for_archetype(
                     ARCH_MONUMENTAL, variants, looks
                 )
@@ -2808,9 +2811,9 @@ class TestFacadeLooks(unittest.TestCase):
     def test_the_old_two_argument_calls_still_work(self):
         """Both functions are called with one argument elsewhere, and a
         default of one look is what keeps that meaning the same thing."""
-        from src.facade import style_for_archetype, wall_styles
+        from src.facade import SPECIAL_ORDER, style_for_archetype, wall_styles
 
-        self.assertEqual(len(wall_styles(5)), 7)
+        self.assertEqual(len(wall_styles(5)), 5 + len(SPECIAL_ORDER))
         self.assertEqual(style_for_archetype(5, 5), 5)
         self.assertEqual(style_for_archetype(4, 5), 6)
 
@@ -2894,9 +2897,11 @@ class TestFacadeLooks(unittest.TestCase):
         photograph and fell back to drawn brick -- so one house in three had
         real grain and its neighbours did not."""
         from src.facade import GROUND_STYLES, wall_styles
-        from src.textures import WALL_TEXTURES
+        from src.textures import DRAWN_STYLES, WALL_TEXTURES
 
         for style in list(wall_styles(5, 4)) + list(GROUND_STYLES):
+            if style.family in DRAWN_STYLES:
+                continue  # planks and glass are drawn, not photographed
             self.assertIn(
                 style.family, WALL_TEXTURES,
                 f"{style.name} resolves to {style.family!r}, which has no "
@@ -3062,6 +3067,7 @@ class TestFacadeLooks(unittest.TestCase):
         allocation spends a dozen textures on sixteen pre-1920 houses and
         still leaves the interbellum era repeating."""
         from src.buildings import assign_facade_slots
+        from src.facade import SPECIAL_ORDER
 
         # The measured Bronbeek era counts.
         mix = []
@@ -3079,8 +3085,9 @@ class TestFacadeLooks(unittest.TestCase):
             plan.per_era, (1, 12, 3, 1, 1),
             "the looks were not allocated by how many buildings wear them",
         )
-        # 20 textures, not the 62 a flat twelve would cost.
-        self.assertEqual(plan.total_slots, 20)
+        # 18 era looks, not the 60 a flat twelve would cost, and the walls
+        # of the buildings that are something else.
+        self.assertEqual(plan.total_slots, 18 + len(SPECIAL_ORDER))
         busiest = max(np.bincount(slots))
         self.assertLess(
             busiest, 120,
@@ -3089,6 +3096,7 @@ class TestFacadeLooks(unittest.TestCase):
 
     def test_a_sparse_era_is_not_given_looks_it_cannot_use(self):
         from src.buildings import assign_facade_slots
+        from src.facade import SPECIAL_ORDER
 
         # Three pre-1920 houses and nothing else.
         _, plan = assign_facade_slots(
@@ -3098,7 +3106,7 @@ class TestFacadeLooks(unittest.TestCase):
             5, {"looks_per_era": 12, "buildings_per_look": 80},
         )
         self.assertEqual(plan.per_era, (1, 1, 1, 1, 1))
-        self.assertEqual(plan.total_slots, 7)
+        self.assertEqual(plan.total_slots, 5 + len(SPECIAL_ORDER))
 
     def test_an_archetype_special_takes_no_era_look(self):
         """A church does not make the houses around it repeat less."""
@@ -3185,9 +3193,9 @@ class TestFacadeLooks(unittest.TestCase):
 
     def test_the_shipped_budget_is_the_measured_one(self):
         """80 is not arbitrary: it is what puts the busiest Bronbeek wall on
-        81 of 1322 buildings rather than 967, at 20 textures."""
+        81 of 1322 buildings rather than 967, at 18 era textures."""
         from src.config import DEFAULTS
-        from src.facade import LookPlan
+        from src.facade import SPECIAL_ORDER, LookPlan
 
         budget = DEFAULTS["facade"]["buildings_per_look"]
         self.assertEqual(budget, 80)
@@ -3196,7 +3204,7 @@ class TestFacadeLooks(unittest.TestCase):
             cap=DEFAULTS["facade"]["looks_per_era"], target=budget,
         )
         self.assertEqual(plan.per_era, (1, 12, 3, 1, 1))
-        self.assertEqual(plan.total_slots, 20)
+        self.assertEqual(plan.total_slots, 18 + len(SPECIAL_ORDER))
         self.assertLess(max(967 / 12, 240 / 3), 100)
 
     def test_the_pipeline_hands_the_plan_to_the_texture_stage(self):
@@ -3306,7 +3314,7 @@ class TestFacade(unittest.TestCase):
         self.assertGreater(relief.max(), 0.55)
 
     def test_normal_map_written_alongside_colour(self):
-        from src.facade import generate_facade_textures
+        from src.facade import SPECIAL_ORDER, generate_facade_textures
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {
@@ -3315,9 +3323,9 @@ class TestFacade(unittest.TestCase):
                 "ground_floor": False,
             }
             pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
-            # One era variant, plus the monumental and industrial styles that
-            # every run carries.
-            self.assertEqual(len(pairs), 3)
+            # One era variant, plus the walls of churches, schools, sheds and
+            # the other buildings that every run carries.
+            self.assertEqual(len(pairs), 1 + len(SPECIAL_ORDER))
             colour, normal = pairs[0]
             self.assertTrue(colour.is_file())
             self.assertIsNotNone(normal)
@@ -3330,7 +3338,7 @@ class TestFacade(unittest.TestCase):
 
     def test_ground_floor_texture_is_written_last(self):
         """The Blender stage addresses it as the trailing material slot."""
-        from src.facade import generate_facade_textures
+        from src.facade import SPECIAL_ORDER, generate_facade_textures
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {
@@ -3339,8 +3347,8 @@ class TestFacade(unittest.TestCase):
                 "ground_floor": True,
             }
             pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
-            # Two era variants, the two archetype styles, then the ground.
-            self.assertEqual(len(pairs), 5)
+            # Two era variants, the archetype styles, then the ground.
+            self.assertEqual(len(pairs), 2 + len(SPECIAL_ORDER) + 1)
             self.assertEqual(pairs[-1][0].name, "facade_ground.png")
 
 
@@ -3349,9 +3357,11 @@ class TestPhotoTextures(unittest.TestCase):
 
     def test_every_style_has_a_texture_mapped(self):
         from src.facade import GROUND_STYLES, STYLES, wall_styles
-        from src.textures import WALL_TEXTURES
+        from src.textures import DRAWN_STYLES, WALL_TEXTURES
 
         for style in wall_styles(len(STYLES)) + list(GROUND_STYLES):
+            if style.name in DRAWN_STYLES:
+                continue
             self.assertIn(style.name, WALL_TEXTURES, f"{style.name} has no surface")
 
     def test_a_texture_is_tiled_to_its_real_world_size(self):
@@ -13362,7 +13372,7 @@ class TestFacadeRegisters(unittest.TestCase):
         import shapely
 
         from src.buildings import (
-            ARCH_HOUSE, ARCH_INDUSTRIAL, ARCH_MONUMENTAL, BuildingSet, classify_archetype,
+            ARCH_CHURCH, ARCH_HOUSE, ARCH_PARKING, BuildingSet, classify_archetype,
         )
         from src.landmarks import Landmarks, Monument, TypedArea, apply_landmarks
 
@@ -13382,24 +13392,29 @@ class TestFacadeRegisters(unittest.TestCase):
             monuments=[Monument((4.0, 35.0), 36000, "Woningen en woningbouwcomplexen", "Woonhuis")],
         )
         stats = apply_landmarks(buildings, landmarks)
-        self.assertEqual(stats, {"typed": 2, "monuments": 1})
+        self.assertEqual(stats["typed"], 2)
+        self.assertEqual(stats["monuments"], 1)
+        self.assertEqual(stats["from_top10nl"], 2)
+        self.assertEqual(stats["from_monuments"], 0, "a listed house is still a house")
         self.assertEqual(church.landmark, "kerk")
         self.assertEqual(church.landmark_name, "Geertekerk")
+        self.assertEqual((church.kind, garage.kind, house.kind), ("church", "parking", ""))
         self.assertEqual(house.landmark, "")
-        self.assertEqual(classify_archetype(church), ARCH_MONUMENTAL)
-        self.assertEqual(classify_archetype(garage), ARCH_INDUSTRIAL)
+        self.assertEqual(classify_archetype(church), ARCH_CHURCH)
+        self.assertEqual(classify_archetype(garage), ARCH_PARKING)
         self.assertEqual(monument.monument, 36000)
         self.assertEqual(monument.build_year, 1850, "a monument the BAG gives no year is old")
 
     def test_a_religious_monument_is_a_church(self):
-        from src.buildings import ARCH_MONUMENTAL, BuildingSet, classify_archetype
+        from src.buildings import ARCH_CHURCH, BuildingSet, classify_archetype
         from src.landmarks import Landmarks, Monument, apply_landmarks
 
         chapel = self._building("chapel", 0, 0, 10, 8, height=8.0, year=1700, floors=1)
         apply_landmarks(BuildingSet(buildings=[chapel]), Landmarks(monuments=[
             Monument((5.0, 4.0), 123, "Religieuze gebouwen", "Kerk en kerkonderdeel")
         ]))
-        self.assertEqual(classify_archetype(chapel), ARCH_MONUMENTAL)
+        self.assertEqual(chapel.kind, "church")
+        self.assertEqual(classify_archetype(chapel), ARCH_CHURCH)
 
     def test_the_registers_are_read(self):
         from src.landmarks import parse_monuments, parse_top10
@@ -13411,6 +13426,12 @@ class TestFacadeRegisters(unittest.TestCase):
              "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]]}},
         ])
         self.assertEqual([(a.types, a.name) for a in areas], [(("huizenblok", "klokkentoren"), "Domtoren")])
+        # Every type a kind is read from passes, not only churches and towers.
+        mill = parse_top10([
+            {"properties": {"typegebouw": "windmolen: korenmolen", "naam": "De Windotter"},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]]}},
+        ])
+        self.assertEqual([a.types for a in mill], [("windmolen: korenmolen",)])
         monuments = parse_monuments([{
             "geometry": {"type": "Point", "coordinates": [136941, 455423]},
             "properties": {"rijksmonument_nummer": 36123, "hoofdcategorie": "Religieuze gebouwen",
@@ -13484,12 +13505,28 @@ class TestFacadeRegisters(unittest.TestCase):
             texture, cells, layout = generate_sign_texture([b.shop.name for b in boards], Path(tmp))
             self.assertTrue(texture.is_file())
         vertices, faces, uv = board_mesh(boards, cells, layout)
-        self.assertEqual(len(faces), 2 * 12)
+        # Two boards, and an awning over the cafe: both its faces and a valance.
+        self.assertEqual(len(faces), 2 * 12 + 6)
         tri = vertices[faces]
         normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-        # The first two triangles of each board are its face: towards the street.
-        self.assertTrue((normals[0::12, 1] < 0).all() and (normals[1::12, 1] < 0).all())
+        # Each board's face looks at the street.
+        self.assertGreaterEqual(int((normals[:, 1] < -1e-9).sum()), 4)
         self.assertTrue(((uv >= 0) & (uv <= 1)).all())
+        # The awning reaches out over the pavement, below the board.
+        self.assertLess(float(vertices[:, 1].min()), -1.3)
+
+    def test_a_name_keeps_its_accents(self):
+        from src.signage import plain_letters
+
+        self.assertEqual(plain_letters("Café Carël"), "Cafe Carel")
+        with tempfile.TemporaryDirectory() as tmp:
+            from PIL import Image
+
+            from src.signage import generate_sign_texture
+
+            path, cells, _ = generate_sign_texture(["Café Carël"], Path(tmp))
+            self.assertIn("Café Carël", cells)
+            self.assertTrue(Image.open(path).size[0] > 0)
 
     def test_a_board_goes_on_the_street_side_not_the_party_wall(self):
         import shapely
@@ -13518,6 +13555,311 @@ class TestFacadeRegisters(unittest.TestCase):
             place_boards([Shop("Binnen", "shop", (4.0, 5.0))], enclosed, lambda x, y: np.zeros(len(x))),
             [],
         )
+
+
+class TestBuildingKinds(unittest.TestCase):
+    """What a building is, and what that does to its walls: the BAG's units,
+    OpenStreetMap, TOP10NL, and the doors, canopies and terraces that follow."""
+
+    _building = staticmethod(TestFacadeRegisters._building)
+
+    @staticmethod
+    def _box_building(identifier, x0, y0, x1, y1, height):
+        """A closed box with real walls, wound to face out."""
+        from src.buildings import Building
+
+        ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        walls = []
+        for (ax, ay), (bx, by) in zip(ring, ring[1:] + ring[:1]):
+            walls.append([[ax, ay, 0.0], [bx, by, 0.0], [bx, by, height]])
+            walls.append([[ax, ay, 0.0], [bx, by, height], [ax, ay, height]])
+        roof = np.array([
+            [[x0, y0, height], [x1, y0, height], [x1, y1, height]],
+            [[x0, y0, height], [x1, y1, height], [x0, y1, height]],
+        ])
+        return Building(
+            identifier=identifier, wall_tris=np.array(walls, dtype=np.float64), roof_tris=roof,
+            ground_z_nap=0.0, roof_max_nap=height, floors=1, wall_top_nap=height,
+            build_year=1990, footprint_m2=(x1 - x0) * (y1 - y0),
+        )
+
+    def test_the_bag_purposes_are_kept_apart(self):
+        from src.usage import (
+            FUNCTION_EDUCATION, FUNCTION_HOME, FUNCTION_NONE, FUNCTION_PUBLIC,
+            FUNCTION_RETAIL, parse_pand,
+        )
+
+        _, school = parse_pand({"identificatie": "0344100000000001",
+                                "gebruiksdoel": "onderwijsfunctie", "aantal_verblijfsobjecten": 1})
+        self.assertEqual(school.group, FUNCTION_EDUCATION, "a school is no longer a meeting place")
+        _, mixed = parse_pand({"identificatie": "2", "aantal_verblijfsobjecten": "3",
+                               "gebruiksdoel": "woonfunctie,winkelfunctie,bijeenkomstfunctie"})
+        self.assertEqual(mixed.group, FUNCTION_RETAIL)
+        self.assertEqual(mixed.groups, frozenset({FUNCTION_HOME, FUNCTION_RETAIL, FUNCTION_PUBLIC}))
+        _, shed = parse_pand({"identificatie": "3", "gebruiksdoel": None,
+                              "aantal_verblijfsobjecten": 0, "status": "Pand in gebruik"})
+        self.assertEqual((shed.group, shed.units), (FUNCTION_NONE, 0))
+        self.assertIsNone(parse_pand({"gebruiksdoel": "woonfunctie"}))
+
+    def test_the_registers_name_the_kind(self):
+        from src.kinds import (
+            bag_key, ground_kind_from_osm, kind_from_monument, kind_from_osm,
+            kind_from_top10, stronger_ground,
+        )
+
+        self.assertEqual(kind_from_osm({"building": "church"}), "church")
+        self.assertEqual(kind_from_osm(
+            {"building": "yes", "amenity": "place_of_worship", "religion": "muslim"}), "mosque")
+        self.assertEqual(kind_from_osm({"building": "roof", "amenity": "fuel"}), "fuel_canopy")
+        # The shop at a petrol station is not the roof over the pumps.
+        self.assertEqual(kind_from_osm({"building": "retail", "amenity": "fuel"}), "")
+        self.assertEqual(kind_from_osm({"building": "yes", "man_made": "water_tower"}), "water_tower")
+        self.assertEqual(kind_from_osm({"building": "house"}), "", "what the BAG import wrote says nothing")
+        self.assertEqual(kind_from_top10(["huizenblok", "kas, warenhuis"]), "greenhouse")
+        self.assertEqual(kind_from_monument("Molens", "Windmolen"), "windmill")
+        self.assertEqual(kind_from_monument("Molens", "Watermolen"), "")
+        self.assertEqual(kind_from_monument("Boerderijen, molens en bedrijven", "Schuur"), "barn")
+        self.assertEqual(ground_kind_from_osm({"amenity": "cafe"}), "horeca")
+        self.assertEqual(ground_kind_from_osm({"amenity": "bench"}), "")
+        self.assertEqual(stronger_ground("horeca", "hotel"), "hotel", "the lobby, not the bar in it")
+        self.assertEqual(stronger_ground("", "shop"), "shop")
+        self.assertEqual(bag_key("NL.IMBAG.Pand.0344100000000004"), bag_key("344100000000004"))
+
+    def test_openstreetmap_names_buildings_by_their_bag_id(self):
+        from src.buildings import ARCH_MOSQUE, BuildingSet, classify_archetype, kind_label
+        from src.landmarks import apply_landmarks
+        from src.osm import OsmData, OsmNode, OsmWay
+
+        mosque = self._building("NL.IMBAG.Pand.0344100000012345", 0, 0, 20, 20)
+        corner = self._building("NL.IMBAG.Pand.0344100000054321", 30, 0, 40, 10)
+        osm = OsmData(
+            buildings=[OsmWay(1, np.zeros((0, 2)), (), {
+                "building": "yes", "amenity": "place_of_worship", "religion": "muslim",
+                "ref:bag": "344100000012345", "name": "Ulu Camii",
+            })],
+            nodes=[OsmNode(2, (35.0, 5.0), {"amenity": "cafe"}),
+                   OsmNode(3, (36.0, 5.0), {"tourism": "hotel"}),
+                   OsmNode(4, (60.0, 5.0), {"shop": "bakery"})],  # in no building
+        )
+        stats = apply_landmarks(BuildingSet(buildings=[mosque, corner]), None, osm=osm)
+        self.assertEqual(stats["from_osm"], 1)
+        self.assertEqual((mosque.kind, mosque.landmark_name), ("mosque", "Ulu Camii"))
+        self.assertEqual(classify_archetype(mosque), ARCH_MOSQUE)
+        self.assertEqual(kind_label(mosque), "moskee")
+        self.assertEqual(corner.ground_kind, "hotel")
+
+    def test_osm_keeps_the_buildings_that_say_something(self):
+        from src.osm import parse_elements
+
+        elements = [
+            {"type": "node", "id": 1, "lon": 5.1100, "lat": 52.0850},
+            {"type": "node", "id": 2, "lon": 5.1101, "lat": 52.0850},
+            {"type": "node", "id": 3, "lon": 5.1101, "lat": 52.0851},
+            {"type": "way", "id": 10, "nodes": [1, 2, 3, 1],
+             "tags": {"building": "church", "ref:bag": "344100000000001"}},
+            {"type": "way", "id": 11, "nodes": [1, 2, 3, 1],
+             "tags": {"building": "house", "ref:bag": "344100000000002"}},
+            {"type": "way", "id": 12, "nodes": [1, 2, 3, 1], "tags": {"building": "church"}},
+        ]
+        data = parse_elements(elements)
+        self.assertEqual([w.id for w in data.buildings], [10])
+
+    def test_buildings_with_nothing_in_them_are_sheds_garages_and_barns(self):
+        from src.buildings import (
+            ARCH_BARN, ARCH_CHURCH, ARCH_GARAGES, ARCH_HALL, ARCH_HOUSE, ARCH_OUTBUILDING,
+            ARCH_SCHOOL, classify_archetype, kind_label,
+        )
+
+        def unitless(building):
+            building.function, building.units = 11, 0
+            return building
+
+        shed = unitless(self._building("shed", 0, 0, 3, 4, height=2.6, year=1990, floors=1))
+        self.assertEqual(classify_archetype(shed), ARCH_OUTBUILDING)
+        garages = unitless(self._building("garages", 0, 0, 20, 5.5, height=2.8, year=1970, floors=1))
+        self.assertEqual(classify_archetype(garages), ARCH_GARAGES)
+        barn = unitless(self._building("barn", 0, 0, 40, 15, height=9.0, year=1960, floors=1))
+        self.assertEqual(classify_archetype(barn), ARCH_BARN)
+        barn.archetype = ARCH_BARN
+        self.assertEqual(kind_label(barn), "schuur of stal")
+        # The same small building with a home in it is a house.
+        house = self._building("house", 0, 0, 3, 4, height=2.6, year=1990, floors=1)
+        house.function, house.units = 0, 1
+        self.assertEqual(classify_archetype(house), ARCH_HOUSE)
+        school = self._building("school", 0, 0, 40, 20, height=9.0, year=1970, floors=2)
+        school.function = 6
+        self.assertEqual(classify_archetype(school), ARCH_SCHOOL)
+        gym = self._building("gym", 0, 0, 40, 25, height=8.0, year=1980, floors=1)
+        gym.function = 8
+        self.assertEqual(classify_archetype(gym), ARCH_HALL)
+        # What a register says outranks the BAG: a church with no unit in it.
+        chapel = unitless(self._building("chapel", 0, 0, 10, 8, height=8.0, year=1900, floors=1))
+        chapel.kind = "church"
+        self.assertEqual(classify_archetype(chapel), ARCH_CHURCH)
+        # A listed building with nothing in it is a gate or a tower, not a shed.
+        gate = unitless(self._building("gate", 0, 0, 6, 8, height=4.5, year=1600, floors=1))
+        gate.monument = 36000
+        self.assertNotEqual(classify_archetype(gate), ARCH_OUTBUILDING)
+
+    def test_an_old_house_keeps_its_wall_whatever_it_is_used_for(self):
+        """OpenStreetMap tags medieval houses round the Neude building=industrial
+        and the university's old houses on the Drift building=university."""
+        from src.buildings import (
+            ARCH_INDUSTRIAL, ARCH_RETAIL, ARCH_SCHOOL, classify_archetype,
+        )
+
+        house = self._building("house", 0, 0, 8, 12, height=13.0, year=1650, floors=4)
+        house.function, house.kind = 1, "industrial"
+        self.assertEqual(classify_archetype(house), ARCH_RETAIL)
+        college = self._building("college", 0, 0, 8, 12, height=13.0, year=1700, floors=4)
+        college.function, college.kind = 6, "school"
+        self.assertNotEqual(classify_archetype(college), ARCH_SCHOOL)
+        # A listed school of 1956 is listed for the way it looks.
+        listed = self._building("listed", 0, 0, 40, 12, height=12.0, year=1956, floors=3)
+        listed.function, listed.kind, listed.monument = 6, "school", 36151
+        self.assertNotEqual(classify_archetype(listed), ARCH_SCHOOL)
+        # New, they are what they say.
+        shed = self._building("shed", 0, 0, 30, 20, height=8.0, year=1985, floors=1)
+        shed.kind = "industrial"
+        self.assertEqual(classify_archetype(shed), ARCH_INDUSTRIAL)
+        school = self._building("school", 0, 0, 40, 12, height=10.0, year=1975, floors=3)
+        school.kind = "school"
+        self.assertEqual(classify_archetype(school), ARCH_SCHOOL)
+
+    def test_the_ground_floor_follows_what_is_inside(self):
+        from src.buildings import ground_style_for
+        from src.facade import (
+            GROUND_DOORS, GROUND_HOME, GROUND_HORECA, GROUND_LOBBY, GROUND_RETAIL, GROUND_STYLES,
+        )
+
+        building = self._building("b", 0, 0, 10, 10)
+        building.function = 1
+        self.assertEqual(ground_style_for(building), GROUND_RETAIL)
+        building.ground_kind = "horeca"
+        self.assertEqual(ground_style_for(building), GROUND_HORECA)
+        building.ground_kind = "hotel"
+        self.assertEqual(ground_style_for(building), GROUND_LOBBY)
+        building.ground_kind, building.kind = "", "fire_station"
+        self.assertEqual(ground_style_for(building), GROUND_DOORS)
+        building.kind, building.function = "", 0
+        self.assertEqual(ground_style_for(building), GROUND_HOME)
+        self.assertEqual(GROUND_STYLES[GROUND_DOORS].door, "roller")
+
+    def test_a_church_wall_is_laid_out_in_bays_and_a_school_in_storeys(self):
+        from src.buildings import ARCH_CHURCH, ARCH_HOUSE, ARCH_SCHOOL, bay_height_for
+        from src.facade import EXTRA_STYLES
+
+        building = self._building("b", 0, 0, 10, 10)
+        building.archetype = ARCH_CHURCH
+        self.assertEqual(bay_height_for(building, {}), EXTRA_STYLES["church"].tile_height_m)
+        building.archetype = ARCH_SCHOOL
+        self.assertEqual(bay_height_for(building, {}), 0.0)
+        building.archetype = ARCH_HOUSE
+        self.assertEqual(bay_height_for(building, {}), 0.0)
+
+    def test_the_new_walls_are_drawn(self):
+        """Read off the relief, where glass is set back from the wall. Row 0
+        of a tile is the foot of the wall, as for every style."""
+        from src.facade import EXTRA_STYLES, RELIEF_WALL, render_facade_layers
+
+        def openings(name):
+            relief = render_facade_layers(EXTRA_STYLES[name], 128, seed=3)[1]
+            return relief < RELIEF_WALL - 0.05, relief > RELIEF_WALL + 0.05
+
+        glass, raised = openings("closed")
+        self.assertLess(float(glass.mean()) + float(raised.mean()), 0.01, "a closed wall has nothing in it")
+        glass, _ = openings("glasshouse")
+        self.assertGreater(float(glass.mean()), 0.6, "a greenhouse is mostly glass")
+        glass, raised = openings("church")
+        self.assertGreater(float(raised.mean()), 0.05, "no buttresses")
+        rows = np.where(glass.any(axis=1))[0]
+        sill, head = int(rows.min()), int(rows.max())
+        self.assertGreater(head - sill, 64, "a lancet is tall")
+        # Pointed: narrower near its head than half way up.
+        self.assertLess(int(glass[head - 2].sum()), int(glass[(sill + head) // 2].sum()) // 2)
+
+    def test_a_canopy_is_a_roof_on_posts(self):
+        from src.buildings import CANOPY_FASCIA_M, open_canopy
+        from src.facade_uv import fit_wall_u
+
+        canopy = self._box_building("canopy", 0, 0, 20, 12, 5.0)
+        canopy.kind = "fuel_canopy"
+        self.assertTrue(open_canopy(canopy))
+        walls = canopy.wall_tris
+        cut = 5.0 - CANOPY_FASCIA_M
+        low = walls[(walls[:, :, 2] < cut - 1e-6).any(axis=1)]
+        self.assertGreater(len(low), 0, "nothing holds it up")
+        # Below the fascia there are only posts, standing inside the outline.
+        self.assertTrue((low[:, :, 0] > 0.5).all() and (low[:, :, 0] < 19.5).all())
+        self.assertTrue((low[:, :, 1] > 0.5).all() and (low[:, :, 1] < 11.5).all())
+        # The soffit faces down, so it is seen from under the canopy.
+        flat = walls[(np.abs(walls[:, :, 2] - cut) < 1e-6).all(axis=1)]
+        normals = np.cross(flat[:, 1] - flat[:, 0], flat[:, 2] - flat[:, 0])
+        self.assertTrue(len(flat) and (normals[:, 2] < 0).all())
+        u = fit_wall_u(walls, np.zeros(len(walls), dtype=int), np.array([4.0]))
+        self.assertTrue(np.isfinite(u).all())
+
+    def test_a_shed_gets_one_door_facing_the_road(self):
+        from src.buildings import ARCH_OUTBUILDING, BuildingSet
+        from src.doors import LEAF_DEPTH_M, door_meshes
+        from src.osm import OsmData, OsmWay
+
+        shed = self._box_building("shed", 0, 0, 4, 3, 2.5)
+        shed.archetype = ARCH_OUTBUILDING
+        road = OsmWay(1, np.array([[-50.0, -10.0], [50.0, -10.0]]), (1, 2), {"highway": "residential"})
+        meshes = door_meshes(BuildingSet(buildings=[shed]), osm=OsmData(ways=[road]))
+        leaf, frame = meshes["doors"], meshes["door_frames"]
+        self.assertEqual(len(leaf), 10, "one leaf, its back against the wall")
+        self.assertEqual(len(frame), 30)
+        # On the south wall, the one that looks at the road, in its middle.
+        self.assertAlmostEqual(float(leaf[:, :, 1].max()), 0.0, places=9)
+        self.assertAlmostEqual(float(leaf[:, :, 1].min()), -LEAF_DEPTH_M, places=9)
+        self.assertAlmostEqual(float(leaf[:, :, 0].mean()), 2.0, places=6)
+        self.assertAlmostEqual(float(leaf[:, :, 2].max()), 2.0, places=6)
+        normals = np.cross(leaf[:, 1] - leaf[:, 0], leaf[:, 2] - leaf[:, 0])
+        front = (np.abs(leaf[:, :, 1] + LEAF_DEPTH_M) < 1e-9).all(axis=1)
+        self.assertTrue((normals[front, 1] < 0).all(), "the door faces out")
+
+        # A house against the south wall: the door goes on another one.
+        house = self._box_building("house", 0, -8, 4, 0, 8.0)
+        meshes = door_meshes(BuildingSet(buildings=[shed, house]), osm=OsmData(ways=[road]))
+        self.assertGreater(float(meshes["doors"][:, :, 1].min()), 0.0)
+
+    def test_a_barn_door_is_two_leaves_in_a_gable(self):
+        from src.buildings import ARCH_BARN, ARCH_HOUSE, BuildingSet
+        from src.doors import door_meshes
+
+        barn = self._box_building("barn", 0, 0, 30, 12, 4.5)
+        barn.archetype = ARCH_BARN
+        house = self._box_building("house", 50, 0, 60, 10, 6.0)
+        house.archetype = ARCH_HOUSE
+        meshes = door_meshes(BuildingSet(buildings=[barn, house]))
+        leaves = meshes["doors"]
+        self.assertEqual(len(leaves), 20)
+        x = leaves[:, :, 0]
+        self.assertTrue((x <= 1e-9).all() or (x >= 30 - 1e-9).all(), "not in a gable end")
+        self.assertAlmostEqual(float(np.ptp(leaves[:, :, 1])), 3.2, places=6)
+
+    def test_a_cafe_with_seats_outside_gets_a_terrace(self):
+        import shapely
+
+        from src.furniture import KIND_TERRACE, Footprints, terraces
+        from src.osm import OsmData, OsmNode
+
+        footprints = Footprints(polygons=[shapely.box(0, 0, 10, 10)])
+        osm = OsmData(nodes=[
+            OsmNode(1, (5.0, 1.0), {"amenity": "cafe", "outdoor_seating": "yes"}),
+            OsmNode(2, (5.0, 9.0), {"amenity": "restaurant"}),  # seats inside only
+            OsmNode(3, (5.0, 5.0), {"amenity": "bench", "outdoor_seating": "yes"}),
+        ])
+        found = terraces(osm, footprints, BBox(-20, -20, 30, 30))
+        self.assertEqual(len(found), 1)
+        item = found[0]
+        self.assertEqual(item.kind, KIND_TERRACE)
+        self.assertAlmostEqual(item.x, 5.0, places=6)
+        self.assertAlmostEqual(item.y, -2.4, places=6)
+        # The tables run along the front.
+        np.testing.assert_allclose([np.cos(item.spin), np.sin(item.spin)], [1.0, 0.0], atol=1e-9)
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")

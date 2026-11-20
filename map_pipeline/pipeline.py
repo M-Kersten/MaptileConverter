@@ -72,6 +72,7 @@ from src.sources import (  # noqa: E402
 )
 from src.facade import (  # noqa: E402
     CAR_PAINT,
+    GROUND_STYLES,
     LookPlan,
     generate_facade_textures,
     generate_fence_texture,
@@ -106,6 +107,7 @@ from src.structures import (  # noqa: E402
     write_bridge_list,
 )
 from src.waterworks import fetch_waterworks  # noqa: E402
+from src.doors import door_meshes  # noqa: E402
 from src.landmarks import fetch_landmarks, landmark_meshes, save_landmarks  # noqa: E402
 from src.signage import SignSet, build_shop_signs, write_shop_list  # noqa: E402
 from src.surfaces import (  # noqa: E402
@@ -737,6 +739,17 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             fetch_landmarks(config.bbox, cache_dir=work_dir / "_bgt")
             if bool(config.facade.get("landmarks", True)) else None
         )
+        # OpenStreetMap, read once for everything that uses it: what the
+        # buildings are and what their ground floors are, and later the road
+        # paint, the furniture and the shop names. A failed read is empty.
+        street_osm = None
+        if any((
+            bool(config.facade.get("landmarks", True)),
+            bool(config.facade.get("shop_signs", True)),
+            want_traffic,
+            want_furniture and bool(config.furniture.get("osm", True)),
+        )):
+            street_osm = fetch_osm(config.bbox.buffered(30.0), cache_dir=work_dir / "_bgt")
         buildings = build_buildings(
             config.bbox,
             work_dir,
@@ -753,13 +766,15 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             # Churches, towers and rijksmonumenten, from TOP10NL and the
             # monument register; a failure costs only the improvement.
             landmarks=landmarks,
+            osm=street_osm if bool(config.facade.get("landmarks", True)) else None,
         )
-        # Sails on the windmills the register names, and the wind turbines.
+        # Sails on the windmills the register names, and the wind turbines;
+        # a door in the closed walls of every shed, barn and kiosk.
         landmark_file = None
-        if landmarks:
-            shapes = landmark_meshes(buildings, landmarks, terrain)
-            if shapes:
-                landmark_file = save_landmarks(shapes, work_dir / "landmarks.npz")
+        shapes = landmark_meshes(buildings, landmarks, terrain)
+        shapes.update(door_meshes(buildings, osm=street_osm, terrain=terrain))
+        if shapes:
+            landmark_file = save_landmarks(shapes, work_dir / "landmarks.npz")
 
     ground_layers = None
     harbour = HarbourSet()
@@ -963,6 +978,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     max_retries=int(config.surfaces["max_retries"]),
                     cache_dir=work_dir / "_bgt",
                 ),
+                osm=street_osm,
             )
             if len(traffic):
                 traffic_texture = generate_traffic_texture(work_dir)
@@ -974,7 +990,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         with Stage("street furniture (BGT, NDW, OSM)", next_step(), total):
             cache_dir = work_dir / "_bgt"
             # The traffic stage's reads when it ran; cached reads otherwise.
-            osm = traffic.osm
+            osm = traffic.osm if traffic.osm is not None else street_osm
             if osm is None and bool(config.furniture.get("osm", True)):
                 osm = fetch_osm(config.bbox.buffered(30.0), cache_dir=cache_dir)
             roads = traffic.roads
@@ -1123,12 +1139,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             work_dir, facade_cfg=facade_cfg, plan=plan
         )
         ground_variants = (
-            (2 if len(usage) else 1) if config.facade["ground_floor"] else 0
+            (len(GROUND_STYLES) if len(usage) else 1) if config.facade["ground_floor"] else 0
         )
         # A name board over every shop OpenStreetMap names, on its facade.
         shop_signs = SignSet([])
         if bool(config.facade.get("shop_signs", True)):
-            osm = traffic.osm
+            osm = traffic.osm if traffic.osm is not None else street_osm
             if osm is None:
                 osm = fetch_osm(config.bbox.buffered(30.0), cache_dir=work_dir / "_bgt")
             shop_signs = build_shop_signs(
@@ -1231,7 +1247,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
         write_attribution(
             out_dir,
-            osm=traffic.used_osm or bool(furniture.sources.get("osm")) or bool(len(shop_signs)),
+            # The buildings' kinds and ground floors read OpenStreetMap too.
+            osm=traffic.used_osm or bool(furniture.sources.get("osm")) or bool(len(shop_signs))
+            or bool(
+                (getattr(buildings, "landmark_stats", {}) or {}).get("from_osm")
+                or (getattr(buildings, "landmark_stats", {}) or {}).get("ground_floors")
+            ),
             signs=bool(traffic.signs),
             chargers=bool(furniture.sources.get("ndw")),
             extra=tuple(

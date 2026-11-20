@@ -47,7 +47,23 @@ WALL_TEXTURES: dict[str, str] = {
     "industrial": "concrete_block_wall",
     "ground_home": "large_red_bricks",
     "ground_retail": "concrete_wall_007",
+    "church": "medieval_red_brick",
+    "mosque": "painted_plaster_wall",
+    "school": "brick_wall_006",
+    "hall": "concrete_wall_007",
+    "parking": "concrete_wall_008",
+    "closed": "large_red_bricks",
+    "technical": "concrete_wall_008",
+    "garages": "brick_wall_10",
+    "ground_horeca": "brick_wall_10",
+    "ground_lobby": "concrete_wall_007",
+    "ground_closed": "concrete_block_wall",
+    "ground_doors": "large_red_bricks",
 }
+
+# Styles drawn on purpose rather than for want of a photograph: boarding and
+# glass, which no brick photograph describes.
+DRAWN_STYLES = frozenset({"barn", "outbuilding", "glasshouse"})
 
 # 1k is more than enough under a 512 px tile, and keeps the download to about a
 # megabyte per style rather than fifty.
@@ -246,6 +262,8 @@ def load_wall_bases(
     missed: list[str] = []
 
     for index, style in enumerate(styles):
+        if getattr(style, "family", style.name) in DRAWN_STYLES:
+            continue
         try:
             bases[index] = wall_base(
                 style,
