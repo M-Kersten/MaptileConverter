@@ -1858,7 +1858,8 @@ went wrong without it:
   it does not replace it, because a roof *edge* is as rough as any crown.
 - **One seed per crown.** Every cell of a crown clears the height threshold, so
   the peaks are found first and each tree then reserves its own crown. Registered
-  trees reserve theirs before any seed is taken — with a token three-metre
+  trees reserve theirs before any seed is taken, every one of them, even
+  where two surveyed trees stand inside each other's crowns — with a token three-metre
   reservation instead, a quarter of the detections landed inside a tree the model
   already had.
 
@@ -1888,6 +1889,34 @@ runs about 1% of that window; a trailer, container or van roof 20 to 60%.
 `trees.detect_flat_top_on` names the surfaces (`paved` by default), and
 `detect_flat_top_share`, `detect_flat_top_tolerance_m` and
 `detect_flat_top_window_m` set the test.
+
+**Every found peak has to be a crown of its own.** Measured over the disk the
+tree would be drawn with, three more checks, each aimed at what was still
+getting through over Utrecht centre and the north of Arnhem:
+
+- **Fill.** At least 15% of the disk stands above the detection floor. A lamp
+  post, a catenary mast or a flagpole is tall and rough but one or two cells
+  across, and along a railway every mast was a tree.
+- **Texture.** At least 40% of the crown is speckled: more than 30 cm off the
+  median of its 3 x 3 neighbourhood. Lidar falls into leaves to a different
+  depth on each return and bounces off a roof at the same one, so this is what
+  catches the roofs 3DBAG does not have: station platform canopies, the glass
+  domes of a shopping centre, a deck. Registered trees run 0.77 at the median;
+  a quarter of the found peaks ran under 0.37, nearly all of them roofs. Roof
+  cells inside the disk are left out of both measures, because the step off a
+  gutter is as speckled as any leaf.
+- **Shoulder.** Nothing within 1.5 m stands more than 1 m above the peak.
+  Where a crown's top is refused (it hangs over the road, it is too close to
+  the eaves) or already taken by a registered tree, the highest cell left is
+  on its flank, and drawing it gave that crown a second tree at its edge.
+  Cells above the height cap and roof cells do not count, so a beech that
+  tops the cap does not hold off the tree beside it.
+
+Over the Utrecht square these take the found trees from 3347 to 1932, over
+the Arnhem one from 6621 to 4981. They also cost some real trees in dense
+woodland, where one crown's flank rises into the next. `detect_min_crown_fill`,
+`detect_min_crown_texture`, `detect_shoulder_m` and `detect_shoulder_rise_m`
+set them, and 0 turns each one off.
 
 **Detected trees arrive under their own parent.** The model gets
 `Trees_registered` and `Trees_detected`, each holding one object per tree

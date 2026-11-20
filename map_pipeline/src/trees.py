@@ -416,6 +416,10 @@ def detect_trees(
     eaves_clearance_m: float = 2.0,
     clearance_per_metre: float = 0.15,
     min_spacing_m: float = 3.0,
+    min_crown_fill: float = 0.0,
+    min_crown_texture: float = 0.0,
+    shoulder_m: float = 0.0,
+    shoulder_rise_m: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Find tree crowns the BGT never registered. Returns `(xy, heights)`.
 
@@ -507,6 +511,33 @@ def detect_trees(
         if not len(seed_rows):
             return np.zeros((0, 2)), np.zeros(0)
 
+    if min_crown_fill > 0 or min_crown_texture > 0 or shoulder_m > 0:
+        # Also on the seeds, before the spacing pass, so a mast refused here
+        # does not hold off the real crown beside it.
+        keep, reasons = _crown_checks(
+            ndsm, seed_rows, seed_cols,
+            cell=cell,
+            building_mask=building_mask,
+            min_height_m=min_height_m,
+            max_height_m=max_height_m,
+            crown_radius_ratio=crown_radius_ratio,
+            min_fill=min_crown_fill,
+            min_texture=min_crown_texture,
+            shoulder_m=shoulder_m,
+            shoulder_rise_m=shoulder_rise_m,
+        )
+        if not keep.all():
+            LOG.info(
+                "dropped %d canopy peaks that are not a crown of their own: "
+                "%d too thin (poles, masts, lamp posts), %d too smooth (roofs, "
+                "domes, canopies), %d on the flank of a higher crown",
+                int((~keep).sum()), reasons["thin"], reasons["smooth"],
+                reasons["shoulder"],
+            )
+        seed_rows, seed_cols = seed_rows[keep], seed_cols[keep]
+        if not len(seed_rows):
+            return np.zeros((0, 2)), np.zeros(0)
+
     heights = ndsm[seed_rows, seed_cols]
     xs = left + (seed_cols + 0.5) * cell_x
     ys = top - (seed_rows + 0.5) * cell_y
@@ -526,15 +557,15 @@ def detect_trees(
     )
     taken: dict = {}
 
-    def claim(x, y, reach, store):
+    def claim(x, y, reach, force=False):
         key = (int(x // grid_size), int(y // grid_size))
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for ox, oy, oreach in taken.get((key[0] + dx, key[1] + dy), ()):
-                    if np.hypot(x - ox, y - oy) < max(reach, oreach):
-                        return False
-        if store:
-            taken.setdefault(key, []).append((x, y, reach))
+        if not force:
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for ox, oy, oreach in taken.get((key[0] + dx, key[1] + dy), ()):
+                        if np.hypot(x - ox, y - oy) < max(reach, oreach):
+                            return False
+        taken.setdefault(key, []).append((x, y, reach))
         return True
 
     # Registered trees are placed first and never displaced: where the BGT has
@@ -552,12 +583,18 @@ def detect_trees(
         reserved = np.maximum(
             np.asarray(registered_reach, dtype=np.float64).ravel(), min_spacing_m
         )
+    #
+    # Forced, every one of them. Two registered trees often stand inside each
+    # other's crowns -- a row planted 2 m apart -- and when the second had to
+    # pass the same test as a found peak it failed, reserved nothing, and left
+    # its spot open: a found tree 0.64 m from a surveyed one at Utrecht, 0.81 m
+    # at Arnhem.
     for (x, y), reach in zip(fixed, reserved):
-        claim(float(x), float(y), float(reach), store=True)
+        claim(float(x), float(y), float(reach), force=True)
 
     keep_x, keep_y, keep_h = [], [], []
     for x, y, height, reach in zip(xs, ys, heights, spacing):
-        if not claim(float(x), float(y), float(reach), store=True):
+        if not claim(float(x), float(y), float(reach)):
             continue
         keep_x.append(float(x))
         keep_y.append(float(y))
@@ -586,6 +623,117 @@ def detect_trees(
         peak_count,
     )
     return xy, found_h
+
+
+# How far a cell has to stand off the median of its 3 x 3 neighbourhood to
+# count as leafy. Lidar falls into a crown to different depths from one return
+# to the next, so a crown is a speckle at half-metre scale; a roof, a dome or a
+# platform canopy is a surface, which only departs from its neighbours at an
+# edge or a skylight.
+CROWN_SPECKLE_M = 0.3
+# The smallest crown the checks measure over, so a young tree still has a few
+# cells of crown to judge.
+CROWN_MIN_RADIUS_M = 1.0
+
+
+def _crown_measures(
+    ndsm, rows, cols, *, cell, building_mask, min_height_m, max_height_m,
+    crown_radius_ratio, shoulder_m,
+):
+    """Fill, texture and shoulder rise of each seed, as three arrays.
+
+    See `_crown_checks` for what each one is and why.
+    """
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    count = len(rows)
+    fill = np.zeros(count)
+    texture = np.zeros(count)
+    rise = np.full(count, -np.inf)
+    n_rows, n_cols = ndsm.shape
+    shoulder_cells = int(np.ceil(shoulder_m / cell)) if shoulder_m > 0 else 0
+
+    for index, (row, col) in enumerate(zip(rows, cols)):
+        height = float(ndsm[row, col])
+        radius = max(crown_radius_ratio * height, CROWN_MIN_RADIUS_M)
+        reach = max(int(np.ceil(radius / cell)), shoulder_cells) + 1
+        r0, r1 = max(0, row - reach), min(n_rows, row + reach + 1)
+        c0, c1 = max(0, col - reach), min(n_cols, col + reach + 1)
+        window = ndsm[r0:r1, c0:c1]
+        yy, xx = np.mgrid[r0:r1, c0:c1]
+        distance = np.hypot(yy - row, xx - col) * cell
+
+        if shoulder_cells:
+            near = distance <= shoulder_m
+            if building_mask is not None:
+                near &= ~building_mask[r0:r1, c0:c1]
+            values = window[near]
+            values = values[np.isfinite(values) & (values <= max_height_m)]
+            if len(values):
+                rise[index] = float(values.max()) - height
+
+        z = np.nan_to_num(window, nan=0.0)
+        disk = distance <= radius
+        leafy = disk & (z > min_height_m)
+        if building_mask is not None:
+            # A roof is not crown, and the step off its edge is as speckled
+            # as any leaf: counted in, it passes a gutter as a tree.
+            roof = building_mask[r0:r1, c0:c1]
+            disk &= ~roof
+            leafy &= ~roof
+        fill[index] = leafy.sum() / max(int(disk.sum()), 1)
+        if leafy.any():
+            padded = np.pad(z, 1, mode="edge")
+            median = np.median(
+                sliding_window_view(padded, (3, 3)).reshape(*z.shape, 9), axis=-1
+            )
+            texture[index] = float(
+                (np.abs(z - median)[leafy] > CROWN_SPECKLE_M).mean()
+            )
+    return fill, texture, rise
+
+
+def _crown_checks(
+    ndsm, rows, cols, *, cell, building_mask, min_height_m, max_height_m,
+    crown_radius_ratio, min_fill, min_texture, shoulder_m, shoulder_rise_m,
+):
+    """Which seeds look like a crown of their own. Returns (keep, reasons).
+
+    Three things a canopy peak has to show, fill and texture measured over the
+    crown the tree would be drawn with (its height times the crown ratio, at
+    least CROWN_MIN_RADIUS_M):
+
+    * Fill. Enough of that disk stands above the detection floor. A lamp
+      post, a catenary mast or a flagpole is one or two cells: rough enough
+      and tall enough, but with nothing around it.
+    * Texture. Enough of the crown is speckled (see CROWN_SPECKLE_M). This is
+      what catches the roofs the building footprints miss -- station
+      canopies, the domes of a shopping centre, a deck -- whose edges pass
+      the roughness test.
+    * Shoulder. No cell within `shoulder_m` stands more than
+      `shoulder_rise_m` above the peak. A peak with something clearly higher
+      right beside it is the flank of a crown whose top was refused or
+      reserved -- by the road under it, the eaves beside it, the registered
+      tree it belongs to -- and drawing it gives that crown a second tree at
+      its edge. Cells above the height cap do not count, so a beech that tops
+      the cap is not held against the tree beside it, and nor do buildings: a
+      tree beside a taller roof is still a tree.
+    """
+    fill, texture, rise = _crown_measures(
+        ndsm, rows, cols, cell=cell, building_mask=building_mask,
+        min_height_m=min_height_m, max_height_m=max_height_m,
+        crown_radius_ratio=crown_radius_ratio, shoulder_m=shoulder_m,
+    )
+    shoulder = (rise > shoulder_rise_m) if shoulder_m > 0 else np.zeros(len(rows), bool)
+    thin = ~shoulder & (fill < min_fill)
+    smooth = ~shoulder & ~thin & (texture < min_texture)
+    keep = ~(shoulder | thin | smooth)
+    reasons = {
+        "thin": int(thin.sum()),
+        "smooth": int(smooth.sum()),
+        "shoulder": int(shoulder.sum()),
+    }
+    return keep, reasons
 
 
 def _not_flat_topped(ndsm, rows, cols, mask, *, share, tolerance_m, half_cells):
@@ -778,6 +926,10 @@ def build_trees(
                 trees_cfg.get("detect_clearance_per_metre", 0.15)
             ),
             min_spacing_m=float(trees_cfg.get("detect_min_spacing_m", 3.0)),
+            min_crown_fill=float(trees_cfg.get("detect_min_crown_fill", 0.15)),
+            min_crown_texture=float(trees_cfg.get("detect_min_crown_texture", 0.4)),
+            shoulder_m=float(trees_cfg.get("detect_shoulder_m", 1.5)),
+            shoulder_rise_m=float(trees_cfg.get("detect_shoulder_rise_m", 1.0)),
         )
         if len(found):
             ground = np.asarray(

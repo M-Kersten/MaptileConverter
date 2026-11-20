@@ -1015,6 +1015,115 @@ class TestTreeDetection(unittest.TestCase):
             "the real crown on the yard went with it",
         )
 
+    CROWN_CHECKS = dict(min_crown_fill=0.15, min_crown_texture=0.4,
+                        shoulder_m=1.5, shoulder_rise_m=1.0)
+
+    def test_a_pole_is_not_a_tree(self):
+        """A lamp post, a catenary mast or a flagpole is tall and rough, and
+        one or two cells across. A crown fills the disk it is drawn with."""
+        from src.trees import detect_trees
+
+        grid = self._put(self._blank(), 30, 70, 9.0, radius=3.0, rough=0.9)
+        grid[118:121, 138:141] = 10.0 + np.array(
+            [[0.0, 0.6, 0.1], [0.4, 1.0, 0.3], [0.2, 0.5, 0.0]]
+        )                                   # RD (70, 40)
+        args = dict(min_height_m=3.0, crown_radius_ratio=0.26, min_roughness_m=0.3)
+        loose, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), **args
+        )
+        kept, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), **args,
+            **self.CROWN_CHECKS,
+        )
+        on_pole = lambda pts: [(x, y) for x, y in pts if np.hypot(x - 70, y - 40) < 2]
+        self.assertTrue(on_pole(loose), "the fixture's pole was never a tree")
+        self.assertEqual(on_pole(kept), [], "a tree still stands on the pole")
+        self.assertTrue(
+            any(np.hypot(x - 30, y - 70) < 2 for x, y in kept),
+            "the real crown went with it",
+        )
+
+    def test_a_roof_the_footprints_miss_is_not_a_tree(self):
+        """A dome or a station canopy that 3DBAG does not have is as tall and,
+        at its edges, as rough as a crown. It is not speckled: lidar falls
+        into leaves to a different depth on every return and bounces off a
+        roof at the same one."""
+        from src.trees import detect_trees
+
+        grid = self._put(self._blank(), 30, 70, 9.0, radius=3.0, rough=0.9)
+        # A smooth dome, 12 m tall and 12 m across, at RD (65, 35).
+        grid = self._put(grid, 65, 35, 12.0, radius=6.0)
+        args = dict(min_height_m=3.0, crown_radius_ratio=0.26, min_roughness_m=0.3)
+        loose, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), **args
+        )
+        kept, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), **args,
+            **self.CROWN_CHECKS,
+        )
+        on_dome = lambda pts: [(x, y) for x, y in pts if np.hypot(x - 65, y - 35) < 6]
+        self.assertTrue(on_dome(loose), "the fixture's dome was never a tree")
+        self.assertEqual(on_dome(kept), [], "a tree still stands on the dome")
+        self.assertTrue(
+            any(np.hypot(x - 30, y - 70) < 2 for x, y in kept),
+            "the real crown went with it",
+        )
+
+    def test_the_flank_of_a_crown_is_not_a_second_tree(self):
+        """Where a crown's top is refused -- here because it hangs over the
+        carriageway -- the highest cell left is on its flank, at the kerb. That
+        is the same tree, not another one beside it."""
+        from src.trees import detect_trees
+
+        grid = self._put(self._blank(), 50, 50, 16.0, radius=6.0, rough=0.6, seed=8)
+        grid = self._put(grid, 25, 80, 9.0, radius=3.0, rough=0.9, seed=9)
+        road = np.zeros(grid.shape, dtype=bool)
+        road[90:120, :] = True              # RD y 40..55, the crown's top
+        args = dict(min_height_m=3.0, crown_radius_ratio=0.26, min_roughness_m=0.3,
+                    road_mask=road)
+        loose, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), **args
+        )
+        kept, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), **args,
+            **self.CROWN_CHECKS,
+        )
+        on_flank = lambda pts: [(x, y) for x, y in pts if np.hypot(x - 50, y - 50) < 7]
+        self.assertTrue(on_flank(loose), "the fixture's crown left no flank")
+        self.assertEqual(on_flank(kept), [], "the crown's flank is still a tree")
+        self.assertTrue(
+            any(np.hypot(x - 25, y - 80) < 2 for x, y in kept),
+            "the crown standing on its own went with it",
+        )
+
+    def test_every_registered_tree_reserves_its_spot(self):
+        """Two surveyed trees inside each other's crowns both stand. When the
+        second had to pass the spacing test like a found peak, it failed,
+        reserved nothing, and a found tree went in 0.64 m from it."""
+        from src.trees import detect_trees
+
+        # Two registered trees 2 m apart, and a crown peaking on the second.
+        grid = self._put(self._blank(), 52, 50, 12.0, radius=3.0, rough=0.9, seed=6)
+        surveyed = np.array([[50.0, 50.0], [52.0, 50.0]])
+        found, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=surveyed,
+            registered_reach=np.array([3.0, 3.0]),
+            min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3,
+        )
+        self.assertEqual(
+            [(x, y) for x, y in found if np.hypot(x - 52, y - 50) < 3.0], [],
+            "a found tree stands on the spot of the second surveyed tree",
+        )
+
+    def test_the_crown_checks_are_on_by_default(self):
+        """The checks are only worth anything if the pipeline asks for them."""
+        from src.config import DEFAULTS
+
+        trees = DEFAULTS["trees"]
+        self.assertGreater(trees["detect_min_crown_fill"], 0)
+        self.assertGreater(trees["detect_min_crown_texture"], 0)
+        self.assertGreater(trees["detect_shoulder_m"], 0)
+
     def test_the_yard_mask_is_read_off_the_land_cover_grid(self):
         """Row 0 of the land-cover grid is the southern edge; row 0 of the
         canopy raster is the northern one."""
