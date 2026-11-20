@@ -465,6 +465,13 @@ HARBOUR_OBJECTS = {
 }
 # Painted steel: the railings along bridges and catwalks.
 RAILING_MATERIAL = ("Staal", (0.2, 0.22, 0.24), 0.4)
+# Lock gates are tarred timber, their balance beams painted white, a weir is
+# steel: no texture says any of that better than the colour does.
+PLAIN_STRUCTURES = {
+    "lock_gate": ("Sluisdeur", (0.07, 0.05, 0.035), 0.8),
+    "lock_beam": ("Balans", (0.82, 0.82, 0.8), 0.6),
+    "weir": ("Stuw", (0.23, 0.25, 0.26), 0.5),
+}
 
 
 def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
@@ -1700,6 +1707,8 @@ def build_buildings(
     )
     years = data["build_year"] if "build_year" in data.files else None
     heights = data["height_m"] if "height_m" in data.files else None
+    landmarks = data["landmark"] if "landmark" in data.files else None
+    monuments = data["monument"] if "monument" in data.files else None
 
     # One object per building, so a building is something you click on, move,
     # delete or swap, and its own GameObject in Unity. The triangles of each
@@ -1744,6 +1753,12 @@ def build_buildings(
             obj["build_year"] = int(years[index])
         if heights is not None:
             obj["height_m"] = round(float(heights[index]), 2)
+        # What the registers call it, and its rijksmonument number: a
+        # postprocessor can swap a named church for a modelled one by this.
+        if landmarks is not None and str(landmarks[index]):
+            obj["landmark"] = str(landmarks[index])
+        if monuments is not None and int(monuments[index]):
+            obj["rijksmonument"] = int(monuments[index])
         objects.append(obj)
 
     log(
@@ -2710,6 +2725,63 @@ def build_traffic(scene: dict, work_dir: Path, material, cutout_material=None) -
     return objects
 
 
+LANDMARK_OBJECTS = {
+    # npz key: object name, plain material
+    "sails": ("WindmillSails", ("Wieken", (0.12, 0.09, 0.07), 0.8)),
+    "turbines": ("WindTurbines", ("Windturbine", (0.86, 0.87, 0.88), 0.4)),
+}
+
+
+def build_landmarks(scene: dict, work_dir: Path) -> list:
+    """Windmill sails and wind turbines, built in RD by `src/landmarks.py`."""
+    landmark_file = scene.get("landmarks", {}).get("file")
+    if not landmark_file or not (work_dir / landmark_file).is_file():
+        return []
+    data = np.load(work_dir / landmark_file)
+    origin_x, origin_y = scene["origin_rd"]
+    shift = np.array([origin_x, origin_y, float(scene["ground_z_offset_nap"])])
+    objects = []
+    for key, (name, plain) in LANDMARK_OBJECTS.items():
+        if key not in data.files or not len(data[key]):
+            continue
+        triangles = np.asarray(data[key], dtype=np.float64) - shift
+        corners, indices = _weld_corners(triangles.reshape(-1, 3))
+        n_triangles = len(triangles)
+        material = bpy.data.materials.get(plain[0]) or make_plain_material(*plain)
+        objects.append(build_mesh_object(
+            name, corners, indices, np.arange(0, n_triangles * 3, 3),
+            np.full(n_triangles, 3), _box_uvs(triangles, 4.0),
+            np.zeros(n_triangles), [material], shade_smooth=False,
+        ))
+        log(f"{name}: {n_triangles} triangles")
+    return objects
+
+
+def build_signage(scene: dict, work_dir: Path, material) -> list:
+    """The name boards over the shops, one object, built in RD by
+    `src/signage.py` and moved to the origin here, like the traffic meshes."""
+    signage_file = scene.get("signage", {}).get("file")
+    if not signage_file or not (work_dir / signage_file).is_file():
+        return []
+    data = np.load(work_dir / signage_file)
+    faces = np.asarray(data["signs_faces"], dtype=np.int64)
+    if not len(faces):
+        return []
+    origin_x, origin_y = scene["origin_rd"]
+    shift = np.array([origin_x, origin_y, float(scene["ground_z_offset_nap"])])
+    vertices = np.asarray(data["signs_vertices"], dtype=np.float64) - shift
+    uv = np.asarray(data["signs_uv"], dtype=np.float64)
+    loops = faces.reshape(-1)
+    n_triangles = len(faces)
+    obj = build_mesh_object(
+        "ShopSigns", vertices, loops, np.arange(0, n_triangles * 3, 3),
+        np.full(n_triangles, 3), uv[loops], np.zeros(n_triangles), [material],
+        shade_smooth=False,
+    )
+    log(f"shop signs: {n_triangles // 12} boards")
+    return [obj]
+
+
 def _hull(cx, cy, cz, length, beam, depth, freeboard, spin):
     """A boat hull: a box with the bow drawn to a point, as (verts, faces).
 
@@ -2994,11 +3066,32 @@ def _rail_quads(triangles, uv):
     return np.asarray(corners), np.asarray(corner_uv), np.asarray(sizes, dtype=np.int64)
 
 
-def build_structures(scene: dict, work_dir: Path, material):
+def _box_uvs(triangles: np.ndarray, scale: float) -> np.ndarray:
+    """Metre UVs projected along each triangle's own main axis, (n*3, 2).
+
+    A deck is mapped from above, a wall from the side it faces. Mapping
+    everything from above, as this used to, smeared a pier's or an arch's
+    walls into vertical streaks: every point straight above another has the
+    same x and y.
+    """
+    edges_a = triangles[:, 1] - triangles[:, 0]
+    edges_b = triangles[:, 2] - triangles[:, 0]
+    normal = np.abs(np.cross(edges_a, edges_b))
+    flat = triangles.reshape(-1, 3)
+    uvs = flat[:, :2].copy()
+    facing_x = np.repeat((normal[:, 0] >= normal[:, 1]) & (normal[:, 0] > normal[:, 2]), 3)
+    facing_y = np.repeat((normal[:, 1] > normal[:, 0]) & (normal[:, 1] > normal[:, 2]), 3)
+    uvs[facing_x] = flat[facing_x][:, [1, 2]]
+    uvs[facing_y] = flat[facing_y][:, [0, 2]]
+    return uvs / float(scale)
+
+
+def build_structures(scene: dict, work_dir: Path, material, masonry_material=None):
     """Bridge decks, the piers under them, and tunnels below the ground.
 
     One object per kind, so a deck can be given a drivable collider and a pier
-    cannot, and so the tunnel is selectable on its own.
+    cannot, and so the tunnel is selectable on its own. The body of a masonry
+    bridge is brick, with its own material.
     """
     structures_file = scene.get("structures", {}).get("file")
     if not structures_file or not (work_dir / structures_file).is_file():
@@ -3039,13 +3132,14 @@ def build_structures(scene: dict, work_dir: Path, material):
         # corner of every face, so after a weld the UVs follow `indices` rather
         # than `corners` -- and the loop indices have to be `indices` too, or
         # they address a buffer that no longer exists at that length.
-        loop_xy = corners[indices][:, :2]
-        uvs = np.column_stack([loop_xy[:, 0] / 6.0, loop_xy[:, 1] / 6.0])
+        brick = label == "masonry" and masonry_material is not None
+        tile = float(scene.get("structures", {}).get("masonry_tile_m", 2.0)) if brick else 6.0
+        uvs = _box_uvs(corners[indices].reshape(-1, 3, 3), tile)
         # A railing is painted steel, not the concrete of the deck it is on.
+        plain = RAILING_MATERIAL if label == "railing" else PLAIN_STRUCTURES.get(label)
         own = (
-            bpy.data.materials.get(RAILING_MATERIAL[0])
-            or make_plain_material(*RAILING_MATERIAL)
-        ) if label == "railing" else material
+            bpy.data.materials.get(plain[0]) or make_plain_material(*plain)
+        ) if plain is not None else (masonry_material if brick else material)
         objects.append(
             build_mesh_object(
                 f"Structures_{label}",
@@ -3458,6 +3552,7 @@ def copy_textures(
         ("furniture", "furniture"),
         ("fence", "barriers"),
         ("traffic", "traffic"),
+        ("signage", "signage"),
         ("vehicle", "vehicles"),
         ("rail", "rails"),
         ("structure", "structures"),
@@ -3465,6 +3560,9 @@ def copy_textures(
         name = scene.get(section, {}).get("texture")
         if name and (work_dir / name).is_file():
             extras[key] = copy(name)
+    masonry = scene.get("structures", {}).get("masonry_texture")
+    if masonry and (work_dir / masonry).is_file():
+        extras["masonry"] = copy(masonry)
     return aerial_dst, facades, extras
 
 
@@ -3619,6 +3717,16 @@ def main() -> int:
                 ),
             )
 
+    with _Layer("Landmarks", "Landmarks"):
+        build_landmarks(scene, work_dir)
+
+    if "signage" in extra_textures:
+        with _Layer("Shop signs", "Shop_Signs"):
+            build_signage(
+                scene, work_dir,
+                make_textured_material("M_shopsigns", extra_textures["signage"], roughness=0.5),
+            )
+
     if "vehicle" in extra_textures:
         # Car paint is the one glossy thing out here.
         with _Layer("Vehicles"):
@@ -3646,6 +3754,9 @@ def main() -> int:
                 make_textured_material(
                     "M_structure", extra_textures["structure"], roughness=0.8
                 ),
+                make_textured_material(
+                    "M_masonry", extra_textures["masonry"], roughness=0.85
+                ) if "masonry" in extra_textures else None,
             )
 
     # After everything visible, because the proxies are built from the same

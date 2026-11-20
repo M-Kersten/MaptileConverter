@@ -574,6 +574,22 @@ class GroundPaint:
     def __len__(self) -> int:
         return len(self._polygons)
 
+    def keep_inside(self, bbox: BBox) -> int:
+        """Drop the pieces whose middle is outside `bbox`, and say how many.
+
+        A painter starts from things inside the area, but a parking bay or a
+        crossing that starts inside can run on past its edge.
+        """
+        keep = [
+            i for i, polygon in enumerate(self._polygons)
+            if bbox.xmin <= polygon[:, 0].mean() <= bbox.xmax
+            and bbox.ymin <= polygon[:, 1].mean() <= bbox.ymax
+        ]
+        dropped = len(self._polygons) - len(keep)
+        self._polygons = [self._polygons[i] for i in keep]
+        self._uv = [self._uv[i] for i in keep]
+        return dropped
+
     def mesh(self, height_at: Callable, lift: float) -> MeshBuilder:
         out = MeshBuilder()
         if not self._polygons:
@@ -1909,12 +1925,14 @@ def build_traffic(
             paint_parking_bays(paint, wegdeel, bbox)
             if bool(traffic_cfg.get("parking_bays", True)) else {}
         )
+        paint.keep_inside(bbox)
         if len(paint):
             result.meshes["markings"] = paint.mesh(
                 height_at, float(traffic_cfg.get("marking_lift_m", 0.03))
             ).arrays()
         symbols = GroundPaint()
         symbol_stats = paint_symbols(symbols, osm, network, road, cycle, bbox)
+        symbols.keep_inside(bbox)
         if len(symbols):
             result.meshes["symbols"] = symbols.mesh(
                 height_at, float(traffic_cfg.get("marking_lift_m", 0.03))
@@ -1929,6 +1947,7 @@ def build_traffic(
     if want_covers:
         paint = GroundPaint()
         result.counts.update(paint_covers(paint, bgt("put"), bbox, roads))
+        paint.keep_inside(bbox)
         if len(paint):
             result.meshes["covers"] = paint.mesh(
                 height_at, float(traffic_cfg.get("cover_lift_m", 0.015))

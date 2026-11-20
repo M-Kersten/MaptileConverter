@@ -27,6 +27,9 @@ output/<area_name>/
 ├── vehicles.json    car and boat positions and headings, same idea
 ├── traffic.json     every traffic sign with its RVV code, the traffic lights
 │                    and the crossings, for prefabs and for traffic logic
+├── waterworks.json  every bridge over water with its clearance, and the locks
+│                    and weirs
+├── shops.json       every shop name board, with what the shop is
 ├── landcover.png    surface class per pixel, registered to the same bbox
 ├── landcover.json   what the class values mean
 ├── facade*.png      generated facade textures, referenced by the FBX
@@ -34,6 +37,8 @@ output/<area_name>/
 ├── water.png        canal water
 ├── furniture.png    materials and colours atlas for street furniture
 ├── traffic.png      traffic sign faces, road paint, symbols and signal lamps
+├── shopsigns.png    the shop names, one cell each
+├── masonry.png      brick for the arches of masonry bridges
 ├── vehicle.png      car paint, hull and timber atlas
 ├── rail.png         ballast with sleepers, and rail steel
 ├── structure.png    concrete for decks, piers and tunnel walls
@@ -463,6 +468,12 @@ Other knobs worth knowing:
 | `traffic.signals` | `true` | Traffic lights on the BGT's signal poles. |
 | `traffic.covers` | `true` | Manhole lids, gully grates and hydrant lids from the BGT. |
 | `traffic.parking_bays` | `true` | White lines between the stalls of every BGT parking bay. |
+| `structures.deck_bodies` | `true` | A body under every bridge deck: brick arches under masonry bridges, a slab under the rest. |
+| `structures.deck_thickness_m` | `0.9` | How deep the slab under a deck is, where nothing measured it. |
+| `structures.water_boards` | `true` | Read the water boards' register for bridge clearances, locks and weirs. |
+| `structures.locks_and_weirs` | `true` | Build lock gates and weirs from that register. |
+| `facade.landmarks` | `true` | Read TOP10NL, the monument register and the wind turbine register. |
+| `facade.shop_signs` | `true` | A name board over every shop OpenStreetMap names. |
 | `traffic.marking_lift_m` | `0.03` | How far paint lies above the road. Raise it if markings flicker at long range in your renderer. |
 | `export.collision` | `false` | Add invisible `Collision_*` shapes for physics. See [Collision shapes](#collision-shapes). |
 | `export.collision_tree_crowns` | `true` | Whether a tree's collider includes its canopy. `false` leaves the trunk alone, at a quarter of the triangles. |
@@ -512,6 +523,10 @@ src/roads.py       road ladders: stations, cross-sections, kerbs, objects
 src/furniture.py   BGT lampposts, bollards, signs and benches
 src/osm.py         OpenStreetMap highways and tagged nodes, via the main API
 src/traffic.py     NDW signs, traffic lights, road paint, manholes and gullies
+src/ogcapi.py      paging an OGC API collection over an RD bbox
+src/waterworks.py  the water boards' bridges, locks and weirs, and their geometry
+src/landmarks.py   TOP10NL types, rijksmonumenten, windmill sails, wind turbines
+src/signage.py     shop name boards on the facades
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
 src/structures.py  bridge decks and piers, and tunnels below ground
@@ -594,7 +609,10 @@ outliner and an empty that everything in it hangs from:
 | `Water` | water surfaces and beds |
 | `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
 | `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named |
-| `Traffic` | `TrafficSigns`, `TrafficLights`, `RoadMarkings` and `StreetCovers`, one material between them |
+| `Traffic` | `TrafficSigns`, `TrafficLights`, `RoadMarkings`, `RoadSymbols` and `StreetCovers` |
+| `Shop signs` | `ShopSigns`, the name boards over the shops |
+| `Landmarks` | `WindmillSails` and `WindTurbines` |
+| `Structures` | decks, piers, `masonry` (arches), `slab`, railings, `lock_gate`, `lock_beam`, `weir` |
 | `Collision` | the physics proxies, hidden; see [Collision shapes](#collision-shapes) |
 
 **Trees are instances.** Ten thousand trees share twelve meshes: three kinds,
@@ -1708,6 +1726,60 @@ this pipeline that is drawn rather than measured, and `metadata.json` says so.
 Tunnels get side walls but no ceiling, deliberately: a roofed tunnel is
 invisible in the model it was just added to.
 
+### What is under a deck
+
+A deck used to be a sheet: its road surface and nothing under it, so from a
+boat every bridge was a plank at street level. Every deck now has a body. Its
+sides run down from the deck's edge and its underside closes it.
+
+**The water boards know the room under a bridge.** Every water board keeps a
+register of the structures in its water, published together through PDOK as
+IMWA. Over the Utrecht centre square kilometre all fourteen bridges are in it,
+with the height of the underside in NAP, the clear width of the opening, the
+length along the water and the material, and every one is masonry. Each IMWA
+bridge point lands on a BGT deck, so the two are matched by position.
+
+| Deck | Underside | Body |
+|---|---|---|
+| over water, masonry in the register | the register's height at the crown | brick, a segmental arch across the water |
+| over water, other material or not registered | the register's height, or the deck less `deck_thickness_m` (0.9) | concrete slab |
+| over land | the deck less `deck_thickness_m` | concrete slab |
+
+**Which way is across** comes from the water, not the register: the shortest
+line through the deck's wet middle is square to the banks, and that is the way
+an arch spans. IMWA's own `richting` is the bridge's axis on some bridges and
+the waterway's on others. The arch springs just above the water level the
+surface stage measured and rises to the register's underside height.
+
+**A pier in the water splits the arch.** The register types the Oudegracht
+bridges as spanning "via intermediate supports", and the BGT draws the pier.
+Where a BGT pier stands in the water under an arched bridge, each stretch
+between the banks and the piers gets an arch of its own, and the pier is brick
+too. Taller than half its width, an opening is a half ellipse instead.
+
+**`waterworks.json`** lists every bridge over water with its underside, the
+water level, the clearance between them, the span and where the numbers came
+from (`source`: "water board" or "estimated"), and the locks and weirs below.
+It is what a boat simulation needs, and the mesh cannot tell it: over the
+Oudegracht the four bridges clear the water by 4.2 to 4.5 m.
+
+### Locks and weirs
+
+The register places every lock and weir as a point. A lock's chamber is found
+in the water itself: walking along the channel from the point, the lock is
+where the water narrows to the register's width (or, without one, the
+narrowest stretch near the point). A narrow stretch longer than 12 m is the
+chamber, with a pair of mitre gates at each end; shorter ones are the heads,
+with a pair in each. The gates point at the higher water where the levels
+either side differ, and each leaf carries a white balance beam reaching five
+metres past its heel over the quay. Over the Weerdsluis that is two pairs of
+gates 13 m apart across an 8 m chamber.
+
+A weir is a plate across its ditch at the register's crest height, where that
+is within two metres of the water, with a frame over it for the kinds that are
+wound up and down. There are 211 in the 10 by 10 km round Utrecht and none in
+its centre.
+
 ## Railways
 
 BGT `spoor`, and the first linear dataset here. Everything else arrives as
@@ -1791,6 +1863,47 @@ car has nothing to cut and one parked out over the void is simply wrong.
 Four checks cover the part that could silently go wrong: that boats are inside a
 water polygon, that their heights match a real water level, that cars are on
 ground, and that nothing landed outside the area.
+
+## What the registers say a building is
+
+3DBAG gives every building its shape and the BAG its use; neither says that
+one of them is a church. Two registers do, and both are read before the facades
+are chosen (`src/landmarks.py`):
+
+- **TOP10NL** types its buildings: church, chapel, tower, bell tower, water
+  tower, car park, station, town hall. Its polygons are generalised, and a
+  church in a terrace is often one polygon with the block ("huizenblok|kerk"),
+  so a type only passes to a building that is most of its polygon.
+- **The national monument register** places every rijksmonument with its
+  category. A monument point inside a footprint is exact where TOP10NL is not:
+  162 of the 179 along the Oudegracht stretch land on a building.
+
+A church gets the monumental wall whatever its storey count or BAG function,
+and so does a religious monument; an old tower, station or town hall too. A
+car park gets the industrial wall. Every rijksmonument carries its number
+into the model as the custom property `rijksmonument`, next to `bag_id`, and a
+named landmark its name as `landmark`, so a postprocessor can swap the Domtoren
+for a modelled one by name. A monument the BAG gives no year gets a historic
+wall.
+
+**Windmills and wind turbines** are drawn from the registers too. A
+rijksmonument in the category "Industrie- en poldermolen" gets four sails on
+its cap, facing the prevailing south-westerly, sized to the body 3DBAG has. Every
+wind turbine in RIVM's register gets a tower to its registered hub height and a
+three-bladed rotor of its registered diameter. They are in the `Landmarks`
+collection, as `WindmillSails` and `WindTurbines`.
+
+## Shop names
+
+The shopfront ground storey is the same shopfront everywhere. What tells one
+shopping street from the next is the names over the windows. OpenStreetMap
+has them: 745 named shops, cafes and restaurants over the Utrecht square
+kilometre. Each becomes a board over its window on the nearest facade whose
+outside is the street, not the next house: the nearest wall to a point in a
+terrace is as often the party wall as the front. Boards on one facade are kept
+apart, and the name is drawn into `shopsigns.png`, one cell per name, in a
+colour picked from the name, so a chain wears the same board everywhere.
+`shops.json` lists every board with its name, kind and position.
 
 ## Building function
 
@@ -2406,6 +2519,13 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
 - **Traffic signs** — NDW (Nationaal Dataportaal Wegverkeer) traffic sign
   register (CC0)
 - **Public charging points** — NDW charging point register (CC0)
+- **Bridge clearances, locks and weirs** — the water boards' register (IMWA),
+  Het Waterschapshuis via PDOK (CC BY-SA 4.0); `waterworks.json` is shared
+  under the same licence
+- **Building types** — BRT TOP10NL, Kadaster via PDOK (CC BY 4.0)
+- **Rijksmonumenten** — national monument register, Rijksdienst voor het
+  Cultureel Erfgoed
+- **Wind turbines** — RIVM Atlas Leefomgeving
 - **Lane counts, crossings, speed humps, signalled junctions, bicycle parking
   and street furniture the BGT lacks** —
   © OpenStreetMap contributors (ODbL). Credited in `ATTRIBUTION.txt` only when

@@ -76,6 +76,7 @@ from src.facade import (  # noqa: E402
     generate_facade_textures,
     generate_fence_texture,
     generate_furniture_texture,
+    generate_masonry_texture,
     generate_rail_texture,
     generate_structure_texture,
     generate_tree_texture,
@@ -97,11 +98,16 @@ from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
 from src.rails import RailSet, build_rails, save_rails  # noqa: E402
 from src.structures import KIND_NAMES as STRUCTURE_KIND_NAMES  # noqa: E402
 from src.structures import (  # noqa: E402
+    KIND_MASONRY,
     StructureSet,
     build_structures,
     deck_surface,
     save_structures,
+    write_bridge_list,
 )
+from src.waterworks import fetch_waterworks  # noqa: E402
+from src.landmarks import fetch_landmarks, landmark_meshes, save_landmarks  # noqa: E402
+from src.signage import SignSet, build_shop_signs, write_shop_list  # noqa: E402
 from src.surfaces import (  # noqa: E402
     CLASS_NAMES,
     SurfaceSet,
@@ -727,6 +733,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             usage = fetch_usage(config.bbox, usage_cfg=config.usage)
 
     with Stage("buildings (3DBAG LoD2.2)", next_step(), total):
+        landmarks = (
+            fetch_landmarks(config.bbox, cache_dir=work_dir / "_bgt")
+            if bool(config.facade.get("landmarks", True)) else None
+        )
         buildings = build_buildings(
             config.bbox,
             work_dir,
@@ -740,7 +750,16 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             ),
             usage=usage if len(usage) else None,
             facade_cfg=config.facade,
+            # Churches, towers and rijksmonumenten, from TOP10NL and the
+            # monument register; a failure costs only the improvement.
+            landmarks=landmarks,
         )
+        # Sails on the windmills the register names, and the wind turbines.
+        landmark_file = None
+        if landmarks:
+            shapes = landmark_meshes(buildings, landmarks, terrain)
+            if shapes:
+                landmark_file = save_landmarks(shapes, work_dir / "landmarks.npz")
 
     ground_layers = None
     harbour = HarbourSet()
@@ -1052,6 +1071,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     structures = StructureSet()
     structure_texture = None
+    masonry_texture = None
     if want_structures:
         with Stage("bridges and tunnels (BGT)", next_step(), total):
             # A bridge deck is a hard surface the surface model sees, so its
@@ -1065,11 +1085,16 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 timeout=float(config.terrain["timeout_s"]),
                 max_retries=int(config.terrain["max_retries"]),
             )
+            waterworks = (
+                fetch_waterworks(config.bbox, cache_dir=work_dir / "_bgt")
+                if bool(config.structures.get("water_boards", True)) else None
+            )
             structures = build_structures(
                 config.bbox,
                 work_dir,
                 structures_cfg=config.structures,
                 terrain=terrain,
+                waterworks=waterworks,
                 dsm_sampler=raster_sampler(dsm_path) if dsm_path else None,
                 # The layered style cuts canal beds below the water; a pier
                 # stands on the bed, not on the surveyed ground above it.
@@ -1080,6 +1105,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             if len(structures.tris):
                 save_structures(structures, work_dir / "structures.npz")
                 structure_texture = generate_structure_texture(work_dir)
+                if structures.count_of_tris(KIND_MASONRY):
+                    masonry_texture = generate_masonry_texture(work_dir)
+            if structures.bridges or structures.locks or structures.weirs:
+                write_bridge_list(structures, config.geo, out_dir)
 
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
@@ -1096,6 +1125,18 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         ground_variants = (
             (2 if len(usage) else 1) if config.facade["ground_floor"] else 0
         )
+        # A name board over every shop OpenStreetMap names, on its facade.
+        shop_signs = SignSet([])
+        if bool(config.facade.get("shop_signs", True)):
+            osm = traffic.osm
+            if osm is None:
+                osm = fetch_osm(config.bbox.buffered(30.0), cache_dir=work_dir / "_bgt")
+            shop_signs = build_shop_signs(
+                config.bbox, work_dir, osm=osm, buildings=buildings,
+                ground_at=terrain.surface,
+            )
+            if len(shop_signs):
+                write_shop_list(shop_signs, config.geo, out_dir)
 
     with Stage("scene description", next_step(), total):
         write_scene_description(
@@ -1112,6 +1153,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             water_texture=water_texture,
             furniture_texture=furniture_texture,
             traffic_texture=traffic_texture,
+            signage_texture=shop_signs.texture,
+            landmark_file=landmark_file,
             surfaces_cfg=config.surfaces,
             surface_class_names={
                 int(k): v for k, v in CLASS_NAMES.items()
@@ -1126,6 +1169,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             rail_texture=rail_texture,
             rail_kind_names={str(k): v for k, v in RAIL_KIND_NAMES.items()},
             structure_texture=structure_texture,
+            masonry_texture=masonry_texture,
             structure_kind_names={
                 str(k): v for k, v in STRUCTURE_KIND_NAMES.items()
             },
@@ -1157,6 +1201,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             extra={
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
+                "shop_signs": shop_signs.stats(),
+                "landmarks": dict(getattr(buildings, "landmark_stats", {}) or {}),
                 "traffic": traffic.stats(),
                 "barriers": barriers.stats(),
                 "vehicles": vehicles.stats(),
@@ -1185,9 +1231,19 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
         write_attribution(
             out_dir,
-            osm=traffic.used_osm or bool(furniture.sources.get("osm")),
+            osm=traffic.used_osm or bool(furniture.sources.get("osm")) or bool(len(shop_signs)),
             signs=bool(traffic.signs),
             chargers=bool(furniture.sources.get("ndw")),
+            extra=tuple(
+                key for key, used in (
+                    ("waterworks", bool(structures.bridges and any(
+                        b.get("source") == "water board" for b in structures.bridges
+                    )) or bool(structures.locks or structures.weirs)),
+                    ("top10nl", bool((getattr(buildings, "landmark_stats", {}) or {}).get("typed"))),
+                    ("monuments", bool((getattr(buildings, "landmark_stats", {}) or {}).get("monuments"))),
+                    ("turbines", bool(landmarks and landmarks.turbines)),
+                ) if used
+            ),
         )
 
         report = CheckReport()

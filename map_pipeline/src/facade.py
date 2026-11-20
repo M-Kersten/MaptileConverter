@@ -985,6 +985,56 @@ def generate_structure_texture(
     return path
 
 
+def generate_masonry_texture(
+    work_dir: Path, size_px: int = 512, seed: int = 91, tile_m: float = 2.0
+) -> Path:
+    """Brick in running bond, for the arches and walls of masonry bridges.
+
+    One tile is `tile_m` square. A Dutch waal brick is about 21 by 5 cm and a
+    course with its joint 6.25 cm, so a two-metre tile holds 32 courses and
+    nine and a half bricks across each.
+    """
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    px_per_m = size_px / tile_m
+    course = 0.0625 * px_per_m
+    brick = 0.22 * px_per_m
+    joint = max(1.0, 0.01 * px_per_m)
+    rows = np.arange(size_px)
+    cols = np.arange(size_px)
+    course_index = (rows // course).astype(int)
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+
+    palette = np.array([
+        (138, 66, 48), (150, 74, 54), (124, 60, 46), (160, 86, 62), (112, 58, 48),
+    ], dtype=np.float64)
+    courses = int(np.ceil(size_px / course)) + 1
+    per_course = int(np.ceil(size_px / brick)) + 2
+    colours = palette[rng.integers(0, len(palette), size=(courses, per_course))]
+    colours *= rng.uniform(0.9, 1.08, size=(courses, per_course, 1))
+
+    for r in range(courses):
+        y0, y1 = int(r * course), int(min(size_px, (r + 1) * course))
+        if y0 >= size_px:
+            break
+        # Half a brick along on every other course: running bond.
+        shift = (brick / 2.0) if r % 2 else 0.0
+        index = ((cols + shift) // brick).astype(int)
+        canvas[y0:y1] = colours[r, index][None, :, :]
+        in_joint = ((cols + shift) % brick) < joint
+        canvas[y0:y1, in_joint] = (186, 180, 168)
+        canvas[y0:min(size_px, y0 + int(np.ceil(joint)))] = (186, 180, 168)
+
+    grain = _value_noise((size_px, size_px), cells=max(8, size_px // 16), rng=rng)
+    canvas *= 1.0 + 0.10 * (grain - 0.5)[:, :, None] * 2.0
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "masonry.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB").save(path)
+    LOG.info("wrote %s (running bond brick, %.0f m tile, %dpx)", path.name, tile_m, size_px)
+    return path
+
+
 def generate_rail_texture(
     work_dir: Path, size_px: int = 256, seed: int = 63
 ) -> Path:
@@ -1193,6 +1243,7 @@ __all__ = [
     "furniture_uv",
     "generate_fence_texture",
     "generate_furniture_texture",
+    "generate_masonry_texture",
     "generate_rail_texture",
     "generate_structure_texture",
     "generate_vehicle_texture",

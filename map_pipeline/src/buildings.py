@@ -70,6 +70,14 @@ class Building:
     storeys_known: bool = True
     footprint_m2: float = 0.0
     archetype: int = 0
+    # What TOP10NL or the monument register says the building is: "kerk",
+    # "toren", "parkeerdak, parkeerdek, parkeergarage". Empty for most.
+    landmark: str = ""
+    landmark_name: str = ""
+    # The rijksmonument number, when the building is one.
+    monument: int | None = None
+    monument_category: str = ""
+    monument_subcategory: str = ""
     # Filled in when the ground storey is split off; carries its own material.
     ground_wall_tris: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float64)
@@ -117,6 +125,8 @@ class BuildingSet:
     # model built during an outage can differ from one built the week before.
     source: str = "api"
     source_version: str = ""
+    # How many buildings TOP10NL typed and how many rijksmonumenten were placed.
+    landmark_stats: dict = field(default_factory=dict)
     # Looks allocated to each era, filled in once the buildings are known.
     # The facade stage has to generate exactly these textures, in this order,
     # or a building wears the wrong wall. See facade.LookPlan.
@@ -763,6 +773,22 @@ def classify_archetype(building: Building) -> int:
     footprint = building.footprint_m2
     function = building.function
 
+    # What the registers say outranks every guess below: a church that is
+    # low, has a storey count and is registered as a meeting place is still
+    # a church. See src/landmarks.py.
+    from .landmarks import SHEDS, TOWERS, WORSHIP
+
+    landmark = getattr(building, "landmark", "")
+    old = not building.build_year or building.build_year < 1940
+    if landmark in WORSHIP:
+        return ARCH_MONUMENTAL
+    if landmark in TOWERS and old:
+        return ARCH_MONUMENTAL
+    if landmark in ("stationsgebouw", "gemeentehuis") and old and height >= 10.0:
+        return ARCH_MONUMENTAL
+    if landmark in SHEDS and landmark != "kas, warenhuis":
+        return ARCH_INDUSTRIAL
+
     # No recorded storeys and real height means a building a storey grid does
     # not describe: a tower, spire, church or hall. That catches modern
     # high-rises too, though, since they often carry no storey count either, so
@@ -1156,6 +1182,15 @@ def save_buildings(
             [b.wall_height_m for b in buildings.buildings], dtype=np.float64
         ),
         floors=np.array([b.floors for b in buildings.buildings], dtype=np.int32),
+        # What the registers call it, and its rijksmonument number (0: none),
+        # for the Blender stage to carry onto the building's object.
+        landmark=np.array(
+            [getattr(b, "landmark_name", "") or getattr(b, "landmark", "")
+             for b in buildings.buildings], dtype="U64",
+        ),
+        monument=np.array(
+            [getattr(b, "monument", None) or 0 for b in buildings.buildings], dtype=np.int64
+        ),
         lod=np.array(buildings.lod),
     )
     LOG.info("wrote %s (%d buildings)", path, len(buildings))
@@ -1221,8 +1256,13 @@ def build_buildings(
     ground_floor_height_m: float | None = None,
     usage=None,
     facade_cfg: dict | None = None,
+    landmarks=None,
 ) -> BuildingSet:
-    """Fetch, clean, ground, and cache the buildings for `bbox`."""
+    """Fetch, clean, ground, and cache the buildings for `bbox`.
+
+    `landmarks` (`landmarks.fetch_landmarks`) marks the churches, towers and
+    rijksmonumenten before the facades are chosen.
+    """
     result = fetch_buildings(
         bbox, buildings_cfg=buildings_cfg, work_dir=work_dir
     )
@@ -1263,6 +1303,11 @@ def build_buildings(
         LOG.info(
             "matched BAG function to %d of %d buildings", matched, len(result.buildings)
         )
+
+    if landmarks:
+        from .landmarks import apply_landmarks
+
+        result.landmark_stats = apply_landmarks(result, landmarks)
 
     # Archetypes are needed before the split, because they decide which
     # buildings get one at all.

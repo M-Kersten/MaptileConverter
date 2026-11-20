@@ -164,6 +164,12 @@ DEFAULTS: dict[str, Any] = {
         "clip_mode": "centroid",
     },
     "facade": {
+        # Churches, towers and rijksmonumenten from TOP10NL and the monument
+        # register, so a church gets a church's wall whatever its storeys.
+        "landmarks": True,
+        # A name board over every shop and cafe OpenStreetMap names, on the
+        # facade nearest it.
+        "shop_signs": True,
         # One storey per texture tile vertically, so windows line up per floor
         # whatever the building height.
         "floor_height_m": 3.0,
@@ -434,6 +440,13 @@ DEFAULTS: dict[str, Any] = {
         # A deck floats this far over its measured height, so it does not fight
         # the road riding on it for the same depth.
         "deck_lift_m": 0.05,
+        # A body under every deck: brick round an arch where the water board
+        # registers a masonry bridge, a slab this thick everywhere else. Off,
+        # a deck is a sheet with nothing under it.
+        "deck_bodies": True,
+        "deck_thickness_m": 0.9,
+        # The water boards' register of bridges, locks and weirs.
+        "water_boards": True,
         # Used only when the surface model has no reading over a deck, which is
         # rare. A Dutch road bridge clears what it crosses by about this much.
         "fallback_clearance_m": 5.0,

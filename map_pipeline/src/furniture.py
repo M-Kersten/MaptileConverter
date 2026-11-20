@@ -312,6 +312,58 @@ class Footprints:
         point = shapely.Point(float(xy[0]), float(xy[1]))
         return bool(len(self.tree.query(point, predicate="within")))
 
+    def facade(self, xy, reach: float) -> tuple[np.ndarray, np.ndarray] | None:
+        """The nearest point on a facade within `reach`, and the direction out
+        of the building there."""
+        found = self.wall(xy, reach)
+        if found is None:
+            return None
+        distance, outward = found
+        xy = np.asarray(xy, dtype=np.float64)
+        inside = self.inside(xy)
+        point = xy + outward * distance if inside else xy - outward * distance
+        return point, outward
+
+    def street_facade(self, xy, reach: float, clear: float = 1.5):
+        """The nearest point on a facade within `reach` whose outside is not
+        another building, and the direction out there.
+
+        The nearest wall to a point inside a terraced house is as often the
+        party wall as the front; this walks the outline for the nearest
+        stretch that faces the street.
+        """
+        import shapely
+
+        found = self.facade(xy, reach)
+        if found is None:
+            return None
+        point, outward = found
+        if not self.inside(point + outward * clear):
+            return point, outward
+        here = shapely.Point(float(xy[0]), float(xy[1]))
+        best = None
+        for index in self.tree.query(here.buffer(reach)):
+            shape = self.shapes[int(index)]
+            for polygon in shapely.get_parts(shape):
+                if polygon.geom_type != "Polygon":
+                    continue
+                polygon = shapely.orient_polygons(polygon) if hasattr(shapely, "orient_polygons") else polygon
+                ring = shapely.get_coordinates(shapely.segmentize(polygon.exterior, 0.5))[:, :2]
+                for a, b in zip(ring[:-1], ring[1:]):
+                    edge = b - a
+                    length = float(np.linalg.norm(edge))
+                    if length < 1e-6:
+                        continue
+                    middle = (a + b) / 2.0
+                    distance = float(np.linalg.norm(middle - np.asarray(xy, dtype=np.float64)))
+                    if distance > reach or (best is not None and distance >= best[0]):
+                        continue
+                    # Counter-clockwise: the outside is on the right.
+                    out = np.array([edge[1], -edge[0]]) / length
+                    if not self.inside(middle + out * clear):
+                        best = (distance, middle, out)
+        return None if best is None else (best[1], best[2])
+
     def wall(self, xy, reach: float) -> tuple[float, np.ndarray] | None:
         """Distance to the nearest facade within `reach`, and the direction
         out of the building through it."""

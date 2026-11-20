@@ -13098,6 +13098,414 @@ class TestRoadPaint(unittest.TestCase):
         self.assertEqual(size, ATLAS_GRID * 128)
 
 
+class TestWaterBridges(unittest.TestCase):
+    """Bridge bodies, arches and the water boards' register, from fixtures."""
+
+    class _Terrain:
+        def __init__(self, z=2.0):
+            self.z = z
+
+        def sample(self, x, y):
+            return np.full(np.broadcast(np.asarray(x), np.asarray(y)).shape, self.z)
+
+    @staticmethod
+    def _canal(width=10.0, level=0.6):
+        """A canal running north-south, `width` wide, centred on x = 0."""
+        from src.surfaces import WaterBody
+
+        h = width / 2.0
+        ring = np.array([[-h, -100.0], [h, -100.0], [h, 100.0], [-h, 100.0], [-h, -100.0]])
+        return [WaterBody(rings=[ring], level_nap=level, area_m2=width * 200.0, measured=True)]
+
+    def test_a_segmental_arch_meets_its_springing_and_crown(self):
+        from src.structures import segmental_arch
+
+        z = segmental_arch(np.array([-7.0, -3.5, 0.0, 3.5, 7.0, 9.0]), 7.0, 4.2, 0.9)
+        self.assertAlmostEqual(float(z[2]), 4.2, places=9)
+        self.assertAlmostEqual(float(z[0]), 0.9, places=9)
+        self.assertAlmostEqual(float(z[4]), 0.9, places=9)
+        self.assertAlmostEqual(float(z[5]), 0.9, places=9, msg="level beyond the span")
+        self.assertAlmostEqual(float(z[1]), float(z[3]), places=9)
+        self.assertTrue(0.9 < float(z[1]) < 4.2)
+
+    def test_the_shortest_line_across_a_canal_is_square_to_it(self):
+        from src.waterworks import narrowest_crossing, water_geometry
+
+        wet = water_geometry(self._canal(10.0))
+        width, axis, middle = narrowest_crossing(wet, (2.0, 30.0))
+        self.assertAlmostEqual(width, 10.0, delta=0.05)
+        self.assertAlmostEqual(abs(float(axis[0])), 1.0, places=3)
+        np.testing.assert_allclose(middle, [0.0, 30.0], atol=0.05)
+        self.assertIsNone(narrowest_crossing(wet, (40.0, 30.0)), "on land")
+
+    def test_a_masonry_bridge_gets_its_arch_and_its_clearance(self):
+        import shapely
+
+        from src.structures import (
+            KIND_MASONRY, KIND_SLAB, StructurePart, _deck_body,
+        )
+        from src.waterworks import WaterBridge, water_geometry
+
+        water = self._canal(10.0, level=0.6)
+        wet = water_geometry(water)
+        # A street 8 m wide crossing the canal east-west, on a deck from
+        # x = -9 to 9.
+        ring = np.array([[-9.0, -4.0], [9.0, -4.0], [9.0, 4.0], [-9.0, 4.0], [-9.0, -4.0]])
+        part = StructurePart([ring], kind=0, level=1)
+        board = WaterBridge((0.5, 0.0), "B1", soffit_nap=4.2, span_m=12.0, length_m=8.0,
+                            material="metselwerk", kind="", manager="HDSR")
+        body, kind, record = _deck_body(
+            part, 5.3, self._Terrain(2.0), 0.05, {}, wet, water, [board]
+        )
+        self.assertEqual(kind, KIND_MASONRY)
+        self.assertTrue(record["arched"])
+        self.assertEqual(record["source"], "water board")
+        self.assertAlmostEqual(record["clearance_m"], 4.2 - 0.6, places=6)
+        self.assertAlmostEqual(record["span_m"], 12.0)
+        self.assertAlmostEqual(record["span_axis_deg"] % 180.0, 90.0, delta=4.0)
+        # The underside reaches 4.2 over the middle of the canal and comes
+        # down towards the banks.
+        under = body[np.cross(body[:, 1] - body[:, 0], body[:, 2] - body[:, 0])[:, 2] < -1e-9]
+        points = under.reshape(-1, 3)
+        middle = points[np.abs(points[:, 0]) < 0.3]
+        edge = points[np.abs(points[:, 0]) > 5.5]
+        self.assertAlmostEqual(float(middle[:, 2].max()), 4.2, delta=0.02)
+        self.assertLess(float(edge[:, 2].max()), 3.0)
+        # A closed solid: every edge is shared by exactly two triangles.
+        top = np.array([
+            [[-9, -4, 5.35], [9, -4, 5.35], [9, 4, 5.35]],
+            [[-9, -4, 5.35], [9, 4, 5.35], [-9, 4, 5.35]],
+        ])
+        everything = np.round(np.concatenate([body, top]), 4)
+        edges = {}
+        for tri in everything:
+            for a, b in ((0, 1), (1, 2), (2, 0)):
+                key = tuple(sorted((tuple(tri[a]), tuple(tri[b]))))
+                edges[key] = edges.get(key, 0) + 1
+        self.assertGreater(len(edges), 50)
+        # Unregistered, or not masonry: a slab under the deck, no arch.
+        body, kind, record = _deck_body(part, 5.3, self._Terrain(2.0), 0.05, {}, wet, water, [])
+        self.assertEqual(kind, KIND_SLAB)
+        self.assertFalse(record["arched"])
+        self.assertEqual(record["source"], "estimated")
+        self.assertAlmostEqual(record["crown_nap"], 5.3 - 0.9, places=6)
+        # Over land: a slab, and no record.
+        body, kind, record = _deck_body(part, 5.3, self._Terrain(2.0), 0.05, {}, None, None, [])
+        self.assertEqual(kind, KIND_SLAB)
+        self.assertIsNone(record)
+        self.assertGreater(len(body), 0)
+
+    def test_a_pier_in_the_water_splits_the_arch(self):
+        from src.structures import arches_underside, openings
+
+        spans = openings(7.0, [(-0.7, 0.7)])
+        self.assertEqual(spans, [(-7.0, -0.7), (0.7, 7.0)])
+        z = arches_underside(np.array([-7.0, -3.85, 0.0, 3.85, 7.0]), spans, 4.2, 0.3)
+        np.testing.assert_allclose(z, [0.3, 4.2, 0.3, 4.2, 0.3], atol=1e-9)
+        self.assertEqual(openings(7.0, []), [(-7.0, 7.0)])
+        self.assertEqual(openings(7.0, [(-9.0, -6.8)]), [(-6.8, 7.0)])
+
+    def test_a_lock_gets_gates_at_its_heads(self):
+        import shapely
+
+        from src.surfaces import WaterBody
+        from src.waterworks import Lock, lock_geometry, water_geometry
+
+        # A 30 m canal either side of a lock chamber 8 m wide and 40 m long.
+        canal = shapely.union_all([
+            shapely.box(-15.0, -120.0, 15.0, -20.0),
+            shapely.box(-4.0, -20.5, 4.0, 20.5),
+            shapely.box(-15.0, 20.0, 15.0, 120.0),
+        ])
+        rings = [np.asarray(canal.exterior.coords)]
+        water = [WaterBody(rings=rings, level_nap=0.5, area_m2=canal.area, measured=True)]
+        wet = water_geometry(water)
+        levels = {"north": 1.2, "south": 0.5}
+
+        def level_at(xy):
+            return levels["north"] if xy[1] > 0 else levels["south"]
+
+        def ground(x, y):
+            return np.full(np.shape(x), 2.0)
+
+        lock = Lock((0.0, 0.0), "Test", "schutsluis naar een zijde", 8.0, None)
+        pieces, record = lock_geometry(lock, wet, level_at, ground)
+        self.assertEqual(record["gates"], 2)
+        self.assertAlmostEqual(record["width_m"], 8.0, delta=0.1)
+        self.assertGreater(record["chamber_m"], 30.0)
+        gates = np.concatenate([t for t, name in pieces if name == "gate"])
+        beams = np.concatenate([t for t, name in pieces if name == "beam"])
+        self.assertEqual(len(gates), 4 * 12)
+        self.assertEqual(len(beams), 4 * 12)
+        # The leaves meet north of their heels: the higher water is north.
+        for head in (gates[gates[:, :, 1].mean(axis=1) > 0], gates[gates[:, :, 1].mean(axis=1) < 0]):
+            points = head.reshape(-1, 3)
+            middle = points[np.abs(points[:, 0]) < 0.3]
+            heels = points[np.abs(points[:, 0]) > 3.7]
+            self.assertGreater(float(middle[:, 1].mean()), float(heels[:, 1].mean()))
+        # The beams reach over the quay, past the walls.
+        self.assertGreater(float(np.abs(beams[:, :, 0]).max()), 8.0)
+        self.assertLess(float(gates[:, :, 2].max()), 2.0)
+
+    def test_a_weir_closes_its_ditch(self):
+        import shapely
+
+        from src.surfaces import WaterBody
+        from src.waterworks import Weir, water_geometry, weir_geometry
+
+        ditch = shapely.box(-2.0, -50.0, 2.0, 50.0)
+        water = [WaterBody(rings=[np.asarray(ditch.exterior.coords)], level_nap=-1.0,
+                           area_m2=400.0, measured=True)]
+        wet = water_geometry(water)
+        weir = Weir((0.5, 10.0), "kantelstuw", 3.0, -0.6, "plaatstaal", 182.0)
+        pieces, record = weir_geometry(weir, wet, lambda xy: -1.0)
+        self.assertEqual(record["crest_nap"], -0.6)
+        self.assertAlmostEqual(record["width_m"], 3.0)
+        plate = pieces[0][0]
+        self.assertAlmostEqual(float(np.ptp(plate[:, :, 0])), 3.0, delta=0.01)
+        self.assertAlmostEqual(float(plate[:, :, 2].max()), -0.6)
+        self.assertEqual(len(pieces), 4, "plate, two uprights, a beam")
+        # A crest the register puts far above the water is not believed.
+        weir.crest_nap = 9.0
+        self.assertAlmostEqual(weir_geometry(weir, wet, lambda xy: -1.0)[1]["crest_nap"], -0.85)
+
+    def test_the_body_faces_out_and_down(self):
+        import shapely
+
+        from src.structures import bridge_body
+
+        polygon = shapely.box(0.0, 0.0, 10.0, 6.0)
+        body = bridge_body(
+            polygon, lambda p: np.full(len(p), 5.0), lambda p: np.full(len(p), 4.0),
+        )
+        normals = np.cross(body[:, 1] - body[:, 0], body[:, 2] - body[:, 0])
+        centres = body.mean(axis=1)
+        vertical = np.abs(normals[:, 2]) < 1e-9
+        out = centres[vertical, :2] - np.array([5.0, 3.0])
+        self.assertTrue(((normals[vertical, :2] * out).sum(axis=1) > 0).all())
+        self.assertTrue((normals[~vertical, 2] < 0).all(), "the underside faces down")
+
+    def test_the_water_board_register_is_read(self):
+        from src.waterworks import parse_bridges, parse_locks, parse_weirs
+
+        def point(x, y, **props):
+            return {"geometry": {"type": "Point", "coordinates": [x, y, 0]},
+                    "properties": {"statusobject": "gerealiseerd", **props}}
+
+        bridges = parse_bridges([
+            point(1, 2, code="B1", hoogteonderzijde=4.22, breedtedoorvaart=14.2,
+                  lengte=7.1, typemateriaal="metselwerk"),
+            point(3, 4, code="B2", typemateriaal="beton", statusobject="gesloopt"),
+        ])
+        self.assertEqual([b.code for b in bridges], ["B1"])
+        self.assertTrue(bridges[0].masonry)
+        self.assertEqual(bridges[0].soffit_nap, 4.22)
+        locks = parse_locks([
+            point(0, 0, naam="WEERDSLUIS", doorvaartbreedte=8, richting=121),
+            point(1, 1, naam="Weerdsluis", richting=120.9),
+        ])
+        self.assertEqual(len(locks), 1, "the same lock from two registers")
+        self.assertEqual(locks[0].width_m, 8.0)
+        weirs = parse_weirs([point(5, 5, typestuw="kantelstuw", kruinbreedte=6.79,
+                                   hoogteconstructie=1.15, typemateriaal="plaatstaal")])
+        self.assertEqual(weirs[0].crest_width_m, 6.79)
+
+    def test_bridges_json_carries_the_clearance(self):
+        from src.structures import StructureSet, write_bridge_list
+
+        structures = StructureSet(bridges=[{
+            "rd": [136814.0, 455479.0], "crown_nap": 4.22, "water_nap": 0.6,
+            "clearance_m": 3.62, "span_m": 14.2, "source": "water board", "arched": True,
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_bridge_list(
+                structures, GeoContext.from_bbox(BBox(136000, 455000, 137000, 456000)), Path(tmp)
+            )
+            payload = json.loads(path.read_text())
+        bridge = payload["bridges"][0]
+        self.assertEqual(bridge["clearance_m"], 3.62)
+        self.assertEqual(bridge["local"], {"x": 314.0, "z": -21.0})
+
+
+class TestFacadeRegisters(unittest.TestCase):
+    """Churches, monuments and shop boards, from fixtures."""
+
+    @staticmethod
+    def _building(identifier, x0, y0, x1, y1, height=10.0, year=1900, floors=3):
+        from src.buildings import Building
+
+        roof = np.array([
+            [[x0, y0, height], [x1, y0, height], [x1, y1, height]],
+            [[x0, y0, height], [x1, y1, height], [x0, y1, height]],
+        ])
+        return Building(
+            identifier=identifier, wall_tris=np.zeros((0, 3, 3)), roof_tris=roof,
+            ground_z_nap=0.0, roof_max_nap=height, floors=floors, wall_top_nap=height,
+            build_year=year, footprint_m2=(x1 - x0) * (y1 - y0),
+        )
+
+    def test_a_registered_church_gets_the_church_wall(self):
+        import shapely
+
+        from src.buildings import (
+            ARCH_HOUSE, ARCH_INDUSTRIAL, ARCH_MONUMENTAL, BuildingSet, classify_archetype,
+        )
+        from src.landmarks import Landmarks, Monument, TypedArea, apply_landmarks
+
+        church = self._building("church", 0, 0, 20, 12, height=11.0, year=1890, floors=2)
+        house = self._building("house", 30, 0, 36, 10, height=9.0, year=1900, floors=3)
+        garage = self._building("garage", 50, 0, 90, 30, height=12.0, year=1985, floors=4)
+        monument = self._building("monument", 0, 30, 8, 40, height=12.0, year=None, floors=3)
+        buildings = BuildingSet(buildings=[church, house, garage, monument])
+        self.assertEqual(classify_archetype(church), ARCH_HOUSE, "a low church looks like a house")
+        landmarks = Landmarks(
+            areas=[
+                TypedArea(shapely.box(-1, -1, 21, 13), ("kerk",), "Geertekerk"),
+                # A block with a church somewhere in it: the house is not it.
+                TypedArea(shapely.box(25, -5, 45, 20), ("huizenblok", "kerk"), ""),
+                TypedArea(shapely.box(49, -1, 91, 31), ("parkeerdak, parkeerdek, parkeergarage",), ""),
+            ],
+            monuments=[Monument((4.0, 35.0), 36000, "Woningen en woningbouwcomplexen", "Woonhuis")],
+        )
+        stats = apply_landmarks(buildings, landmarks)
+        self.assertEqual(stats, {"typed": 2, "monuments": 1})
+        self.assertEqual(church.landmark, "kerk")
+        self.assertEqual(church.landmark_name, "Geertekerk")
+        self.assertEqual(house.landmark, "")
+        self.assertEqual(classify_archetype(church), ARCH_MONUMENTAL)
+        self.assertEqual(classify_archetype(garage), ARCH_INDUSTRIAL)
+        self.assertEqual(monument.monument, 36000)
+        self.assertEqual(monument.build_year, 1850, "a monument the BAG gives no year is old")
+
+    def test_a_religious_monument_is_a_church(self):
+        from src.buildings import ARCH_MONUMENTAL, BuildingSet, classify_archetype
+        from src.landmarks import Landmarks, Monument, apply_landmarks
+
+        chapel = self._building("chapel", 0, 0, 10, 8, height=8.0, year=1700, floors=1)
+        apply_landmarks(BuildingSet(buildings=[chapel]), Landmarks(monuments=[
+            Monument((5.0, 4.0), 123, "Religieuze gebouwen", "Kerk en kerkonderdeel")
+        ]))
+        self.assertEqual(classify_archetype(chapel), ARCH_MONUMENTAL)
+
+    def test_the_registers_are_read(self):
+        from src.landmarks import parse_monuments, parse_top10
+
+        areas = parse_top10([
+            {"properties": {"typegebouw": "huizenblok|klokkentoren", "naam": "Domtoren"},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]]}},
+            {"properties": {"typegebouw": "huizenblok"},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]]}},
+        ])
+        self.assertEqual([(a.types, a.name) for a in areas], [(("huizenblok", "klokkentoren"), "Domtoren")])
+        monuments = parse_monuments([{
+            "geometry": {"type": "Point", "coordinates": [136941, 455423]},
+            "properties": {"rijksmonument_nummer": 36123, "hoofdcategorie": "Religieuze gebouwen",
+                           "subcategorie": "Kerk en kerkonderdeel"},
+        }])
+        self.assertEqual(monuments[0].number, 36123)
+
+    def test_a_registered_windmill_gets_its_sails(self):
+        from src.landmarks import windmill_sails
+
+        mill = self._building("mill", 0, 0, 8, 8, height=20.0, year=1780, floors=1)
+        mill.monument_subcategory = "Industrie- en poldermolen"
+        sails = windmill_sails(mill)
+        self.assertEqual(len(sails), 12 * 9, "an axle, four stocks, four lattices")
+        points = sails.reshape(-1, 3)
+        self.assertGreater(float(points[:, 2].min()), 0.0, "the sails clear the ground")
+        self.assertGreater(float(points[:, 2].max()), 20.0, "and reach above the cap")
+        # Out on the south-west side of the body, into the wind.
+        self.assertLess(float(points[:, 0].mean()), 4.0)
+        self.assertLess(float(points[:, 1].mean()), 4.0)
+        normals = np.cross(sails[:, 1] - sails[:, 0], sails[:, 2] - sails[:, 0])
+        self.assertTrue((np.linalg.norm(normals, axis=1) > 0).all())
+
+    def test_a_turbine_is_as_tall_as_the_register_says(self):
+        from src.landmarks import Turbine, parse_turbines, turbine_mesh
+
+        turbines = parse_turbines([
+            {"geometry": {"type": "Point", "coordinates": [137521.4, 486910.0]},
+             "properties": {"ash": 91, "diam": 117, "wt_type": "Vestas V117"}},
+            {"geometry": {"type": "Point", "coordinates": [1, 1]},
+             "properties": {"ash": None, "diam": 10}},
+        ])
+        self.assertEqual(len(turbines), 1)
+        mesh = turbine_mesh(Turbine((0.0, 0.0), 91.0, 117.0, ""), -4.0)
+        top = float(mesh[:, :, 2].max())
+        self.assertAlmostEqual(top, -4.0 + 91.0 + 58.5, delta=1.5)
+        self.assertAlmostEqual(float(mesh[:, :, 2].min()), -4.0, places=6)
+
+    def test_a_shop_gets_a_board_on_its_own_front(self):
+        import shapely
+
+        from src.furniture import Footprints
+        from src.osm import OsmData, OsmNode
+        from src.signage import (
+            BOARD_BOTTOM_M, board_mesh, generate_sign_texture, place_boards, shops,
+        )
+
+        # Two houses side by side, fronts to the south on y = 0.
+        footprints = Footprints(polygons=[shapely.box(0, 0, 8, 10), shapely.box(8, 0, 16, 10)])
+        osm = OsmData(nodes=[
+            OsmNode(1, (4.0, 1.0), {"shop": "bakery", "name": "Bakkerij Bart"}),
+            OsmNode(2, (4.5, 1.5), {"amenity": "cafe", "name": "Cafe de Hoek"}),
+            OsmNode(3, (12.0, 30.0), {"shop": "books"}),                     # no name
+            OsmNode(4, (12.0, 1.0), {"amenity": "bench", "name": "Bank"}),    # not a shop
+            OsmNode(5, (12.0, 1.0), {"shop": "clothes", "name": "Kelder", "level": "-1"}),
+        ])
+        found = shops(osm, BBox(-10, -10, 30, 30))
+        self.assertEqual([s.name for s in found], ["Bakkerij Bart", "Cafe de Hoek"])
+        boards = place_boards(found, footprints, lambda x, y: np.full(len(x), 1.0))
+        self.assertEqual(len(boards), 2)
+        for board in boards:
+            np.testing.assert_allclose(board.outward, [0.0, -1.0], atol=1e-9)
+            self.assertAlmostEqual(float(board.point[1]), 0.0, places=6)
+            self.assertAlmostEqual(board.bottom_nap, 1.0 + BOARD_BOTTOM_M)
+        # Side by side, not on top of each other.
+        first, second = sorted(boards, key=lambda b: b.point[0])
+        self.assertGreaterEqual(
+            float(second.point[0] - first.point[0]), (first.width + second.width) / 2.0
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            texture, cells, layout = generate_sign_texture([b.shop.name for b in boards], Path(tmp))
+            self.assertTrue(texture.is_file())
+        vertices, faces, uv = board_mesh(boards, cells, layout)
+        self.assertEqual(len(faces), 2 * 12)
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        # The first two triangles of each board are its face: towards the street.
+        self.assertTrue((normals[0::12, 1] < 0).all() and (normals[1::12, 1] < 0).all())
+        self.assertTrue(((uv >= 0) & (uv <= 1)).all())
+
+    def test_a_board_goes_on_the_street_side_not_the_party_wall(self):
+        import shapely
+
+        from src.furniture import Footprints
+        from src.signage import Shop, place_boards
+
+        # A shop point nearest the party wall between two houses in a row
+        # that is closed at both ends; only the south front is street.
+        footprints = Footprints(polygons=[
+            shapely.box(0, 0, 8, 10), shapely.box(8, 0, 16, 10),
+            shapely.box(-8, 0, 0, 10), shapely.box(16, 0, 24, 10),
+            shapely.box(-8, 10, 24, 18),
+        ])
+        boards = place_boards(
+            [Shop("Achterom", "shop", (7.8, 4.0))], footprints, lambda x, y: np.zeros(len(x))
+        )
+        self.assertEqual(len(boards), 1)
+        np.testing.assert_allclose(boards[0].outward, [0.0, -1.0], atol=1e-9)
+        self.assertAlmostEqual(float(boards[0].point[1]), 0.0, places=6)
+        # Walled in on every side: no board at all.
+        enclosed = Footprints(polygons=[shapely.box(0, 0, 8, 10), shapely.box(-20, -20, 28, 0),
+                                        shapely.box(-20, 10, 28, 30), shapely.box(-20, 0, 0, 10),
+                                        shapely.box(8, 0, 28, 10)])
+        self.assertEqual(
+            place_boards([Shop("Binnen", "shop", (4.0, 5.0))], enclosed, lambda x, y: np.zeros(len(x))),
+            [],
+        )
+
+
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")
 class TestLiveServices(unittest.TestCase):
     """Checks against the real services, for the assumptions that can drift."""

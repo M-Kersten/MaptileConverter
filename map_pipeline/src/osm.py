@@ -49,6 +49,9 @@ NODE_KEYS = (
     "barrier",
     "leisure",
     "tourism",
+    "shop",
+    "craft",
+    "office",
 )
 
 # Ways that are not roads but are street detail: a bicycle parking drawn as
@@ -61,7 +64,7 @@ AREA_TAGS = {
 
 # Bumped when what is kept changes, so an older cache is not read as if it
 # held everything a newer run expects.
-CACHE_VERSION = "osm2"
+CACHE_VERSION = "osm3"
 
 
 def keep_way(tags: dict) -> bool:

@@ -240,6 +240,41 @@ SOURCES: tuple[Source, ...] = (
         note="deck heights come from the AHN surface model",
     ),
     Source(
+        id="waterworks",
+        label="Bridges, locks and weirs (water boards)",
+        provider="Het Waterschapshuis",
+        contributes=(
+            "the underside height, opening and material of every bridge the "
+            "water boards register, so masonry bridges get their arches; lock "
+            "gates and weirs"
+        ),
+        toggles=(("structures", "water_boards"),),
+        fallback_url="https://api.pdok.nl/hwh/waterschappen-kunstwerken-imwa/ogc/v2",
+        optional=True,
+    ),
+    Source(
+        id="landmarks",
+        label="Churches and monuments (TOP10NL, RCE)",
+        provider="Kadaster / Rijksdienst voor het Cultureel Erfgoed",
+        contributes=(
+            "which buildings are churches, towers and car parks, and which are "
+            "rijksmonumenten, so they get the facade that fits"
+        ),
+        toggles=(("facade", "landmarks"),),
+        fallback_url="https://api.pdok.nl/kadaster/brt-top10nl/ogc/v1",
+        optional=True,
+    ),
+    Source(
+        id="shop_signs",
+        label="Shop names (OpenStreetMap)",
+        provider="OpenStreetMap",
+        contributes="a name board over every shop, cafe and restaurant OpenStreetMap names",
+        toggles=(("facade", "shop_signs"),),
+        fallback_url="https://api.openstreetmap.org/api/0.6/map.json",
+        probe_url="https://api.openstreetmap.org/api/0.6/capabilities",
+        optional=True,
+    ),
+    Source(
         id="rails",
         label="Railways (BGT)",
         provider="PDOK",

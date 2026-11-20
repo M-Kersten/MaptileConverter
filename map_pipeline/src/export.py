@@ -56,6 +56,23 @@ ATTRIBUTION = {
         "Public charging points from the NDW charging point register, CC0. "
         "https://opendata.ndw.nu"
     ),
+    "waterworks": (
+        "Bridge clearances and openings, locks and weirs from the water boards' "
+        "register (IMWA), Het Waterschapshuis via PDOK, CC BY-SA 4.0. "
+        "waterworks.json is shared under the same licence."
+    ),
+    "top10nl": (
+        "Building types (churches, towers, car parks) from BRT TOP10NL, "
+        "Kadaster via PDOK, CC BY 4.0."
+    ),
+    "monuments": (
+        "Rijksmonumenten from the national monument register, Rijksdienst "
+        "voor het Cultureel Erfgoed. https://monumentenregister.cultureelerfgoed.nl"
+    ),
+    "turbines": (
+        "Wind turbines, hub heights and rotor diameters from RIVM's Atlas "
+        "Leefomgeving. https://www.atlasleefomgeving.nl"
+    ),
     "textures": (
         "Wall surfaces under the generated facades from Poly Haven (CC0, no "
         "attribution required). https://polyhaven.com"
@@ -186,6 +203,8 @@ def write_scene_description(
     water_texture: Path | None = None,
     furniture_texture: Path | None = None,
     traffic_texture: Path | None = None,
+    signage_texture: Path | None = None,
+    landmark_file: Path | None = None,
     surfaces_cfg: dict | None = None,
     road_class_names: dict | None = None,
     surface_class_names: dict | None = None,
@@ -198,6 +217,7 @@ def write_scene_description(
     rail_kind_names: dict | None = None,
     structure_texture: Path | None = None,
     structure_kind_names: dict | None = None,
+    masonry_texture: Path | None = None,
     car_colours: int = 6,
     ground_variants: int = 0,
     layered: dict | None = None,
@@ -291,6 +311,14 @@ def write_scene_description(
             if traffic_texture is not None
             else {}
         ),
+        # Windmill sails and wind turbines, as triangles.
+        "landmarks": {"file": landmark_file.name} if landmark_file is not None else {},
+        # Name boards over the shops, with the names in their own atlas.
+        "signage": (
+            {"file": "shopsigns.npz", "texture": signage_texture.name}
+            if signage_texture is not None
+            else {}
+        ),
         # Barriers share the furniture atlas, so they are gated on the same
         # texture existing rather than on one of their own.
         "barriers": (
@@ -333,6 +361,11 @@ def write_scene_description(
                 "file": "structures.npz",
                 "texture": structure_texture.name,
                 "kind_names": structure_kind_names or {},
+                # Brick for the arches of masonry bridges; tiles every 2 m.
+                **(
+                    {"masonry_texture": masonry_texture.name, "masonry_tile_m": 2.0}
+                    if masonry_texture is not None else {}
+                ),
             }
             if structure_texture is not None
             else {}
@@ -367,7 +400,8 @@ def write_scene_description(
 
 
 def write_attribution(
-    out_dir: Path, *, osm: bool = False, signs: bool = False, chargers: bool = False
+    out_dir: Path, *, osm: bool = False, signs: bool = False, chargers: bool = False,
+    extra: tuple[str, ...] = (),
 ) -> Path:
     """Drop the source credits next to the model.
 
@@ -389,6 +423,14 @@ def write_attribution(
         f"NWB:       {ATTRIBUTION['roads']}",
         *([f"Signs:     {ATTRIBUTION['signs']}"] if signs else []),
         *([f"Chargers:  {ATTRIBUTION['chargers']}"] if chargers else []),
+        *[
+            f"{label:<10} {ATTRIBUTION[key]}"
+            for key, label in (
+                ("waterworks", "Water:"), ("top10nl", "TOP10NL:"),
+                ("monuments", "Monuments:"), ("turbines", "Turbines:"),
+            )
+            if key in extra
+        ],
         *([f"OSM:       {ATTRIBUTION['osm']}"] if osm else []),
         f"Textures:  {ATTRIBUTION['textures']}",
         "",
