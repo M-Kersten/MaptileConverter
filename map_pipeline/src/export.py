@@ -183,6 +183,7 @@ def write_scene_description(
     rail_kind_names: dict | None = None,
     structure_texture: Path | None = None,
     structure_kind_names: dict | None = None,
+    passage_texture: Path | None = None,
     car_colours: int = 6,
     ground_variants: int = 0,
     layered: dict | None = None,
@@ -205,7 +206,11 @@ def write_scene_description(
             "file": "terrain_mesh.npz" if getattr(terrain, "mesh", None) is not None
             else "terrain_grid.npz",
         },
-        "buildings": {"file": "buildings.npz"},
+        "buildings": {
+            "file": "buildings.npz",
+            # Concrete for the lining of the passages cut under buildings.
+            **({"passage_texture": passage_texture.name} if passage_texture is not None else {}),
+        },
         "aerial": {
             "file": aerial.path.name,
             "bbox_rd": aerial.bbox.as_list(),

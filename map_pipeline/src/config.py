@@ -162,6 +162,28 @@ DEFAULTS: dict[str, Any] = {
         # which keeps the model bounded without cutting geometry open.
         # "intersect" keeps every building the API returns.
         "clip_mode": "centroid",
+        # A road or water at ground level inside a building's footprint runs
+        # under it: 3DBAG stands the building on it anyway, so a tunnel is cut
+        # through its base and lined. How high is drawn, not measured; see
+        # src/passages.py and the README.
+        "passages": {
+            "enabled": True,
+            # Ceiling above the highest ground under the passage, by what
+            # passes: road, footpath or cycle path, railway, water, and the
+            # paving -- a platform, a forecourt -- that widens one of those.
+            "clearance_m": {
+                "road": 4.5, "path": 3.0, "rail": 6.0, "water": 3.0, "paved": 3.0,
+            },
+            # A building that leaves less than this under its lowest roof is
+            # left whole.
+            "min_headroom_m": 2.2,
+            # Narrower or smaller than this is the BGT and the BAG disagreeing
+            # about where a facade is, not a passage.
+            "min_width_m": 1.0,
+            "min_area_m2": 4.0,
+            # The ceiling stays this far below the lowest roof over it.
+            "slab_m": 0.5,
+        },
     },
     "facade": {
         # One storey per texture tile vertically, so windows line up per floor

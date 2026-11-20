@@ -3927,6 +3927,229 @@ class TestBridgeDecks(unittest.TestCase):
         np.testing.assert_allclose(z, 9.05)
 
 
+def _block(x0, y0, x1, y1, z0, z1):
+    """A 3DBAG-shaped box: four walls and a roof, faces outward, no floor."""
+    from src.buildings import triangulate_surface
+
+    corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    walls = [
+        triangulate_surface([np.array([[ax, ay, z0], [bx, by, z0], [bx, by, z1], [ax, ay, z1]], float)])
+        for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1])
+    ]
+    roof = triangulate_surface([np.array([[x, y, z1] for x, y in corners], float)])
+    return np.concatenate(walls), roof
+
+
+def _building_over(polygons, *, height=15.0, ground=lambda x, y: np.zeros(np.shape(x)), **cfg):
+    """A 20 x 10 m block with `polygons` -- (shapely polygon, kind) -- under it."""
+    from src.buildings import Building, BuildingSet
+    from src.passages import PassageArea, cut_passages
+
+    walls, roof = _block(0, 0, 20, 10, 0, height)
+    building = Building("NL.IMBAG.Pand.1", walls, roof, 0.0, height, 3, wall_top_nap=height)
+    buildings = BuildingSet([building])
+    buildings.passages = cut_passages(
+        buildings, [PassageArea(p, k) for p, k in polygons], ground, cfg or None
+    )
+    return building, buildings.passages, buildings
+
+
+def _signed_volume(triangles):
+    t = np.asarray(triangles)
+    return float(np.einsum("ij,ij->i", t[:, 0], np.cross(t[:, 1], t[:, 2])).sum() / 6.0)
+
+
+def _normals(triangles):
+    n = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    return n / np.linalg.norm(n, axis=1)[:, None]
+
+
+class TestPassagesUnderBuildings(unittest.TestCase):
+    """A road or water at ground level inside a footprint runs under the
+    building, so the building gets a tunnel. 3DBAG stands every building on
+    the ground over its whole top-view footprint, which put a facade across
+    the Catharijnebaan and the end of the Catharijnesingel at Hoog Catharijne."""
+
+    def test_a_road_through_a_building_is_a_lined_tunnel(self):
+        import shapely
+
+        building, stats, _ = _building_over([(shapely.box(8, -5, 14, 15), "road")])
+        self.assertEqual(stats.passages, 1)
+        top = stats.cut[0][2]
+        self.assertAlmostEqual(top, 4.5)
+
+        # Nothing of either facade is left across the road below the ceiling.
+        walls = building.wall_tris
+        low_in_road = [
+            t for t in walls
+            if t[:, 2].min() < top - 1e-6
+            and 8.0 + 1e-6 < t[:, 0].mean() < 14.0 - 1e-6
+        ]
+        self.assertEqual(low_in_road, [])
+        # The lintel over the mouth stays.
+        lintel = [t for t in walls if t[:, 2].min() >= top - 1e-6 and 8 < t[:, 0].mean() < 14]
+        self.assertTrue(lintel)
+
+        lining = building.passage_tris
+        normals = _normals(lining)
+        ceiling = lining[normals[:, 2] < -0.99]
+        self.assertTrue(np.allclose(ceiling[:, :, 2], top))
+        self.assertAlmostEqual(
+            float(sum(0.5 * abs(np.cross(t[1] - t[0], t[2] - t[0])[2]) for t in ceiling)), 60.0, places=3
+        )
+        # A side wall each side, facing into the passage, from the wall base up.
+        west = lining[np.isclose(lining[:, :, 0], 8.0).all(axis=1)]
+        east = lining[np.isclose(lining[:, :, 0], 14.0).all(axis=1)]
+        self.assertTrue((_normals(west)[:, 0] > 0.99).all())
+        self.assertTrue((_normals(east)[:, 0] < -0.99).all())
+        self.assertAlmostEqual(west[:, :, 2].min(), 0.0)
+        self.assertAlmostEqual(west[:, :, 2].max(), top)
+
+        # Still one closed shell, every face outward: the block less the tunnel.
+        shell = np.concatenate([building.wall_tris, building.roof_tris, lining])
+        self.assertAlmostEqual(_signed_volume(shell), 20 * 10 * 15 - 6 * 10 * top, places=6)
+
+    def test_headroom_follows_what_passes_under(self):
+        import shapely
+
+        cases = {"path": 3.0, "water": 3.0, "rail": 6.0, "road": 4.5}
+        for kind, clearance in cases.items():
+            with self.subTest(kind=kind):
+                _, stats, _ = _building_over(
+                    [(shapely.box(8, -5, 14, 15), kind)], ground=lambda x, y: np.full(np.shape(x), 1.5)
+                )
+                self.assertAlmostEqual(stats.cut[0][2], 1.5 + clearance)
+        # A road and the footpath beside it are one tunnel, high enough for both.
+        _, stats, _ = _building_over([
+            (shapely.box(8, -5, 12, 15), "road"), (shapely.box(12, -5, 14, 15), "path"),
+        ])
+        self.assertEqual(stats.passages, 1)
+        self.assertAlmostEqual(stats.cut[0][2], 4.5)
+
+    def test_the_ceiling_stays_a_slab_under_the_roof(self):
+        import shapely
+
+        _, stats, _ = _building_over([(shapely.box(8, -5, 14, 15), "road")], height=4.8)
+        self.assertAlmostEqual(stats.cut[0][2], 4.8 - 0.5)
+
+    def test_a_building_too_low_to_pass_under_is_left_whole(self):
+        import shapely
+
+        building, stats, _ = _building_over([(shapely.box(8, -5, 14, 15), "road")], height=2.5)
+        self.assertEqual((stats.passages, stats.too_low), (0, 1))
+        self.assertEqual(len(building.passage_tris), 0)
+        self.assertEqual(len(building.wall_tris), 8)
+
+    def test_a_pavement_grazing_the_facade_is_no_passage(self):
+        """The BGT and the BAG disagree about where a facade is by tens of
+        centimetres all over the country; that is not an arcade."""
+        import shapely
+
+        building, stats, _ = _building_over([(shapely.box(-5, -3, 25, 0.4), "path")])
+        self.assertEqual(stats.passages, 0)
+        self.assertEqual(len(building.wall_tris), 8)
+
+    def test_a_dead_end_is_closed_at_its_end_and_the_far_facade_stands(self):
+        import shapely
+
+        building, stats, _ = _building_over([(shapely.box(8, -5, 14, 5), "road")])
+        lining = building.passage_tris
+        end = lining[np.isclose(lining[:, :, 1], 5.0).all(axis=1)]
+        self.assertTrue(len(end))
+        self.assertTrue((_normals(end)[:, 1] < -0.99).all())
+        north = [t for t in building.wall_tris if np.isclose(t[:, 1], 10.0).all()]
+        self.assertAlmostEqual(
+            float(sum(np.linalg.norm(np.cross(t[1] - t[0], t[2] - t[0])) / 2 for t in north)), 20 * 15, places=6
+        )
+        shell = np.concatenate([building.wall_tris, building.roof_tris, lining])
+        self.assertAlmostEqual(_signed_volume(shell), 20 * 10 * 15 - 6 * 5 * 4.5, places=6)
+
+    def test_an_arcade_opens_the_facade_along_it(self):
+        """A pavement two metres in under a cantilevered storey: the facade
+        over it comes down to a colonnade's ceiling, and the wall behind is
+        lined."""
+        import shapely
+
+        building, stats, _ = _building_over([(shapely.box(-5, -3, 25, 2), "path")])
+        self.assertEqual(stats.passages, 1)
+        south = [t for t in building.wall_tris if np.isclose(t[:, 1], 0.0).all()]
+        self.assertGreaterEqual(min(t[:, 2].min() for t in south), 3.0 - 1e-6)
+        back = building.passage_tris[np.isclose(building.passage_tris[:, :, 1], 2.0).all(axis=1)]
+        self.assertTrue((_normals(back)[:, 1] < -0.99).all())
+
+    def test_what_passes_under_is_read_from_the_bgt(self):
+        from src.passages import passage_kind
+
+        self.assertEqual(passage_kind("wegdeel", {"functie": "rijbaan lokale weg", "relatieve_hoogteligging": 0}), "road")
+        self.assertEqual(passage_kind("wegdeel", {"functie": "OV-baan"}), "road")
+        self.assertEqual(passage_kind("wegdeel", {"functie": "fietspad"}), "path")
+        self.assertEqual(passage_kind("wegdeel", {"functie": "voetpad op trap"}), "path")
+        self.assertEqual(passage_kind("wegdeel", {"functie": "spoorbaan"}), "rail")
+        self.assertEqual(passage_kind("waterdeel", {"type": "waterloop"}), "water")
+        # A footbridge runs over the building's ground floor or onto it, and a
+        # tunnel under its foundations.
+        self.assertIsNone(passage_kind("wegdeel", {"functie": "voetpad", "relatieve_hoogteligging": 1}))
+        self.assertIsNone(passage_kind("wegdeel", {"functie": "rijbaan", "relatieve_hoogteligging": -1}))
+        self.assertEqual(passage_kind("onbegroeidterreindeel", {"fysiek_voorkomen": "gesloten verharding"}), "paved")
+        self.assertEqual(passage_kind("kunstwerkdeel_vlak", {"type": "perron"}), "paved")
+        self.assertIsNone(passage_kind("kunstwerkdeel_vlak", {"type": "keermuur"}))
+        self.assertIsNone(passage_kind("begroeidterreindeel", {}))
+
+    def test_paving_widens_a_passage_but_makes_none_of_its_own(self):
+        """A station hall spans its platforms as well as its tracks; a paved
+        yard under a building is no road through it."""
+        import shapely
+
+        building, stats, _ = _building_over([(shapely.box(8, -5, 14, 15), "paved")])
+        self.assertEqual(stats.passages, 0)
+        self.assertEqual(len(building.wall_tris), 8)
+
+        _, stats, _ = _building_over([
+            (shapely.box(2, -5, 6, 15), "rail"), (shapely.box(6, -5, 10, 15), "paved"),
+            (shapely.box(10, -5, 14, 15), "rail"),
+        ], height=20.0)
+        self.assertEqual(stats.passages, 1)
+        self.assertAlmostEqual(stats.cut[0][1].area, 12 * 10, places=6)
+        self.assertAlmostEqual(stats.cut[0][2], 6.0)
+
+    def test_switched_off_leaves_the_buildings_alone(self):
+        import shapely
+
+        building, stats, _ = _building_over([(shapely.box(8, -5, 14, 15), "road")], enabled=False)
+        self.assertEqual(stats.passages, 0)
+        self.assertEqual(len(building.wall_tris), 8)
+
+    def test_the_check_reads_the_cut_back(self):
+        """It passes on a cut building, and fails on one left standing."""
+        import shapely
+
+        from src.validate import CheckReport, check_passages
+
+        _, _, buildings = _building_over([(shapely.box(8, -5, 14, 15), "road")])
+        report = CheckReport()
+        check_passages(report, buildings)
+        self.assertTrue(report.checks[-1].passed, report.checks[-1].detail)
+
+        walls, roof = _block(0, 0, 20, 10, 0, 15)
+        buildings.buildings[0].wall_tris = walls
+        report = CheckReport()
+        check_passages(report, buildings)
+        self.assertFalse(report.checks[-1].passed)
+
+    def test_the_passage_is_saved_beside_the_building(self):
+        import shapely
+
+        from src.buildings import save_buildings
+
+        _, _, buildings = _building_over([(shapely.box(8, -5, 14, 15), "road")])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_buildings(buildings, Path(tmp) / "buildings.npz")
+            data = np.load(path)
+            self.assertEqual(len(data["passage_tris"]), len(data["passage_building"]))
+            self.assertGreater(len(data["passage_tris"]), 0)
+            self.assertTrue((data["passage_building"] == 0).all())
+
+
 class TestRoadClasses(unittest.TestCase):
     """A Dutch street is brick, and its cycle path is red. Both matter."""
 
@@ -5684,6 +5907,14 @@ def _blender_mesh_calls():
     # A real road network, from the real mesher: a T-junction.
     _, street = _build_street()
     np.savez(folder / "roads.npz", **street.to_npz_fields(), road_lift_m=0.03)
+    # A building with a road under it, cut and saved by the real code, so its
+    # tunnel lining rides along in its own material slot.
+    import shapely
+
+    from src.buildings import save_buildings
+
+    _, _, passing = _building_over([(shapely.box(8, -5, 14, 15), "road")])
+    save_buildings(passing, folder / "buildings.npz")
 
     scene = {
         "origin_rd": [100.0, 100.0],
@@ -5700,9 +5931,12 @@ def _blender_mesh_calls():
                      "road_class_names": {"1": "road_asphalt", "8": "footpath",
                                           "12": "kerb"}},
         "export": {"collision": True, "collision_tree_crowns": True},
+        "buildings": {"file": "buildings.npz"},
+        "facade": {"floor_height_m": 3.0, "ground_floor_height_m": 3.6},
     }
 
     for name, args in (
+        ("build_buildings", (scene, folder, ["M"], "M", ["M"], "M")),
         ("build_trees", (scene, folder, "M")),
         ("build_furniture", (scene, folder, "M")),
         ("build_barriers", (scene, folder, "M")),

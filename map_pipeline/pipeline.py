@@ -38,6 +38,7 @@ if __name__ == "__main__":
     if report_missing():
         raise SystemExit(2)
 
+from src.bgt import fetch_current as bgt_fetch  # noqa: E402
 from src.bgt import use_cache as bgt_cache  # noqa: E402
 from src.harbour import HarbourSet, build_harbour  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
@@ -50,6 +51,7 @@ from src.elevation import (  # noqa: E402
     raster_sampler,
 )
 from src.terrain_mesh import build_terrain_mesh  # noqa: E402
+from src.passages import fetch_passage_areas  # noqa: E402
 from src.layered import build_layered_ground  # noqa: E402
 from src.nwb import NWB_URL, fetch_centrelines  # noqa: E402
 from src.roads import (  # noqa: E402
@@ -127,6 +129,7 @@ from src.validate import (  # noqa: E402
     check_barriers,
     check_layered,
     check_furniture,
+    check_passages,
     check_rails,
     check_structures,
     check_vehicles,
@@ -705,6 +708,21 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             usage = fetch_usage(config.bbox, usage_cfg=config.usage)
 
     with Stage("buildings (3DBAG LoD2.2)", next_step(), total):
+        # The roads, water and platforms at ground level, for a tunnel through
+        # every building standing over one. The surfaces stage has read most
+        # of them already, so they come back from the run's cache.
+        passage_areas = None
+        if bool((config.buildings.get("passages") or {}).get("enabled", True)):
+            passage_areas = fetch_passage_areas(
+                config.bbox,
+                bgt_fetch,
+                {
+                    "page_limit": int(config.surfaces["page_limit"]),
+                    "timeout": float(config.surfaces["timeout_s"]),
+                    "max_retries": int(config.surfaces["max_retries"]),
+                    "max_pages": int(config.surfaces["max_pages"]),
+                },
+            )
         buildings = build_buildings(
             config.bbox,
             work_dir,
@@ -718,6 +736,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             ),
             usage=usage if len(usage) else None,
             facade_cfg=config.facade,
+            passage_areas=passage_areas,
         )
 
     ground_layers = None
@@ -1003,6 +1022,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 save_structures(structures, work_dir / "structures.npz")
                 structure_texture = generate_structure_texture(work_dir)
 
+    # The passages cut under buildings are lined in the same concrete, which
+    # a run without bridges or tunnels has not made yet.
+    passage_texture = None
+    if any(len(b.passage_tris) for b in buildings.buildings):
+        passage_texture = structure_texture or generate_structure_texture(work_dir)
+
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
         facade_cfg["ground_by_function"] = bool(len(usage))
@@ -1047,6 +1072,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             rail_texture=rail_texture,
             rail_kind_names={str(k): v for k, v in RAIL_KIND_NAMES.items()},
             structure_texture=structure_texture,
+            passage_texture=passage_texture,
             structure_kind_names={
                 str(k): v for k, v in STRUCTURE_KIND_NAMES.items()
             },
@@ -1112,6 +1138,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             report, buildings, max_height_m=float(config.buildings["max_height_m"])
         )
         check_buildings_on_terrain(report, buildings, terrain)
+        check_passages(report, buildings)
         check_built_terrain(report, work_dir, terrain)
         check_terrain_mesh(
             report, terrain,
