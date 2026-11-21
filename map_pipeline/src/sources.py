@@ -139,6 +139,22 @@ SOURCES: tuple[Source, ...] = (
         url_path=("trees", "api_url"),
     ),
     Source(
+        id="osm",
+        label="Street details (OpenStreetMap)",
+        provider="OpenStreetMap",
+        contributes=(
+            "café terraces, statues and memorials, flights of steps, and the "
+            "benches, bins, bicycle racks, fountains and post boxes a "
+            "municipality does not register"
+        ),
+        toggles=(("furniture", "osm"),),
+        url_path=("furniture", "osm_url"),
+        fallback_url="https://api.openstreetmap.org/api/0.6/map",
+        probe_url="https://api.openstreetmap.org/api/0.6/capabilities",
+        note="© OpenStreetMap contributors, ODbL",
+        soft=True,
+    ),
+    Source(
         id="barriers",
         label="Walls, fences and hedges (BGT)",
         provider="PDOK",
@@ -186,7 +202,8 @@ SOURCES: tuple[Source, ...] = (
         provider="Mapillary",
         contributes=(
             "street-level photos that show what each facade looks like: how "
-            "many storeys and windows, what colour"
+            "many storeys and windows, what colour; the paving's colour; and "
+            "the shop signs, bins, bike racks and signs its detectors found"
         ),
         toggles=(("photos", "mapillary"),),
         url_path=("photos", "mapillary_url"),

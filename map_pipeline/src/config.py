@@ -66,6 +66,16 @@ DEFAULTS: dict[str, Any] = {
         # The curb generator on every walkway and traffic island. Needs
         # Blender 5; with an older one the walkways stay flat.
         "kerbs": True,
+        # Lay a walkway the survey shows level with the road beside it as
+        # road, without a kerb: an old centre's pedestrian street is paved
+        # from wall to wall. False kerbs every walkway, as the modellers'
+        # hand-made file does.
+        "flush_walkways": True,
+        # Photographed paving (Poly Haven, CC0) on every road, walkway and
+        # lawn, in the material the BGT says it is paved with and the colour
+        # the street photos or the aerial show. False keeps the flat colours
+        # of the hand-made file.
+        "paving": True,
         # The modellers' own settings for it.
         "curb": {
             "width_m": 0.3,
@@ -345,6 +355,17 @@ DEFAULTS: dict[str, Any] = {
         # be worth arguing about.
         "flagpole_height_m": 7.0,
         "catenary_height_m": 7.5,
+        # What the BGT does not register, from OpenStreetMap: benches, bins,
+        # bicycle racks, fountains, post boxes, statues and memorials, and the
+        # café terraces (src/street_objects.py, src/terraces.py). Westerwolde
+        # and Súdwest-Fryslân register no street furniture at all.
+        "osm": True,
+        "osm_url": "https://api.openstreetmap.org/api/0.6/map",
+        "terraces": True,
+        # Objects Mapillary's detectors found in its photos and placed on the
+        # map: shop signs, bins, bike racks, lampposts, traffic signs, manhole
+        # covers. Needs the Mapillary source on (photos.mapillary).
+        "mapillary_objects": True,
     },
     "barriers": {
         # Walls, fences, hedges and the small structures bolted onto buildings.
@@ -893,6 +914,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         )
     layered["mesher"] = mesher
     layered["water_surface"] = bool(layered.get("water_surface", True))
+    layered["flush_walkways"] = bool(layered.get("flush_walkways", True))
+    layered["paving"] = bool(layered.get("paving", True))
     layered["harbour"] = bool(layered.get("harbour", True))
     layered["water_level_offset_m"] = float(layered.get("water_level_offset_m", 0.0))
     for key in ("outline_m", "ditch_depth_m"):
@@ -923,6 +946,9 @@ def load_config(path: str | Path) -> PipelineConfig:
             raise ValueError(f"photos.{key} must not be negative, got {value}")
         photos[key] = value
     photos["mapillary"] = bool(photos.get("mapillary", False))
+    furniture = merged["furniture"]
+    for key in ("osm", "terraces", "mapillary_objects"):
+        furniture[key] = bool(furniture.get(key, True))
     photos["folder"] = str(photos.get("folder") or "").strip()
 
     return PipelineConfig(

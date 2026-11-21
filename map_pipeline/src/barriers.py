@@ -1099,8 +1099,16 @@ def build_barriers(
     deck_at=None,
     surface_at=None,
     buildings=None,
+    stair_outlines=(),
+    osm=None,
+    survey_at=None,
 ) -> BarrierSet:
     """Fetch every barrier collection and turn it into draped geometry.
+
+    Steps are cut into treads (`stairs`): the BGT's stoops climb to their
+    building, and the flights in `stair_outlines` (the BGT's "voetpad op
+    trap", shapely polygons) and OpenStreetMap's ``highway=steps`` in `osm`
+    climb the way the bare earth `survey_at` rises.
 
     `surface_at(x, y)` is the surface model (AHN DSM), NaN where it has no
     reading. A canopy's top is read from it (`_measured_top`).
@@ -1233,6 +1241,22 @@ def build_barriers(
                         else [rings]
                     )
                     for rings in pieces:
+                        if style.name == "steps" and footprints_under is not None:
+                            flight = _stoop(rings, footprints_under, ground, surface_at)
+                            if flight is not None:
+                                # Every tread down into the ground, so none
+                                # stands on air at the side of the flight.
+                                deep = replace(style, height_m=flight.rise_m + 0.3)
+                                for tread_rings, top_z in flight.treads:
+                                    verts, tris, uvs = _extrude_rings(
+                                        tread_rings, ground, deep, step_m,
+                                        tolerance_m=drape_tolerance_m, top_z=top_z,
+                                    )
+                                    if len(tris):
+                                        chunks.append((verts, tris, uvs, style))
+                                counts[style.name] = counts.get(style.name, 0) + 1
+                                counts["steps_cut_into_treads"] = counts.get("steps_cut_into_treads", 0) + 1
+                                continue
                         top = None
                         if style.top_from_survey and surface_at is not None:
                             open_rings = [
@@ -1275,6 +1299,21 @@ def build_barriers(
                                 )
                                 if len(c_tris):
                                     collision_chunks.append((c_verts, c_tris))
+
+    flights = _public_flights(
+        stair_outlines, osm, terrain.surface, survey_at, styled(AREA_STYLES, "gebouwinstallatie", "toegangstrap"),
+    )
+    for flight, style in flights:
+        deep = replace(style, height_m=flight.rise_m + 0.3)
+        for tread_rings, top_z in flight.treads:
+            verts, tris, uvs = _extrude_rings(
+                tread_rings, terrain.surface, deep, step_m,
+                tolerance_m=drape_tolerance_m, top_z=top_z,
+            )
+            if len(tris):
+                chunks.append((verts, tris, uvs, style))
+        key = "flights_from_osm" if flight.source == "osm" else "flights_from_bgt"
+        counts[key] = counts.get(key, 0) + 1
 
     if not chunks:
         LOG.info("no barriers found")
@@ -1351,6 +1390,57 @@ def build_barriers(
         )
     save_barriers(result, work_dir / "barriers.npz")
     return result
+
+
+def _stoop(rings, footprints_under, ground, surface_at):
+    """A stoop's treads, climbing to the building it stands against."""
+    import shapely
+
+    from .stairs import stoop_flight
+
+    try:
+        polygon = shapely.make_valid(shapely.Polygon(
+            np.asarray(rings[0])[:, :2], [np.asarray(r)[:, :2] for r in rings[1:]]
+        ))
+    except Exception:  # noqa: BLE001 - the block it was is the fallback
+        return None
+    if polygon.is_empty or polygon.geom_type != "Polygon":
+        return None
+    building = footprints_under(polygon.buffer(0.5))
+    if building is None:
+        return None
+    return stoop_flight(polygon, building=building, ground_at=ground, surface_at=surface_at)
+
+
+def _public_flights(stair_outlines, osm, ground, survey_at, style):
+    """Flights of public steps: the BGT's, and OpenStreetMap's it lacks."""
+    import shapely
+
+    from .stairs import osm_step_outlines, public_flight
+
+    if style is None:
+        return []
+    out = []
+    bgt = [p for p in stair_outlines or () if p is not None and not p.is_empty]
+    for polygon in bgt:
+        for part in getattr(polygon, "geoms", [polygon]):
+            flight = public_flight(part, ground_at=ground, survey_at=survey_at, source="bgt")
+            if flight is not None:
+                out.append((flight, style))
+    taken = shapely.union_all(np.array(bgt, dtype=object)).buffer(1.0) if bgt else None
+    for outline, count in osm_step_outlines(osm, taken):
+        flight = public_flight(
+            outline, ground_at=ground, survey_at=survey_at, source="osm", step_count=count,
+        )
+        if flight is not None:
+            out.append((flight, style))
+    if out:
+        LOG.info(
+            "steps: %d flights cut into treads, %d from the BGT and %d from OpenStreetMap",
+            len(out), sum(1 for f, _ in out if f.source == "bgt"),
+            sum(1 for f, _ in out if f.source == "osm"),
+        )
+    return out
 
 
 def _length(points: np.ndarray) -> float:

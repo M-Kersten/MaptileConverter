@@ -105,18 +105,32 @@ BENCH_TYPES = {"bank"}
 
 @dataclass
 class FurnitureSet:
-    """Positions and kinds, ready for the Blender stage to instance."""
+    """Positions and kinds, ready for the Blender stage to instance.
+
+    `spin`, `height_m`, `size` and `z_m` are per object and NaN where the
+    Blender stage chooses (`street_objects.StreetObject`); `source` says
+    which register or map each came from.
+    """
 
     xy: np.ndarray = field(default_factory=lambda: np.zeros((0, 2)))
     ground_z_nap: np.ndarray = field(default_factory=lambda: np.zeros(0))
     kind: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
     counts: dict[str, int] = field(default_factory=dict)
+    spin: np.ndarray | None = None
+    height_m: np.ndarray | None = None
+    size: np.ndarray | None = None
+    z_m: np.ndarray | None = None
+    source: np.ndarray | None = None
+    sources: dict = field(default_factory=dict)
 
     def __len__(self) -> int:
         return int(len(self.xy))
 
     def stats(self) -> dict:
-        return {"count": len(self), **self.counts}
+        out = {"count": len(self), **self.counts}
+        if self.sources:
+            out["by_source"] = self.sources
+        return out
 
 
 def build_furniture(
@@ -186,11 +200,21 @@ def build_furniture(
 
 def save_furniture(furniture: FurnitureSet, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(furniture)
+
+    def column(values, fill=np.nan):
+        return np.full(n, fill, dtype=np.float64) if values is None else np.asarray(values, dtype=np.float64)
+
     np.savez_compressed(
         path,
         xy=furniture.xy,
         ground_z_nap=furniture.ground_z_nap,
         kind=furniture.kind,
+        spin=column(furniture.spin),
+        height_m=column(furniture.height_m),
+        size=column(furniture.size),
+        z_m=column(furniture.z_m),
+        source=column(furniture.source, 0.0).astype(np.int8),
     )
     LOG.info("wrote %s (%d objects)", path, len(furniture))
     return path

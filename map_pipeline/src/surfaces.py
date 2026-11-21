@@ -850,7 +850,10 @@ def _ground_areas(bbox: BBox, fetch_kwargs: dict, result: SurfaceSet) -> list:
                 clipped = [clip_ring_to_bbox(ring, bbox) for ring in rings]
                 clipped = [ring for ring in clipped if len(ring) >= 4]
                 if clipped:
-                    areas.append(GroundArea(clipped, kind[0], kind[1], level))
+                    areas.append(GroundArea(
+                        clipped, kind[0], kind[1], level,
+                        functie=str(properties.get("functie") or ""),
+                    ))
     counts: dict[str, int] = {}
     for area in areas:
         name = LAYER_NAMES[area.layer]

@@ -83,7 +83,7 @@ from src.facade import (  # noqa: E402
     generate_water_texture,
 )
 from src.barriers import BarrierSet, build_barriers  # noqa: E402
-from src.furniture import FurnitureSet, build_furniture  # noqa: E402
+from src.furniture import FurnitureSet, build_furniture, save_furniture  # noqa: E402
 from src.imagery import build_aerial  # noqa: E402
 from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
 from src.rails import RailSet, build_rails, save_rails  # noqa: E402
@@ -497,7 +497,84 @@ def _collision_metadata(work_dir: Path) -> dict:
     return {"collision": collision} if collision.get("objects") else {}
 
 
-def layered_scene(config: PipelineConfig, ground, harbour=None) -> dict:
+def stair_outlines(surfaces) -> list:
+    """The BGT's flights of public steps ("voetpad op trap"), as polygons."""
+    import numpy as np
+    import shapely
+
+    from src.layered import is_stair
+    from src.terrain_mesh import _polygonal
+
+    out = []
+    for area in getattr(surfaces, "areas", None) or ():
+        if area.level != 0 or not is_stair(area.functie):
+            continue
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in area.rings]
+        rings = [r for r in rings if len(r) >= 4]
+        if rings:
+            polygon = _polygonal(shapely.make_valid(shapely.Polygon(rings[0], rings[1:])))
+            if not polygon.is_empty:
+                out.append(polygon)
+    return out
+
+
+def street_details(config, work_dir, furniture, *, buildings, surfaces, terrain, surface_at,
+                   street_photos):
+    """OpenStreetMap and Mapillary's objects on top of the BGT's furniture.
+
+    Returns ``(osm, furniture)``: the OpenStreetMap features, for the steps
+    the barriers stage builds, and the merged furniture, or None when there
+    was nothing to add. Either source failing costs only what it adds.
+    """
+    from src.elevation import raster_sampler
+    from src.street_objects import add_street_objects
+
+    cfg = config.furniture
+    osm = None
+    if cfg.get("osm"):
+        from src.osm import fetch_osm
+
+        try:
+            osm = fetch_osm(config.bbox, cache_dir=work_dir / "_osm", api_url=str(cfg["osm_url"]))
+            LOG.info("OpenStreetMap: %s", osm.stats())
+        except Exception as exc:  # noqa: BLE001 - a soft source
+            LOG.warning("OpenStreetMap could not be read (%s); its details are left out", exc)
+            osm = None
+    features = None
+    if cfg.get("mapillary_objects") and config.photos.get("mapillary") and street_photos.uses_mapillary:
+        from src.mapillary import fetch_map_features, find_token, session_for
+
+        try:
+            token = find_token()
+            if token:
+                features = fetch_map_features(
+                    config.bbox, session=session_for(token),
+                    cache_dir=work_dir / "_mapillary" / "features",
+                    api_url=str(config.photos.get("mapillary_url") or "https://graph.mapillary.com"),
+                )
+        except Exception as exc:  # noqa: BLE001 - a soft source
+            LOG.warning("Mapillary's map features could not be read (%s)", exc)
+            features = None
+    if osm is None and not features:
+        return osm, None
+    dtm_tif = work_dir / "ahn_dtm.tif"
+    found, _ = add_street_objects(
+        furniture,
+        osm=osm,
+        mapillary_features=features,
+        buildings=buildings,
+        areas=getattr(surfaces, "areas", None),
+        water=getattr(surfaces, "water", None),
+        surface_at=terrain.surface,
+        survey_top=surface_at,
+        survey_ground=raster_sampler(dtm_tif) if dtm_tif.is_file() else terrain.sample,
+        terraces=bool(cfg.get("terraces", True)),
+        bbox=config.bbox,
+    )
+    return osm, found
+
+
+def layered_scene(config: PipelineConfig, ground, harbour=None, paving=None) -> dict:
     """What the Blender stage needs to build the modellers' ground."""
     settings = config.layered
     curb = settings["curb"]
@@ -523,6 +600,12 @@ def layered_scene(config: PipelineConfig, ground, harbour=None) -> dict:
         "water_level_offset_m": float(settings.get("water_level_offset_m", 0.0)),
         "walkway_material": str(curb.get("walkway_material") or ""),
         "curb_material": str(curb.get("curb_material") or "Beton"),
+        # Photographed paving per material (`src/paving.py`); a material not
+        # here keeps its flat colour.
+        "paving": dict(paving or {}),
+        # Beside photographed paving the hand-made file's white kerb glares:
+        # grey concrete, as kerbs are.
+        "curb_rgb": [0.3, 0.3, 0.29] if paving else None,
         "stats": {
             k: v for k, v in ground.stats.items()
             if k in ("faces", "vertices", "quad_share", "grid_error_max_m")
@@ -679,7 +762,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_surfaces = bool(
         config.surfaces["water"] or config.surfaces["land_cover"] or layered
     )
-    want_furniture = bool(config.furniture["enabled"])
+    want_furniture = bool(config.furniture["enabled"] or config.furniture.get("osm"))
     want_barriers = bool(config.barriers["enabled"])
     want_usage = bool(config.usage["enabled"])
     want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
@@ -809,6 +892,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             # whichever layer is under it.
             settings = config.layered
             curb = settings["curb"]
+            # The bare-earth survey as fetched, before any smoothing: only the
+            # DTM is bare earth, a DSM would read every parked car as a kerb.
+            dtm_tif = work_dir / f"ahn_{str(config.terrain['ahn_model']).lower()}.tif"
+            if str(config.terrain["ahn_model"]).upper() != "DTM":
+                dtm_tif = work_dir / "ahn_dtm.tif"
             ground_layers = build_layered_ground(
                 terrain,
                 surfaces.areas,
@@ -826,6 +914,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 ditch_depth_m=float(settings["ditch_depth_m"]),
                 mesher=str(settings["mesher"]),
                 square_m=float(settings["square_m"]),
+                # The survey at its own half metre: a kerb of 6 cm is a step
+                # there and a slope on the terrain's grid.
+                ground_at=(
+                    raster_sampler(dtm_tif)
+                    if settings.get("kerbs", True) and settings.get("flush_walkways", True)
+                    and dtm_tif.is_file()
+                    else None
+                ),
             )
             terrain.mesh = ground_layers.mesh
             terrain.layers = ground_layers
@@ -983,6 +1079,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     street_photos = StreetPhotoResult()
     observed_plan = None
     photo_textures = None
+    paving_seen: dict = {}
     if want_photos:
         with Stage("street photos (Mapillary and your own)", next_step(), total):
             street_photos = build_street_photos(
@@ -1000,17 +1097,42 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 buildings, street_photos, config, work_dir, out_dir,
                 terrain=terrain, trees=trees if len(trees) else None, surfaces=surfaces,
             )
+            if layered and config.layered.get("paving", True) and street_photos.coverage is not None:
+                # The paving's colour as the street sees it: the aerial makes
+                # red-brown brick grey.
+                from src.facade_capture import PhotoPixels, crowns_from_trees
+                from src.paving import photo_colours
+                from src.photo_coverage import _SegmentIndex
+
+                paving_seen = photo_colours(
+                    street_photos.photos, surfaces.areas, terrain.sample, PhotoPixels(max_cached=2),
+                    faces_index=_SegmentIndex(street_photos.coverage.faces),
+                    crowns=crowns_from_trees(trees) if len(trees) else [],
+                )
 
     furniture = FurnitureSet()
     furniture_texture = None
+    osm = None
     if want_furniture:
-        with Stage("street furniture (BGT)", next_step(), total):
-            furniture = build_furniture(
-                config.bbox,
-                work_dir,
-                furniture_cfg=config.furniture,
-                terrain=terrain,
+        with Stage("street furniture (BGT, OpenStreetMap, Mapillary)", next_step(), total):
+            furniture = (
+                build_furniture(
+                    config.bbox,
+                    work_dir,
+                    furniture_cfg=config.furniture,
+                    terrain=terrain,
+                )
+                if config.furniture["enabled"]
+                else FurnitureSet()
             )
+            osm, found = street_details(
+                config, work_dir, furniture,
+                buildings=buildings, surfaces=surfaces, terrain=terrain,
+                surface_at=surface_at, street_photos=street_photos,
+            )
+            if found is not None:
+                furniture = found
+                save_furniture(furniture, work_dir / "furniture.npz")
             if len(furniture):
                 furniture_texture = generate_furniture_texture(work_dir)
 
@@ -1036,6 +1158,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # building's roof is.
                 surface_at=surface_at,
                 buildings=buildings,
+                # Flights of steps, cut into treads the way the bare earth
+                # climbs: the BGT's, and OpenStreetMap's it lacks.
+                stair_outlines=stair_outlines(surfaces),
+                osm=osm if config.furniture.get("osm") else None,
+                survey_at=(
+                    raster_sampler(work_dir / "ahn_dtm.tif")
+                    if (work_dir / "ahn_dtm.tif").is_file() else None
+                ),
             )
             # Shares the furniture atlas: the same eight flat patches cover a
             # brick wall and a wooden bench, and one texture is one material.
@@ -1122,6 +1252,20 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         ground_variants = (
             (2 if len(usage) else 1) if config.facade["ground_floor"] else 0
         )
+        paving_entry: dict = {}
+        if ground_layers is not None and config.layered.get("paving", True):
+            from src.layered import MATERIAL_NAMES
+            from src.paving import aerial_colours, build_paving_textures, scene_entry, target_colours
+
+            used = [
+                MATERIAL_NAMES[m] for m in sorted({int(v) for v in ground_layers.face_material if v >= 0})
+            ]
+            targets = target_colours(
+                used,
+                photo=paving_seen,
+                aerial=aerial_colours(surfaces.areas, aerial.path, aerial.path.with_suffix(".pgw")),
+            )
+            paving_entry = scene_entry(build_paving_textures(used, work_dir, targets=targets))
 
     with Stage("scene description", next_step(), total):
         write_scene_description(
@@ -1157,7 +1301,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             ground_variants=ground_variants,
             photo_textures=photo_textures.pages if photo_textures is not None else None,
             layered=(
-                layered_scene(config, ground_layers, harbour)
+                layered_scene(config, ground_layers, harbour, paving=paving_entry)
                 if ground_layers is not None
                 else None
             ),
@@ -1215,9 +1359,16 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
+        from src.street_objects import SOURCE_MAPILLARY, SOURCE_OSM
+
+        drawn_from = (
+            {int(v) for v in furniture.source} if furniture.source is not None else set()
+        )
         write_attribution(
             out_dir,
             mapillary=street_photos.uses_mapillary,
+            osm=SOURCE_OSM in drawn_from or bool(barriers.counts.get("flights_from_osm")),
+            mapillary_objects=SOURCE_MAPILLARY in drawn_from,
             mapillary_textures=bool(
                 photo_textures is not None
                 and any(

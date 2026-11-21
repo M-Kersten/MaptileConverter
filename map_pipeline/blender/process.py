@@ -336,6 +336,12 @@ class _Layer:
         return False
 
 
+def srgb_to_linear(value: float) -> float:
+    """One sRGB channel, 0 to 1, as the linear value Blender's colours take."""
+    value = float(value)
+    return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+
 def planar_uv(points_xy: np.ndarray, aerial_bbox_local: list[float]) -> np.ndarray:
     """Top-down UV from local XY, normalised to the aerial footprint.
 
@@ -1273,12 +1279,33 @@ def build_layered(scene: dict, work_dir: Path, aerial_material) -> dict:
     _GROUND.clear()
     _GROUND.update(vertices=vertices, loops=loops, starts=starts, sizes=sizes)
 
+    paving = scene.get("_paving") or {}
     materials = {
-        name: make_plain_material(name, tuple(rgb), float(rough))
+        name: (
+            make_textured_material(
+                name, paving[name]["colour_path"], float(paving[name]["roughness"]),
+                paving[name]["normal_path"],
+            )
+            if name in paving
+            else make_plain_material(name, tuple(rgb), float(rough))
+        )
         for name, rgb, rough in zip(
             material_names, data["material_rgb"], data["material_roughness"]
         )
     }
+    curb_rgb = cfg.get("curb_rgb")
+    curb_name = str(cfg.get("curb_material") or "Beton")
+    if curb_rgb and curb_name in materials and curb_name not in paving:
+        materials[curb_name] = make_plain_material(curb_name, tuple(curb_rgb), 0.85)
+    # What a viewport in solid mode shows: the paving's own colour.
+    for name, entry in paving.items():
+        if name in materials and entry.get("rgb"):
+            rgb = [srgb_to_linear(v / 255.0) for v in entry["rgb"]]
+            materials[name].diffuse_color = (*rgb, 1.0)
+    # Metres of ground each material's texture covers, for its faces' UVs.
+    tile_m = np.array([
+        float(paving[name]["tile_m"]) if name in paving else 0.0 for name in material_names
+    ])
 
     # ---- the terrain: the ground no layer covers ---------------------------
     bare = np.flatnonzero((face_object < 0) | (face_layer == 0))
@@ -1310,13 +1337,13 @@ def build_layered(scene: dict, work_dir: Path, aerial_material) -> dict:
         made = _layer_objects(
             scene, cfg, vertices, loops, starts, sizes, face_material, face_object,
             names, layers, lifts, material_names, materials, curb_group,
-            only=lambda layer: layer != LAYER_GRASS,
+            only=lambda layer: layer != LAYER_GRASS, tile_m=tile_m,
         )
     with _Layer("Terrain Cutout", "Terrain_Cutout"):
         made += _layer_objects(
             scene, cfg, vertices, loops, starts, sizes, face_material, face_object,
             names, layers, lifts, material_names, materials, curb_group,
-            only=lambda layer: layer == LAYER_GRASS,
+            only=lambda layer: layer == LAYER_GRASS, tile_m=tile_m,
         )
     kerbed = sum(1 for _, layer, kerbs in made if kerbs)
     log(
@@ -1388,9 +1415,27 @@ def split_pinches(points, loops, starts, sizes):
     return points, loops
 
 
+def _paving_uv(points_xy: np.ndarray, loop_material: np.ndarray, tile_m: np.ndarray, bbox_local):
+    """UVs for the ground's loops: metres over each material's texture size.
+
+    A face whose material wears a photographed paving gets the ground's own
+    x and y divided by the metres that photograph covers, so a brick is a
+    brick's size wherever it is and whatever reads the FBX. Faces in a flat
+    colour keep the aerial's UVs, as before.
+    """
+    uv = planar_uv(points_xy, bbox_local)
+    if tile_m is None or not len(loop_material):
+        return uv
+    size = np.where(loop_material >= 0, tile_m[np.clip(loop_material, 0, len(tile_m) - 1)], 0.0)
+    textured = size > 0
+    if textured.any():
+        uv[textured] = points_xy[textured] / size[textured, None]
+    return uv
+
+
 def _layer_objects(
     scene, cfg, vertices, loops, starts, sizes, face_material, face_object,
-    names, layers, lifts, material_names, materials, curb_group, only,
+    names, layers, lifts, material_names, materials, curb_group, only, tile_m=None,
 ) -> list:
     """One object per name: its faces of the ground, where they are."""
     made = []
@@ -1425,7 +1470,9 @@ def _layer_objects(
             local,
             local_starts,
             face_sizes,
-            planar_uv(points[local][:, :2], bbox_local),
+            _paving_uv(
+                points[local][:, :2], np.repeat(face_material[faces], face_sizes), tile_m, bbox_local,
+            ),
             np.array([slot_of.get(int(m), 0) for m in face_material[faces]]),
             [materials[material_names[m]] for m in slots] or [curb_material],
             shade_smooth=False,
@@ -2156,7 +2203,27 @@ def _box(cx, cy, cz, sx, sy, sz, spin=0.0):
     return corners, faces
 
 
-def _furniture_pieces(kind, x, y, base, spin, uv, cfg):
+def _along(x, y, spin, a, c=0.0):
+    """The point `a` along `spin` and `c` across it from (x, y)."""
+    return (x + a * np.cos(spin) - c * np.sin(spin), y + a * np.sin(spin) + c * np.cos(spin))
+
+
+def _figure(x, y, z, height, spin, colour):
+    """A standing figure in boxes: legs, body, arms, head, `height` tall."""
+    s = height / 1.75
+    pieces = []
+    for side in (-1.0, 1.0):
+        lx, ly = _along(x, y, spin, 0.0, side * 0.09 * s)
+        pieces.append((_box(lx, ly, z + 0.42 * s, 0.14 * s, 0.13 * s, 0.84 * s, spin), colour))
+        ax, ay = _along(x, y, spin, 0.0, side * 0.25 * s)
+        pieces.append((_box(ax, ay, z + 1.13 * s, 0.1 * s, 0.1 * s, 0.6 * s, spin), colour))
+    pieces.append((_box(x, y, z + 1.14 * s, 0.24 * s, 0.4 * s, 0.62 * s, spin), colour))
+    pieces.append((_box(x, y, z + 1.6 * s, 0.17 * s, 0.17 * s, 0.24 * s, spin), colour))
+    return pieces
+
+
+def _furniture_pieces(kind, x, y, base, spin, uv, cfg, height=float("nan"),
+                      size=float("nan"), lift=float("nan")):
     """The boxes one piece of street furniture is made of.
 
     A proxy, not a model: three or four boxes that read correctly at the
@@ -2213,9 +2280,10 @@ def _furniture_pieces(kind, x, y, base, spin, uv, cfg):
             (_box(x, y, base + 2.9, 1.34, 1.34, 0.16, spin), metal),
         ]
     if kind == 7:  # art object: a plinth and something on it
+        top = 2.2 if not np.isfinite(height) else max(0.4, height - 0.4)
         return [
             (_box(x, y, base + 0.2, 1.6, 1.6, 0.4, spin), stone),
-            (_box(x, y, base + 1.5, 0.7, 0.7, 2.2, spin + 0.6), stone),
+            (_box(x, y, base + 0.4 + top / 2, 0.7, 0.7, top, spin + 0.6), stone),
         ]
     if kind == 8:  # memorial: a wider plinth, a slab, and a step
         return [
@@ -2258,6 +2326,103 @@ def _furniture_pieces(kind, x, y, base, spin, uv, cfg):
             (_box(x, y, base + mast / 2, 0.24, 0.24, mast, spin), paint),
             (_box(x + 0.8 * np.cos(spin), y + 0.8 * np.sin(spin),
                   base + mast - 0.4, 1.6, 0.1, 0.1, spin), paint),
+        ]
+    # Patches a scene file from before the atlas grew to sixteen lacks.
+    black, red, white = (uv.get(n, metal) for n in ("black", "red", "white"))
+    canvas, rattan, bronze = (uv.get(n, stone) for n in ("canvas", "rattan", "bronze"))
+    water, terracotta, hedge = (uv.get(n, glass) for n in ("water", "terracotta", "hedge"))
+    if kind == 14:  # bike rack, with the bikes parked in it
+        stands = int(np.clip(size if np.isfinite(size) else 6, 2, 12))
+        length = 0.6 * stands
+        pieces = [(_box(x, y, base + 0.35, length, 0.05, 0.7, spin), black)]
+        # Seven in ten stands taken: a Dutch rack is never empty.
+        for i in range(stands):
+            if (i * 7) % 10 >= 7:
+                continue
+            bx, by = _along(x, y, spin, -length / 2 + 0.3 + 0.6 * i)
+            pieces.append((_box(bx, by, base + 0.5, 1.75, 0.06, 0.95, spin + np.pi / 2), black))
+        return pieces
+    if kind == 15:  # litter bin
+        return [
+            (_box(x, y, base + 0.45, 0.42, 0.42, 0.9, spin), black),
+            (_box(x, y, base + 0.92, 0.48, 0.48, 0.05, spin), metal),
+        ]
+    if kind == 16:  # shop sign, flat on the wall above the shop front
+        z = base + (lift if np.isfinite(lift) else 3.1)
+        return [
+            (_box(x, y, z, 1.9, 0.04, 0.55, spin), black),
+            (_box(x, y, z, 1.8, 0.07, 0.45, spin), white),
+        ]
+    if kind == 17:  # sign or banner out from the wall on a bracket
+        z = base + (lift if np.isfinite(lift) else 3.1)
+        bx, by = _along(x, y, spin, -0.35)
+        return [
+            (_box(bx, by, z + 0.36, 0.8, 0.04, 0.04, spin), metal),
+            (_box(x, y, z, 0.6, 0.04, 0.7, spin), canvas),
+        ]
+    if kind == 18:  # manhole cover, gully grating, valve lid
+        side = size if np.isfinite(size) else 0.6
+        return [(_box(x, y, base + 0.006, side, side * (0.7 if side < 0.5 else 1.0), 0.012, spin), metal)]
+    if kind == 19:  # fountain: a basin with a column, or a drinking tap
+        if np.isfinite(size) and size < 0.5:
+            return [(_box(x, y, base + 0.5, 0.28, 0.28, 1.0, spin), metal)]
+        return [
+            (_box(x, y, base + 0.25, 2.6, 2.6, 0.5, spin), stone),
+            (_box(x, y, base + 0.44, 2.3, 2.3, 0.04, spin), water),
+            (_box(x, y, base + 1.0, 0.4, 0.4, 1.4, spin), stone),
+            (_box(x, y, base + 1.7, 0.9, 0.9, 0.12, spin), stone),
+        ]
+    if kind == 20:  # planter with a shrub in it
+        return [
+            (_box(x, y, base + 0.3, 1.1, 1.1, 0.6, spin), terracotta),
+            (_box(x, y, base + 0.95, 0.9, 0.9, 0.7, spin + 0.4), hedge),
+        ]
+    if kind == 21:  # post box on its post
+        return [
+            (_box(x, y, base + 0.5, 0.12, 0.12, 1.0, spin), metal),
+            (_box(x, y, base + 1.2, 0.46, 0.34, 0.5, spin), red),
+        ]
+    if kind == 22:  # pole
+        tall = height if np.isfinite(height) else 4.0
+        return [(_box(x, y, base + tall / 2, 0.12, 0.12, tall, spin), metal)]
+    if kind == 23:  # statue: a plinth and a figure on it, as tall as surveyed
+        total = height if np.isfinite(height) else 3.2
+        plinth = float(np.clip(0.38 * total, 0.5, 1.6))
+        figure = max(total - plinth, 0.8)
+        return [(_box(x, y, base + plinth / 2, 1.1, 1.1, plinth, spin), stone)] + _figure(
+            x, y, base + plinth, figure, spin, bronze,
+        )
+    if kind == 24:  # terrace table and its chairs
+        chairs = 4 if not np.isfinite(size) or size >= 3 else 2
+        pieces = [
+            (_box(x, y, base + 0.74, 0.7, 0.7, 0.04, spin), white),
+            (_box(x, y, base + 0.37, 0.07, 0.07, 0.72, spin), black),
+        ]
+        sides = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)][:chairs]
+        for da, dc in sides:
+            cx, cy = _along(x, y, spin, 0.62 * da, 0.62 * dc)
+            facing = spin + (0.0 if dc == 0 else np.pi / 2)
+            pieces.append((_box(cx, cy, base + 0.45, 0.42, 0.42, 0.05, facing), rattan))
+            pieces.append((_box(cx, cy, base + 0.22, 0.05, 0.05, 0.44, facing), black))
+            rx, ry = _along(cx, cy, spin, 0.2 * da, 0.2 * dc)
+            pieces.append((_box(rx, ry, base + 0.7, 0.05 if dc == 0 else 0.42,
+                                0.42 if dc == 0 else 0.05, 0.5, spin), rattan))
+        return pieces
+    if kind == 25:  # parasol
+        width = size if np.isfinite(size) else 2.6
+        return [
+            (_box(x, y, base + 1.2, 0.06, 0.06, 2.4, spin), metal),
+            (_box(x, y, base + 2.3, width, width, 0.05, spin), canvas),
+            (_box(x, y, base + 2.4, width * 0.62, width * 0.62, 0.14, spin), canvas),
+            (_box(x, y, base + 2.5, width * 0.25, width * 0.25, 0.1, spin), canvas),
+        ]
+    if kind == 26:  # lantern on a bracket on the facade
+        z = base + (lift if np.isfinite(lift) else 4.5)
+        bx, by = _along(x, y, spin, -0.25)
+        return [
+            (_box(bx, by, z + 0.25, 0.5, 0.05, 0.05, spin), black),
+            (_box(x, y, z, 0.22, 0.22, 0.38, spin), black),
+            (_box(x, y, z - 0.02, 0.16, 0.16, 0.24, spin), white),
         ]
     # Anything unmapped would be a guess. Drawing nothing is the honest answer.
     return []
@@ -2399,6 +2564,13 @@ def build_furniture(scene: dict, work_dir: Path, material):
     z_offset = float(scene["ground_z_offset_nap"])
     cfg = scene.get("furniture", {})
 
+    def column(name):
+        if name in data.files and len(data[name]) == len(xy):
+            return np.asarray(data[name], dtype=np.float64)
+        return np.full(len(xy), np.nan)
+
+    spins, heights, sizes, lifts = column("spin"), column("height_m"), column("size"), column("z_m")
+
     # Where each material sits in the atlas, from the scene file rather than
     # duplicated here. Falls back to the old two-patch split so an older
     # scene.json still renders.
@@ -2408,17 +2580,22 @@ def build_furniture(scene: dict, work_dir: Path, material):
         for name, default in (
             # V from the bottom of the image: the first row is written at
             # the top. See `furniture_uv`.
-            ("metal", (0.125, 0.75)), ("wood", (0.375, 0.75)),
-            ("brick", (0.625, 0.75)), ("concrete", (0.875, 0.75)),
-            ("hedge", (0.125, 0.25)), ("paint", (0.375, 0.25)),
-            ("stone", (0.625, 0.25)), ("glass", (0.875, 0.25)),
+            ("metal", (0.125, 0.875)), ("wood", (0.375, 0.875)),
+            ("brick", (0.625, 0.875)), ("concrete", (0.875, 0.875)),
+            ("hedge", (0.125, 0.625)), ("paint", (0.375, 0.625)),
+            ("stone", (0.625, 0.625)), ("glass", (0.875, 0.625)),
+            ("bronze", (0.125, 0.375)), ("canvas", (0.375, 0.375)),
+            ("rattan", (0.625, 0.375)), ("terracotta", (0.875, 0.375)),
+            ("red", (0.125, 0.125)), ("white", (0.375, 0.125)),
+            ("black", (0.625, 0.125)), ("water", (0.875, 0.125)),
         )
     }
 
-    vertices: list[np.ndarray] = []
-    faces: list[np.ndarray] = []
-    uvs: list[np.ndarray] = []
-    offset = 0
+    # One object per group, so a designer can hide the summer terraces or
+    # the signs on the facades in one click; one material for all of them.
+    furniture_groups = {24: "Terraces", 25: "Terraces", 16: "FacadeDetail",
+                        17: "FacadeDetail", 26: "FacadeDetail"}
+    groups: dict[str, dict] = {}
     rng = np.random.default_rng(808)
     drawn = 0
 
@@ -2427,43 +2604,52 @@ def build_furniture(scene: dict, work_dir: Path, material):
         y = float(xy[index, 1]) - origin_y
         base = float(ground[index]) - z_offset
         kind = int(kinds[index])
+        # Drawn for every object, so an object with a direction of its own
+        # leaves every other's spin as it was.
         spin = float(rng.random()) * np.pi
+        if np.isfinite(spins[index]):
+            spin = float(spins[index])
 
-        pieces = _furniture_pieces(kind, x, y, base, spin, uv, cfg)
+        pieces = _furniture_pieces(
+            kind, x, y, base, spin, uv, cfg,
+            height=float(heights[index]), size=float(sizes[index]), lift=float(lifts[index]),
+        )
         if pieces:
             drawn += 1
-
+        group = groups.setdefault(
+            furniture_groups.get(kind, "StreetFurniture"),
+            {"vertices": [], "faces": [], "uvs": [], "offset": 0},
+        )
         for (piece_verts, piece_faces), uv_patch in pieces:
-            vertices.append(piece_verts)
-            faces.append(piece_faces + offset)
-            uvs.append(np.tile(uv_patch, (len(piece_faces) * 3, 1)))
-            offset += len(piece_verts)
+            group["vertices"].append(piece_verts)
+            group["faces"].append(piece_faces + group["offset"])
+            group["uvs"].append(np.tile(uv_patch, (len(piece_faces) * 3, 1)))
+            group["offset"] += len(piece_verts)
 
-    if not vertices:
+    made = []
+    for name, group in groups.items():
+        if not group["vertices"]:
+            continue
+        all_faces = np.vstack(group["faces"])
+        n_triangles = len(all_faces)
+        made.append(build_mesh_object(
+            name,
+            np.vstack(group["vertices"]),
+            all_faces.reshape(-1),
+            np.arange(0, n_triangles * 3, 3),
+            np.full(n_triangles, 3),
+            np.vstack(group["uvs"]),
+            np.zeros(n_triangles),
+            [material],
+            shade_smooth=False,
+        ))
+        log(f"street furniture: {name}, {n_triangles} triangles")
+    if not made:
         log("street furniture: nothing of a drawable type")
         return None
+    log(f"street furniture: {drawn} of {len(xy)} objects drawn")
+    return made[0]
 
-    all_vertices = np.vstack(vertices)
-    all_faces = np.vstack(faces)
-    all_uvs = np.vstack(uvs)
-    n_triangles = len(all_faces)
-
-    obj = build_mesh_object(
-        "StreetFurniture",
-        all_vertices,
-        all_faces.reshape(-1),
-        np.arange(0, n_triangles * 3, 3),
-        np.full(n_triangles, 3),
-        all_uvs,
-        np.zeros(n_triangles),
-        [material],
-        shade_smooth=False,
-    )
-    log(
-        f"street furniture: {drawn} of {len(xy)} objects drawn, "
-        f"{n_triangles} triangles"
-    )
-    return obj
 
 
 def _hull(cx, cy, cz, length, beam, depth, freeboard, spin):
@@ -3222,6 +3408,19 @@ def copy_textures(
         name = scene.get(section, {}).get("texture")
         if name and (work_dir / name).is_file():
             extras[key] = copy(name)
+    # Photographed paving for the layered ground's materials.
+    paving = {}
+    for material, entry in ((scene.get("layered") or {}).get("paving") or {}).items():
+        colour = entry.get("colour")
+        if not colour or not (work_dir / colour).is_file():
+            continue
+        normal = entry.get("normal")
+        paving[material] = {
+            **entry,
+            "colour_path": copy(colour),
+            "normal_path": copy(normal) if normal and (work_dir / normal).is_file() else None,
+        }
+    scene["_paving"] = paving
     return aerial_dst, facades, extras
 
 

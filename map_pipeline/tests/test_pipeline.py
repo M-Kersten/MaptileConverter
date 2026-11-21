@@ -639,6 +639,21 @@ class TestTrees(unittest.TestCase):
         self.assertTrue(mask[int(40 - 20), 25])
         self.assertFalse(mask[int(40 - 35), 5])
 
+    def test_water_mask_leaves_the_island_inside_a_moat_dry(self):
+        """Bourtange: one ring of moat round the town, the town its hole.
+        Filling the outline alone drowned the square and every tree on it."""
+        from types import SimpleNamespace
+
+        from src.trees import _rasterize_water
+
+        outer = np.array([[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]], dtype=float)
+        inner = np.array([[20, 20], [80, 20], [80, 80], [20, 80], [20, 20]], dtype=float)
+        surfaces = SimpleNamespace(water=[SimpleNamespace(rings=[outer, inner])])
+        mask = _rasterize_water(surfaces, (0.0, 0.0, 100.0, 100.0), (100, 100))
+        self.assertTrue(mask[5, 5])  # the moat
+        self.assertFalse(mask[50, 50])  # the town in it
+        self.assertAlmostEqual(float(mask.mean()), 1.0 - 0.36, delta=0.03)
+
     def test_local_maximum_finds_a_crown_beside_the_point(self):
         """A BGT point marks the trunk, so a point sample misses the canopy."""
         from src.trees import _max_in_radius
@@ -7886,6 +7901,29 @@ class TestLayeredGround(unittest.TestCase):
         material = int(self.ground.face_material[face])
         return int(self.mesh.face_kind[face]), (MATERIAL_NAMES[material] if material >= 0 else None)
 
+    def test_a_walkway_level_with_its_road_loses_its_kerb(self):
+        """Ganzenmarkt: brick from wall to wall, the footpath level with the
+        carriageway. The survey says which footpaths are kerbed."""
+        from src.layered import GroundArea, ROAD, WALKWAY, flush_walkways
+
+        road = GroundArea([_rect_ring(0.0, 0.0, 40.0, 6.0)], ROAD, "Bakstenen")
+        kerbed = GroundArea([_rect_ring(0.0, 6.0, 40.0, 9.0)], WALKWAY, "Bakstenen")
+        level = GroundArea([_rect_ring(0.0, -3.0, 40.0, 0.0)], WALKWAY, "Tegels")
+        lonely = GroundArea([_rect_ring(100.0, 100.0, 110.0, 110.0)], WALKWAY, "Tegels")
+        areas = [road, kerbed, level, lonely]
+
+        def ground_at(x, y):
+            y = np.asarray(y, dtype=float)
+            # A 12 cm kerb on the north side, none on the south, a 2% camber.
+            return 1.0 + 0.02 * np.abs(y - 3.0) + np.where(y > 6.0, 0.12, 0.0)
+
+        stats = flush_walkways(areas, ground_at)
+        self.assertEqual(kerbed.layer, WALKWAY)
+        self.assertEqual(level.layer, ROAD)
+        self.assertEqual(level.material, "Tegels")  # its own paving, kept
+        self.assertEqual(lonely.layer, WALKWAY)  # nothing to measure against
+        self.assertEqual((stats["measured"], stats["flush"]), (2, 1))
+
     def test_the_bgt_is_read_the_way_the_modellers_draw_it(self):
         from src.layered import GRASS, MOTORWAY, ROAD, WALKWAY, classify
 
@@ -7908,7 +7946,30 @@ class TestLayeredGround(unittest.TestCase):
             ("ondersteunendwegdeel", {"functie": "berm", "fysiek_voorkomen": "groenvoorziening"},
              (GRASS, "Gras")),
             ("ondersteunendwegdeel", {"functie": "berm", "fysiek_voorkomen": "half verhard"},
+             (ROAD, "Grind")),
+            # What the BGT says a street is paved with is what it is drawn in.
+            ("wegdeel", {"functie": "voetpad", "fysiek_voorkomen": "open verharding",
+                         "plus_fysiek_voorkomen": "gebakken klinkers"}, (WALKWAY, "Bakstenen")),
+            ("wegdeel", {"functie": "rijbaan lokale weg", "fysiek_voorkomen": "open verharding",
+                         "plus_fysiek_voorkomen": "sierbestrating"}, (ROAD, "Sierbestrating")),
+            ("wegdeel", {"functie": "voetpad", "plus_fysiek_voorkomen": "tegels"},
+             (WALKWAY, "Tegels")),
+            ("wegdeel", {"functie": "voetpad", "plus_fysiek_voorkomen": "betonstraatstenen"},
+             (WALKWAY, "Betonstenen")),
+            ("wegdeel", {"functie": "voetpad", "fysiek_voorkomen": "gesloten verharding"},
+             (WALKWAY, "Verharding")),
+            ("wegdeel", {"functie": "voetpad", "fysiek_voorkomen": "half verhard",
+                         "plus_fysiek_voorkomen": "grind"}, (WALKWAY, "Grind")),
+            # Hindeloopen's cycle path is brick, not red asphalt.
+            ("wegdeel", {"functie": "fietspad", "plus_fysiek_voorkomen": "gebakken klinkers"},
+             (ROAD, "Bakstenen")),
+            ("wegdeel", {"functie": "fietspad", "plus_fysiek_voorkomen": "asfalt"},
+             (ROAD, "Fietspad")),
+            # A flight of steps is laid flat, without a kerb, under its steps.
+            ("wegdeel", {"functie": "voetpad op trap", "fysiek_voorkomen": "gesloten verharding"},
              (ROAD, "Verharding")),
+            ("wegdeel", {"functie": "voetpad op trap", "plus_fysiek_voorkomen": "gebakken klinkers"},
+             (ROAD, "Bakstenen")),
             ("ondersteunendwegdeel", {"functie": "berm", "fysiek_voorkomen": "onverhard"}, None),
             ("begroeidterreindeel", {"fysiek_voorkomen": "grasland overig"}, (GRASS, "Gras")),
             ("onbegroeidterreindeel", {"fysiek_voorkomen": "gesloten verharding"},
@@ -8341,7 +8402,7 @@ class TestLayeredInBlender(unittest.TestCase):
 
         namespace = _process_namespace(
             {"build_layered", "_layer_objects", "_mark_layer_outlines", "_faces_subset",
-             "_GROUND", "split_pinches",
+             "_GROUND", "split_pinches", "_paving_uv", "srgb_to_linear",
              "_weighted_normals", "_triangulate_on_export", "set_modifier_input",
              "planar_uv", "LAYER_ROAD", "LAYER_MOTORWAY", "LAYER_WALKWAY", "LAYER_GRASS",
              "LAYER_ROLES"},

@@ -43,12 +43,21 @@ ATTRIBUTION = {
         "by Rijkswaterstaat, via PDOK (CC0)."
     ),
     "textures": (
-        "Wall surfaces under the generated facades from Poly Haven (CC0, no "
-        "attribution required). https://polyhaven.com"
+        "Wall surfaces under the generated facades, and the photographed paving, "
+        "from Poly Haven (CC0, no attribution required). https://polyhaven.com"
     ),
     "mapillary": (
         "Street-level imagery from Mapillary contributors (CC BY-SA 4.0), used "
         "to read facades. https://www.mapillary.com"
+    ),
+    "mapillary_objects": (
+        "Positions of shop signs, bins, bike racks, lamps and signs from "
+        "Mapillary's map features (CC BY-SA 4.0). https://www.mapillary.com"
+    ),
+    "osm": (
+        "Terraces, statues, steps and street furniture from OpenStreetMap: "
+        "© OpenStreetMap contributors, available under the Open Database "
+        "Licence (ODbL). https://www.openstreetmap.org/copyright"
     ),
 }
 
@@ -353,7 +362,8 @@ def write_scene_description(
 
 
 def write_attribution(
-    out_dir: Path, *, mapillary: bool = False, mapillary_textures: bool = False
+    out_dir: Path, *, mapillary: bool = False, mapillary_textures: bool = False,
+    osm: bool = False, mapillary_objects: bool = False,
 ) -> Path:
     """Drop the source credits next to the model.
 
@@ -376,6 +386,10 @@ def write_attribution(
     ]
     if mapillary:
         lines.append(f"Photos:    {ATTRIBUTION['mapillary']}")
+    if mapillary_objects:
+        lines.append(f"Objects:   {ATTRIBUTION['mapillary_objects']}")
+    if osm:
+        lines.append(f"OSM:       {ATTRIBUTION['osm']}")
     if mapillary_textures:
         lines += [
             "",

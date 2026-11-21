@@ -301,6 +301,112 @@ def photo_from_record(record: dict) -> Photo | None:
     )
 
 
+# Mapillary's object detections, the "map features": every object its
+# detectors found in more than one photo, placed by triangulating those
+# detections. The classes the model can draw, mapped onto the same kinds as
+# OpenStreetMap's (see osm.classify).
+FEATURE_KINDS = {
+    "object--street-light": "lamp",
+    "object--bench": "bench",
+    "object--trash-can": "bin",
+    "object--bike-rack": "bike_rack",
+    "object--fire-hydrant": "hydrant",
+    "object--junction-box": "cabinet",
+    "object--mailbox": "box",
+    "object--parking-meter": "box",
+    "object--phone-booth": "box",
+    "object--support--pole": "pole",
+    "object--support--utility-pole": "pole",
+    "object--bollard": "bollard",
+    "object--manhole": "manhole",
+    "object--catch-basin": "manhole",
+    "object--water-valve": "manhole",
+    "object--sign--store": "facade_sign",
+    "object--sign--advertisement": "facade_sign",
+    "object--banner": "facade_sign",
+    "object--sign--information": "facade_sign",
+}
+FEATURE_FIELDS = ("id", "object_value", "geometry", "last_seen_at", "aligned_direction")
+
+
+def feature_kind(value: str) -> str | None:
+    """What a map feature becomes, or None. Traffic signs are any of the
+    hundreds of sign classes, so they are recognised by family."""
+    if value in FEATURE_KINDS:
+        return FEATURE_KINDS[value]
+    family = value.split("--", 1)[0]
+    if family in ("regulatory", "warning", "information", "complementary") or value.startswith("object--traffic-sign"):
+        return "traffic_sign"
+    return None
+
+
+def fetch_map_features(
+    bbox_rd: BBox,
+    *,
+    session: requests.Session,
+    cache_dir: Path | None = None,
+    api_url: str = API_URL,
+    timeout: float = 60.0,
+    max_retries: int = 4,
+    min_year: int = 0,
+) -> list[dict]:
+    """Map features the model can draw: ``{"kind", "value", "x", "y", "heading"}``.
+
+    `min_year` drops objects last seen before it: a bench detected in 2014
+    and never since may well have gone.
+    """
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    found: dict[str, dict] = {}
+    for tile in _tiles(rd_bbox_to_wgs84(bbox_rd)):
+        cached = cache_dir / f"features_{_tile_key(tile)}.json" if cache_dir else None
+        if cached is not None and cached.is_file() and (time.time() - cached.stat().st_mtime) / 86400.0 <= 30.0:
+            records = json.loads(cached.read_text(encoding="utf-8"))
+        else:
+            response = get_with_retry(
+                f"{api_url.rstrip('/')}/map_features",
+                params={
+                    "fields": ",".join(FEATURE_FIELDS),
+                    "bbox": ",".join(f"{v:.7f}" for v in tile.as_tuple()),
+                    "limit": PAGE_LIMIT,
+                },
+                timeout=timeout,
+                max_retries=max_retries,
+                session=session,
+                description="Mapillary map features",
+            )
+            payload = response.json()
+            if "error" in payload:
+                raise ServiceError(f"Mapillary refused the map feature search: {payload['error']}")
+            records = list(payload.get("data", []))
+            if cached is not None:
+                cached.write_text(json.dumps(records), encoding="utf-8")
+        for record in records:
+            found[str(record["id"])] = record
+    out = []
+    for record in found.values():
+        kind = feature_kind(str(record.get("object_value", "")))
+        geometry = record.get("geometry") or {}
+        if kind is None or not geometry.get("coordinates"):
+            continue
+        seen = record.get("last_seen_at")
+        if min_year and seen:
+            year = datetime.fromtimestamp(float(seen) / 1000.0, tz=timezone.utc).year
+            if year < min_year:
+                continue
+        lon, lat = (float(v) for v in geometry["coordinates"][:2])
+        x, y = lonlat_to_rd(lon, lat)
+        direction = record.get("aligned_direction")
+        out.append({
+            "kind": kind,
+            "value": record.get("object_value"),
+            "x": float(x),
+            "y": float(y),
+            "heading": float(direction) if direction is not None else None,
+        })
+    return out
+
+
 def mapillary_id(photo: Photo) -> str:
     return photo.id.removeprefix("mly_")
 
@@ -459,6 +565,9 @@ def download_images(
 
 __all__ = [
     "API_URL",
+    "FEATURE_KINDS",
+    "feature_kind",
+    "fetch_map_features",
     "LICENCE",
     "MissingToken",
     "TOKEN_ENV",

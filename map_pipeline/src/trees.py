@@ -887,25 +887,38 @@ def _road_classes(names) -> set[int]:
     return wanted
 
 
-def _rasterize_rings(rings, bounds, shape) -> np.ndarray:
-    """Even-odd scanline fill of polygon rings onto a raster."""
+def _rasterize_polygons(polygons, bounds, shape) -> np.ndarray:
+    """Even-odd scanline fill of polygons, each a list of rings, holes cut out.
+
+    A polygon's outline and its holes are filled together, so what is inside
+    a hole stays empty. That matters most for water: a fortress moat is one
+    ring of water round the whole town, and filling its outline alone put
+    92.7% of Bourtange under water, every tree on its square with it.
+    """
     left, bottom, right, top = bounds
     rows, cols = shape
     cell_x = (right - left) / cols
     cell_y = (top - bottom) / rows
     mask = np.zeros(shape, dtype=bool)
 
-    for ring in rings:
-        ring = np.asarray(ring, dtype=np.float64)
-        if ring.ndim != 2 or len(ring) < 3:
+    for polygon in polygons:
+        edges = []
+        for ring in polygon:
+            ring = np.asarray(ring, dtype=np.float64)
+            if ring.ndim != 2 or len(ring) < 3:
+                continue
+            ring = ring[:, :2]
+            if not np.array_equal(ring[0], ring[-1]):
+                ring = np.vstack([ring, ring[:1]])
+            px = (ring[:, 0] - left) / cell_x
+            py = (top - ring[:, 1]) / cell_y
+            edges.append(np.column_stack([px[:-1], py[:-1], px[1:], py[1:]]))
+        if not edges:
             continue
-        ring = ring[:, :2]
-        px = (ring[:, 0] - left) / cell_x
-        py = (top - ring[:, 1]) / cell_y
-        ax, ay, bx, by = px[:-1], py[:-1], px[1:], py[1:]
-        for row in range(
-            max(0, int(np.floor(py.min()))), min(rows, int(np.ceil(py.max())) + 1)
-        ):
+        ax, ay, bx, by = np.concatenate(edges).T
+        low = min(ay.min(), by.min())
+        high = max(ay.max(), by.max())
+        for row in range(max(0, int(np.floor(low))), min(rows, int(np.ceil(high)) + 1)):
             centre = row + 0.5
             straddles = (ay > centre) != (by > centre)
             if not straddles.any():
@@ -962,9 +975,8 @@ def _rasterize_water(surfaces, bounds, shape) -> np.ndarray | None:
     if not bodies:
         return None
 
-    mask = _rasterize_rings(
-        (ring for body in bodies for ring in getattr(body, "rings", ()) or ()),
-        bounds, shape,
+    mask = _rasterize_polygons(
+        (list(getattr(body, "rings", ()) or ()) for body in bodies), bounds, shape,
     )
     LOG.info("masked %.1f%% of the canopy model as water", 100.0 * mask.mean())
     return mask
@@ -997,17 +1009,16 @@ def _rasterize_roads(surfaces, bounds, shape, classes) -> np.ndarray | None:
         return None
 
     wanted = set(classes)
-    rings = [
-        ring
+    polygons = [
+        list(getattr(part, "rings", ()) or ())
         for part in parts
         if int(getattr(part, "surface_class", -1)) in wanted
         and int(getattr(part, "level", 0)) <= 0
-        for ring in getattr(part, "rings", ()) or ()
     ]
-    if not rings:
+    if not any(polygons):
         return None
 
-    mask = _rasterize_rings(rings, bounds, shape)
+    mask = _rasterize_polygons(polygons, bounds, shape)
     LOG.info(
         "masked %.1f%% of the canopy model as road a tree would not stand on",
         100.0 * mask.mean(),

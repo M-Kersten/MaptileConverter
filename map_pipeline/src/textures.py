@@ -91,12 +91,27 @@ def _pick_file(entry: dict) -> str:
     raise TextureUnavailable("asset publishes no downloadable diffuse map")
 
 
-def fetch_texture(slug: str, work_dir: Path, *, timeout_s: float = 60.0) -> Path:
-    """Download one texture's albedo, or return the copy already on disk."""
+def _normal_entry(files: dict) -> dict:
+    """The OpenGL-convention normal map, which is what Blender reads."""
+    for key in ("nor_gl", "Normal", "normal", "nor"):
+        entry = files.get(key)
+        if isinstance(entry, dict) and entry:
+            return entry
+    raise TextureUnavailable("asset publishes no normal map")
+
+
+def fetch_texture(
+    slug: str, work_dir: Path, *, timeout_s: float = 60.0, kind: str = "diffuse"
+) -> Path:
+    """Download one texture's albedo (or its normal map), or return the cached copy.
+
+    `kind` is "diffuse" or "normal".
+    """
     cache = _cache_dir(work_dir)
     cache.mkdir(parents=True, exist_ok=True)
+    tag = RESOLUTION if kind == "diffuse" else f"normal_{RESOLUTION}"
 
-    for existing in cache.glob(f"{slug}_{RESOLUTION}.*"):
+    for existing in cache.glob(f"{slug}_{tag}.*"):
         return existing
 
     meta_path = cache / f"{slug}.json"
@@ -112,16 +127,17 @@ def fetch_texture(slug: str, work_dir: Path, *, timeout_s: float = 60.0) -> Path
         files = response.json()
         meta_path.write_text(json.dumps(files), encoding="utf-8")
 
-    url = _pick_file(_diffuse_entry(files))
+    entry = _normal_entry(files) if kind == "normal" else _diffuse_entry(files)
+    url = _pick_file(entry)
     suffix = Path(url).suffix or ".jpg"
-    path = cache / f"{slug}_{RESOLUTION}{suffix}"
+    path = cache / f"{slug}_{tag}{suffix}"
 
     response = get_with_retry(
         url,
         timeout=timeout_s,
         max_retries=2,
         expect_binary=True,
-        description=f"texture {slug}",
+        description=f"texture {slug} ({kind})",
     )
     path.write_bytes(response.content)
     LOG.info("cached %s (%.1f MB)", path.name, len(response.content) / 1e6)

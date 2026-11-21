@@ -61,7 +61,9 @@ LAYER_WORDS = {ROAD: "Wegen", MOTORWAY: "Snelweg", WALKWAY: "Voetpaden", GRASS: 
 # Flat colours, named and coloured as in the hand-made file where it has one:
 # linear RGB and roughness. Asfalt, Bakstenen, Beton, Beton_Geel and Gras are
 # theirs; Fietspad and Verharding are the two surfaces their square did not
-# need a colour for.
+# need a colour for. Sierbestrating, Tegels, Betonstenen and Grind are what the
+# BGT says a street is paved with where it says (`paving_material`): a city
+# centre is brick and setts from wall to wall, not yellow concrete.
 MATERIALS: dict[str, tuple[tuple[float, float, float], float]] = {
     "Asfalt": ((0.0496, 0.0496, 0.0496), 0.5),
     "Bakstenen": ((0.1414, 0.0969, 0.0822), 0.5),
@@ -70,18 +72,56 @@ MATERIALS: dict[str, tuple[tuple[float, float, float], float]] = {
     "Beton_Geel": ((0.6146, 0.4983, 0.1433), 0.5),
     "Beton": ((0.8, 0.8, 0.8), 0.5),
     "Gras": ((0.0697, 0.1031, 0.0007), 1.0),
+    "Sierbestrating": ((0.2159, 0.1878, 0.15), 0.7),
+    "Tegels": ((0.305, 0.2961, 0.2705), 0.6),
+    "Betonstenen": ((0.2307, 0.2159, 0.1878), 0.65),
+    "Grind": ((0.3515, 0.2961, 0.2016), 0.9),
 }
 MATERIAL_NAMES = tuple(MATERIALS)
+
+# What a BGT surface is paved with, by its `plus_fysiek_voorkomen` (matched by
+# substring: "gebakken klinkers", "betonstraatstenen") and failing that its
+# `fysiek_voorkomen`. Over the Ganzenmarkt in Utrecht 116 of 153 road parts
+# say which; in Bourtange 73 of 73.
+PAVINGS: tuple[tuple[str, str], ...] = (
+    ("klinker", "Bakstenen"),
+    ("sierbestrating", "Sierbestrating"),
+    ("natuursteen", "Sierbestrating"),
+    ("betonstraatst", "Betonstenen"),  # -steen, -stenen
+    ("grasbeton", "Betonstenen"),
+    ("tegel", "Tegels"),
+    ("asfalt", "Asfalt"),
+    ("beton", "Verharding"),
+    ("grind", "Grind"),
+    ("schelpen", "Grind"),
+    ("puin", "Grind"),
+    ("half verhard", "Grind"),
+)
+
+# The surfaces each layer can be drawn in. A road takes what it is paved with;
+# a walkway too, and Beton_Geel, the modellers' own walkway, where the BGT does
+# not say. A walkway the survey shows level with the road beside it is laid as
+# road (`flush_walkways`), in its own material.
+ROAD_SURFACES = ("Asfalt", "Bakstenen", "Sierbestrating", "Betonstenen", "Tegels", "Fietspad")
+WALKWAY_SURFACES = (
+    "Beton_Geel", "Bakstenen", "Sierbestrating", "Betonstenen", "Tegels", "Asfalt",
+    "Verharding", "Grind",
+)
 
 # Which outline wins where two overlap, best first. The BGT is a partition,
 # so this only settles the slivers where two surveys disagree.
 PRIORITY = (
-    (MOTORWAY, "Asfalt"),
-    (ROAD, "Asfalt"), (ROAD, "Bakstenen"), (ROAD, "Fietspad"),
-    (WALKWAY, "Beton_Geel"),
-    (ROAD, "Verharding"),
-    (GRASS, "Gras"),
+    ((MOTORWAY, "Asfalt"),)
+    + tuple((ROAD, material) for material in ROAD_SURFACES)
+    + tuple((WALKWAY, material) for material in WALKWAY_SURFACES)
+    + ((ROAD, "Beton_Geel"), (ROAD, "Verharding"), (ROAD, "Grind"), (GRASS, "Gras"))
 )
+
+# How far a walkway may stand above the road beside it, measured in the
+# survey, and still be level with it: no kerb. A Dutch kerb shows 8 to 15 cm;
+# the old centres' low ones 5 to 8. Over the Ganzenmarkt 21 of 53 footpaths
+# beside a road are within 3 cm of it, and in Hindeloopen 24 of 25.
+FLUSH_BELOW_M = 0.05
 
 # A green verge or island counts as an island -- raised, kerbed all round --
 # when paving surrounds at least this much of it and it is no bigger than
@@ -128,6 +168,22 @@ class GroundArea:
     layer: int
     material: str
     level: int = 0  # BGT relatieve_hoogteligging
+    functie: str = ""  # the BGT's own word for it: "voetpad op trap" is a stair
+
+
+def paving_material(physical: str, plus: str, default: str) -> str:
+    """What a surface is paved with, from the BGT's words for it."""
+    for token, material in PAVINGS:
+        if token in plus:
+            return material
+    if "half verhard" in physical:
+        return "Grind"
+    return default
+
+
+def is_stair(functie: str) -> bool:
+    """A BGT footpath that is a flight of steps: "voetpad op trap"."""
+    return "trap" in str(functie or "").lower()
 
 
 def classify(collection: str, properties: dict) -> tuple[int, str] | None:
@@ -137,9 +193,13 @@ def classify(collection: str, properties: dict) -> tuple[int, str] | None:
     paved traffic islands are walkways: the curb generator raises them. Green
     traffic islands start as grass and become islands when paving surrounds
     them (`ISLAND_SHARE`). Paving that is no road -- a forecourt, a hard verge
-    -- is laid flat in grey, without kerbs. Yards, sand and water stay terrain.
+    -- is laid flat without kerbs. Yards, sand and water stay terrain. Each
+    takes the material the BGT says it is paved with (`paving_material`).
+
+    A flight of steps ("voetpad op trap") is laid flat as road, under the
+    steps the barriers stage stands on it: a kerb round a stair is no kerb.
     """
-    from .surfaces import CLASS_CYCLE, CLASS_FOOTPATH, CLASS_ROAD_BRICK, road_class
+    from .surfaces import CLASS_CYCLE, CLASS_FOOTPATH, road_class
 
     functie = str(properties.get("functie") or "").strip().lower()
     physical = str(properties.get("fysiek_voorkomen") or "").strip().lower()
@@ -150,29 +210,149 @@ def classify(collection: str, properties: dict) -> tuple[int, str] | None:
     if collection == "wegdeel":
         if "rijbaan" in functie and ("autosnelweg" in functie or "autoweg" in functie):
             return MOTORWAY, "Asfalt"
+        if is_stair(functie):
+            return ROAD, paving_material(physical, plus, "Verharding")
         code = road_class(functie, plus or physical)
         if code == CLASS_FOOTPATH:
-            return WALKWAY, "Beton_Geel"
+            closed = "gesloten" in physical
+            return WALKWAY, paving_material(physical, plus, "Verharding" if closed else "Beton_Geel")
         if code == CLASS_CYCLE:
-            return ROAD, "Fietspad"
-        if code == CLASS_ROAD_BRICK:
-            return ROAD, "Bakstenen"
+            material = paving_material(physical, plus, "Fietspad")
+            # A cycle path in brick is brick; in asphalt it is red asphalt.
+            return ROAD, ("Fietspad" if material in ("Asfalt", "Verharding") else material)
         if "onverhard" in physical:
             return None  # a track across a field is the field
-        return ROAD, "Asfalt"
+        # Open paving is laid in elements, and asphalt is closed paving by
+        # definition: an open carriageway the BGT says no more of is brick,
+        # which is what most of them are.
+        material = paving_material(physical, plus, "Bakstenen" if "open" in physical else "Asfalt")
+        if material in ("Verharding", "Beton_Geel"):
+            material = "Asfalt"
+        return ROAD, material
     if collection == "ondersteunendwegdeel":
         if "verkeerseiland" in functie:
-            return (WALKWAY, "Beton_Geel") if paved else (GRASS, "Gras")
+            return (WALKWAY, paving_material(physical, plus, "Beton_Geel")) if paved else (GRASS, "Gras")
         if green:
             return GRASS, "Gras"
         if paved:
-            return ROAD, "Verharding"
+            return ROAD, paving_material(physical, plus, "Verharding")
         return None
     if collection == "begroeidterreindeel":
         return GRASS, "Gras"
     if collection == "onbegroeidterreindeel":
-        return (ROAD, "Verharding") if paved else None
+        if not paved:
+            return None
+        # A forecourt in open paving is pavers; in closed paving, concrete.
+        return ROAD, paving_material(physical, plus, "Betonstenen" if "open" in physical else "Verharding")
     return None
+
+
+def flush_walkways(
+    areas: list[GroundArea],
+    ground_at,
+    *,
+    flush_below_m: float = FLUSH_BELOW_M,
+    min_stations: int = 6,
+) -> dict:
+    """Lay as road every walkway the survey shows level with the road beside it.
+
+    The curb generator raises every walkway and builds a kerb round it, which
+    is what a suburban footpath is. An old centre's pedestrian street is brick
+    from wall to wall, the footpath level with the carriageway: Ganzenmarkt
+    drawn with kerbs is a road with pavements it does not have. The survey
+    tells them apart. Every half metre along where a walkway meets a road, the
+    bare ground 0.75 to 1.25 m inside the walkway is compared with the same
+    distance into the road; a walkway whose median step is under
+    `flush_below_m` is laid as road, in its own material, and has no kerb.
+
+    `ground_at(x, y)` is the bare-earth survey at its own resolution: a grid
+    averaged to a metre smooths a 6 cm kerb into a slope. Walkways meeting no
+    road, or too little of one to measure, keep their kerb. Changes `areas`
+    in place; returns what it measured.
+    """
+    import shapely
+
+    from .terrain_mesh import _polygonal
+
+    def polygon_of(area):
+        rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in area.rings]
+        rings = [r for r in rings if len(r) >= 4]
+        if not rings:
+            return None
+        polygon = _polygonal(shapely.make_valid(shapely.Polygon(rings[0], rings[1:])))
+        return None if polygon.is_empty else polygon
+
+    roads = [polygon_of(a) for a in areas if a.layer == ROAD and a.level == 0]
+    roads = [r for r in roads if r is not None]
+    stats = {"walkways": 0, "measured": 0, "flush": 0, "steps_m": []}
+    if not roads:
+        return stats
+    road = shapely.union_all(np.array(roads, dtype=object))
+    near_road = road.buffer(0.4)
+    shapely.prepare(road)
+    shapely.prepare(near_road)
+    offsets = np.array([0.75, 1.0, 1.25])
+    for area in areas:
+        if area.layer != WALKWAY or area.level != 0:
+            continue
+        stats["walkways"] += 1
+        polygon = polygon_of(area)
+        if polygon is None or not polygon.intersects(near_road):
+            continue
+        shared = polygon.boundary.intersection(near_road)
+        lines = [g for g in getattr(shared, "geoms", [shared]) if g.geom_type == "LineString"]
+        stations, normals = [], []
+        for line in lines:
+            coords = np.asarray(line.coords)
+            for a, b in zip(coords[:-1], coords[1:]):
+                length = float(np.hypot(*(b - a)))
+                if length < 0.25:
+                    continue
+                along = (b - a) / length
+                normal = np.array([-along[1], along[0]])
+                for t in np.arange(0.25, length, 0.5):
+                    stations.append(a + along * t)
+                    normals.append(normal)
+        if len(stations) < min_stations:
+            continue
+        stations = np.asarray(stations)
+        normals = np.asarray(normals)
+        # Point every normal into the walkway.
+        probe = stations + normals * 0.6
+        inward = shapely.contains_xy(polygon, probe[:, 0], probe[:, 1])
+        normals[~inward] *= -1.0
+        probe = stations + normals * 0.6
+        keep = shapely.contains_xy(polygon, probe[:, 0], probe[:, 1])
+        inside = stations[:, None, :] + normals[:, None, :] * offsets[None, :, None]
+        outside = stations[:, None, :] - normals[:, None, :] * offsets[None, :, None]
+        on_road = shapely.contains_xy(road, outside[..., 0], outside[..., 1]).all(axis=1)
+        keep &= on_road
+        if keep.sum() < min_stations:
+            continue
+        z_in = np.asarray(ground_at(inside[keep, :, 0].ravel(), inside[keep, :, 1].ravel()),
+                          dtype=np.float64).reshape(-1, len(offsets))
+        z_out = np.asarray(ground_at(outside[keep, :, 0].ravel(), outside[keep, :, 1].ravel()),
+                           dtype=np.float64).reshape(-1, len(offsets))
+        good = (np.isfinite(z_in).sum(axis=1) >= 2) & (np.isfinite(z_out).sum(axis=1) >= 2)
+        if good.sum() < min_stations:
+            continue
+        with np.errstate(all="ignore"):
+            steps = np.nanmedian(z_in[good], axis=1) - np.nanmedian(z_out[good], axis=1)
+        step = float(np.median(steps))
+        stats["measured"] += 1
+        stats["steps_m"].append(round(step, 3))
+        if step < flush_below_m:
+            area.layer = ROAD
+            stats["flush"] += 1
+    steps = np.asarray(stats["steps_m"])
+    stats["step_median_m"] = round(float(np.median(steps)), 3) if len(steps) else None
+    LOG.info(
+        "kerbs: %d of %d walkways meet a road; %d of them level with it, laid as road "
+        "without a kerb (median step %s m)",
+        stats["measured"], stats["walkways"], stats["flush"], stats["step_median_m"],
+    )
+    stats["steps_m"] = stats["steps_m"][:200]
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +450,8 @@ def build_layered_ground(
     mesher: str = "quads",
     quays=(),
     square_m: float | None = None,
+    ground_at=None,
+    flush_below_m: float = FLUSH_BELOW_M,
 ) -> LayeredGround:
     """The terrain and its layers, from the survey and the BGT areas.
 
@@ -282,6 +464,10 @@ def build_layered_ground(
     `square_m` is the size of the grid squares and the spacing of the
     stations along every outline (`layered_mesh.NEAR_CELL_M` if not given),
     the same everywhere; a whole number of survey grid squares.
+
+    `ground_at(x, y)`, the bare-earth survey at its own resolution, lets
+    walkways level with the road beside them be laid as road, without a kerb
+    (`flush_walkways`); without it every walkway is kerbed.
 
     `mesher` "quads" lays the terrain out in quads (`layered_mesh`);
     "ribcage" lays it out as the 3D team draws it: ribs across what is
@@ -299,6 +485,11 @@ def build_layered_ground(
     ox, oy = float(xs[0]), float(ys[0])
     width, height = float(xs[-1] - ox), float(ys[-1] - oy)
     frame = shapely.box(0.0, 0.0, width, height)
+
+    kerbs = (
+        flush_walkways(areas, ground_at, flush_below_m=flush_below_m)
+        if ground_at is not None else None
+    )
 
     # ---- regions: the BGT cut into one layer and material each -----------
     by_code: dict[int, list] = {}
@@ -328,6 +519,8 @@ def build_layered_ground(
     order = [_code(layer, material) for layer, material in PRIORITY]
     # Water after the paving, so a road over a culvert stays a road.
     order.insert(order.index(_code(GRASS, "Gras")), WATER_CODE)
+    # Anything PRIORITY does not rank still gets drawn, last.
+    order += sorted(code for code in by_code if code not in order)
     layers = [
         (code, _polygonal(shapely.union_all(np.array(by_code[code], dtype=object))))
         for code in order
@@ -359,11 +552,10 @@ def build_layered_ground(
                 depth_m=float(ditch_depth_m), tolerance_m=float(tolerance_m),
                 # Roads get rows wide enough to ladder straight across;
                 # yards, forecourts and footpaths the grid's.
-                paved_codes={
-                    _code(MOTORWAY, "Asfalt"), _code(ROAD, "Asfalt"),
-                    _code(ROAD, "Bakstenen"), _code(ROAD, "Fietspad"),
-                },
-                narrow_codes={_code(WALKWAY, "Beton_Geel"), _code(ROAD, "Verharding")},
+                paved_codes={_code(MOTORWAY, "Asfalt")}
+                | {_code(ROAD, material) for material in ROAD_SURFACES},
+                narrow_codes={_code(WALKWAY, material) for material in WALKWAY_SURFACES}
+                | {_code(ROAD, m) for m in ("Beton_Geel", "Verharding", "Grind")},
                 quays=quays,
                 **({"near_m": float(square_m)} if square_m else {}),
             )
@@ -404,6 +596,9 @@ def build_layered_ground(
         loops = np.concatenate(faces).astype(np.int64) if faces else np.zeros(0, np.int64)
     face_layer, face_material = _split_code(codes)
     face_material = np.where(face_layer == TERRAIN, -1, face_material)
+    face_layer, face_material, blunted = _blunt_walkway_tips(
+        points, loops, sizes, face_layer, face_material,
+    )
 
     vertices = np.column_stack([points[:, 0] + ox, points[:, 1] + oy, z])
     edges, edge_on, vertex_on = _layer_outlines(loops, sizes, face_layer, len(points))
@@ -451,6 +646,7 @@ def build_layered_ground(
         "refinement_rounds": int(rounds),
         "outline_edges_missing": int(missing),
         "walkway_hairpins_removed": int(hairpins),
+        "walkway_tips_blunted": int(blunted),
         "water_bodies": int(len(bodies)),
         **mesh_stats,
         "faces_by_layer": {
@@ -458,6 +654,7 @@ def build_layered_ground(
         },
         "objects": {name: int((face_object == i).sum()) for i, name in enumerate(names)},
         "parts_on_bridges_or_tunnels": int(skipped_levels),
+        **({"kerbs": kerbs} if kerbs is not None else {}),
         **timings,
         "seconds": round(time.time() - started, 1),
     }
@@ -487,6 +684,80 @@ def build_layered_ground(
         origin=(ox, oy),
         stats=stats,
     )
+
+
+def _blunt_walkway_tips(points, loops, sizes, face_layer, face_material, *,
+                        limit_deg: float | None = None, rounds: int = 12):
+    """Faces at a needle tip of the walkway, handed to the ground beside them.
+
+    `_without_hairpins` takes the needles out of the BGT's outlines, but the
+    mesher makes its own: an outline simplified one way on one side and
+    another on the other leaves a wedge between them, and over the
+    Ganzenmarkt one 0.6 m wide and 5 m long ended in a 7 degree tip, off
+    which the curb generator's mitre flew 4.5 m. A tip is a vertex where the
+    walkway's faces meet in less than `limit_deg` all told; the walkway
+    faces there become whatever ground shares most edge with them, and it
+    goes round again, since the next vertex down may be the new tip.
+    Returns the layers, the materials and how many faces changed hands.
+    """
+    limit_deg = HAIRPIN_DEG if limit_deg is None else float(limit_deg)
+    sizes = np.asarray(sizes, dtype=np.int64)
+    loops = np.asarray(loops, dtype=np.int64)
+    face_layer = np.asarray(face_layer, dtype=np.int64).copy()
+    face_material = np.asarray(face_material, dtype=np.int64).copy()
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
+    face_of = np.repeat(np.arange(len(sizes)), sizes)
+    following = np.arange(len(loops)) + 1
+    following[starts + sizes - 1] = starts
+    previous = np.arange(len(loops)) - 1
+    previous[starts] = starts + sizes - 1
+    xy = np.asarray(points, dtype=np.float64)[:, :2]
+    # The corner angle of every face at every one of its vertices.
+    a = xy[loops[previous]] - xy[loops]
+    b = xy[loops[following]] - xy[loops]
+    norms = np.hypot(*a.T) * np.hypot(*b.T)
+    corner = np.degrees(np.arccos(np.clip((a * b).sum(axis=1) / np.maximum(norms, 1e-12), -1.0, 1.0)))
+    # Each edge, by its two vertices, and the faces either side of it.
+    pairs = np.sort(np.column_stack([loops, loops[following]]), axis=1)
+    _, edge_id = np.unique(pairs, axis=0, return_inverse=True)
+    edge_id = edge_id.ravel()
+    order = np.argsort(edge_id, kind="stable")
+    changed = 0
+    for _ in range(rounds):
+        walk = face_layer[face_of] == WALKWAY
+        total = np.bincount(loops[walk], weights=corner[walk], minlength=len(xy))
+        touched = np.bincount(loops[walk], minlength=len(xy)) > 0
+        tips = np.flatnonzero(touched & (total < limit_deg))
+        if not len(tips):
+            break
+        tip_set = np.zeros(len(xy), dtype=bool)
+        tip_set[tips] = True
+        faces = np.unique(face_of[walk & tip_set[loops]])
+        moved = 0
+        for face in faces.tolist():
+            mine = np.arange(starts[face], starts[face] + sizes[face])
+            # The faces across this face's edges, and what they are.
+            across = []
+            for loop in mine.tolist():
+                same = order[np.searchsorted(edge_id[order], edge_id[loop]):]
+                for other in same[:4].tolist():
+                    if edge_id[other] != edge_id[loop]:
+                        break
+                    neighbour = face_of[other]
+                    if neighbour != face and face_layer[neighbour] != WALKWAY:
+                        across.append((int(face_layer[neighbour]), int(face_material[neighbour])))
+            if not across:
+                continue
+            values, counts = np.unique(np.array(across), axis=0, return_counts=True)
+            layer, material = values[int(np.argmax(counts))]
+            face_layer[face], face_material[face] = layer, material
+            moved += 1
+        if not moved:
+            break
+        changed += moved
+    if changed:
+        LOG.info("layered ground: %d walkway faces at needle tips given to the ground beside them", changed)
+    return face_layer, face_material, changed
 
 
 def _simplify(pieces, tolerance_m: float, frame):
@@ -1002,6 +1273,7 @@ def _objects(face_layer, *, prefix):
 
 
 __all__ = [
+    "FLUSH_BELOW_M",
     "GRASS",
     "GroundArea",
     "LAYER_NAMES",
@@ -1012,7 +1284,11 @@ __all__ = [
     "ROAD",
     "TERRAIN",
     "WALKWAY",
+    "PAVINGS",
     "build_layered_ground",
     "classify",
+    "flush_walkways",
+    "is_stair",
     "object_name",
+    "paving_material",
 ]

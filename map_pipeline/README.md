@@ -814,15 +814,21 @@ How it is built (`src/layered.py`):
   | BGT | Layer | Material |
   | --- | --- | --- |
   | `wegdeel`, carriageway of a motorway (*autosnelweg*, *autoweg*) | motorway | `Asfalt` |
-  | `wegdeel`, footpath or pedestrian area | walkway | `Beton_Geel` |
-  | `wegdeel`, cycle path | road | `Fietspad` |
-  | `wegdeel`, brick or tiled carriageway | road | `Bakstenen` |
+  | `wegdeel`, footpath or pedestrian area | walkway | its paving; `Beton_Geel` where the BGT does not say |
+  | `wegdeel`, flight of steps (*voetpad op trap*) | road, with steps on it | its paving |
+  | `wegdeel`, cycle path | road | `Fietspad`, or its brick or setts |
   | `wegdeel`, unpaved | terrain | — |
-  | `wegdeel`, any other | road | `Asfalt` |
-  | `ondersteunendwegdeel`, traffic island, paved / green | walkway / grass | `Beton_Geel` / `Gras` |
-  | `ondersteunendwegdeel`, verge, green / paved | grass / road | `Gras` / `Verharding` |
+  | `wegdeel`, any other | road | its paving; `Bakstenen` for open paving, `Asfalt` for closed |
+  | `ondersteunendwegdeel`, traffic island, paved / green | walkway / grass | its paving / `Gras` |
+  | `ondersteunendwegdeel`, verge, green / paved | grass / road | `Gras` / its paving |
   | `begroeidterreindeel` | grass | `Gras` |
-  | `onbegroeidterreindeel`, paved / not | road / terrain | `Verharding` / — |
+  | `onbegroeidterreindeel`, paved / not | road / terrain | its paving; `Betonstenen` open, `Verharding` closed / — |
+
+  "Its paving" is read from `plus_fysiek_voorkomen`: *gebakken klinkers* is
+  `Bakstenen`, *sierbestrating* and *natuursteen* `Sierbestrating`,
+  *tegels* `Tegels`, *betonstraatstenen* `Betonstenen`, *asfalt* `Asfalt`,
+  *half verhard* and *grind* `Grind`. Round the Ganzenmarkt 116 of 153 road
+  parts say which; in Bourtange all 73.
 
   `Asfalt`, `Bakstenen`, `Beton`, `Beton_Geel` and `Gras` are the modellers'
   own materials, colours included; `Fietspad` and `Verharding` are the two
@@ -844,6 +850,31 @@ How it is built (`src/layered.py`):
   walkway too thin for a kerb on each side, or a small one keeping a corner
   under 6°, becomes part of its neighbour. At Hazeldonk that is 0.3% of the
   footpath area.
+* **Level or kerbed.** An old centre's pedestrian street is paved from wall
+  to wall, the footpath level with the carriageway, and drawn with a kerb it
+  is a road with pavements it does not have. Every half metre along where a
+  walkway meets a road, the half-metre survey 0.75 to 1.25 m inside the
+  walkway is compared with the same distance into the road; a walkway whose
+  median step is under 5 cm is laid as road, in its own paving, with no kerb
+  (`flush_walkways`). Round the Ganzenmarkt 30 of the 50 footpaths beside a
+  road are level with it; in Hindeloopen 24 of 25.
+* **Needle tips after meshing.** The mesher makes its own needles: an outline
+  simplified one way on one side and another on the other leaves a wedge, and
+  round the Ganzenmarkt one 0.6 m wide ended in a 7° tip, off which the kerb
+  flew 4.5 m. Wherever the walkway's faces meet in less than 20° all told,
+  the faces at that tip go to the ground beside them.
+* **Photographed paving** (`src/paving.py`). Each material wears a Poly Haven
+  photograph (CC0) at the size it covers: brick in a herringbone for
+  `Bakstenen`, setts for `Sierbestrating`, 30 cm tiles for `Tegels` and
+  `Beton_Geel`, pavers in half bond, asphalt, red asphalt, gravel, lawn,
+  with its normal map, on UVs in metres over the photograph's size so a brick
+  is a brick's size in the FBX too. Its colour is the street's: the aerial
+  sees Utrecht's red-brown brick as grey (129, 125, 119), so the hue comes
+  from the checked street photos, sampled on the ground round each camera
+  past walls and tree crowns and looked up in the BGT for its material, and
+  the brightness from the aerial, softened as the walls' is. A material no
+  photo saw keeps a typical colour at the aerial's brightness. The kerb turns
+  concrete grey beside it. `layered.paving: false` keeps the flat colours.
 * **Ground, in quads** (`src/layered_mesh.py`). The modellers' feedback on
   the first version, a triangulation refined until it fitted the survey, was:
   quads rather than a complete triangulation, with minimal but realistic height
@@ -1050,6 +1081,8 @@ The layered style's settings, all optional:
 | `layered.harbour` | true | quay faces, jetties, pontoons, mooring posts, catwalks and fenders |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.kerbs` | true | the curb generator on every walkway |
+| `layered.flush_walkways` | true | a walkway the survey shows level with the road beside it is laid as road, without a kerb |
+| `layered.paving` | true | photographed paving per material, coloured from the street photos and the aerial; false keeps the flat colours |
 | `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
 
 Over the Hazeldonk square kilometre the ground is 84,867 faces, 77% of them
@@ -1445,7 +1478,7 @@ deck.
 None of this is structurally important, which is exactly the point. A street
 with nothing on it reads as a model; the same street with lampposts along the
 kerb, a wall between the plots and a hedge behind it reads as a place. Everything
-here shares one 8-patch atlas and one material, so a few thousand objects cost
+here shares one 16-patch atlas and one material, so a few thousand objects cost
 one draw call. Its patches are addressed with V counted up from the bottom of
 the image, as Blender reads it; counted from the top, as the image is written,
 every lookup read the patch from the other row — metal came out hedge green, a
@@ -1567,6 +1600,62 @@ rooflines, topology far worse than anything in this pipeline, and a licence that
 does not permit extraction. What is above is the other route to the same
 density: every object is a known thing, in a named group, that a level designer
 can take apart.
+
+### Beyond the BGT: OpenStreetMap, Mapillary and the survey
+
+What makes a square a place is mostly what no register keeps. Three sources
+fill in round the BGT's own street furniture (`src/street_objects.py`):
+
+* **OpenStreetMap** (`src/osm.py`), read from the main API in cached tiles of
+  0.004°: benches, bins, bicycle racks with their capacity, fountains, post
+  boxes, statues and memorials, terraces and steps. © OpenStreetMap
+  contributors, ODbL, credited in `ATTRIBUTION.txt` when used.
+* **Mapillary's map features**, with the Mapillary source on: what its
+  detectors found in several photos and placed by triangulation. Shop signs,
+  bins, bike racks, benches, traffic signs, manhole covers, lamps.
+* **The survey**, for heights: a statue is as tall as the surface model within
+  half a metre of it, less the ground in a ring round it (the bare earth has a
+  hole where the statue stands).
+
+They merge by trust: the BGT first, OpenStreetMap where the BGT has nothing
+of the same kind close by, Mapillary where neither has, each kind with its
+own distance (4 m for a lamp, 1.2 m for a bollard in a row). A ground object
+just inside a building is moved out to the wall and one deep inside is left
+out. Shop signs hang on the nearest wall: store and advertising signs flat
+on it at the top of the shop front, banners out on a bracket. Mapillary's own
+direction for a sign does not tell them apart: round the Ganzenmarkt 88 of
+163 point more than 60° off their wall, the way the cameras looked. A street
+light Mapillary places within 2 m of a facade is a lantern on that facade,
+which is how the old centres are lit: 33 of the 52 it found beyond the BGT's
+63 lampposts round the Ganzenmarkt.
+
+**Terraces** (`src/terraces.py`) come from OpenStreetMap. An outlined one
+(`leisure=outdoor_seating`) is filled with tables and chairs on a 2 m grid
+turned to its long side, parasols over every other table. A café, bar or
+restaurant tagged `outdoor_seating=yes` with no outline gets a row of three
+along its own facade, where the BGT says there is paving in front that is not
+asphalt, water or a yard.
+
+**Steps** (`src/stairs.py`) are cut into treads: the BGT's flights of public
+steps (*voetpad op trap*), OpenStreetMap's `highway=steps` where the BGT has
+none, and the BGT's stoops. A flight climbs along its outline's long side,
+the survey just beyond each end saying which end is up and by how much, one
+riser of about 17 cm per tread and the top tread level with the ground above.
+A flight steeper than 51° is the quay wall beside it read as the flight, and
+stays flat. A stoop climbs to its building, as high as the surface model
+sees its landing, three steps where it cannot.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `furniture.osm` | true | OpenStreetMap's street objects, terraces and steps |
+| `furniture.terraces` | true | café terraces from OpenStreetMap |
+| `furniture.mapillary_objects` | true | Mapillary's detected objects, when the Mapillary source is on |
+
+In the villages these are most of what there is. Westerwolde and
+Súdwest-Fryslân register no street furniture in the BGT at all, so Bourtange
+and Hindeloopen had bare streets; OpenStreetMap has 20 benches, 8 bins,
+3 terraces and 26 flights of steps in Bourtange, and Mapillary 44 photos and
+10 objects. Hindeloopen has 7 mapped objects and 29 detected ones.
 
 ## Bridges and tunnels
 
