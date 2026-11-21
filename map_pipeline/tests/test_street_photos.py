@@ -837,6 +837,301 @@ class PoseRefineTests(unittest.TestCase):
                 self.assertEqual(views[0].photo, "good")
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: straightened walls, measured facades, observed styles
+# ---------------------------------------------------------------------------
+
+
+def _paint_wall(photo: Photo, face, pattern, background=(70, 120, 200)) -> np.ndarray:
+    """A picture of one wall from `photo`, coloured by pattern(u, z).
+
+    Every pixel's ray is followed to the wall's plane; where it lands inside
+    the wall it takes the pattern's colour, elsewhere the sky's.
+    """
+    from src.camera import unproject_camera
+
+    cam = photo.camera
+    cols, rows = np.meshgrid(np.arange(cam.width) + 0.5, np.arange(cam.height) + 0.5)
+    rays = unproject_camera(cam, np.column_stack([cols.ravel(), rows.ravel()])) @ photo.rotation
+    normal = np.array([face.normal[0], face.normal[1], 0.0])
+    origin = np.array([face.start[0], face.start[1], 0.0])
+    denom = rays @ normal
+    t = ((origin - photo.centre) @ normal) / np.where(np.abs(denom) > 1e-9, denom, np.nan)
+    hit = photo.centre + rays * t[:, None]
+    tangent = (face.end - face.start) / face.width_m
+    u = (hit[:, :2] - face.start) @ tangent
+    z = hit[:, 2]
+    inside = (t > 0) & (u >= 0) & (u <= face.width_m) & (z >= face.z_min) & (z <= face.z_max)
+    out = np.tile(np.array(background, dtype=np.float64), (len(u), 1))
+    out[inside] = pattern(u[inside], z[inside])
+    return out.reshape(cam.height, cam.width, 3).astype(np.uint8)
+
+
+def _facade_pattern(bay=2.5, storey=3.0, win_w=0.4, win_h=0.5, sill=0.25,
+                    wall=(150, 80, 60), glass=(40, 50, 60)):
+    def pattern(u, z):
+        in_bay = np.mod(u, bay) / bay
+        in_storey = np.mod(z, storey) / storey
+        window = (np.abs(in_bay - 0.5) < win_w / 2) & (in_storey >= sill) & (in_storey < sill + win_h)
+        out = np.tile(np.array(wall, dtype=np.float64), (len(u), 1))
+        out[window] = glass
+        return out
+    return pattern
+
+
+def _wall_image(width_m=20.0, height_m=15.0, m_per_px=0.05, **pattern_args):
+    from src.facade_capture import WallImage
+
+    w, h = int(width_m / m_per_px), int(height_m / m_per_px)
+    u = (np.arange(w) + 0.5) * m_per_px
+    z = height_m - (np.arange(h) + 0.5) * m_per_px
+    uu, zz = np.meshgrid(u, z)
+    rgb = _facade_pattern(**pattern_args)(uu.ravel(), zz.ravel()).reshape(h, w, 3)
+    rng = np.random.default_rng(0)
+    rgb = np.clip(rgb + rng.normal(0, 4, rgb.shape), 0, 255).astype(np.float32)
+    return WallImage(face=0, rgb=rgb, weight=np.ones((h, w), np.float32),
+                     m_per_px=m_per_px, width_m=width_m, z_min=0.0, z_max=height_m)
+
+
+class FacadeCaptureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.buildings = BuildingSet(buildings=[box_building("x", 0, 0, 12, 8, height=9.0)])
+        self.faces = wall_faces(self.buildings)
+        self.front = next(i for i, f in enumerate(self.faces) if np.allclose(f.normal, [0, -1]))
+
+    def test_a_wall_comes_out_straight_and_the_right_way_round(self) -> None:
+        from src.facade_capture import PhotoPixels, capture_wall
+
+        face = self.faces[self.front]
+        # Left half red, right half green, seen from the street.
+        def pattern(u, z):
+            out = np.zeros((len(u), 3))
+            out[u < 6.0] = (200, 40, 40)
+            out[u >= 6.0] = (40, 200, 40)
+            out[(z > 7.0) & (u < 6.0)] = (40, 40, 200)
+            return out
+        photo = photo_at(5.0, -14.0, 0.0, z=2.0, ident="front")
+        photo.rotation = rotation_from_heading(10.0, pitch_deg=12.0)
+        photo.camera = Camera(PERSPECTIVE, 1600, 1200, 0.6)
+        image = _paint_wall(photo, face, pattern)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "front.png"
+            from PIL import Image
+
+            Image.fromarray(image).save(path)
+            photo.path = str(path)
+            wall = capture_wall(face, self.front, [photo], PhotoPixels(), m_per_px=0.1)
+        self.assertGreater(wall.coverage, 0.9)
+        rgb = wall.rgb
+        h, w = rgb.shape[:2]
+        left_low = rgb[int(h * 0.8), int(w * 0.25)]
+        right_low = rgb[int(h * 0.8), int(w * 0.75)]
+        left_high = rgb[int(h * 0.1), int(w * 0.25)]
+        self.assertGreater(left_low[0], 150)  # red on the left
+        self.assertGreater(right_low[1], 150)  # green on the right
+        self.assertGreater(left_high[2], 150)  # blue above 7 m, row 0 at the top
+
+    def test_registration_finds_a_shift(self) -> None:
+        from src.facade_capture import register_shift
+
+        a = _wall_image(width_m=10, height_m=8, m_per_px=0.05)
+        rgb = np.roll(a.rgb, (3, -5), axis=(0, 1))
+        dr, dc, peak = register_shift((a.rgb, a.weight), (rgb, a.weight), 10)
+        self.assertEqual((dr, dc), (-3, 5))
+        self.assertGreater(peak, 0.05)
+
+    def test_fusion_drops_what_only_one_view_shows(self) -> None:
+        from src.facade_capture import fuse_views
+
+        a = _wall_image(width_m=10, height_m=8)
+        views = [(a.rgb.copy(), a.weight.copy()) for _ in range(3)]
+        views[1][0][100:140, 50:120] = (250, 250, 250)  # a white van in one photo
+        for mode in ("blend", "best"):
+            fused, weight = fuse_views(views, mode=mode, m_per_px=0.05)
+            patch = fused[100:140, 50:120]
+            self.assertLess(float(np.abs(patch - a.rgb[100:140, 50:120]).mean()), 12.0, mode)
+            self.assertTrue(np.all(fused <= 255.0))
+
+    def test_gable_sky_is_masked(self) -> None:
+        from src.facade_capture import face_outline
+
+        # A gable end: a pentagon, 8 m wide, eaves at 6 m, ridge at 10 m.
+        a, b = np.array([0.0, 0, 0]), np.array([8.0, 0, 0])
+        e1, e2, top = np.array([8.0, 0, 6]), np.array([0.0, 0, 6]), np.array([4.0, 0, 10])
+        tris = np.array([[a, b, e1], [a, e1, e2], [e2, e1, top]])
+        building = Building("g", tris, np.zeros((0, 3, 3)), 0.0, 10.0, 2, wall_top_nap=6.0)
+        face = wall_faces(BuildingSet(buildings=[building]))[0]
+        mask = face_outline(face, (100, 80))
+        self.assertFalse(mask[2, 2])  # top left corner is sky
+        self.assertTrue(mask[2, 40])  # under the ridge is wall
+        self.assertTrue(mask[90, 5])
+
+    def test_tree_crown_in_the_way(self) -> None:
+        from src.facade_capture import Crown, _segment_hits_spheres
+
+        origin = np.array([0.0, -10.0, 2.0])
+        targets = np.array([[0.0, 0.0, 3.0], [8.0, 0.0, 3.0]])
+        hits = _segment_hits_spheres(origin, targets, [Crown(0.0, -5.0, 3.0, 1.5)])
+        self.assertEqual(list(hits), [True, False])
+
+
+class FacadeMeasureTests(unittest.TestCase):
+    def test_reads_a_regular_facade(self) -> None:
+        from src.facade_measure import measure_wall
+
+        wall = _wall_image(width_m=25.0, height_m=15.0, bay=2.5, storey=3.0,
+                           win_w=0.4, win_h=0.5, sill=0.25)
+        m = measure_wall(wall, ground_z=0.0, wall_top_z=15.0, building_id="b", area_m2=375)
+        self.assertAlmostEqual(m.bay_m, 2.5, delta=0.1)
+        self.assertAlmostEqual(m.storey_m, 3.0, delta=0.12)
+        self.assertAlmostEqual(m.window_width_frac, 0.4, delta=0.1)
+        self.assertAlmostEqual(m.window_height_frac, 0.5, delta=0.1)
+        self.assertAlmostEqual(m.sill_frac, 0.25, delta=0.08)
+        for got, want in zip(m.wall_rgb, (150, 80, 60)):
+            self.assertAlmostEqual(got, want, delta=10)
+
+    def test_fundamental_not_a_multiple(self) -> None:
+        from src.facade_measure import dominant_period
+
+        x = np.arange(0, 40, 0.05)
+        profile = (np.mod(x, 2.0) < 0.8).astype(float)
+        period, score = dominant_period(profile, 0.05, 1.0, 8.0)
+        self.assertAlmostEqual(period, 2.0, delta=0.06)
+        self.assertGreater(score, 0.5)
+
+    def test_wide_windows_read_as_wide(self) -> None:
+        from src.facade_measure import measure_wall
+
+        # Windows 85% of each bay, between slim piers. Past about 90% glass
+        # and wall cover the same share of the front, and which is the wall
+        # is a question the colours cannot settle: that is a facade for a
+        # photo texture, not for measuring.
+        wall = _wall_image(width_m=24.0, height_m=15.0, bay=1.7, storey=3.6,
+                           win_w=0.85, win_h=0.5, sill=0.3, wall=(90, 95, 105), glass=(160, 190, 210))
+        m = measure_wall(wall, ground_z=0.0, wall_top_z=15.0)
+        self.assertGreaterEqual(m.window_width_frac, 0.75)
+
+    def test_a_blank_wall_has_no_windows(self) -> None:
+        from src.facade_capture import WallImage
+        from src.facade_measure import measure_wall
+
+        rng = np.random.default_rng(2)
+        rgb = np.clip(np.full((300, 400, 3), (180, 170, 150.0)) + rng.normal(0, 5, (300, 400, 3)), 0, 255)
+        wall = WallImage(0, rgb.astype(np.float32), np.ones((300, 400), np.float32), 0.05, 20.0, 0.0, 15.0)
+        m = measure_wall(wall, ground_z=0.0, wall_top_z=15.0)
+        self.assertEqual(m.bay_m, 0.0)
+        self.assertIsNotNone(m.wall_rgb)
+
+    def test_combining_walls(self) -> None:
+        from src.facade_measure import WallMeasurement, combine_walls
+
+        walls = [
+            WallMeasurement(1, "b", 300.0, 1.0, wall_rgb=(240, 240, 238), storey_m=2.7, storey_confidence=0.6),
+            WallMeasurement(2, "b", 200.0, 1.0, wall_rgb=(150, 80, 60), storey_m=2.7, storey_confidence=0.6),
+            WallMeasurement(3, "b", 100.0, 1.0, wall_rgb=(60, 90, 160)),
+        ]
+        m = combine_walls("b", walls, ground_z=0.0, wall_top_z=14.4, model_floors=5)
+        # One of the walls' own colours, never a mixture of them.
+        self.assertIn(m.wall_rgb, [w.wall_rgb for w in walls])
+        # A ground storey and four of 2.7 m above it.
+        self.assertEqual(m.storeys, 5)
+        far = combine_walls("b", walls, ground_z=0.0, wall_top_z=14.4, model_floors=12)
+        self.assertEqual(far.storeys, 0)
+
+    def test_brightness_gain_rules(self) -> None:
+        from src.photo_colour import wall_gain
+
+        self.assertAlmostEqual(wall_gain((80, 60, 50), 2.0, strength=1.0), 2.0)
+        self.assertAlmostEqual(wall_gain((80, 60, 50), 2.0, strength=0.7), 2.0 ** 0.7)
+        # A pale wall stops at the ceiling.
+        g = wall_gain((170, 165, 150), 2.0)
+        self.assertLess(g, 1.15)
+        # A wall in full sun is brought down even with no gain.
+        self.assertLess(wall_gain((250, 248, 245), 1.0), 1.0)
+
+    def test_photo_gain_against_the_aerial(self) -> None:
+        from src.camera import project_camera  # noqa: F401
+        from src.geo import BBox
+        from src.photo_colour import AerialColours, photo_gain
+
+        aerial = AerialColours(np.full((200, 200, 3), 160.0), BBox(-50, -50, 50, 50))
+        photo = photo_at(0.0, 0.0, 0.0, kind=SPHERICAL, z=2.0, ident="p")
+        photo.camera = Camera(SPHERICAL, 1024, 512)
+        # Ground at half the aerial's brightness, sky white.
+        image = np.full((512, 1024, 3), 80, dtype=np.uint8)
+        image[:200] = 250
+        gain, details = photo_gain(photo, image, aerial, lambda x, y: np.zeros(np.shape(x)))
+        self.assertIsNotNone(gain, details)
+        self.assertAlmostEqual(float(gain[0]), 2.0, delta=0.1)
+
+
+class ObservedStyleTests(unittest.TestCase):
+    def test_walls_get_looks_and_buildings_their_largest(self) -> None:
+        from src.facade_measure import FacadeMeasurement, WallMeasurement
+        from src.facade_observed import plan_observed
+
+        buildings = BuildingSet(buildings=[
+            box_building("a", 0, 0, 10, 8), box_building("b", 20, 0, 30, 8),
+        ])
+        for b in buildings.buildings:
+            b.build_year = 1930
+        brick = dict(wall_rgb=(150, 80, 60), bay_m=2.4, window_width_frac=0.4,
+                     window_height_frac=0.5, sill_frac=0.25)
+        measurements = {
+            "a": FacadeMeasurement("a", [
+                WallMeasurement(10, "a", 90.0, 1.0, **brick),
+                WallMeasurement(11, "a", 30.0, 1.0, wall_rgb=(230, 230, 228)),
+            ], storeys=3),
+            # Same brick on b: shares a's style.
+            "b": FacadeMeasurement("b", [WallMeasurement(20, "b", 80.0, 1.0, **dict(brick, wall_rgb=(152, 82, 61)))]),
+        }
+        keys = {10: (0, 1, 2), 11: (0, 3, 4), 20: (1, 1, 2)}
+        plan = plan_observed(measurements, buildings, n_variants=5, max_styles=24, face_keys=keys)
+        self.assertEqual(len(plan.styles), 2)
+        self.assertEqual(plan.face_look[(0, 1, 2)], plan.face_look[(1, 1, 2)])
+        self.assertNotEqual(plan.face_look[(0, 1, 2)], plan.face_look[(0, 3, 4)])
+        self.assertEqual(plan.look_of[0], plan.face_look[(0, 1, 2)])
+        self.assertAlmostEqual(plan.face_tile_m[(0, 1, 2)], 2.4)
+        self.assertEqual(plan.floors, {0: 3})
+        style = plan.styles[plan.face_look[(0, 1, 2)]]
+        self.assertEqual(style.windows_across, 1)
+        self.assertEqual(style.wall_rgb, (150, 80, 60))
+        self.assertEqual(style.family, "interbellum")
+
+    def test_buildings_file_carries_per_wall_styles(self) -> None:
+        from src.buildings import save_buildings
+
+        buildings = BuildingSet(buildings=[box_building("a", 0, 0, 10, 8)])
+        faces = wall_faces(buildings)
+        front = next(f for f in faces if np.allclose(f.normal, [0, -1]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_buildings(
+                buildings, Path(tmp) / "b.npz", style_index=np.array([3]),
+                facade_cfg={"tile_width_m": 4.0},
+                face_style={front.key: 9}, face_tile_width={front.key: 2.5},
+            )
+            data = np.load(path)
+            wall_style = data["wall_style"]
+            normals = np.cross(data["wall_tris"][:, 1] - data["wall_tris"][:, 0],
+                               data["wall_tris"][:, 2] - data["wall_tris"][:, 0])
+            facing_south = normals[:, 1] < 0
+            self.assertTrue(np.all(wall_style[facing_south] == 9))
+            self.assertTrue(np.all(wall_style[~facing_south] == 3))
+            # 10 m front at a measured 2.5 m bay: four bays across.
+            u = data["wall_u"].reshape(-1, 3)[facing_south]
+            self.assertAlmostEqual(float(u.max() - u.min()), 4.0, places=6)
+
+    def test_facade_u_runs_left_to_right_from_outside(self) -> None:
+        from src.facade_uv import fit_wall_u
+
+        # The south wall of a box, seen from the south: west is left.
+        house = box_building("a", 0, 0, 10, 8)
+        south = house.wall_tris[:2]
+        u = fit_wall_u(south, np.zeros(2, dtype=np.int32), np.array([4.0])).reshape(-1)
+        x = south.reshape(-1, 3)[:, 0]
+        self.assertGreater(np.corrcoef(x, u)[0, 1], 0.99)
+
+
 def _server():
     import importlib.util
 

@@ -1047,6 +1047,8 @@ def save_buildings(
     path: Path,
     style_index: np.ndarray | None = None,
     facade_cfg: dict | None = None,
+    face_style: dict | None = None,
+    face_tile_width: dict | None = None,
 ) -> Path:
     """Write the building set to a compact npz for the Blender stage.
 
@@ -1057,6 +1059,11 @@ def save_buildings(
     Facade U is fitted here too, for the same reason: it is numpy the Blender
     stage would otherwise have to carry, and the answer does not depend on
     which origin the geometry is later shifted to.
+
+    `face_style` and `face_tile_width` give, per wall face key (see
+    facade_uv.wall_face_keys), the style slot and the metres of wall one
+    tile covers, for the walls the street photos read. Every other wall
+    takes its building's.
     """
     wall_chunks, roof_chunks, ground_chunks = [], [], []
     wall_owner, roof_owner, ground_owner = [], [], []
@@ -1095,16 +1102,31 @@ def save_buildings(
     # shopfront whose divisions miss the windows directly above it.
     archetypes = np.array([b.archetype for b in buildings.buildings], dtype=np.int32)
     tile_width = tile_widths(archetypes, facade_cfg or {"tile_width_m": 4.0})
-    fitted_u = fit_wall_u(
-        np.concatenate([walls, grounds], axis=0),
-        np.concatenate([wall_ids, ground_ids]),
-        tile_width,
-    )
+    all_walls = np.concatenate([walls, grounds], axis=0)
+    all_ids = np.concatenate([wall_ids, ground_ids])
+    triangle_tile = None
+    wall_style = None
+    if face_style or face_tile_width:
+        from .facade_uv import wall_face_keys
+
+        face, keys = wall_face_keys(all_walls, all_ids)
+        key_rows = [tuple(int(v) for v in row) for row in keys]
+        if face_tile_width:
+            per_face = np.array([face_tile_width.get(k, np.nan) for k in key_rows])
+            triangle_tile = per_face[face]
+        if face_style:
+            per_face = np.array([face_style.get(k, -1) for k in key_rows], dtype=np.int32)
+            wall_style = per_face[face[: len(walls)]]
+            # Unread walls wear their building's style.
+            own = np.asarray(style_index, dtype=np.int32)[wall_ids] if style_index is not None else np.zeros(len(walls), dtype=np.int32)
+            wall_style = np.where(wall_style >= 0, wall_style, own).astype(np.int32)
+    fitted_u = fit_wall_u(all_walls, all_ids, tile_width, triangle_tile_width=triangle_tile)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
         style_index=np.asarray(style_index, dtype=np.int32),
+        **({"wall_style": wall_style} if wall_style is not None else {}),
         wall_tris=walls,
         wall_building=wall_ids,
         wall_u=fitted_u[: len(walls) * 3],

@@ -57,8 +57,23 @@ def wall_face_ids(
     triangle. Triangles belong together when they are on the same building,
     point the same way, and lie on the same line through the plan.
     """
+    face, keys = wall_face_keys(triangles, building_index)
+    return face, len(keys)
+
+
+def wall_face_keys(
+    triangles: np.ndarray, building_index: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Like :func:`wall_face_ids`, with each face's key: building, direction
+    bin and offset bin, as rows of an (n_faces, 3) array.
+
+    The key names a face independently of the order its triangles came in,
+    which is what lets the photo stage, working from the buildings in
+    memory, and the buildings file, written in another order, agree on
+    which face is which.
+    """
     if len(triangles) == 0:
-        return np.zeros(0, dtype=np.int64), 0
+        return np.zeros(0, dtype=np.int64), np.zeros((0, 3), dtype=np.int64)
 
     tangent = wall_tangents(triangles)
 
@@ -75,15 +90,17 @@ def wall_face_ids(
     offset = np.round((centroid * normal).sum(axis=1) / OFFSET_BIN_M).astype(np.int64)
 
     keys = np.column_stack([building_index.astype(np.int64), direction, offset])
-    _, face = np.unique(keys, axis=0, return_inverse=True)
+    unique, face = np.unique(keys, axis=0, return_inverse=True)
     face = face.reshape(-1).astype(np.int64)
-    return face, int(face.max()) + 1
+    return face, unique
 
 
 def fit_wall_u(
     triangles: np.ndarray,
     building_index: np.ndarray,
     tile_width: np.ndarray,
+    *,
+    triangle_tile_width: np.ndarray | None = None,
 ) -> np.ndarray:
     """U per triangle corner, a whole number of bays across every wall face.
 
@@ -93,11 +110,19 @@ def fit_wall_u(
 
     Faces too narrow for even one bay are centred on the tile seam, which is
     the blank pier between windows, so a half-metre sliver shows brick.
+
+    U runs left to right for someone standing outside looking at the wall,
+    so a texture is never seen mirrored. `triangle_tile_width`, where given
+    and finite, sets a face's tile width from its own triangles instead of
+    its building's: a wall the street photos measured has its own bay.
     """
     if len(triangles) == 0:
         return np.zeros(0)
 
-    tangent = wall_tangents(triangles)
+    # wall_tangents runs right to left seen from outside; turned round, the
+    # texture reads the right way. Before this every facade was mirrored,
+    # which only a shopfront's door or a lettered sign gives away.
+    tangent = -wall_tangents(triangles)
     corners = triangles.reshape(-1, 3)
     metres = (corners[:, :2] * np.repeat(tangent, 3, axis=0)).sum(axis=1)
 
@@ -113,6 +138,10 @@ def fit_wall_u(
     # speak for the face's tile width.
     face_tile = np.zeros(n_faces)
     face_tile[face] = tile_width[building_index]
+    if triangle_tile_width is not None:
+        own = np.asarray(triangle_tile_width, dtype=np.float64)
+        measured = np.isfinite(own) & (own > 0.5)
+        face_tile[face[measured]] = own[measured]
 
     span = np.maximum(high - low, 1e-6)
     bays = np.maximum(1.0, np.round(span / face_tile))
@@ -152,5 +181,6 @@ __all__ = [
     "fit_wall_u",
     "tile_widths",
     "wall_face_ids",
+    "wall_face_keys",
     "wall_tangents",
 ]

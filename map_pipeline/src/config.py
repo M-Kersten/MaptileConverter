@@ -486,6 +486,22 @@ DEFAULTS: dict[str, Any] = {
         # Width photos are checked at. 360 photos are fetched at this size
         # for the check too; the full size is only fetched to paint with.
         "refine_image_size": 2048,
+        # Read the facades the checked photos see well -- wall colour, window
+        # columns, storeys -- and draw those buildings from what was read
+        # rather than from their era's average.
+        "read_facades": True,
+        "read_max_walls": 400,
+        "read_m_per_px": 0.05,
+        # Bring every photo to the aerial's brightness, measured on the
+        # ground around the camera, so a wall photographed on a dull day
+        # does not come out darker than the roofs beside it.
+        "colour_from_aerial": True,
+        # How much of that lift is applied, in stops: 1 takes the walls to
+        # the aerial's sunlit brightness, 0 leaves the photos as they are.
+        "brightness_strength": 0.7,
+        # The most textures the measured facades may add. Buildings that
+        # measured alike share one.
+        "observed_styles_max": 24,
         "timeout_s": 60,
         "max_retries": 4,
     },

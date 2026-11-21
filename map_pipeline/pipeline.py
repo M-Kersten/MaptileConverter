@@ -529,6 +529,53 @@ def layered_scene(config: PipelineConfig, ground, harbour=None) -> dict:
     }
 
 
+def apply_facade_readings(buildings, street_photos, config: PipelineConfig, work_dir: Path):
+    """Draw the buildings the photos read from what was read.
+
+    The buildings file was written before any photo was looked at, so it is
+    written again: with the storeys the photos counted, the bay widths they
+    measured, and each read building pointed at its observed style, which
+    the facade stage generates after the era styles.
+    """
+    from src.buildings import assign_facade_slots, save_buildings
+    from src.facade_observed import apply_floors, plan_observed
+
+    variants = int(config.facade["variants"])
+    faces = street_photos.coverage.faces if street_photos.coverage else []
+    observed = plan_observed(
+        street_photos.facades,
+        buildings,
+        n_variants=variants,
+        max_styles=int(config.photos.get("observed_styles_max", 24)),
+        face_keys={i: face.key for i, face in enumerate(faces)},
+    )
+    changed = apply_floors(buildings, observed)
+    style_index, plan = assign_facade_slots(buildings, variants, config.facade)
+    # The era allocation must not move: the facade stage generates exactly
+    # the looks the buildings were first numbered against.
+    if tuple(plan.per_era) != tuple(buildings.facade_looks or plan.per_era):
+        from src.facade import LookPlan
+
+        plan = LookPlan(buildings.facade_looks)
+    for index, look in observed.look_of.items():
+        style_index[index] = plan.total_slots + look
+    save_buildings(
+        buildings,
+        work_dir / "buildings.npz",
+        style_index=style_index,
+        facade_cfg=config.facade,
+        face_style={key: plan.total_slots + look for key, look in observed.face_look.items()},
+        face_tile_width=observed.face_tile_m,
+    )
+    LOG.info(
+        "facades from photos: %d walls of %d buildings drawn from %d measured "
+        "styles, %d with measured bays, %d storey counts changed",
+        len(observed.face_look), len(observed.look_of), len(observed.styles),
+        len(observed.face_tile_m), changed,
+    )
+    return observed
+
+
 def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     work_dir = config.work_dir(REPO_ROOT)
     out_dir = config.out_dir(REPO_ROOT)
@@ -730,20 +777,6 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             facade_cfg=config.facade,
         )
 
-    street_photos = StreetPhotoResult()
-    if want_photos:
-        with Stage("street photos (Mapillary and your own)", next_step(), total):
-            street_photos = build_street_photos(
-                config.bbox,
-                work_dir,
-                out_dir,
-                photos_cfg=config.photos,
-                buildings=buildings,
-                terrain=terrain,
-                base_dir=REPO_ROOT,
-                aerial_path=aerial.path,
-            )
-
     ground_layers = None
     harbour = HarbourSet()
     if layered:
@@ -922,6 +955,29 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 strength=float(config.trees.get("ground_shade", 0.35)),
             )
 
+    # After the trees, whose crowns hide walls, and after the relighting,
+    # since the aerial as the model shows it is what the photos' brightness
+    # is matched to.
+    street_photos = StreetPhotoResult()
+    observed_plan = None
+    if want_photos:
+        with Stage("street photos (Mapillary and your own)", next_step(), total):
+            street_photos = build_street_photos(
+                config.bbox,
+                work_dir,
+                out_dir,
+                photos_cfg=config.photos,
+                buildings=buildings,
+                terrain=terrain,
+                base_dir=REPO_ROOT,
+                aerial_path=aerial.path,
+                trees=trees if len(trees) else None,
+            )
+            if street_photos.facades:
+                observed_plan = apply_facade_readings(
+                    buildings, street_photos, config, work_dir
+                )
+
     furniture = FurnitureSet()
     furniture_texture = None
     if want_furniture:
@@ -1037,7 +1093,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             LookPlan(buildings.facade_looks) if buildings.facade_looks else None
         )
         facade_paths = generate_facade_textures(
-            work_dir, facade_cfg=facade_cfg, plan=plan
+            work_dir, facade_cfg=facade_cfg, plan=plan,
+            observed=observed_plan.styles if observed_plan else None,
         )
         ground_variants = (
             (2 if len(usage) else 1) if config.facade["ground_floor"] else 0

@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from .camera import SPHERICAL, project_world
-from .facade_uv import wall_face_ids
+from .facade_uv import wall_face_keys
 from .photos import Photo
 
 LOG = logging.getLogger(__name__)
@@ -77,6 +77,9 @@ class WallFace:
     area_m2: float
     samples: np.ndarray  # (k, 3) points on the face
     triangles: np.ndarray  # (t, 3, 3) the wall triangles it was made from
+    # (building index, direction bin, offset bin): names this face in the
+    # buildings file too. See facade_uv.wall_face_keys.
+    key: tuple = ()
     exposed: bool = True
     # Shared with a neighbour, rather than only close to one: see
     # PARTY_CLEARANCE_M. Every party wall is unexposed; an alley wall is
@@ -221,7 +224,8 @@ def wall_faces(buildings) -> list[WallFace]:
         return []
     tris = np.concatenate(chunks)
     owner = np.concatenate(owners)
-    face_of, n_faces = wall_face_ids(tris, owner)
+    face_of, face_keys = wall_face_keys(tris, owner)
+    n_faces = len(face_keys)
 
     edge1 = tris[:, 1] - tris[:, 0]
     edge2 = tris[:, 2] - tris[:, 0]
@@ -292,6 +296,7 @@ def wall_faces(buildings) -> list[WallFace]:
                 area_m2=area,
                 samples=samples,
                 triangles=tris[members],
+                key=tuple(int(v) for v in face_keys[face]),
             )
         )
     return faces

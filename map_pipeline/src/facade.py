@@ -69,6 +69,10 @@ class FacadeStyle:
     # to its era, or `historic_1` finds no photograph and one house in three
     # comes out with drawn brick next to its neighbours' real grain.
     base_name: str = ""
+    # How hard the photographed wall surface is pulled to `wall_rgb`, when
+    # this style wants other than the run's setting. A style measured from
+    # street photos wants its colour to show.
+    tint: float | None = None
 
     @property
     def family(self) -> str:
@@ -738,7 +742,11 @@ def _wall_bases(
 
 
 def generate_facade_textures(
-    work_dir: Path, *, facade_cfg: dict, plan: "LookPlan | None" = None
+    work_dir: Path,
+    *,
+    facade_cfg: dict,
+    plan: "LookPlan | None" = None,
+    observed: list[FacadeStyle] | None = None,
 ) -> list[tuple[Path, Path | None]]:
     """Write the facade textures, returning ``(colour, normal)`` per variant.
 
@@ -748,6 +756,10 @@ def generate_facade_textures(
     numbered against puts the wrong wall on every building after the first era
     whose count changed. Without one, every era gets the configured number of
     looks, which is what a run with no buildings to measure can do.
+
+    `observed` styles, measured from street photos, come after the plan's
+    styles and before the ground storey, so a building given one carries
+    slot ``plan.total_slots + k``.
 
     When the ground storey is enabled its texture comes last, so the Blender
     stage can address it as the final material slot.
@@ -766,7 +778,7 @@ def generate_facade_textures(
     seed = int(facade_cfg["seed"])
     want_normal = bool(facade_cfg.get("normal_map", True))
 
-    styles = plan.styles()
+    styles = plan.styles() + list(observed or [])
     ground_styles: list[FacadeStyle] = []
     if bool(facade_cfg.get("ground_floor", True)):
         # Both ground variants are written when building function is available,

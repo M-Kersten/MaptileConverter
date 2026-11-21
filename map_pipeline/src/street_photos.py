@@ -65,6 +65,10 @@ class StreetPhotoResult:
     problems: list[str] = field(default_factory=list)
     coverage_map: Path | None = None
     alignments: dict = field(default_factory=dict)
+    # Building id -> facade_measure.FacadeMeasurement.
+    facades: dict = field(default_factory=dict)
+    # Photo id -> brightness gain against the aerial.
+    gains: dict = field(default_factory=dict)
 
     @property
     def uses_mapillary(self) -> bool:
@@ -91,6 +95,22 @@ class StreetPhotoResult:
                 "median_shift_m": round(float(np.median([np.hypot(*a.params[3:5]) for a in ok])), 2) if ok else None,
                 "median_turn_deg": round(float(np.median([abs(a.params[0]) for a in ok])), 2) if ok else None,
             }
+        if self.facades:
+            measured = list(self.facades.values())
+            out["facades"] = {
+                "buildings_read": len(measured),
+                "with_colour": sum(1 for m in measured if m.has_colour),
+                "with_window_columns": sum(1 for m in measured if m.has_windows),
+                "with_storeys_counted": sum(1 for m in measured if m.storeys > 0),
+                "walls_read": sum(len(m.walls) for m in measured),
+            }
+        if self.gains:
+            values = np.array([float(g) for g in self.gains.values()])
+            out["brightness_from_aerial"] = {
+                "photos": len(values),
+                "median_gain": round(float(np.median(values)), 3),
+                "range": [round(float(values.min()), 3), round(float(values.max()), 3)],
+            }
         if self.coverage is not None:
             out["coverage"] = self.coverage.stats()
         if self.problems:
@@ -116,6 +136,7 @@ def build_street_photos(
     base_dir: Path,
     aerial_path: Path | None = None,
     session=None,
+    trees=None,
 ) -> StreetPhotoResult:
     result = StreetPhotoResult()
     gathered: list[Photo] = []
@@ -218,6 +239,12 @@ def build_street_photos(
 
     result.coverage = coverage
     write_coverage(coverage, work_dir / "photo_coverage.json")
+
+    if photos_cfg.get("read_facades", True) and result.alignments:
+        read_facades(
+            result, coverage, buildings, terrain, work_dir, out_dir,
+            photos_cfg=photos_cfg, bbox=bbox, aerial_path=aerial_path, trees=trees,
+        )
     result.coverage_map = render_coverage_map(
         coverage, result.photos, bbox, out_dir / "photo_coverage.png",
         background=aerial_path,
@@ -237,6 +264,177 @@ def build_street_photos(
         s["buildings_with_measurable_wall"],
     )
     return result
+
+
+def walls_to_read(coverage: Coverage, buildings, limit: int, per_building: int = 4):
+    """The walls worth reading, with the views to read them from.
+
+    Exposed walls that some photo verified for the wall's own building may
+    see, largest first, at most `per_building` of one building. Returns
+    ``[(face index, [photo ids])]``.
+    """
+    chosen: list[tuple[int, list[str]]] = []
+    taken: dict[int, int] = {}
+    order = sorted(range(len(coverage.faces)), key=lambda i: -coverage.faces[i].area_m2)
+    for i in order:
+        face = coverage.faces[i]
+        if not face.exposed or coverage.face_class(i) not in (MEASURE, TEXTURE):
+            continue
+        views = [v.photo for v in coverage.views[i] if v.verified is True][:4]
+        if not views or taken.get(face.building, 0) >= per_building:
+            continue
+        taken[face.building] = taken.get(face.building, 0) + 1
+        chosen.append((i, views))
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def read_facades(
+    result: StreetPhotoResult,
+    coverage: Coverage,
+    buildings,
+    terrain,
+    work_dir: Path,
+    out_dir: Path,
+    *,
+    photos_cfg: dict,
+    bbox: BBox,
+    aerial_path: Path | None,
+    trees=None,
+) -> None:
+    """Measure the facades the checked photos see well (route 1)."""
+    from .facade_capture import PhotoPixels, capture_wall, crowns_from_trees, save_wall_image
+    from .facade_measure import combine_walls, measure_wall
+    from .photo_colour import AerialColours, photo_gain, smooth_gains, wall_gain
+
+    chosen = walls_to_read(coverage, buildings, int(photos_cfg.get("read_max_walls", 400)))
+    if not chosen:
+        return
+    by_id = {p.id: p for p in result.photos}
+    index = _SegmentIndex(coverage.faces)
+    crowns = crowns_from_trees(trees) if trees is not None else []
+    pixels = PhotoPixels()
+
+    # Brightness against the aerial, per photo and then per sequence.
+    gains: dict[str, np.ndarray] = {}
+    if photos_cfg.get("colour_from_aerial", True) and aerial_path and Path(aerial_path).is_file():
+        aerial = AerialColours.load(aerial_path, bbox)
+        needed = sorted({pid for _, views in chosen for pid in views})
+        for pid in needed:
+            photo = by_id.get(pid)
+            if photo is None or not photo.path:
+                continue
+            try:
+                gain, _ = photo_gain(
+                    photo, pixels.get(photo.path), aerial, terrain.sample,
+                    faces_index=index, crowns=crowns,
+                )
+            except OSError:
+                continue
+            if gain is not None:
+                gains[pid] = gain
+        gains = smooth_gains(by_id, gains)
+        result.gains = {pid: float(g[0]) for pid, g in gains.items()}
+
+    walls_by_building: dict[int, list] = {}
+    sheet = []
+    walls_dir = work_dir / "walls"
+    walls_dir.mkdir(parents=True, exist_ok=True)
+    m_per_px = float(photos_cfg.get("read_m_per_px", 0.05))
+    for face_index, views in chosen:
+        face = coverage.faces[face_index]
+        building = buildings.buildings[face.building]
+        photos = [by_id[pid] for pid in views if pid in by_id and by_id[pid].path]
+        wall = capture_wall(
+            face, face_index, photos, pixels,
+            m_per_px=m_per_px, faces_index=index, crowns=crowns,
+            target_px_per_m=1.0 / m_per_px,
+        )
+        if wall is None:
+            continue
+        measurement = measure_wall(
+            wall,
+            ground_z=building.ground_z_nap,
+            wall_top_z=building.wall_top_nap or building.roof_max_nap,
+            building_id=building.identifier,
+            area_m2=face.area_m2,
+        )
+        used = [g[0] for pid, g in gains.items() if pid in wall.views] or [1.0]
+        if measurement.wall_rgb is not None:
+            gain = wall_gain(
+                measurement.wall_rgb, float(np.median(used)),
+                strength=float(photos_cfg.get("brightness_strength", 0.7)),
+            )
+            measurement.gain = gain
+            measurement.wall_rgb = _scaled(measurement.wall_rgb, gain)
+            measurement.trim_rgb = _scaled(measurement.trim_rgb, gain)
+            measurement.glass_rgb = _scaled(measurement.glass_rgb, gain)
+            wall.rgb = np.clip(wall.rgb * gain, 0.0, 255.0)
+        walls_by_building.setdefault(face.building, []).append(measurement)
+        if len(sheet) < 12 and measurement.wall_rgb is not None:
+            sheet.append((wall, measurement, building))
+        save_wall_image(wall, walls_dir / f"{building.identifier}_{face_index}.jpg")
+
+    for building_index, walls in walls_by_building.items():
+        building = buildings.buildings[building_index]
+        result.facades[building.identifier] = combine_walls(
+            building.identifier,
+            walls,
+            ground_z=building.ground_z_nap,
+            wall_top_z=building.wall_top_nap or building.roof_max_nap,
+            model_floors=int(building.floors),
+        )
+
+    (out_dir / "facades.json").write_text(
+        json.dumps(
+            {"buildings": [m.to_dict() for m in result.facades.values()]}, indent=1
+        ),
+        encoding="utf-8",
+    )
+    _draw_wall_checks(sheet, out_dir / "photo_checks")
+    LOG.info(
+        "facades: read %d walls of %d buildings; %d with a wall colour, %d with "
+        "window columns, %d with storeys counted",
+        sum(len(w) for w in walls_by_building.values()), len(result.facades),
+        sum(1 for m in result.facades.values() if m.has_colour),
+        sum(1 for m in result.facades.values() if m.has_windows),
+        sum(1 for m in result.facades.values() if m.storeys > 0),
+    )
+
+
+def _scaled(rgb, gain: float):
+    if rgb is None:
+        return None
+    return tuple(int(min(255, round(v * gain))) for v in rgb)
+
+
+def _draw_wall_checks(walls, folder: Path) -> None:
+    """Straightened walls with the measured bays and storeys drawn on."""
+    from PIL import Image, ImageDraw
+
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in folder.glob("wall_*.jpg"):
+        old.unlink()
+    for wall, measurement, building in walls:
+        shown = wall.rgb * wall.weight[..., None] + 128.0 * (1 - wall.weight[..., None])
+        image = Image.fromarray(np.clip(shown, 0, 255).astype(np.uint8))
+        draw = ImageDraw.Draw(image)
+        step = wall.m_per_px
+        if measurement.bay_m > 0:
+            u = 0.0
+            while u < wall.width_m:
+                draw.line([(u / step, 0), (u / step, image.height)], fill=(0, 230, 255))
+                u += measurement.bay_m
+        if measurement.storey_m > 0:
+            z = building.ground_z_nap
+            while z < wall.z_max:
+                row = float(wall.row_of_z(z))
+                draw.line([(0, row), (image.width, row)], fill=(255, 230, 0))
+                z += measurement.storey_m
+        swatch = tuple(int(v) for v in measurement.wall_rgb)
+        draw.rectangle([4, 4, 44, 44], fill=swatch, outline=(255, 255, 255))
+        image.save(folder / f"wall_{building.identifier}_{wall.face}.jpg", quality=85)
 
 
 def refine_candidates(coverage: Coverage, limit: int) -> list[str]:
@@ -388,6 +586,8 @@ def refine_poses(
 
 __all__ = [
     "StreetPhotoResult",
+    "read_facades",
+    "walls_to_read",
     "build_street_photos",
     "refine_candidates",
     "refine_poses",

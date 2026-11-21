@@ -1678,9 +1678,9 @@ come from Mapillary, open street-level imagery that covers most Dutch cities,
 and from a folder of your own photos for whatever Mapillary never drove past.
 
 This is being built in phases. What exists now: the photos are gathered, put
-in place, lined up with the model and checked, and every wall is scored on what
-they can do for it. Reading the facades off them, and wearing them as
-textures, come next.
+in place, lined up with the model and checked, every wall is scored on what
+they can do for it, and the walls they see well are read: wall colour, window
+columns, storeys. Wearing the photos as textures comes next.
 
 **Switching it on.** Tick *Straatfoto's* under Lagen, or set it in the config:
 
@@ -1775,6 +1775,55 @@ With only checked photos allowed to texture, 43% of the exposed wall area can
 wear a photo and 56 of the 89 buildings have at least one such wall; 65% can be
 measured. Trees and parked cars in front of a wall are not yet counted as
 obstructions, so these shares are still optimistic.
+
+**Reading the facades.** The largest walls the checked photos see well are
+straightened: every pixel of a picture laid out in the wall's own metres, left
+to right as seen from the street and up, is a point on the wall projected into
+each photo that sees it. Pixels behind another building count for nothing,
+pixels seen through a tree crown for little, and oblique or distant views for
+less than square-on near ones. Up to four views are lined up with each other by
+phase correlation on their edges and fused, so a van parked in one photo and
+gone in the next drops out. From the straightened wall the stage reads:
+
+- the wall colour: the largest colour cluster that turns up in nearly every
+  square metre, read somewhat above its middle brightness, clear of the shade
+  under sills and short of the glare of a low sun. Sunlit and shaded parts of
+  one wall are merged by hue, since shade is bluer as well as darker;
+- the bay width and the storey height, from the rhythm of how unlike the wall
+  each pixel is, across and up, taking the fundamental period rather than a
+  multiple of it. Columns are read from the upper storeys, which carry a
+  building's typical rhythm: a hotel's double-height lobby once outvoted its
+  windows;
+- how wide and tall the windows are and where their sills sit, by folding the
+  wall over one bay and one storey.
+
+The bottom two metres are not read, nor the ground storey where one is split
+off: that is where the parked cars are, and the model draws it separately.
+
+Each measured wall gets an observed facade style, its era's style with the
+measured colour, windows and bay in place of the era's; walls that measured
+alike share one, up to `observed_styles_max` (24). A building's walls that no
+photo saw wear the style of its largest measured wall, and its storey count is
+replaced by the counted one when the two agree to within a storey. Churches and
+sheds keep their own compositions. `output/<area>/facades.json` lists every
+building and wall read, and `photo_checks/wall_*.jpg` shows a dozen straightened
+walls with the measured bays and storeys drawn on.
+
+**The photos' brightness.** Street photos come from many cameras on many days,
+and an overcast one makes red brick brown. Every photo also sees the pavement
+around the camera, which the aerial sees from above, so the ratio of the two
+brightnesses is the photo's exposure against the aerial's. It is taken as the
+median over each Mapillary sequence, applied at 0.7 of its stops
+(`brightness_strength`), and never lifts a wall colour past a light render.
+Only brightness is matched, not colour: where buildings shaded a street on the
+day of the flight the aerial's paving is bluish, and matching colour turned
+walls blue. Over central Arnhem the photos came out about one stop darker than
+the aerial.
+
+What this cannot do is draw a facade the generator has no words for. It draws
+one window per bay, so a terrace of paired windows comes out evenly spaced, an
+office of ribbon glazing reads unreliably, and a white block with a red awning
+on every storey can be read as either. The photo textures are for those.
 
 **Licence.** Mapillary images are CC BY-SA 4.0. `ATTRIBUTION.txt` credits
 Mapillary's contributors whenever a run used their photos. A wall measured from

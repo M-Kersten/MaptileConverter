@@ -1677,7 +1677,13 @@ def build_buildings(
 
     material_indices = np.empty(n_walls + n_roofs + n_grounds, dtype=np.int32)
     if n_walls:
-        if style_index is not None and len(facade_materials) > 1:
+        if "wall_style" in data.files and len(facade_materials) > 1:
+            # Per wall, where the street photos read walls of one building
+            # as different materials; the rest wear their building's style.
+            material_indices[:n_walls] = np.clip(
+                data["wall_style"], 0, len(facade_materials) - 1
+            )
+        elif style_index is not None and len(facade_materials) > 1:
             material_indices[:n_walls] = np.clip(
                 style_index[wall_owner], 0, len(facade_materials) - 1
             )

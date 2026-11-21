@@ -253,7 +253,9 @@ def load_wall_bases(
                 work_dir,
                 tile_width_m=style.tile_width_m,
                 tile_height_m=tile_heights[index],
-                tint_strength=tint_strength,
+                tint_strength=(
+                    tint_strength if getattr(style, "tint", None) is None else float(style.tint)
+                ),
                 timeout_s=timeout_s,
             )
         except TextureUnavailable as exc:
