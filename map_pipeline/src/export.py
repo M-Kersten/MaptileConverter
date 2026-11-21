@@ -189,6 +189,7 @@ def write_scene_description(
     structure_kind_names: dict | None = None,
     car_colours: int = 6,
     ground_variants: int = 0,
+    photo_textures: list[Path] | None = None,
     layered: dict | None = None,
 ) -> Path:
     """Write scene.json: everything the Blender stage needs, and nothing else.
@@ -228,6 +229,9 @@ def write_scene_description(
             "variants": len(facade_paths),
             "ground_floor": bool(facade_cfg.get("ground_floor", False)),
             "ground_variants": int(ground_variants),
+            # Atlas pages of walls that wear their own street photos, read by
+            # the buildings' per-triangle photo page and UVs.
+            "photo_files": [path.name for path in (photo_textures or [])],
             "ground_floor_height_m": float(
                 facade_cfg.get("ground_floor_height_m", 3.6)
             ),
@@ -348,7 +352,9 @@ def write_scene_description(
     return path
 
 
-def write_attribution(out_dir: Path, *, mapillary: bool = False) -> Path:
+def write_attribution(
+    out_dir: Path, *, mapillary: bool = False, mapillary_textures: bool = False
+) -> Path:
     """Drop the source credits next to the model.
 
     3DBAG asks for a copyright notice on reuse, and the AHN and aerial layers
@@ -370,6 +376,14 @@ def write_attribution(out_dir: Path, *, mapillary: bool = False) -> Path:
     ]
     if mapillary:
         lines.append(f"Photos:    {ATTRIBUTION['mapillary']}")
+    if mapillary_textures:
+        lines += [
+            "",
+            "Some walls wear textures made from Mapillary photos. Those textures",
+            "(photo_wall_*.jpg, and the model wherever it shows them) are derived",
+            "from CC BY-SA 4.0 images: credit the photographers, listed in",
+            "photo_credits.json, and share them under the same licence.",
+        ]
     lines += [
         "",
         "Keep this notice with the model when you redistribute it.",

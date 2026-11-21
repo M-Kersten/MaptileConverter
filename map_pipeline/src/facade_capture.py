@@ -51,6 +51,12 @@ TREE_WEIGHT = 0.15
 # A reading this far from the per-pixel consensus, in relative luminance, is
 # taken to be something standing in front of the wall.
 OUTLIER_LUMINANCE = 0.22
+# A ray to the foot of a wall that crosses a parking bay below this height
+# above the street most likely ends on a parked car. The BGT draws every
+# parking bay, so the cars that hide the ground storey of half the walls in
+# a Dutch street are known about before any photo is looked at.
+PARKED_CAR_M = 1.8
+PARKED_CAR_WEIGHT = 0.2
 
 
 @dataclass
@@ -86,6 +92,31 @@ class Crown:
     y: float
     z: float
     radius: float
+
+
+def parking_lookup(class_grid: np.ndarray, xs: np.ndarray, ys: np.ndarray):
+    """``parking(x, y)``: whether RD points lie on a BGT parking bay.
+
+    `class_grid` is the land-cover classes on the terrain grid, row 0 at the
+    south edge, as the ground-surface stage leaves it.
+    """
+    from .surfaces import CLASS_PARKING
+
+    grid = np.asarray(class_grid) == CLASS_PARKING
+    x0, y0 = float(xs[0]), float(ys[0])
+    dx = float(xs[1] - xs[0]) if len(xs) > 1 else 1.0
+    dy = float(ys[1] - ys[0]) if len(ys) > 1 else 1.0
+    rows, cols = grid.shape
+
+    def parking(x, y):
+        c = np.rint((np.asarray(x) - x0) / dx).astype(np.int64)
+        r = np.rint((np.asarray(y) - y0) / dy).astype(np.int64)
+        inside = (c >= 0) & (c < cols) & (r >= 0) & (r < rows)
+        out = np.zeros(np.shape(c), dtype=bool)
+        out[inside] = grid[r[inside], c[inside]]
+        return out
+
+    return parking
 
 
 def crowns_from_trees(trees) -> list[Crown]:
@@ -218,6 +249,26 @@ def _segment_hits_spheres(origin: np.ndarray, targets: np.ndarray, crowns: list[
     return hit
 
 
+def _behind_parked_cars(origin, targets, parking, street_z: float) -> np.ndarray:
+    """Does the ray to each target cross a parking bay low enough to hit a car?
+
+    Walked back from the wall in half-metre steps over the last twelve
+    metres, which is as far as a row of parked cars can be from a facade.
+    """
+    hit = np.zeros(len(targets), dtype=bool)
+    low = targets[:, 2] < street_z + PARKED_CAR_M
+    if not low.any():
+        return hit
+    d = origin - targets[low]
+    length = np.maximum(np.linalg.norm(d[:, :2], axis=1), 1e-6)
+    for step in np.arange(0.5, 12.0, 0.5):
+        t = np.minimum(step / length, 1.0)
+        at = targets[low] + t[:, None] * d
+        crosses = parking(at[:, 0], at[:, 1]) & (at[:, 2] < street_z + PARKED_CAR_M) & (t < 1.0)
+        hit[np.flatnonzero(low)[crosses]] = True
+    return hit
+
+
 def rectify_view(
     face,
     face_index: int,
@@ -228,6 +279,8 @@ def rectify_view(
     faces_index=None,
     crowns: list[Crown] | None = None,
     target_px_per_m: float | None = None,
+    parking=None,
+    street_z: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """One photo's view of one wall, straightened. Returns ``(rgb, weight)``."""
     points, u, z = face_grid(face, m_per_px)
@@ -265,6 +318,9 @@ def rectify_view(
     if crowns:
         behind_tree = _segment_hits_spheres(c, coarse_points, crowns)
         weight *= np.where(_upsample(behind_tree.reshape(ch, cw), (h, w)), TREE_WEIGHT, 1.0)
+    if parking is not None and street_z is not None:
+        behind_car = _behind_parked_cars(c, coarse_points, parking, street_z)
+        weight *= np.where(_upsample(behind_car.reshape(ch, cw), (h, w)), PARKED_CAR_WEIGHT, 1.0)
 
     # How sharply the photo sees each pixel, against what is asked for.
     if target_px_per_m:
@@ -461,6 +517,8 @@ def capture_wall(
     target_px_per_m: float | None = None,
     path_of=None,
     mode: str = "blend",
+    parking=None,
+    street_z: float | None = None,
 ) -> WallImage | None:
     """A wall face straightened from up to a handful of photos and fused.
 
@@ -480,7 +538,7 @@ def capture_wall(
         rgb, weight = rectify_view(
             face, face_index, photo, image,
             m_per_px=m_per_px, faces_index=faces_index, crowns=crowns,
-            target_px_per_m=target_px_per_m,
+            target_px_per_m=target_px_per_m, parking=parking, street_z=street_z,
         )
         if float(weight.mean()) < 0.02:
             continue
@@ -518,6 +576,7 @@ __all__ = [
     "co_register",
     "register_shift",
     "crowns_from_trees",
+    "parking_lookup",
     "face_grid",
     "face_outline",
     "fuse_views",

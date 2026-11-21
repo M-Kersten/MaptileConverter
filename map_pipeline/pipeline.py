@@ -117,6 +117,7 @@ from src.vehicles import (  # noqa: E402
     write_spawn_list,
 )
 from src.validate import (  # noqa: E402
+    check_photo_textures,
     check_street_photos,
     CheckReport,
     check_aerial,
@@ -529,51 +530,72 @@ def layered_scene(config: PipelineConfig, ground, harbour=None) -> dict:
     }
 
 
-def apply_facade_readings(buildings, street_photos, config: PipelineConfig, work_dir: Path):
-    """Draw the buildings the photos read from what was read.
+def apply_street_photos(
+    buildings, street_photos, config: PipelineConfig, work_dir: Path, out_dir: Path,
+    *, terrain=None, trees=None, surfaces=None,
+):
+    """Draw the buildings the photos reached from what the photos gave.
 
     The buildings file was written before any photo was looked at, so it is
-    written again: with the storeys the photos counted, the bay widths they
-    measured, and each read building pointed at its observed style, which
-    the facade stage generates after the era styles.
+    written again, once, with everything: the storeys the photos counted,
+    the bay widths they measured, each read wall pointed at its observed
+    style, and the walls that wear their photos pointed at the atlas.
+    Returns ``(observed plan or None, photo textures)``.
     """
     from src.buildings import assign_facade_slots, save_buildings
+    from src.facade import LookPlan
     from src.facade_observed import apply_floors, plan_observed
+    from src.street_photos import bake_photo_textures
 
     variants = int(config.facade["variants"])
     faces = street_photos.coverage.faces if street_photos.coverage else []
-    observed = plan_observed(
-        street_photos.facades,
-        buildings,
-        n_variants=variants,
-        max_styles=int(config.photos.get("observed_styles_max", 24)),
-        face_keys={i: face.key for i, face in enumerate(faces)},
+    observed = None
+    changed = 0
+    if street_photos.facades:
+        observed = plan_observed(
+            street_photos.facades,
+            buildings,
+            n_variants=variants,
+            max_styles=int(config.photos.get("observed_styles_max", 24)),
+            face_keys={i: face.key for i, face in enumerate(faces)},
+        )
+        changed = apply_floors(buildings, observed)
+
+    textures = bake_photo_textures(
+        street_photos, buildings, work_dir, out_dir,
+        photos_cfg=config.photos, terrain=terrain, trees=trees, surfaces=surfaces,
+        observed=observed, n_variants=variants,
     )
-    changed = apply_floors(buildings, observed)
+    if observed is None and not len(textures):
+        return None, textures
+
     style_index, plan = assign_facade_slots(buildings, variants, config.facade)
     # The era allocation must not move: the facade stage generates exactly
     # the looks the buildings were first numbered against.
-    if tuple(plan.per_era) != tuple(buildings.facade_looks or plan.per_era):
-        from src.facade import LookPlan
-
+    if buildings.facade_looks and tuple(plan.per_era) != tuple(buildings.facade_looks):
         plan = LookPlan(buildings.facade_looks)
-    for index, look in observed.look_of.items():
-        style_index[index] = plan.total_slots + look
+    face_style = {}
+    if observed is not None:
+        for index, look in observed.look_of.items():
+            style_index[index] = plan.total_slots + look
+        face_style = {key: plan.total_slots + look for key, look in observed.face_look.items()}
     save_buildings(
         buildings,
         work_dir / "buildings.npz",
         style_index=style_index,
         facade_cfg=config.facade,
-        face_style={key: plan.total_slots + look for key, look in observed.face_look.items()},
-        face_tile_width=observed.face_tile_m,
+        face_style=face_style,
+        face_tile_width=observed.face_tile_m if observed is not None else None,
+        photo_textures=textures,
     )
-    LOG.info(
-        "facades from photos: %d walls of %d buildings drawn from %d measured "
-        "styles, %d with measured bays, %d storey counts changed",
-        len(observed.face_look), len(observed.look_of), len(observed.styles),
-        len(observed.face_tile_m), changed,
-    )
-    return observed
+    if observed is not None:
+        LOG.info(
+            "facades from photos: %d walls of %d buildings drawn from %d measured "
+            "styles, %d with measured bays, %d storey counts changed",
+            len(observed.face_look), len(observed.look_of), len(observed.styles),
+            len(observed.face_tile_m), changed,
+        )
+    return observed, textures
 
 
 def run(config: PipelineConfig, args: argparse.Namespace) -> int:
@@ -960,6 +982,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     # is matched to.
     street_photos = StreetPhotoResult()
     observed_plan = None
+    photo_textures = None
     if want_photos:
         with Stage("street photos (Mapillary and your own)", next_step(), total):
             street_photos = build_street_photos(
@@ -973,10 +996,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 aerial_path=aerial.path,
                 trees=trees if len(trees) else None,
             )
-            if street_photos.facades:
-                observed_plan = apply_facade_readings(
-                    buildings, street_photos, config, work_dir
-                )
+            observed_plan, photo_textures = apply_street_photos(
+                buildings, street_photos, config, work_dir, out_dir,
+                terrain=terrain, trees=trees if len(trees) else None, surfaces=surfaces,
+            )
 
     furniture = FurnitureSet()
     furniture_texture = None
@@ -1132,6 +1155,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 str(k): v for k, v in STRUCTURE_KIND_NAMES.items()
             },
             ground_variants=ground_variants,
+            photo_textures=photo_textures.pages if photo_textures is not None else None,
             layered=(
                 layered_scene(config, ground_layers, harbour)
                 if ground_layers is not None
@@ -1172,7 +1196,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 },
                 "building_function": usage.stats(),
                 **(
-                    {"street_photos": street_photos.stats()} if want_photos else {}
+                    {"street_photos": {
+                        **street_photos.stats(),
+                        **({"photo_textures": photo_textures.stats()}
+                           if photo_textures is not None and len(photo_textures) else {}),
+                    }} if want_photos else {}
                 ),
                 # What was taken out of the aerial and what was left in it.
                 # Anyone lighting this model needs to know the photo is no
@@ -1187,7 +1215,17 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
-        write_attribution(out_dir, mapillary=street_photos.uses_mapillary)
+        write_attribution(
+            out_dir,
+            mapillary=street_photos.uses_mapillary,
+            mapillary_textures=bool(
+                photo_textures is not None
+                and any(
+                    pid.startswith("mly_")
+                    for ids in photo_textures.sources.values() for pid in ids
+                )
+            ),
+        )
 
         report = CheckReport()
         check_bbox(report, config.bbox)
@@ -1237,6 +1275,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_aerial(report, aerial, config.bbox)
         if want_photos:
             check_street_photos(report, street_photos)
+            if not args.skip_blender:
+                check_photo_textures(report, photo_textures, out_dir, work_dir)
 
         if not args.skip_blender:
             check_export(

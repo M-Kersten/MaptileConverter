@@ -1537,8 +1537,14 @@ def build_buildings(
     facade_materials: list,
     aerial_material,
     ground_materials: list | None = None,
+    photo_materials: list | None = None,
 ):
-    """One object per building, with facade and aerial material slots."""
+    """One object per building, with facade and aerial material slots.
+
+    Walls that wear their own street photos take an atlas page's material
+    and the texture coordinates the photo stage worked out for them,
+    instead of the facade's.
+    """
     data = np.load(work_dir / scene["buildings"]["file"])
     wall_tris = data["wall_tris"]
     roof_tris = data["roof_tris"]
@@ -1641,6 +1647,9 @@ def build_buildings(
     ground_slot_base = len(materials)
     if has_ground:
         materials.extend(ground_materials)
+    photo_slot_base = len(materials)
+    photo_materials = list(photo_materials or [])
+    materials.extend(photo_materials)
 
     parts = [chunk for chunk in (walls, roofs, grounds) if len(chunk)]
     triangles = np.concatenate(parts, axis=0)
@@ -1694,6 +1703,24 @@ def build_buildings(
         material_indices[n_walls + n_roofs :] = ground_slot_base + np.clip(
             ground_style[ground_owner], 0, max(0, len(ground_materials) - 1)
         )
+
+    # Walls wearing their photos: the atlas page's material and its UVs.
+    if photo_materials and "wall_photo_page" in data.files:
+        corner_uv = uvs.reshape(-1, 3, 2)
+        for page_key, uv_key, offset, count in (
+            ("wall_photo_page", "wall_photo_uv", 0, n_walls),
+            ("ground_wall_photo_page", "ground_wall_photo_uv", n_walls + n_roofs, n_grounds),
+        ):
+            if not count or page_key not in data.files:
+                continue
+            page = data[page_key][:count]
+            on = page >= 0
+            if not on.any():
+                continue
+            idx = np.flatnonzero(on) + offset
+            material_indices[idx] = photo_slot_base + np.clip(page[on], 0, len(photo_materials) - 1)
+            corner_uv[idx] = data[uv_key][:count][on]
+        uvs = corner_uv.reshape(-1, 2)
 
     owner = np.concatenate(
         [chunk for chunk, count in ((wall_owner, n_walls), (roof_owner, n_roofs),
@@ -3179,6 +3206,8 @@ def copy_textures(
         (copy(name), copy(normal) if normal else None)
         for name, normal in zip(scene["facade"]["files"], normals)
     ]
+    # Atlas pages of walls wearing their own photos, if any.
+    scene["_photo_pages"] = [copy(name) for name in scene["facade"].get("photo_files", [])]
 
     extras: dict[str, Path] = {}
     for key, section in (
@@ -3251,6 +3280,12 @@ def main() -> int:
         )
         for colour, normal in ground_textures
     ]
+    # One material per atlas page, not per building: a few draw calls for
+    # every photographed wall in the area.
+    photo_materials = [
+        make_textured_material(f"M_{page.stem}", page, roughness=0.85)
+        for page in scene.get("_photo_pages", [])
+    ]
 
     # Each layer its own collection in the .blend and its own parent in the
     # FBX, so Unity's hierarchy reads Roads > Road_Velperweg rather than a
@@ -3273,7 +3308,8 @@ def main() -> int:
             )
     with _Layer("Buildings", "Buildings"):
         build_buildings(
-            scene, work_dir, facade_materials, aerial_material, ground_materials
+            scene, work_dir, facade_materials, aerial_material, ground_materials,
+            photo_materials=photo_materials,
         )
 
     if layered is not None and scene["layered"].get("water_surface", True):

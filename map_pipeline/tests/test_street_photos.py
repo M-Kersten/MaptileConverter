@@ -1132,6 +1132,229 @@ class ObservedStyleTests(unittest.TestCase):
         self.assertGreater(np.corrcoef(x, u)[0, 1], 0.99)
 
 
+# ---------------------------------------------------------------------------
+# Phase 4: photo textures
+# ---------------------------------------------------------------------------
+
+
+class PhotoTextureTests(unittest.TestCase):
+    def test_licence_rule(self) -> None:
+        from src.photo_textures import may_texture
+
+        mine = photo_at(0, 0, 0, ident="o", source=SOURCE_OWN)
+        theirs = photo_at(0, 0, 0, ident="m")
+        self.assertTrue(may_texture(mine, "own"))
+        self.assertFalse(may_texture(theirs, "own"))
+        self.assertTrue(may_texture(theirs, "all"))
+        self.assertFalse(may_texture(mine, "off"))
+
+    def test_packing_keeps_walls_apart(self) -> None:
+        from src.photo_textures import PAD_PX, pack
+
+        rng = np.random.default_rng(3)
+        sizes = [(int(w), int(h)) for w, h in rng.integers(50, 900, size=(60, 2))] + [(5000, 300)]
+        spots, scales = pack(sizes, page_px=2048)
+        rects = []
+        for (w, h), (page, x, y), scale in zip(sizes, spots, scales):
+            w, h = max(1, int(w * scale)), max(1, int(h * scale))
+            self.assertLessEqual(x + w + PAD_PX, 2048)
+            self.assertLessEqual(y + h + PAD_PX, 2048)
+            rects.append((page, x - PAD_PX, y - PAD_PX, x + w + PAD_PX, y + h + PAD_PX))
+        self.assertLess(scales[-1], 1.0)  # wider than a page: shrunk to fit
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                a, b = rects[i], rects[j]
+                if a[0] != b[0]:
+                    continue
+                overlap = min(a[3], b[3]) > max(a[1], b[1]) and min(a[4], b[4]) > max(a[2], b[2])
+                self.assertFalse(overlap, (a, b))
+
+    def test_holes_filled_from_the_next_bay(self) -> None:
+        from src.photo_textures import fill_from_rhythm
+
+        wall = _wall_image(width_m=20.0, height_m=12.0, bay=2.5, storey=3.0)
+        truth = wall.rgb.copy()
+        weight = wall.weight.copy()
+        weight[60:100, 100:140] = 0.0  # a tree in front
+        z = wall.z_of_row(np.arange(wall.rgb.shape[0]))
+        damaged = wall.rgb.copy()
+        damaged[60:100, 100:140] = 0.0
+        filled, w = fill_from_rhythm(damaged, weight, m_per_px=0.05, bay_m=2.5, storey_m=3.0,
+                                     z_of_row=z, ground_top_z=None)
+        self.assertLess(float(np.abs(filled[60:100, 100:140] - truth[60:100, 100:140]).mean()), 8.0)
+        self.assertTrue(np.all(w[60:100, 100:140] == 0.6))
+
+    def test_ground_storey_never_copies_from_above(self) -> None:
+        from src.photo_textures import fill_from_rhythm
+
+        wall = _wall_image(width_m=10.0, height_m=12.0, bay=2.5, storey=3.0)
+        weight = wall.weight.copy()
+        z = wall.z_of_row(np.arange(wall.rgb.shape[0]))
+        ground = z < 3.6
+        weight[ground] = 0.0  # every bay of the ground storey hidden
+        filled, w = fill_from_rhythm(wall.rgb, weight, m_per_px=0.05, bay_m=2.5, storey_m=3.0,
+                                     z_of_row=z, ground_top_z=3.6)
+        self.assertTrue(np.all(w[ground] == 0.0))
+
+    def test_flatten_light_keeps_detail(self) -> None:
+        from src.photo_textures import flatten_light
+        from src.facade_capture import luminance
+
+        wall = _wall_image(width_m=20.0, height_m=12.0)
+        shaded = wall.rgb.copy()
+        shaded[:, : shaded.shape[1] // 2] *= 0.5  # a building's shadow over half
+        out = flatten_light(shaded, wall.weight, 0.05, strength=1.0)
+        left = luminance(out[:, 20:150]).mean()
+        right = luminance(out[:, -150:-20]).mean()
+        self.assertLess(abs(left - right) / right, 0.2)
+        # The windows are still darker than the wall beside them.
+        self.assertGreater(float(np.std(luminance(out))), 10.0)
+
+    def test_placement_uvs_land_on_the_wall(self) -> None:
+        from src.photo_textures import Placement
+
+        placement = Placement(page=0, x=100, y=50, width=200, height=90,
+                              start=(10.0, 0.0), tangent=(1.0, 0.0), z_max=9.0,
+                              m_per_px_u=0.05, m_per_px_z=0.1)
+        corners = np.array([[10.0, 0.0, 9.0], [20.0, 0.0, 9.0], [10.0, 0.0, 0.0]])
+        uv = placement.uv(corners, (1000, 500))
+        np.testing.assert_allclose(uv[0], [100 / 1000, 1 - 50 / 500])
+        np.testing.assert_allclose(uv[1], [300 / 1000, 1 - 50 / 500])
+        np.testing.assert_allclose(uv[2], [100 / 1000, 1 - 140 / 500])
+
+    def test_bake_end_to_end(self) -> None:
+        from src.photo_coverage import _SegmentIndex
+        from src.photo_textures import bake_textures, triangle_photo_uvs
+        from src.facade_uv import wall_face_keys
+        from src.street_photos import StreetPhotoResult
+
+        buildings = BuildingSet(buildings=[box_building("x", 0, 0, 12, 8, height=9.0)])
+        for b in buildings.buildings:
+            b.wall_top_nap = 9.0
+        faces = wall_faces(buildings)
+        front_index = next(i for i, f in enumerate(faces) if np.allclose(f.normal, [0, -1]))
+        front = faces[front_index]
+        photo = photo_at(6.0, -12.0, 0.0, z=2.0, ident="own_front", source=SOURCE_OWN)
+        photo.rotation = rotation_from_heading(0.0, pitch_deg=12.0)
+        photo.camera = Camera(PERSPECTIVE, 1600, 1200, 0.6)
+        photo.verified = True
+        photo.verified_buildings = ["x"]
+        image = _paint_wall(photo, front, _facade_pattern())
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            from PIL import Image
+
+            Image.fromarray(image).save(tmp / "front.png")
+            photo.path = str(tmp / "front.png")
+            result = StreetPhotoResult(photos=[photo])
+            coverage = score_views(faces, [photo])
+            coverage.thresholds = {"min_visible": 0.6, "measure_px_per_m": 12,
+                                   "texture_px_per_m": 40, "texture_needs_verified": True}
+            textures = bake_textures(
+                result, coverage, buildings, tmp, tmp, photos_cfg={"textures": "own"},
+                faces_index=_SegmentIndex(faces),
+            )
+            self.assertEqual(list(textures.placements), [front.key])
+            self.assertTrue(textures.pages[0].is_file())
+            credits = json.loads((tmp / "photo_credits.json").read_text())
+            self.assertEqual(credits["photos"][0]["photo"], "own_front")
+            page = np.asarray(Image.open(textures.pages[0]).convert("RGB"))
+            tris = buildings.buildings[0].wall_tris
+            face, keys = wall_face_keys(tris, np.zeros(len(tris), dtype=np.int64))
+            pages, uv = triangle_photo_uvs(tris, keys[face], textures)
+        on = pages >= 0
+        self.assertEqual(int(on.sum()), 2)  # the two triangles of the front
+        # The middle of the front, read back through its UVs, is the facade:
+        # brick or glass, never the sky.
+        mid = uv[on].reshape(-1, 2).mean(axis=0)
+        h, w = page.shape[:2]
+        colour = page[int((1 - mid[1]) * h), int(mid[0] * w)]
+        self.assertTrue(colour[2] < 120, colour)
+
+
+class PinTests(unittest.TestCase):
+    def _wall(self):
+        buildings = BuildingSet(buildings=[box_building("x", 0, 0, 12, 8, height=9.0)])
+        buildings.buildings[0].wall_top_nap = 9.0
+        faces = wall_faces(buildings)
+        score_views(faces, [])
+        front = next(i for i, f in enumerate(faces) if np.allclose(f.normal, [0, -1]))
+        return buildings, faces, front
+
+    def test_pose_from_four_corners(self) -> None:
+        from src.camera import project_world
+        from src.photo_pin import pose_from_corners, wall_corners
+
+        buildings, faces, front = self._wall()
+        corners = wall_corners(faces[front], buildings.buildings[0])
+        for kind in (PERSPECTIVE, SPHERICAL):
+            truth = photo_at(4.0, -11.0, 0.0, kind=kind, z=1.6, ident="t")
+            truth.rotation = rotation_from_heading(12.0, pitch_deg=9.0, roll_deg=2.0)
+            truth.camera = Camera(kind, 2000, 1000 if kind == SPHERICAL else 1500, 0.7)
+            pixels, ok = project_world(truth.camera, truth.rotation, truth.centre, corners)
+            self.assertTrue(ok.all())
+            rotation, centre, _, error = pose_from_corners(truth.camera, pixels, corners)
+            self.assertLess(error, 0.5, kind)
+            np.testing.assert_allclose(centre, truth.centre, atol=0.02, err_msg=kind)
+            np.testing.assert_allclose(rotation, truth.rotation, atol=1e-3, err_msg=kind)
+
+    def test_focal_found_when_unknown(self) -> None:
+        from src.camera import project_world
+        from src.photo_pin import pose_from_corners, wall_corners
+
+        buildings, faces, front = self._wall()
+        corners = wall_corners(faces[front], buildings.buildings[0])
+        truth = photo_at(2.0, -9.0, 0.0, z=1.6, ident="t")
+        truth.rotation = rotation_from_heading(25.0, pitch_deg=14.0)
+        truth.camera = Camera(PERSPECTIVE, 2000, 1500, 0.62)
+        pixels, _ = project_world(truth.camera, truth.rotation, truth.centre, corners)
+        guess = Camera(PERSPECTIVE, 2000, 1500, 0.85)
+        rotation, centre, camera, error = pose_from_corners(guess, pixels, corners, estimate_focal=True)
+        self.assertAlmostEqual(camera.focal, 0.62, delta=0.02)
+        np.testing.assert_allclose(centre, truth.centre, atol=0.1)
+
+    def test_pin_places_a_photo_without_gps(self) -> None:
+        from src.camera import project_world
+        from src.own_photos import read_folder
+        from src.photo_pin import apply_pin, wall_corners
+
+        buildings, faces, front = self._wall()
+        corners = wall_corners(faces[front], buildings.buildings[0])
+        truth = photo_at(6.0, -10.0, 0.0, z=1.5, ident="t")
+        truth.rotation = rotation_from_heading(-5.0, pitch_deg=10.0)
+        truth.camera = Camera(PERSPECTIVE, 1600, 1200, 0.7)
+        pixels, _ = project_world(truth.camera, truth.rotation, truth.centre, corners)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            _jpeg(folder / "yard.jpg", (1600, 1200), exif=_gps_exif(0.0, 0.0, None, None) if False else None)
+            (folder / "yard.jpg.json").write_text(json.dumps({
+                "focal": 0.7,
+                "pin": {"corners": pixels.tolist(), "x": 6.0, "y": 0.5},
+            }))
+            photo = read_folder(folder).photos[0]
+        self.assertEqual(photo.pose, POSE_MANUAL)
+        placed, why = apply_pin(photo, faces, buildings)
+        self.assertIsNotNone(placed, why)
+        np.testing.assert_allclose(placed.centre, truth.centre, atol=0.05)
+        self.assertTrue(placed.verified)
+        self.assertEqual(placed.verified_buildings, ["x"])
+
+    def test_corners_in_the_wrong_order_are_refused(self) -> None:
+        from src.camera import project_world
+        from src.photo_pin import apply_pin, wall_corners
+
+        buildings, faces, front = self._wall()
+        corners = wall_corners(faces[front], buildings.buildings[0])
+        truth = photo_at(6.0, -10.0, 0.0, z=1.5, ident="t")
+        truth.rotation = rotation_from_heading(0.0, pitch_deg=10.0)
+        truth.camera = Camera(PERSPECTIVE, 1600, 1200, 0.7)
+        pixels, _ = project_world(truth.camera, truth.rotation, truth.centre, corners)
+        truth.pin = {"corners": pixels[[0, 2, 1, 3]].tolist(), "x": 6.0, "y": 0.5}
+        placed, why = apply_pin(truth, faces, buildings)
+        self.assertIsNone(placed)
+        self.assertIn("corners", why)
+
+
 def _server():
     import importlib.util
 

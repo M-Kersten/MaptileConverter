@@ -989,6 +989,39 @@ def check_street_photos(report: CheckReport, result) -> None:
     )
 
 
+def check_photo_textures(report: CheckReport, textures, out_dir: Path, work_dir: Path) -> None:
+    """The walls that wear their photos: pages beside the model, UVs on them.
+
+    A UV off its page shows the next wall's photo, or black; a page left
+    behind in work/ leaves the FBX pointing at nothing.
+    """
+    if textures is None or not len(textures):
+        return
+    missing = [p.name for p in textures.pages if not (out_dir / p.name).is_file()]
+    report.add(
+        "photo_texture_pages_exported",
+        not missing,
+        f"{len(textures.pages)} atlas pages"
+        + (f"; missing beside the model: {', '.join(missing)}" if missing else " beside the model"),
+    )
+    data_path = work_dir / "buildings.npz"
+    if not data_path.is_file():
+        return
+    data = np.load(data_path)
+    if "wall_photo_page" not in data.files:
+        report.add("photo_texture_uvs", False, "no photo UVs in buildings.npz")
+        return
+    pages = np.concatenate([data["wall_photo_page"], data["ground_wall_photo_page"]])
+    uv = np.concatenate([data["wall_photo_uv"], data["ground_wall_photo_uv"]])[pages >= 0]
+    off = int((((uv < -1e-3) | (uv > 1 + 1e-3)).any(axis=(1, 2))).sum()) if len(uv) else 0
+    report.add(
+        "photo_texture_uvs",
+        off == 0 and int((pages >= 0).sum()) > 0,
+        f"{int((pages >= 0).sum())} wall triangles wear a photo; {off} have "
+        f"texture coordinates off their page",
+    )
+
+
 def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
     """The terrain in the model is the grid the pipeline meant to build.
 

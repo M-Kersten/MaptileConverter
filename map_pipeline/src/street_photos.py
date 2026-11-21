@@ -178,6 +178,25 @@ def build_street_photos(
         )
         gathered.extend(own.photos)
 
+    pinned = [p for p in gathered if p.pin]
+    if pinned:
+        from .photo_coverage import mark_exposed
+        from .photo_pin import apply_pin
+
+        pin_faces = wall_faces(buildings)
+        mark_exposed(pin_faces, _SegmentIndex(pin_faces))
+        placed = {}
+        for photo in pinned:
+            moved, why = apply_pin(photo, pin_faces, buildings)
+            if moved is None:
+                LOG.warning("pin on %s not used: %s", photo.id, why)
+                result.problems.append(f"pin on {photo.id} not used: {why}")
+            else:
+                placed[photo.id] = moved
+        gathered = [placed.get(p.id, p) for p in gathered]
+        if placed:
+            LOG.info("%d photos placed by their pins", len(placed))
+
     margin = float(photos_cfg.get("max_distance_m", 40.0))
     reach = bbox.buffered(margin)
     inside = [
@@ -264,6 +283,45 @@ def build_street_photos(
         s["buildings_with_measurable_wall"],
     )
     return result
+
+
+def bake_photo_textures(
+    result: StreetPhotoResult,
+    buildings,
+    work_dir: Path,
+    out_dir: Path,
+    *,
+    photos_cfg: dict,
+    terrain=None,
+    trees=None,
+    surfaces=None,
+    observed=None,
+    n_variants: int = 5,
+    session=None,
+):
+    """Route 2: the walls that can wear their photos get them."""
+    from .facade_capture import crowns_from_trees, parking_lookup
+    from .photo_textures import PhotoTextureSet, bake_textures
+
+    if result.coverage is None or str(photos_cfg.get("textures", "own")).lower() == "off":
+        return PhotoTextureSet()
+    parking = None
+    if surfaces is not None and getattr(surfaces, "class_grid", None) is not None and terrain is not None:
+        parking = parking_lookup(surfaces.class_grid, terrain.xs, terrain.ys)
+    return bake_textures(
+        result,
+        result.coverage,
+        buildings,
+        work_dir,
+        out_dir,
+        photos_cfg=photos_cfg,
+        observed=observed,
+        n_variants=n_variants,
+        faces_index=_SegmentIndex(result.coverage.faces),
+        crowns=crowns_from_trees(trees) if trees is not None else [],
+        parking=parking,
+        session=session,
+    )
 
 
 def walls_to_read(coverage: Coverage, buildings, limit: int, per_building: int = 4):
@@ -517,6 +575,10 @@ def refine_poses(
         photo = by_id[pid]
         if not photo.path:
             continue
+        if photo.pose == "manual" and photo.verified and photo.pin:
+            # Pinned by hand: exact for its wall, and not to be moved by
+            # edges that a tree or a sign may have lined up wrongly.
+            continue
         try:
             image = load_image(photo)
         except OSError as exc:
@@ -586,6 +648,7 @@ def refine_poses(
 
 __all__ = [
     "StreetPhotoResult",
+    "bake_photo_textures",
     "read_facades",
     "walls_to_read",
     "build_street_photos",

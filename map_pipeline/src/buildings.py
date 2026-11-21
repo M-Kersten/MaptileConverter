@@ -1049,6 +1049,7 @@ def save_buildings(
     facade_cfg: dict | None = None,
     face_style: dict | None = None,
     face_tile_width: dict | None = None,
+    photo_textures=None,
 ) -> Path:
     """Write the building set to a compact npz for the Blender stage.
 
@@ -1064,6 +1065,10 @@ def save_buildings(
     facade_uv.wall_face_keys), the style slot and the metres of wall one
     tile covers, for the walls the street photos read. Every other wall
     takes its building's.
+
+    `photo_textures` (a photo_textures.PhotoTextureSet) gives the walls that
+    wear a photo; their triangles get the atlas page they are on and their
+    own texture coordinates.
     """
     wall_chunks, roof_chunks, ground_chunks = [], [], []
     wall_owner, roof_owner, ground_owner = [], [], []
@@ -1106,10 +1111,21 @@ def save_buildings(
     all_ids = np.concatenate([wall_ids, ground_ids])
     triangle_tile = None
     wall_style = None
-    if face_style or face_tile_width:
+    photo_arrays: dict = {}
+    if face_style or face_tile_width or (photo_textures is not None and len(photo_textures)):
         from .facade_uv import wall_face_keys
 
         face, keys = wall_face_keys(all_walls, all_ids)
+        if photo_textures is not None and len(photo_textures):
+            from .photo_textures import triangle_photo_uvs
+
+            page, uv = triangle_photo_uvs(all_walls, keys[face], photo_textures)
+            photo_arrays = {
+                "wall_photo_page": page[: len(walls)],
+                "wall_photo_uv": uv[: len(walls)],
+                "ground_wall_photo_page": page[len(walls):],
+                "ground_wall_photo_uv": uv[len(walls):],
+            }
         key_rows = [tuple(int(v) for v in row) for row in keys]
         if face_tile_width:
             per_face = np.array([face_tile_width.get(k, np.nan) for k in key_rows])
@@ -1127,6 +1143,7 @@ def save_buildings(
         path,
         style_index=np.asarray(style_index, dtype=np.int32),
         **({"wall_style": wall_style} if wall_style is not None else {}),
+        **photo_arrays,
         wall_tris=walls,
         wall_building=wall_ids,
         wall_u=fitted_u[: len(walls) * 3],

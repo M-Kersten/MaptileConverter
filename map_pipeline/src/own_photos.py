@@ -219,6 +219,20 @@ def read_photo(
         except (TypeError, ValueError, ZeroDivisionError):
             return None, "unreadable GPS position"
         x, y = lonlat_to_rd(lon, lat)
+    elif isinstance(side.get("pin"), dict) and (
+        {"x", "y"} <= set(side["pin"]) or {"lat", "lon"} <= set(side["pin"])
+    ):
+        # Pinned to a wall: the pin will say where the camera stood. Until
+        # then it stands at the wall it points at.
+        pin = side["pin"]
+        if "x" in pin:
+            x, y = float(pin["x"]), float(pin["y"])
+            lon = lat = None
+        else:
+            lon, lat = float(pin["lon"]), float(pin["lat"])
+            x, y = lonlat_to_rd(lon, lat)
+        pose = POSE_MANUAL
+        notes.append("placed by its pin")
     else:
         return None, "no position: no GPS in the file and no sidecar"
 
@@ -278,6 +292,7 @@ def read_photo(
         path=str(path),
         position_sigma_m=1.0 if pose == POSE_MANUAL else 5.0,
         height_m=float(side["height_m"]) if "height_m" in side else None,
+        pin=side.get("pin") if isinstance(side.get("pin"), dict) else None,
         notes=notes,
     )
     return photo, ""

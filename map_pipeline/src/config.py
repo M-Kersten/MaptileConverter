@@ -502,6 +502,19 @@ DEFAULTS: dict[str, Any] = {
         # The most textures the measured facades may add. Buildings that
         # measured alike share one.
         "observed_styles_max": 24,
+        # Whose photos may become wall textures: "own" only yours, "all"
+        # Mapillary's too, "off" none. A texture made from a Mapillary photo
+        # is CC BY-SA 4.0: it has to be credited and shared alike, which is
+        # why it is not the default.
+        "textures": "own",
+        "textures_max_walls": 300,
+        # Sharpest a photo texture is made, in pixels per metre of wall.
+        "texture_max_px_per_m": 60.0,
+        "texture_page_px": 4096,
+        # How much of the light that changes over metres is evened out of a
+        # photo texture: a building's shadow across half a facade. 0 keeps
+        # the photo as it is.
+        "texture_flatten_light": 0.5,
         "timeout_s": 60,
         "max_retries": 4,
     },

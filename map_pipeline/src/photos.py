@@ -80,6 +80,9 @@ class Photo:
     # The buildings whose own edges lined up with this photo, by identifier:
     # the walls it may paint. None until a check has been made.
     verified_buildings: list[str] | None = None
+    # Four corners of one wall marked in the photo by hand, and where that
+    # wall is on the map: see photo_pin.
+    pin: dict | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -116,6 +119,7 @@ class Photo:
                 if self.verified_buildings is not None
                 else {}
             ),
+            **({"pin": self.pin} if self.pin else {}),
             **({"notes": list(self.notes)} if self.notes else {}),
         }
 
@@ -143,6 +147,7 @@ class Photo:
             ),
             verified=data.get("verified"),
             verified_buildings=data.get("verified_buildings"),
+            pin=data.get("pin"),
             notes=list(data.get("notes", [])),
         )
 

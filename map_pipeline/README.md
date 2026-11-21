@@ -1677,10 +1677,10 @@ one. Street photos are how a model starts to look like the place itself. They
 come from Mapillary, open street-level imagery that covers most Dutch cities,
 and from a folder of your own photos for whatever Mapillary never drove past.
 
-This is being built in phases. What exists now: the photos are gathered, put
-in place, lined up with the model and checked, every wall is scored on what
-they can do for it, and the walls they see well are read: wall colour, window
-columns, storeys. Wearing the photos as textures comes next.
+What it does: the photos are gathered, put in place, lined up with the model
+and checked; the walls they see well are read (wall colour, window columns,
+storeys) and drawn from what was read; and the walls they see sharply wear the
+photos themselves.
 
 **Switching it on.** Tick *Straatfoto's* under Lagen, or set it in the config:
 
@@ -1824,6 +1824,65 @@ What this cannot do is draw a facade the generator has no words for. It draws
 one window per bay, so a terrace of paired windows comes out evenly spaced, an
 office of ribbon glazing reads unreliably, and a white block with a red awning
 on every storey can be read as either. The photo textures are for those.
+
+**Walls that wear their photos.** A wall a checked photo sees sharply,
+square-on and mostly unobstructed is textured with the photo itself. It is
+straightened as for reading, but at up to 60 px per metre
+(`texture_max_px_per_m`) and from the full-size photos: a 360 photo is fetched
+at its original 7680 px for this, since at 2048 px it gives a wall ten metres
+off a third of the detail. Views are fused per pixel by taking the single best
+one, with the seams between photos feathered over a few decimetres; light that
+changes over metres, a building's shadow across half a front, is evened out at
+half strength (`texture_flatten_light`), and brightness is matched to the
+aerial as for reading.
+
+What no photo saw is filled, in this order:
+
+1. from the wall's own rhythm: the same spot a whole number of bays across or
+   storeys up, using the periods the reading measured. A tree in front of one
+   bay is usually not in front of the next. The ground storey only copies
+   sideways, never from the storeys above;
+2. from the wall's generated facade, its observed style in the same bay and
+   storey grid as the model's own;
+3. blended in with a soft edge, and never letting a hole show through: a
+   reading behind a parked car keeps a fifth of its weight, and a fifth of a
+   car floats on the wall as a ghost.
+
+Parked cars are known before any photo is looked at: the BGT draws every
+parking bay, and a ray to the foot of a wall that crosses one below 1.8 m most
+likely ends on a car. Those readings, and those through tree crowns, count for
+little.
+
+All photographed walls of an area are packed onto a few 4096 px pages,
+`photo_wall_00.jpg` and on, with their edges padded so filtering never reaches
+the neighbour; each page is one material, `M_photo_wall_00`, so a street of
+photographed buildings is a handful of draw calls in Unity. The pages are
+beside the FBX and in the 3D view in the browser. Over 300 m of central Arnhem
+120 walls went onto 9 pages from 185 photos.
+
+**Licence.** `photos.textures` decides whose photos may become textures:
+`own` (the default) only your own, `all` Mapillary's as well, `off` none. A
+texture made from a Mapillary photo is a derivative of a CC BY-SA 4.0 image:
+it has to be credited and shared under the same licence. `photo_credits.json`
+lists every photo used and its author, and `ATTRIBUTION.txt` says so when
+Mapillary photos were used.
+
+**Pinning a photo to a wall.** For a photo nothing else can place, an old one,
+one from a courtyard with no GPS, one whose compass was off: mark the four
+corners of one wall in it, top left, top right, bottom right, bottom left as
+seen, and say where that wall is on the map. In a sidecar:
+
+```json
+{"pin": {"corners": [[412, 233], [1610, 301], [1598, 1180], [430, 1214]],
+         "lat": 51.9801, "lon": 5.9093}}
+```
+
+The model knows where that wall's corners are, its two ends at the street and
+at the eaves, and four points on one plane seen through a known lens fix the
+camera exactly. When the photo does not say what lens took it, the focal
+length is found from the same four points. A pinned photo is trusted for its
+wall and is not moved by the automatic alignment; one whose corners do not fit
+the wall it points at is reported and left out.
 
 **Licence.** Mapillary images are CC BY-SA 4.0. `ATTRIBUTION.txt` credits
 Mapillary's contributors whenever a run used their photos. A wall measured from
