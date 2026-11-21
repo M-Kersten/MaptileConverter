@@ -106,19 +106,14 @@ def render_matches(
     views_file = renders / "views.json"
     views_file.write_text(json.dumps(views), encoding="utf-8")
     script = Path(__file__).resolve().parent.parent / "blender" / "photo_match.py"
+    args = ["--blend", str(blend_path), "--views", str(views_file), "--out", str(renders)]
     if blender_command is None:
         import subprocess
         import sys
 
-        code = (
-            "import sys, runpy; import bpy; "
-            f"bpy.ops.wm.open_mainfile(filepath={str(blend_path)!r}); "
-            f"sys.argv = ['photo_match', '--', '--views', {str(views_file)!r}, '--out', {str(renders)!r}]; "
-            f"runpy.run_path({str(script)!r}, run_name='__main__')"
-        )
-        subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+        subprocess.run([sys.executable, str(script), *args], check=True, capture_output=True, text=True)
     else:
-        blender_command(script, ["--blend", str(blend_path), "--views", str(views_file), "--out", str(renders)])
+        blender_command(script, args)
 
     written = []
     for name in cuts:
@@ -136,4 +131,69 @@ def render_matches(
     return written
 
 
-__all__ = ["blender_view", "cut_view", "render_matches", "view_towards"]
+def choose_matches(result, textures=None, limit: int = 4):
+    """Walls worth comparing: those wearing a photo first, then those read.
+
+    Returns ``[(name, photo, target point)]`` using each wall's best checked
+    view whose pixels are on disk.
+    """
+    coverage = result.coverage
+    if coverage is None:
+        return []
+    by_id = {p.id: p for p in result.photos}
+    textured = set(textures.placements) if textures is not None else set()
+    read = {w.face for m in getattr(result, "facades", {}).values() for w in m.walls}
+    order = sorted(
+        range(len(coverage.faces)),
+        key=lambda i: (coverage.faces[i].key not in textured, i not in read, -coverage.faces[i].area_m2),
+    )
+    chosen, used_photos = [], set()
+    for i in order:
+        face = coverage.faces[i]
+        if face.key not in textured and i not in read:
+            break
+        for view in coverage.views[i]:
+            photo = by_id.get(view.photo)
+            if view.verified is True and photo is not None and photo.path and photo.id not in used_photos:
+                chosen.append((str(len(chosen) + 1), photo, face.centre))
+                used_photos.add(photo.id)
+                break
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def write_photo_matches(result, textures, blend_path: Path, out_dir: Path, *, origin_rd, z_offset, blender_command=None, limit: int = 4) -> list[Path]:
+    """Photo and model side by side for a few walls, into photo_checks/."""
+    from .facade_capture import PhotoPixels
+
+    pixels = PhotoPixels(max_cached=2)
+    pairs = []
+    for name, photo, target in choose_matches(result, textures, limit):
+        try:
+            pairs.append((name, photo, pixels.get(photo.path), target))
+        except OSError:
+            continue
+    checks = out_dir / "photo_checks"
+    for old in checks.glob("match_*.jpg"):
+        old.unlink()
+    if not pairs:
+        return []
+    written = render_matches(
+        pairs, blend_path, checks, origin_rd=origin_rd, z_offset=z_offset,
+        blender_command=blender_command,
+    )
+    import shutil
+
+    shutil.rmtree(checks / "_renders", ignore_errors=True)
+    return written
+
+
+__all__ = [
+    "blender_view",
+    "choose_matches",
+    "cut_view",
+    "render_matches",
+    "view_towards",
+    "write_photo_matches",
+]

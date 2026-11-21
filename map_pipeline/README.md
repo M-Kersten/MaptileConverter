@@ -223,6 +223,11 @@ and turned needs nothing more. For the rest:
 **Bekijken** on a model built with photos shows a Straatfoto's section: how
 many photos there were, how many passed the check, how many walls were read
 and how many wear their photo, then the coverage map and the photo checks.
+With **Voorbeeldbeelden renderen** on, the checks include `match_*.jpg`: a
+street photo next to the model rendered from the same spot, for up to four
+walls, those wearing a photo first. It is the quickest way to see whether the
+model looks like the place. They are rendered with Cycles on the CPU, which
+needs no graphics card, at a few seconds each.
 
 ### The 3D view
 

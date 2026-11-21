@@ -71,6 +71,9 @@ class WallImage:
     z_min: float
     z_max: float
     views: list[str] = field(default_factory=list)
+    # How far the views agree per pixel, 0..1: low where each photo shows
+    # something different in front of the wall. None for a single view.
+    agreement: np.ndarray | None = None
 
     @property
     def coverage(self) -> float:
@@ -453,12 +456,58 @@ def _box_blur(array: np.ndarray, radius: int) -> np.ndarray:
     return total / (k * k)
 
 
+def photo_consistency(
+    views: list[tuple[np.ndarray, np.ndarray]], m_per_px: float, radius_m: float = 0.25
+) -> np.ndarray | None:
+    """How well the views agree on each pixel's surroundings, -1..1.
+
+    The wall's own plane is the one surface on which every photo's pixels
+    line up once the views are registered. Anything standing in front of
+    it -- a car parked two metres out, a bicycle, a bin -- is projected onto
+    a different spot of the wall from each camera, so around such a pixel
+    the photos show different patterns. The local normalised correlation
+    between views, the best over every pair that sees the pixel, says
+    which: high on the wall, low in front of it. A pixel only one view sees
+    cannot be judged and comes out at 1. Returns None for a single view.
+
+    Glass fails this too, reflecting a different street to each camera, so
+    the caller decides where to listen to it.
+    """
+    if len(views) < 2:
+        return None
+    radius = max(1, int(round(radius_m / m_per_px)))
+    lum = [luminance(rgb) for rgb, _ in views]
+    seen = [weight > 0.3 for _, weight in views]
+    stats = []
+    for l in lum:
+        mean = _box_blur(l, radius)
+        var = np.maximum(_box_blur(l * l, radius) - mean * mean, 0.0)
+        stats.append((mean, var))
+    best = np.full(lum[0].shape, -1.0)
+    judged = np.zeros(lum[0].shape, dtype=bool)
+    for i in range(len(views)):
+        for j in range(i + 1, len(views)):
+            both = seen[i] & seen[j]
+            if not both.any():
+                continue
+            cov = _box_blur(lum[i] * lum[j], radius) - stats[i][0] * stats[j][0]
+            denom = np.sqrt(stats[i][1] * stats[j][1])
+            # A flat patch -- plain render -- correlates with nothing; it is
+            # not evidence of something in front, so it counts as agreeing.
+            flat = denom < 25.0
+            ncc = np.where(flat, 1.0, cov / np.maximum(denom, 1e-6))
+            best = np.where(both, np.maximum(best, ncc), best)
+            judged |= both
+    return np.where(judged, best, 1.0).astype(np.float32)
+
+
 def fuse_views(
     views: list[tuple[np.ndarray, np.ndarray]],
     *,
     mode: str = "blend",
     m_per_px: float = 0.05,
-) -> tuple[np.ndarray, np.ndarray]:
+    with_agreement: bool = False,
+):
     """One picture from several, dropping what only one view shows.
 
     ``blend`` averages the views that agree, which is right for measuring:
@@ -466,12 +515,17 @@ def fuse_views(
     ``best`` takes each pixel from the single best view that agrees with the
     others and feathers the seams between views over a few decimetres, which
     is right for a texture: one sharp photo beats the average of three.
+
+    With `with_agreement` a third array says how far the views agree per
+    pixel: the best trust a pixel kept against the best weight it had.
+    Where every view was flagged as the odd one out, it is near nothing.
     """
     if not views:
         raise ValueError("nothing to fuse")
     if len(views) == 1:
-        return views[0]
+        return (*views[0], None) if with_agreement else views[0]
     views = co_register(views, m_per_px)
+    consistency = photo_consistency(views, m_per_px) if with_agreement else None
     gains = match_exposure(views)
     rgb = np.stack([v[0] * g for v, g in zip(views, gains)])  # (n, h, w, 3)
     weight = np.stack([v[1] for v in views])  # (n, h, w)
@@ -486,6 +540,11 @@ def fuse_views(
     # are something in front of the wall in that photo only.
     far = np.abs(lum - consensus[None]) > OUTLIER_LUMINANCE * np.maximum(consensus[None], 20.0)
     trust = np.where(seen_twice[None] & far, 0.05, 1.0) * weight
+    agreement = np.clip(trust.max(axis=0) / np.maximum(weight.max(axis=0), 1e-6), 0.0, 1.0)
+    if consistency is not None:
+        # Either test failing means something in front of the wall: a moving
+        # car is caught by its colour, a parked one by its parallax.
+        agreement = np.minimum(agreement, np.clip(consistency, 0.0, 1.0))
     if mode == "best":
         # The winner per pixel, then softened into overlapping masks so the
         # change from one photo to the next is a fade, not a cut.
@@ -502,6 +561,8 @@ def fuse_views(
     fused = np.clip(fused, 0.0, 255.0)
     confidence = np.clip(weight.max(axis=0), 0.0, 1.0)
     confidence = np.where(total > 1e-6, confidence, 0.0)
+    if with_agreement:
+        return fused.astype(np.float32), confidence.astype(np.float32), agreement.astype(np.float32)
     return fused.astype(np.float32), confidence.astype(np.float32)
 
 
@@ -546,7 +607,7 @@ def capture_wall(
         names.append(photo.id)
     if not views:
         return None
-    rgb, weight = fuse_views(views, mode=mode, m_per_px=m_per_px)
+    rgb, weight, agreement = fuse_views(views, mode=mode, m_per_px=m_per_px, with_agreement=True)
     return WallImage(
         face=face_index,
         rgb=rgb,
@@ -556,6 +617,7 @@ def capture_wall(
         z_min=face.z_min,
         z_max=face.z_max,
         views=names,
+        agreement=agreement,
     )
 
 
@@ -577,6 +639,7 @@ __all__ = [
     "register_shift",
     "crowns_from_trees",
     "parking_lookup",
+    "photo_consistency",
     "face_grid",
     "face_outline",
     "fuse_views",

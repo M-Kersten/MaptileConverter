@@ -1310,6 +1310,26 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             ],
             args.blender,
         )
+        if want_photos and street_photos.coverage is not None:
+            # The comparison that started all this: a street photo next to
+            # the model seen from the same spot.
+            from src.photo_match import write_photo_matches
+
+            try:
+                written = write_photo_matches(
+                    street_photos,
+                    photo_textures,
+                    out_dir / str(config.export.get("blend_name", "model.blend")),
+                    out_dir,
+                    origin_rd=config.geo.origin,
+                    z_offset=float(json.loads((work_dir / "scene.json").read_text())["ground_z_offset_nap"]),
+                    blender_command=lambda script, extra: run_blender_script(
+                        script.name, extra, args.blender
+                    ),
+                )
+                LOG.info("photo and model side by side: %d views in photo_checks/", len(written))
+            except Exception as exc:  # noqa: BLE001 - a preview never fails a build
+                LOG.warning("photo and model side by side not rendered: %s", exc)
 
     LOG.info("=" * 72)
     LOG.info("%s", report.summary())

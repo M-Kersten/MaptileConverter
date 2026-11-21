@@ -46,6 +46,12 @@ PAD_PX = 4
 HOLE_WEIGHT = 0.3
 # Sharpness asked of a photo texture, pixels per metre of wall.
 MIN_PX_PER_M, MAX_PX_PER_M = 24.0, 60.0
+# Up to this height above the street, views that disagree are taken to show
+# something in front of the wall: the cars parked along the kerb where the
+# BGT draws no parking bay, a cyclist, a bin. Higher up, glass looks
+# different from every angle and is left alone.
+STREET_BAND_M = 2.2
+DISAGREE = 0.5
 
 
 @dataclass
@@ -380,6 +386,13 @@ def bake_textures(
         )
         if wall is None:
             continue
+        if wall.agreement is not None:
+            # Translucent cars on a ground floor are two photos' different
+            # cars averaged; better a hole the rhythm or the generated
+            # ground storey can fill.
+            z_rows = wall.z_of_row(np.arange(wall.rgb.shape[0]))
+            street = (z_rows < building.ground_z_nap + STREET_BAND_M)[:, None]
+            wall.weight = np.where(street & (wall.agreement < DISAGREE), wall.weight * 0.2, wall.weight)
         measured = measured_walls.get(face_index)
         gains = [result.gains[pid] for pid in wall.views if pid in getattr(result, "gains", {})]
         # How far this wall may be lifted is asked of its colour as

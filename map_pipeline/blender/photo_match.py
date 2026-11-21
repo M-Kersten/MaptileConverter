@@ -24,7 +24,12 @@ import mathutils
 def parse_args(argv):
     import argparse
 
-    argv = argv[argv.index("--") + 1:] if "--" in argv else []
+    # Blender passes the script's own arguments after "--"; the bpy module,
+    # run as a plain script, passes them straight.
+    if "--" in argv:
+        argv = argv[argv.index("--") + 1:]
+    else:
+        argv = argv[1:] if argv and argv[0].endswith(".py") else argv
     parser = argparse.ArgumentParser()
     parser.add_argument("--views", required=True)
     parser.add_argument("--out", required=True)

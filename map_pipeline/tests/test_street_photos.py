@@ -952,6 +952,31 @@ class FacadeCaptureTests(unittest.TestCase):
             self.assertLess(float(np.abs(patch - a.rgb[100:140, 50:120]).mean()), 12.0, mode)
             self.assertTrue(np.all(fused <= 255.0))
 
+    def test_disagreement_is_reported(self) -> None:
+        from src.facade_capture import fuse_views
+
+        a = _wall_image(width_m=10, height_m=8)
+        views = [(a.rgb.copy(), a.weight.copy()) for _ in range(2)]
+        views[0][0][120:150, 50:120] = (250, 250, 250)  # a white car in one
+        views[1][0][120:150, 50:120] = (20, 20, 30)  # a black car in the other
+        _, _, agreement = fuse_views(views, mode="best", m_per_px=0.05, with_agreement=True)
+        self.assertLess(float(agreement[120:150, 50:120].mean()), 0.2)
+        self.assertGreater(float(agreement[20:60, 50:120].mean()), 0.9)
+
+    def test_something_in_front_of_the_wall_is_inconsistent(self) -> None:
+        from src.facade_capture import photo_consistency
+
+        a = _wall_image(width_m=10, height_m=8)
+        rng = np.random.default_rng(4)
+        car = rng.uniform(20, 230, size=(30, 70, 3)).astype(np.float32)
+        views = [(a.rgb.copy(), a.weight.copy()) for _ in range(2)]
+        # The same car, seen from two places, lands 0.5 m apart on the wall.
+        views[0][0][120:150, 40:110] = car
+        views[1][0][120:150, 50:120] = car
+        consistency = photo_consistency(views, 0.05)
+        self.assertLess(float(np.median(consistency[125:145, 55:105])), 0.5)
+        self.assertGreater(float(np.median(consistency[20:60, :])), 0.8)
+
     def test_gable_sky_is_masked(self) -> None:
         from src.facade_capture import face_outline
 
@@ -1422,6 +1447,46 @@ class PhotoFolderTests(unittest.TestCase):
         self.assertEqual(config["photos"]["folder"], str(root / "photos" / "plein"))
         self.assertEqual(config["photos"]["textures"], "all")
         self.assertNotIn("folder", bare.get("photos", {}))
+
+
+class PhotoMatchTests(unittest.TestCase):
+    def test_textured_walls_are_compared_first(self) -> None:
+        from src.photo_match import choose_matches, write_photo_matches
+        from src.photo_textures import PhotoTextureSet
+        from src.street_photos import StreetPhotoResult
+
+        buildings = BuildingSet(buildings=[box_building("a", 0, 0, 10, 8), box_building("b", 20, 0, 30, 8)])
+        faces = wall_faces(buildings)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            photos = []
+            for ident, x in (("pa", 5.0), ("pb", 25.0)):
+                photo = photo_at(x, -12.0, 0.0, ident=ident, source=SOURCE_OWN)
+                photo.camera = Camera(PERSPECTIVE, 640, 480, 0.6)
+                photo.verified = True
+                _jpeg(tmp / f"{ident}.jpg", (640, 480))
+                photo.path = str(tmp / f"{ident}.jpg")
+                photos.append(photo)
+            result = StreetPhotoResult(photos=photos, coverage=score_views(faces, photos))
+            front_b = next(f for f in faces if f.building_id == "b" and np.allclose(f.normal, [0, -1]))
+            textures = PhotoTextureSet()
+            textures.placements[front_b.key] = object()
+            chosen = choose_matches(result, textures, limit=4)
+            self.assertEqual(chosen[0][1].id, "pb")  # the textured wall first
+            self.assertEqual(len(chosen), 1)  # nothing read, nothing else to compare
+
+            def fake_blender(script, args):
+                from PIL import Image
+
+                views = json.loads(Path(args[args.index("--views") + 1]).read_text())
+                out = Path(args[args.index("--out") + 1])
+                for view in views:
+                    Image.new("RGB", (view["width"], view["height"]), (90, 90, 90)).save(out / f"{view['name']}.png")
+
+            written = write_photo_matches(result, textures, tmp / "model.blend", tmp,
+                                          origin_rd=(0.0, 0.0), z_offset=0.0, blender_command=fake_blender)
+            self.assertEqual([w.name for w in written], ["match_1.jpg"])
+            self.assertFalse((tmp / "photo_checks" / "_renders").exists())
 
 
 def _server():
