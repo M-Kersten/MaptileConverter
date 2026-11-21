@@ -39,6 +39,12 @@ class Source:
     # its own. The source is only down when neither answers -- treating the
     # first as decisive would abort runs that would have finished.
     backup_probe_url: str = ""
+    # A source whose outage should not stop a run: it adds detail to a model
+    # that is complete without it, and its stage carries on when it fails.
+    soft: bool = False
+    # Whether a run asked for without saying starts with this source on. Off
+    # for a source that needs something of the person first, such as a key.
+    default_on: bool = True
 
     def url(self, config: dict) -> str:
         node: Any = config
@@ -173,6 +179,24 @@ SOURCES: tuple[Source, ...] = (
         contributes="railway, tram and metro track, on its own ballast bed",
         toggles=(("rails", "enabled"),),
         url_path=("trees", "api_url"),
+    ),
+    Source(
+        id="mapillary",
+        label="Street photos (Mapillary)",
+        provider="Mapillary",
+        contributes=(
+            "street-level photos that show what each facade looks like: how "
+            "many storeys and windows, what colour"
+        ),
+        toggles=(("photos", "mapillary"),),
+        url_path=("photos", "mapillary_url"),
+        fallback_url="https://graph.mapillary.com",
+        note=(
+            "needs a free access token in MAPILLARY_TOKEN; photos are "
+            "CC BY-SA 4.0"
+        ),
+        soft=True,
+        default_on=False,
     ),
 )
 

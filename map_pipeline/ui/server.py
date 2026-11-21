@@ -93,6 +93,10 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     "rails":              {"c": 0.3, "a": 4.0,  "m": 0.0},
     # Two collections, plus the surface model when trees are off.
     "structures":         {"c": 0.5, "a": 6.0,  "m": 0.0},
+    # Mapillary answers a tile in two to four seconds and a square kilometre
+    # takes about 25 of them; scoring the views was 5 s over 300 m of central
+    # Arnhem, where 360 cameras have been down every street.
+    "photos":             {"c": 3.0, "a": 130.0, "m": 0.0},
     "facade":             {"c": 1.0, "a": 0.0,  "m": 0.0},
     "scene":              {"c": 0.3, "a": 0.0,  "m": 0.0},
     "blender":            {"c": 2.0, "a": 8.0,  "m": 0.0},
@@ -126,8 +130,11 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
             return source_id in chosen
     else:
 
+        from src.sources import BY_ID
+
         def on(source_id: str) -> bool:
-            return bool(payload.get(source_id, True))
+            source = BY_ID.get(source_id)
+            return bool(payload.get(source_id, source.default_on if source else True))
 
     enabled = {
         "terrain": True,
@@ -142,6 +149,7 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
         "vehicles": on("vehicles"),
         "rails": on("rails"),
         "structures": on("structures"),
+        "photos": on("mapillary"),
         "facade": True,
         "scene": True,
         "blender": True,
@@ -401,7 +409,7 @@ def build_config(payload: dict) -> dict:
         selected = {
             source.id
             for source in SOURCES
-            if source.required or payload.get(source.id, True)
+            if source.required or payload.get(source.id, source.default_on)
         }
 
     apply_selection(config, selected)
@@ -1037,6 +1045,17 @@ class Handler(BaseHTTPRequestHandler):
                 detail = status.get("detail", "")
                 if answering and len(urls) > 1 and answering != urls[0]:
                     detail = f"{detail} (via the backup service)"
+                # A service can answer and still be unusable to us: Mapillary
+                # without a token is that, and it is something the person can
+                # fix, unlike an outage.
+                missing = ""
+                if source.id == "mapillary":
+                    from src.mapillary import MissingToken, find_token
+
+                    try:
+                        find_token()
+                    except MissingToken:
+                        missing = "token"
                 listed.append(
                     {
                         "id": source.id,
@@ -1045,6 +1064,8 @@ class Handler(BaseHTTPRequestHandler):
                         "contributes": source.contributes,
                         "required": source.required,
                         "note": source.note,
+                        "default_on": source.default_on,
+                        "missing": missing,
                         "host": status.get("host", ""),
                         "ok": status.get("ok"),
                         "detail": detail,
@@ -1085,6 +1106,12 @@ class Handler(BaseHTTPRequestHandler):
                     "furniture": flag("furniture"),
                     "barriers": flag("barriers"),
                     "usage": flag("usage"),
+                    # The page sends these too; leaving them out here counted
+                    # every one of them in, switched off or not.
+                    "vehicles": flag("vehicles"),
+                    "rails": flag("rails"),
+                    "structures": flag("structures"),
+                    "mapillary": flag("mapillary", False),
                     "preview": flag("preview"),
                 }
             except ValueError:

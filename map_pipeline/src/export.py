@@ -46,6 +46,10 @@ ATTRIBUTION = {
         "Wall surfaces under the generated facades from Poly Haven (CC0, no "
         "attribution required). https://polyhaven.com"
     ),
+    "mapillary": (
+        "Street-level imagery from Mapillary contributors (CC BY-SA 4.0), used "
+        "to read facades. https://www.mapillary.com"
+    ),
 }
 
 
@@ -344,11 +348,12 @@ def write_scene_description(
     return path
 
 
-def write_attribution(out_dir: Path) -> Path:
+def write_attribution(out_dir: Path, *, mapillary: bool = False) -> Path:
     """Drop the source credits next to the model.
 
     3DBAG asks for a copyright notice on reuse, and the AHN and aerial layers
-    are CC BY 4.0, so the credits travel with the output.
+    are CC BY 4.0, so the credits travel with the output. Mapillary photos are
+    CC BY-SA 4.0 and are credited when a run used them.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "ATTRIBUTION.txt"
@@ -362,6 +367,10 @@ def write_attribution(out_dir: Path) -> Path:
         f"BAG:       {ATTRIBUTION['bag']}",
         f"NWB:       {ATTRIBUTION['roads']}",
         f"Textures:  {ATTRIBUTION['textures']}",
+    ]
+    if mapillary:
+        lines.append(f"Photos:    {ATTRIBUTION['mapillary']}")
+    lines += [
         "",
         "Keep this notice with the model when you redistribute it.",
         "",

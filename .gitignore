@@ -8,3 +8,6 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# A personal Mapillary access token, read by src/mapillary.py. Never commit it.
+map_pipeline/mapillary_token.txt

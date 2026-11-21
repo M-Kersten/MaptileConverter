@@ -438,6 +438,47 @@ DEFAULTS: dict[str, Any] = {
         "max_retries": 4,
         "max_pages": 60,
     },
+    "photos": {
+        # Street-level photos, used to read the facades the open data does
+        # not describe. Mapillary needs an access token in the
+        # MAPILLARY_TOKEN environment variable or in mapillary_token.txt next
+        # to pipeline.py; it is never read from this file's output.
+        "mapillary": False,
+        "mapillary_url": "https://graph.mapillary.com",
+        # A folder of your own photos, absolute or relative to the pipeline
+        # folder. Empty for none. See src/own_photos.py for what each one
+        # needs.
+        "folder": "",
+        # Mapillary images older than this year are left out: a facade from
+        # 2014 can have been painted, re-glazed or replaced since.
+        "min_year": 2016,
+        # A dashcam takes a frame every metre or two. One per this many metres
+        # of each sequence is plenty, and costs a fraction of the work.
+        "spacing_m": 4.0,
+        # Photos are this high above the measured ground. Mapillary is mostly
+        # car roofs and bicycle helmets; your own are held at eye height
+        # unless a sidecar says otherwise.
+        "mapillary_camera_height_m": 2.0,
+        "own_camera_height_m": 1.6,
+        # A wall further than this from a camera is not worth reading.
+        "max_distance_m": 40.0,
+        "max_incidence_deg": 75.0,
+        # Image widths fetched from Mapillary: 256, 1024, 2048, or 0 for the
+        # original. A 360 photo spreads its pixels over every direction, so
+        # a 2048 px one has a quarter of the detail of a 2048 px phone photo;
+        # it is fetched at full size.
+        "image_size": 2048,
+        "pano_image_size": 0,
+        # What a view has to manage before a wall counts as covered: this
+        # share of the wall in the picture and unobstructed, and this many
+        # pixels per metre of wall to measure it, or to wear it as a texture.
+        "min_visible": 0.6,
+        "measure_px_per_m": 12.0,
+        "texture_px_per_m": 40.0,
+        "texture_max_incidence_deg": 55.0,
+        "timeout_s": 60,
+        "max_retries": 4,
+    },
     "export": {
         "fbx_name": "model.fbx",
         # The same scene for editing: collections per layer, quads and
@@ -608,6 +649,7 @@ class PipelineConfig:
     structures: dict[str, Any]
     usage: dict[str, Any]
     export: dict[str, Any]
+    photos: dict[str, Any] = field(default_factory=dict)
     source_path: Path | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -638,6 +680,7 @@ class PipelineConfig:
             "rails": self.rails,
             "structures": self.structures,
             "usage": self.usage,
+            "photos": self.photos,
             "export": self.export,
         }
 
@@ -826,6 +869,23 @@ def load_config(path: str | Path) -> PipelineConfig:
             "layered.curb.height_offset_curb_m must be between 0 and the kerb height"
         )
 
+    photos = merged["photos"]
+    for secret in ("mapillary_token", "token", "access_token"):
+        if photos.pop(secret, None) is not None:
+            LOG.warning(
+                "photos.%s is ignored: a token in the config travels with every "
+                "copy of it. Set the MAPILLARY_TOKEN environment variable, or put "
+                "the token in mapillary_token.txt next to pipeline.py.",
+                secret,
+            )
+    for key in ("max_distance_m", "spacing_m"):
+        value = float(photos[key])
+        if value < 0:
+            raise ValueError(f"photos.{key} must not be negative, got {value}")
+        photos[key] = value
+    photos["mapillary"] = bool(photos.get("mapillary", False))
+    photos["folder"] = str(photos.get("folder") or "").strip()
+
     return PipelineConfig(
         name=name,
         bbox=bbox,
@@ -845,6 +905,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         structures=merged["structures"],
         usage=merged["usage"],
         export=merged["export"],
+        photos=merged["photos"],
         source_path=path,
         warnings=warnings + retired,
     )

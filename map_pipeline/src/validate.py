@@ -939,6 +939,56 @@ def check_aerial(report: CheckReport, aerial, bbox: BBox) -> None:
         )
 
 
+def check_street_photos(report: CheckReport, result) -> None:
+    """Warnings only: the photos add detail to a model complete without them.
+
+    A pose is checked for being believable -- on the ground, upright -- since
+    a photo placed in the wrong spot does not fail, it quietly reads the
+    wrong wall.
+    """
+    for problem in result.problems:
+        report.add("street_photos_source", False, problem, severity="warning")
+    report.add(
+        "street_photos_found",
+        bool(result.photos),
+        f"{len(result.photos)} photos around the area",
+        severity="warning",
+    )
+    if not result.photos:
+        return
+
+    # Upright: a camera's image-down axis should point mostly down. A pose
+    # with it pointing sideways or up is a rotation read the wrong way round.
+    downs = np.array([p.rotation[1] for p in result.photos])
+    tilted = int((downs[:, 2] > -0.5).sum())
+    report.add(
+        "street_photos_upright",
+        tilted == 0,
+        f"{tilted} of {len(result.photos)} cameras are tilted more than 60 "
+        f"degrees off upright",
+        severity="warning",
+    )
+    unplaced = [p.id for p in result.photos if "no terrain under the camera" in p.notes]
+    report.add(
+        "street_photos_on_ground",
+        not unplaced,
+        f"{len(unplaced)} photos have no terrain under them"
+        + (f": {', '.join(unplaced[:5])}" if unplaced else ""),
+        severity="warning",
+    )
+    if result.coverage is None:
+        return
+    stats = result.coverage.stats()
+    report.add(
+        "street_photos_see_walls",
+        stats["photos_seeing_a_wall"] > 0,
+        f"{stats['photos_seeing_a_wall']} of {stats['photos']} photos see a wall; "
+        f"{100 * stats['share_measurable']:.0f}% of the exposed wall area can be "
+        f"measured, {100 * stats['share_texture_ready']:.0f}% can wear a photo",
+        severity="warning",
+    )
+
+
 def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
     """The terrain in the model is the grid the pipeline meant to build.
 
@@ -1454,6 +1504,7 @@ def write_report(report: CheckReport, path: Path) -> Path:
 
 
 __all__ = [
+    "check_street_photos",
     "Check",
     "CheckReport",
     "check_aerial",

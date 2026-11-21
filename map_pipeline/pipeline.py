@@ -109,6 +109,7 @@ from src.trees import (  # noqa: E402
     write_tree_list,
 )
 from src.usage import UsageSet, fetch_usage  # noqa: E402
+from src.street_photos import StreetPhotoResult, build_street_photos  # noqa: E402
 from src.vehicles import (  # noqa: E402
     VehicleSet,
     build_vehicles,
@@ -116,6 +117,7 @@ from src.vehicles import (  # noqa: E402
     write_spawn_list,
 )
 from src.validate import (  # noqa: E402
+    check_street_photos,
     CheckReport,
     check_aerial,
     check_bbox,
@@ -566,6 +568,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         # Aborting on the first would stop runs that the fallback would have
         # finished, which is most of what 3DBAG's API outages used to cost.
         blocked = down_sources(settings, reachable, active)
+        for source in [s for s in blocked if s.soft]:
+            LOG.warning(
+                "%s is not answering; the run carries on without it", source.label
+            )
+        blocked = [s for s in blocked if not s.soft]
         for source in active:
             urls = source.probes(settings)
             if (
@@ -611,6 +618,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_structures = bool(
         config.structures["bridges"] or config.structures["tunnels"]
     )
+    want_photos = bool(
+        config.photos.get("mapillary") or config.photos.get("folder")
+    )
 
     # Five fixed stages, plus aerial relighting and the terrain mesh, plus
     # the optional sources, plus Blender.
@@ -618,7 +628,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         (
             want_trees, want_surfaces, want_furniture, want_barriers,
             want_usage,
-            want_vehicles, want_rails, want_structures,
+            want_vehicles, want_rails, want_structures, want_photos,
         )
     ) + (0 if args.skip_blender else 1)
     step = 0
@@ -719,6 +729,20 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             usage=usage if len(usage) else None,
             facade_cfg=config.facade,
         )
+
+    street_photos = StreetPhotoResult()
+    if want_photos:
+        with Stage("street photos (Mapillary and your own)", next_step(), total):
+            street_photos = build_street_photos(
+                config.bbox,
+                work_dir,
+                out_dir,
+                photos_cfg=config.photos,
+                buildings=buildings,
+                terrain=terrain,
+                base_dir=REPO_ROOT,
+                aerial_path=aerial.path,
+            )
 
     ground_layers = None
     harbour = HarbourSet()
@@ -1090,6 +1114,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     ),
                 },
                 "building_function": usage.stats(),
+                **(
+                    {"street_photos": street_photos.stats()} if want_photos else {}
+                ),
                 # What was taken out of the aerial and what was left in it.
                 # Anyone lighting this model needs to know the photo is no
                 # longer carrying its own sun -- and, when it still is, at
@@ -1103,7 +1130,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
         )
         write_metadata(metadata, out_dir, str(config.export["metadata_name"]))
-        write_attribution(out_dir)
+        write_attribution(out_dir, mapillary=street_photos.uses_mapillary)
 
         report = CheckReport()
         check_bbox(report, config.bbox)
@@ -1151,6 +1178,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             report, structures if want_structures else None, terrain
         )
         check_aerial(report, aerial, config.bbox)
+        if want_photos:
+            check_street_photos(report, street_photos)
 
         if not args.skip_blender:
             check_export(

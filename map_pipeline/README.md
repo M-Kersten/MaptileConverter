@@ -1669,6 +1669,85 @@ public buildings get them; housing gets doors and windows. Where a building hold
 several uses, the most street-facing one wins — a shop under flats is a shop at
 street level.
 
+## Street photos
+
+Everything above is measured except the walls: the facades are drawn from a
+building's age and height, so a terrace of real houses comes out as a plausible
+one. Street photos are how a model starts to look like the place itself. They
+come from Mapillary, open street-level imagery that covers most Dutch cities,
+and from a folder of your own photos for whatever Mapillary never drove past.
+
+This is being built in phases. What exists now is the first: the photos are
+gathered, put in place, and every wall is scored on what they can do for it.
+Reading the facades off them, and wearing them as textures, come next.
+
+**Switching it on.** Tick *Straatfoto's* under Lagen, or set it in the config:
+
+```json
+"photos": {"mapillary": true, "folder": "photos/arnhem"}
+```
+
+Mapillary needs a free access token from
+<https://www.mapillary.com/dashboard/developers>. The pipeline reads it from the
+`MAPILLARY_TOKEN` environment variable, or from `mapillary_token.txt` next to
+`pipeline.py`, which git ignores. It is never read from the config: a config is
+written by the UI and travels with the model, and a token in it would travel
+too. Without a token the layer shows *geen sleutel* and the model builds without
+photos; the photos add detail to a model that is complete without them, so they
+are never the reason a run fails.
+
+**Your own photos.** Point `photos.folder` at a folder of JPEGs. Each needs a
+position, and a heading helps:
+
+- A phone writes both into the EXIF when location is on: GPS position, and the
+  direction it pointed.
+- A 360 camera writes its GPS and, often, the heading of the picture's middle
+  column into the GPano XMP block. A 360 photo with no heading is still used:
+  it sees every wall around it, and the heading is solved against the model.
+- Anything else, or anything the camera got wrong, is fixed with a sidecar:
+  `IMG_0042.jpg.json` next to the photo, or an entry under the file name in a
+  `poses.json` in the folder. It takes `lat`/`lon` or RD `x`/`y`, and
+  optionally `heading` (degrees on the RD grid), `pitch`, `roll`, `height_m`
+  above the ground, and `kind` (`perspective`, `fisheye` or `spherical`).
+
+Photos without a position are listed in the log as skipped.
+
+**Where a photo is.** Mapillary runs its own reconstruction over every
+sequence and publishes the result per image: a corrected position, the full
+camera rotation, and the lens's focal length and distortion. Those are used as
+they are, turned from true north onto RD's grid north, which differs by up to
+1.5° across the country. A photo's height comes from the AHN under it plus a
+camera height (2.0 m for Mapillary, mostly car roofs and helmets; 1.6 m for
+your own), because neither GPS nor Mapillary knows its altitude to better than
+several metres. A dashcam takes a frame every metre or two, so a sequence is
+thinned to one photo per 4 m.
+
+**What it scores.** Every wall is split into its flat faces, the same grouping
+the facade textures are fitted over. For each face and each photo within 40 m,
+the stage asks how much of the face lands inside the picture without another
+building in the way, and how many pixels of photo a metre of wall gets. A face
+is *texture ready* when one view sees at least 60% of it at 40 px per metre or
+better within 55° of square-on, and *measurable* at 12 px per metre. Party
+walls, the faces that touch a neighbour, are left out of the shares, since no
+camera could ever see them.
+
+It leaves `photo_coverage.png` next to the model, a plan over the aerial with
+the walls coloured green (texture ready), orange (measurable), red (seen, too
+far or too skew) and grey (not seen), and the cameras as dots. The same numbers
+are in `metadata.json` under `street_photos`. Over 300 m of central Arnhem,
+where 360 cameras have been down every street, 785 photos see two thirds of the
+exposed wall area well enough to measure and half well enough to texture; 86 of
+89 buildings have at least one wall that can wear a photo.
+
+Those shares are an upper bound. Trees, parked cars and scaffolding are not yet
+counted as obstructions, and Mapillary positions are taken as they come; both
+are the next phase.
+
+**Licence.** Mapillary images are CC BY-SA 4.0. `ATTRIBUTION.txt` credits
+Mapillary's contributors whenever a run used their photos. A wall measured from
+a photo carries no licence of its own, but a texture made from one is a
+derivative and has to be shared alike.
+
 ## Trees
 
 Two national sources combine into something neither has alone. The BGT registers
@@ -2270,3 +2349,5 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
   is required for these; they are credited because it is the decent thing, and
   listed here so you know nothing in the model carries an obligation you did not
   choose.
+- **Street photos** — Mapillary contributors (CC BY-SA 4.0), when a run used
+  them

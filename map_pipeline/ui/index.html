@@ -1177,7 +1177,8 @@ const SOURCE_NAME = {
   terrain: "Hoogte", aerial: "Luchtfoto", buildings: "Gebouwen", usage: "Gebouwfunctie",
   trees: "Bomen", water: "Water en kades", land_cover: "Bodembedekking",
   furniture: "Straatmeubilair", barriers: "Muren, hekken en hagen",
-  vehicles: "Auto's en boten", structures: "Bruggen en tunnels", rails: "Spoor"
+  vehicles: "Auto's en boten", structures: "Bruggen en tunnels", rails: "Spoor",
+  mapillary: "Straatfoto's"
 };
 
 const radioValue = name => (document.querySelector(`input[name="${name}"]:checked`) || {}).value;
@@ -1274,7 +1275,7 @@ function settingsForEstimate() {
     barriers: chosen.has("barriers"),
     vehicles: chosen.has("vehicles"), rails: chosen.has("rails"),
     structures: chosen.has("structures"),
-    usage: chosen.has("usage")
+    usage: chosen.has("usage"), mapillary: chosen.has("mapillary")
   });
 }
 
@@ -1701,6 +1702,7 @@ async function resumeRunning() {
 --------------------------------------------------------------------------- */
 let sourceList = [];                       // as described by the server
 const sourceOff = new Set();               // ids the user has turned off
+const sourcesSeen = new Set();             // ids given their starting state
 
 /* "Trees (BGT)" names its dataset in brackets; that says more than the host. */
 function datasetOf(s) {
@@ -1738,6 +1740,7 @@ function renderSources() {
       `${escapeHtml(SOURCE_NAME[s.id] || s.label)}` +
       `<span class="who">${escapeHtml(datasetOf(s))}${
         locked ? " · niet in deze stijl" :
+        s.missing === "token" ? " · geen sleutel" :
         s.ok === false ? " · onbereikbaar" :
         s.degraded ? " · via reserve" : ""}</span>`;
 
@@ -1775,6 +1778,7 @@ function updateSourceStates() {
   }
 
   const blocking = sourceList.filter(s => s.required && s.ok === false);
+  const noKey = sourceList.filter(s => s.missing === "token" && sourceOn(s));
   const optionalDown = sourceList.filter(s => !s.required && s.ok === false && sourceOn(s));
   const names = list => list.map(s => escapeHtml(SOURCE_NAME[s.id] || s.label)).join(", ");
 
@@ -1786,6 +1790,11 @@ function updateSourceStates() {
   } else if (optionalDown.length) {
     note = `<span class="warn">${names(optionalDown)} ${optionalDown.length > 1 ? "zijn" : "is"}
             onbereikbaar. Zet ${optionalDown.length > 1 ? "ze" : "hem"} uit om zonder te bouwen.</span>`;
+  } else if (noKey.length) {
+    note = `<span class="warn">${names(noKey)} ${noKey.length > 1 ? "hebben" : "heeft"} een
+            toegangssleutel nodig. Zet MAPILLARY_TOKEN in de omgeving van de server, of
+            zet de sleutel in mapillary_token.txt naast pipeline.py. Zonder sleutel bouwt
+            het model zonder foto's.</span>`;
   }
   $("sourcesNote").innerHTML = note;
   $("run").disabled = blocking.length > 0 || !!job;
@@ -1799,6 +1808,12 @@ async function checkServices() {
     const r = await fetch("/api/sources");
     const d = await r.json();
     sourceList = d.sources || [];
+    // A source that needs something of the person first, a key, starts off.
+    // Only the first time it is seen: a re-check must not untick it again.
+    for (const s of sourceList) {
+      if (!sourcesSeen.has(s.id) && s.default_on === false) sourceOff.add(s.id);
+      sourcesSeen.add(s.id);
+    }
     renderSources();
     // The estimate depends on the selection, and until now there was nothing
     // to select from, so the first figure was computed against an empty list.
