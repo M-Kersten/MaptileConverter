@@ -1677,9 +1677,10 @@ one. Street photos are how a model starts to look like the place itself. They
 come from Mapillary, open street-level imagery that covers most Dutch cities,
 and from a folder of your own photos for whatever Mapillary never drove past.
 
-This is being built in phases. What exists now is the first: the photos are
-gathered, put in place, and every wall is scored on what they can do for it.
-Reading the facades off them, and wearing them as textures, come next.
+This is being built in phases. What exists now: the photos are gathered, put
+in place, lined up with the model and checked, and every wall is scored on what
+they can do for it. Reading the facades off them, and wearing them as
+textures, come next.
 
 **Switching it on.** Tick *Straatfoto's* under Lagen, or set it in the config:
 
@@ -1739,9 +1740,41 @@ where 360 cameras have been down every street, 785 photos see two thirds of the
 exposed wall area well enough to measure and half well enough to texture; 86 of
 89 buildings have at least one wall that can wear a photo.
 
-Those shares are an upper bound. Trees, parked cars and scaffolding are not yet
-counted as obstructions, and Mapillary positions are taken as they come; both
-are the next phase.
+**Lining a photo up, and catching the ones that will not.** Mapillary's poses
+are good to a metre or two and a degree or two: enough to know what a photo
+sees, not enough to paint with, since a degree at fifteen metres is half a
+window. So the photos that are among the two best views of some wall (at most
+`refine_max`, 250 by default) are downloaded at 2048 px, and each is moved
+until the model's building edges sit on edges in the picture. Only the edges a
+pedestrian sees take part: wall corners and wall tops, so eaves, parapets and
+gable rakes. Ridges, rooftop plant, the line where two terraced houses meet,
+and the foot of each wall behind the parked cars are left out. The match is a
+capped distance to the nearest edge running the same way, searched over
+heading, tilt and position, with a prior that makes a correction larger than
+the source's own error pay for itself in evidence.
+
+The check matters as much as the correction. A photo can be ranked the best
+view of a wall and show a plaque on it, or a glass curtain wall whose mullions
+match nearly anything drawn over them. The verdict is per building: a photo may
+paint a wall only when that wall's building lines up in it, which over central
+Arnhem means enough of its edges land on edges in the picture, clearly more
+than when the model is moved a few degrees or metres off. The photo as a whole
+has to beat the moved model too, a correction that runs into the edge of its
+search is refused, and a correction its own Mapillary sequence disagrees with
+is withdrawn. The limits are set by eye against Arnhem photos, and they are
+stricter for ordinary photos than for 360 ones, which see the model all round.
+
+Over 300 m of central Arnhem the check passed 228 of the 250 photos, moved the
+median camera 0.86 m and 0.25 degrees, and raised the share of model edges
+landing on picture edges from 24% to 42%. `work/<area>/alignment.json` has
+every verdict and its reason, and `output/<area>/photo_checks/` a dozen of the
+photos with the model drawn on, magenta where Mapillary put the camera and
+green where the check moved it.
+
+With only checked photos allowed to texture, 43% of the exposed wall area can
+wear a photo and 56 of the 89 buildings have at least one such wall; 65% can be
+measured. Trees and parked cars in front of a wall are not yet counted as
+obstructions, so these shares are still optimistic.
 
 **Licence.** Mapillary images are CC BY-SA 4.0. `ATTRIBUTION.txt` credits
 Mapillary's contributors whenever a run used their photos. A wall measured from

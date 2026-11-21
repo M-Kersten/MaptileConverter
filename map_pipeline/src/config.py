@@ -476,6 +476,16 @@ DEFAULTS: dict[str, Any] = {
         "measure_px_per_m": 12.0,
         "texture_px_per_m": 40.0,
         "texture_max_incidence_deg": 55.0,
+        # Check the photos that are the best views of some wall against the
+        # model, and move each until the model's edges sit on the picture's.
+        # A photo that will not line up is not trusted to texture or measure.
+        "refine": True,
+        # The most photos checked in one run, best views first. Each costs a
+        # download and about a third of a second.
+        "refine_max": 250,
+        # Width photos are checked at. 360 photos are fetched at this size
+        # for the check too; the full size is only fetched to paint with.
+        "refine_image_size": 2048,
         "timeout_s": 60,
         "max_retries": 4,
     },

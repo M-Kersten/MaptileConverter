@@ -410,18 +410,12 @@ def download_images(
         if wanted
         else {}
     )
-    out: list[Photo] = []
-    for photo in photos:
-        if photo.source != SOURCE_MAPILLARY:
-            out.append(photo)
-            continue
-        path = target(photo)
-        if not path.is_file():
-            url = urls.get(mapillary_id(photo))
-            if not url:
-                out.append(replace(photo, notes=photo.notes + ["no image URL"]))
-                continue
-            # The signed URL is on a CDN that knows nothing of our token.
+    def fetch(photo: Photo) -> str:
+        url = urls.get(mapillary_id(photo))
+        if not url:
+            return "no image URL"
+        # The signed URL is on a CDN that knows nothing of our token.
+        try:
             response = get_with_retry(
                 url,
                 timeout=timeout,
@@ -429,7 +423,28 @@ def download_images(
                 expect_binary=True,
                 description="Mapillary image",
             )
-            path.write_bytes(response.content)
+        except ServiceError as exc:
+            return f"download failed: {exc}"
+        target(photo).write_bytes(response.content)
+        return ""
+
+    # The CDN answers each image in a fraction of a second, so a handful at
+    # once is what decides how long a few hundred take.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        failures = dict(zip((p.id for p in wanted), pool.map(fetch, wanted)))
+
+    out: list[Photo] = []
+    for photo in photos:
+        if photo.source != SOURCE_MAPILLARY:
+            out.append(photo)
+            continue
+        path = target(photo)
+        if not path.is_file():
+            why = failures.get(photo.id) or "no image"
+            out.append(replace(photo, notes=photo.notes + [why]))
+            continue
         with Image.open(path) as image:
             width, height = image.size
         out.append(

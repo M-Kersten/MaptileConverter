@@ -46,6 +46,9 @@ from .photos import Photo
 LOG = logging.getLogger(__name__)
 
 EXPOSED_CLEARANCE_M = 2.5
+# A wall with another building's wall this close outside it is a party wall:
+# the two are one wall, and there is no corner where they meet.
+PARTY_CLEARANCE_M = 0.4
 MIN_FACE_AREA_M2 = 4.0
 MIN_FACE_WIDTH_M = 1.0
 # Sample points across and up each face, inset from its edges.
@@ -75,6 +78,10 @@ class WallFace:
     samples: np.ndarray  # (k, 3) points on the face
     triangles: np.ndarray  # (t, 3, 3) the wall triangles it was made from
     exposed: bool = True
+    # Shared with a neighbour, rather than only close to one: see
+    # PARTY_CLEARANCE_M. Every party wall is unexposed; an alley wall is
+    # unexposed without being one.
+    party: bool = False
 
     @property
     def width_m(self) -> float:
@@ -97,10 +104,14 @@ class View:
     px_per_m: float
     incidence_deg: float
     distance_m: float
+    # The photo's pose was checked against the model and agreed. None when
+    # no check was made.
+    verified: bool | None = None
 
     def to_dict(self) -> dict:
         return {
             "photo": self.photo,
+            **({"verified": self.verified} if self.verified is not None else {}),
             "visible": round(self.visible, 3),
             "px_per_m": round(self.px_per_m, 1),
             "incidence_deg": round(self.incidence_deg, 1),
@@ -125,9 +136,18 @@ class Coverage:
         view = self.best(index, float(t.get("min_visible", 0.6)))
         if view is None:
             return SEEN if self.views[index] else UNSEEN
-        if view.px_per_m >= float(t.get("texture_px_per_m", 40.0)) and view.incidence_deg <= float(
-            t.get("texture_max_incidence_deg", 55.0)
-        ):
+        # Only a pose checked against the model may paint a wall. Until the
+        # check has run the best view says what could be had; once it has,
+        # an unchecked one can still measure but not texture.
+        needs_check = bool(t.get("texture_needs_verified", False))
+        texture_views = [
+            v for v in self.views[index]
+            if v.visible >= float(t.get("min_visible", 0.6))
+            and (v.verified is True or not needs_check)
+            and v.px_per_m >= float(t.get("texture_px_per_m", 40.0))
+            and v.incidence_deg <= float(t.get("texture_max_incidence_deg", 55.0))
+        ]
+        if texture_views:
             return TEXTURE
         if view.px_per_m >= float(t.get("measure_px_per_m", 12.0)):
             return MEASURE
@@ -353,11 +373,14 @@ def mark_exposed(faces: list[WallFace], index: _SegmentIndex) -> None:
         # From just inside the wall, so a neighbour's wall on exactly the same
         # line -- the other side of a party wall -- is crossed, not missed.
         origin = np.array([centre[0], centre[1], mid_z]) - np.r_[face.normal * 0.2, 0.0]
-        probe = origin + np.r_[face.normal * (EXPOSED_CLEARANCE_M + 0.2), 0.0]
+        probes = np.array([
+            origin + np.r_[face.normal * (EXPOSED_CLEARANCE_M + 0.2), 0.0],
+            origin + np.r_[face.normal * (PARTY_CLEARANCE_M + 0.2), 0.0],
+        ])
         candidates = index.near(centre[0], centre[1], EXPOSED_CLEARANCE_M + 1.0)
-        face.exposed = not bool(
-            index.blocked(origin, probe[None], candidates, np.array([i]))[0]
-        )
+        blocked = index.blocked(origin, probes, candidates, np.array([i, i]))
+        face.exposed = not bool(blocked[0])
+        face.party = bool(blocked[1])
 
 
 def score_views(
@@ -387,6 +410,10 @@ def score_views(
     used = 0
 
     for photo in photos:
+        if photo.verified is False:
+            # Checked against the model and found not to agree with it: it
+            # shows something else, or shows it from somewhere else.
+            continue
         camera = photo.camera
         width = int(resolution.get(camera.kind, 0) or 0)
         if width and width < camera.width:
@@ -436,13 +463,29 @@ def score_views(
                     px_per_m=min(across, up),
                     incidence_deg=float(np.degrees(np.arccos(np.clip(cos_inc, -1, 1)))),
                     distance_m=distance,
+                    # A photo checked against the model may paint only the
+                    # buildings that lined up in it.
+                    verified=(
+                        None
+                        if photo.verified is None
+                        else bool(
+                            photo.verified
+                            and (
+                                photo.verified_buildings is None
+                                or face.building_id in photo.verified_buildings
+                            )
+                        )
+                    ),
                 )
             )
             saw_any = True
         used += int(saw_any)
 
     for i, face_views in enumerate(views):
-        face_views.sort(key=lambda v: (v.visible >= 0.6, v.px_per_m * v.visible), reverse=True)
+        face_views.sort(
+            key=lambda v: (v.verified is True, v.visible >= 0.6, v.px_per_m * v.visible),
+            reverse=True,
+        )
         views[i] = face_views[:VIEWS_PER_FACE]
 
     return Coverage(faces=faces, views=views, photos_used=used, photos_total=len(photos))

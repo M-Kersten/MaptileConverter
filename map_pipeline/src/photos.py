@@ -73,6 +73,13 @@ class Photo:
     # Camera height above the ground, when the photo says. Otherwise the
     # run's default for its source applies.
     height_m: float | None = None
+    # Whether the pose was checked against the model and its edges agreed.
+    # None until a check has been made; a photo that failed one never
+    # becomes a texture, and is not trusted to measure either.
+    verified: bool | None = None
+    # The buildings whose own edges lined up with this photo, by identifier:
+    # the walls it may paint. None until a check has been made.
+    verified_buildings: list[str] | None = None
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -103,6 +110,12 @@ class Photo:
             "licence": self.licence,
             "position_sigma_m": self.position_sigma_m,
             **({"height_m": self.height_m} if self.height_m is not None else {}),
+            **({"verified": self.verified} if self.verified is not None else {}),
+            **(
+                {"verified_buildings": list(self.verified_buildings)}
+                if self.verified_buildings is not None
+                else {}
+            ),
             **({"notes": list(self.notes)} if self.notes else {}),
         }
 
@@ -128,6 +141,8 @@ class Photo:
             height_m=(
                 float(data["height_m"]) if data.get("height_m") is not None else None
             ),
+            verified=data.get("verified"),
+            verified_buildings=data.get("verified_buildings"),
             notes=list(data.get("notes", [])),
         )
 

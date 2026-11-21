@@ -475,7 +475,18 @@ class CoverageTests(unittest.TestCase):
         score_views(self.faces, [])
         self.assertFalse(self.faces[self.face("left", [1, 0])].exposed)
         self.assertFalse(self.faces[self.face("right", [-1, 0])].exposed)
+        self.assertTrue(self.faces[self.face("left", [1, 0])].party)
         self.assertTrue(self.faces[self.face("left", [-1, 0])].exposed)
+        self.assertFalse(self.faces[self.face("left", [-1, 0])].party)
+
+    def test_an_alley_wall_is_unexposed_but_no_party_wall(self) -> None:
+        faces = wall_faces(BuildingSet(buildings=[
+            box_building("w", 0, 0, 6, 8), box_building("e", 7.5, 0, 14, 8),
+        ]))
+        score_views(faces, [])
+        alley = [f for f in faces if f.building_id == "w" and np.allclose(f.normal, [1, 0])][0]
+        self.assertFalse(alley.exposed)
+        self.assertFalse(alley.party)
 
     def test_camera_in_front_sees_the_front_sharply(self) -> None:
         # Far enough back that the 50 degree vertical field takes in the eaves.
@@ -574,6 +585,9 @@ class StageTests(unittest.TestCase):
             config = {
                 "mapillary": True, "folder": str(folder), "max_distance_m": 40.0,
                 "spacing_m": 4.0, "min_year": 2016,
+                # The photos here are blank; checking them against the model
+                # is tested on its own below.
+                "refine": False,
             }
             result = build_street_photos(
                 bbox, tmp / "work", tmp / "out", photos_cfg=config,
@@ -643,6 +657,184 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(DEFAULTS["photos"]["mapillary"])
         self.assertNotIn(source, enabled_sources(DEFAULTS))
         self.assertIn(source, enabled_sources({"photos": {"mapillary": True}}))
+
+
+def _street() -> BuildingSet:
+    """Four detached houses of different heights in a row, and one across.
+
+    Detached so each shows its corners: where terraced houses meet there is
+    no edge to see, and the check rightly leaves those lines out.
+    """
+    return BuildingSet(
+        buildings=[
+            box_building("a", 0, 0, 6, 9, height=9.0),
+            box_building("b", 8, 0, 14, 9, height=12.0),
+            box_building("c", 16, 0, 22, 9, height=7.5),
+            box_building("e", 24, 0, 30, 9, height=10.0),
+            box_building("d", 2, -30, 18, -22, height=10.0),
+        ]
+    )
+
+
+def _render_edges(photo: Photo, segments, *, width: int = 2) -> np.ndarray:
+    """A picture of the model's edges from `photo`, white on a grey street."""
+    from PIL import Image, ImageDraw
+
+    from src.camera import project_camera
+
+    image = Image.new("RGB", (photo.camera.width, photo.camera.height), (90, 90, 90))
+    draw = ImageDraw.Draw(image)
+    for a, b in segments:
+        pts = a[None] + np.linspace(0.0, 1.0, 24)[:, None] * (b - a)[None]
+        px, ok = project_camera(photo.camera, (pts - photo.centre) @ photo.rotation.T)
+        for i in range(len(pts) - 1):
+            if ok[i] and ok[i + 1]:
+                draw.line([tuple(px[i]), tuple(px[i + 1])], fill=(235, 235, 235), width=width)
+    return np.asarray(image)
+
+
+class PoseRefineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from src.photo_coverage import _SegmentIndex
+        from src.pose_refine import building_edges, sample_edges
+
+        self.buildings = _street()
+        from src.pose_refine import drop_hidden_seams
+
+        self.segments, self.owner = building_edges(self.buildings)
+        faces = wall_faces(self.buildings)
+        score_views(faces, [])  # marks the party walls
+        # As the stage does: the line where two houses meet is no edge.
+        self.samples = drop_hidden_seams(sample_edges(self.segments, owner=self.owner), faces)
+        self.index = _SegmentIndex(faces)
+        truth = photo_at(15.0, -14.0, 0.0, z=2.0, ident="t")
+        truth.camera = Camera(PERSPECTIVE, 1600, 1200, 0.55)
+        truth.rotation = rotation_from_heading(4.0, pitch_deg=8.0)
+        truth.pose = POSE_SFM
+        truth.position_sigma_m = 1.5
+        self.truth = truth
+
+    def test_feature_edges_are_creases_not_triangulation(self) -> None:
+        from src.pose_refine import feature_edges
+
+        house = box_building("x", 0, 0, 10, 8, height=9.0)
+        edges = feature_edges(np.concatenate([house.wall_tris, house.roof_tris]))
+        # Twelve box edges; the diagonals that split each face are flat.
+        self.assertEqual(len(edges), 12)
+
+    def test_wall_foot_is_left_out(self) -> None:
+        from src.pose_refine import building_edges
+
+        segments, owner = building_edges(BuildingSet(buildings=[box_building("x", 0, 0, 10, 8)]))
+        self.assertEqual(len(segments), 8)
+        self.assertTrue(np.all(segments[:, :, 2].max(axis=1) > 1.0))
+
+    def test_truncated_distance(self) -> None:
+        from src.pose_refine import truncated_distance
+
+        mask = np.zeros((9, 9), dtype=bool)
+        mask[4, 4] = True
+        d = truncated_distance(mask, limit=3)
+        self.assertEqual(d[4, 4], 0)
+        self.assertEqual(d[4, 6], 2)
+        self.assertEqual(d[0, 0], 3)
+
+    def test_recovers_a_displaced_camera(self) -> None:
+        from src.pose_refine import align_photo
+
+        image = _render_edges(self.truth, self.segments)
+        start = Photo(**{**self.truth.__dict__})
+        start.rotation = rotation_from_heading(6.5, pitch_deg=8.0)
+        start.x, start.y = self.truth.x + 0.9, self.truth.y - 0.6
+        refined, alignment = align_photo(
+            start, image, self.samples, self.index
+        )
+        self.assertTrue(alignment.verified, alignment.to_dict())
+        self.assertGreater(alignment.after, alignment.before + 0.3)
+        self.assertGreater(alignment.after, 0.6)
+        self.assertLess(abs(refined.heading_deg - 4.0), 0.6)
+        self.assertLess(np.hypot(refined.x - self.truth.x, refined.y - self.truth.y), 0.6)
+        self.assertTrue(refined.verified)
+
+    def test_verdict_is_per_building(self) -> None:
+        from src.pose_refine import align_photo
+
+        ids = [b.identifier for b in self.buildings.buildings]
+        # House c has been pulled down, or is behind scaffolding: it is not
+        # in the picture. Its neighbours are.
+        drawn = self.segments[self.owner != ids.index("c")]
+        refined, alignment = align_photo(
+            self.truth, _render_edges(self.truth, drawn), self.samples, self.index,
+            building_ids=ids,
+        )
+        self.assertTrue(alignment.verified, alignment.to_dict())
+        self.assertIn("b", refined.verified_buildings)
+        self.assertNotIn("c", refined.verified_buildings)
+
+        faces = wall_faces(self.buildings)
+        coverage = score_views(faces, [refined])
+        by_building = {}
+        for face, views in zip(faces, coverage.views):
+            for view in views:
+                by_building.setdefault(face.building_id, set()).add(view.verified)
+        self.assertEqual(by_building["c"], {False})
+        self.assertIn(True, by_building["b"])
+
+    def test_a_photo_of_something_else_is_not_verified(self) -> None:
+        from src.pose_refine import align_photo
+
+        rng = np.random.default_rng(5)
+        noise = (rng.random((1200, 1600, 3)) * 255).astype(np.uint8)
+        refined, alignment = align_photo(
+            self.truth, noise, self.samples, self.index
+        )
+        self.assertFalse(alignment.verified)
+        self.assertFalse(refined.verified)
+        self.assertTrue(alignment.reason)
+
+    def test_too_little_model_in_view(self) -> None:
+        from src.pose_refine import align_photo
+
+        away = Photo(**{**self.truth.__dict__})
+        away.rotation = rotation_from_heading(184.0)
+        _, alignment = align_photo(
+            away, _render_edges(away, self.segments), self.samples, self.index
+        )
+        self.assertFalse(alignment.verified)
+        self.assertIn("model edge points in view", alignment.reason)
+
+    def test_sequence_outlier_is_withdrawn(self) -> None:
+        from src.pose_refine import Alignment, check_sequences
+
+        photos, alignments = {}, {}
+        for i, (dx, yaw) in enumerate(((0.5, 0.2), (0.6, 0.1), (0.4, 0.3), (2.9, 0.2))):
+            pid = f"p{i}"
+            photos[pid] = photo_at(10.0 * i, 0.0, 0.0, ident=pid, sequence="s")
+            alignments[pid] = Alignment(pid, 0.2, 0.6, 300, (yaw, 0, 0, dx, 0, 0), True)
+        withdrawn = check_sequences(photos, alignments)
+        self.assertEqual(withdrawn, ["p3"])
+        self.assertFalse(alignments["p3"].verified)
+        self.assertTrue(alignments["p0"].verified)
+
+    def test_rejected_photos_do_not_count_and_texture_needs_a_check(self) -> None:
+        faces = wall_faces(self.buildings)
+        good = photo_at(11.0, -12.0, 0.0, ident="good")
+        good.verified = True
+        unchecked = photo_at(3.0, -12.0, 0.0, ident="unchecked")
+        bad = photo_at(19.0, -12.0, 0.0, ident="bad")
+        bad.verified = False
+        coverage = score_views(faces, [good, unchecked, bad])
+        coverage.thresholds = {
+            "min_visible": 0.5, "measure_px_per_m": 12, "texture_px_per_m": 40,
+            "texture_needs_verified": True,
+        }
+        used = {v.photo for views in coverage.views for v in views}
+        self.assertNotIn("bad", used)
+        self.assertEqual(used, {"good", "unchecked"})
+        # Every face's best view is a checked one where there is one.
+        for views in coverage.views:
+            if any(v.photo == "good" for v in views):
+                self.assertEqual(views[0].photo, "good")
 
 
 def _server():
