@@ -140,6 +140,14 @@ DEFAULT_OFFSETS = {ROAD: 0.0, MOTORWAY: 0.0, WALKWAY: 0.0, GRASS: 0.0}
 # terrain code of its own (material slot 15, which no material uses) only so
 # the mesher can tell it apart; it comes out as plain terrain.
 WATER_CODE = TERRAIN * 16 + 15
+# Under a retaining wall: terrain, slot 14, carrying the drop from the street
+# on one side to the wharf on the other (`werf`), under the wall standing on
+# it. Plain terrain once built.
+WALL_CODE = TERRAIN * 16 + 14
+# The survey's ridge under a bridge spills past the deck's outline: the
+# bare earth is drawn in across the gap and read on a half-metre grid. Water
+# points this near a deck are put on the bed like those under it.
+NEAR_DECK_M = 3.0
 # How far under the water level the bed of a ditch is cut. No water surface
 # is drawn over it, so this is the dip itself, not a depth for a plane to
 # hide: enough to read as a ditch from the air.
@@ -452,6 +460,8 @@ def build_layered_ground(
     square_m: float | None = None,
     ground_at=None,
     flush_below_m: float = FLUSH_BELOW_M,
+    walls=(),
+    under_decks=(),
 ) -> LayeredGround:
     """The terrain and its layers, from the survey and the BGT areas.
 
@@ -468,6 +478,15 @@ def build_layered_ground(
     `ground_at(x, y)`, the bare-earth survey at its own resolution, lets
     walkways level with the road beside them be laid as road, without a kerb
     (`flush_walkways`); without it every walkway is kerbed.
+
+    `walls` are retaining walls (shapely, RD): each is a region of its own,
+    its edge on the high side at the ground there and on the low side at the
+    ground there, read just beyond it (`werf`). A canal street four metres
+    over its wharf drops at the wall, rather than down a bank of grid squares.
+
+    `under_decks` are bridge decks over water, ``(polygon, along)`` in RD
+    (`structures.deck_outlines`): the ground under each is read beside the
+    bridge along the water rather than off a survey that cannot see there.
 
     `mesher` "quads" lays the terrain out in quads (`layered_mesh`);
     "ribcage" lays it out as the 3D team draws it: ribs across what is
@@ -516,9 +535,22 @@ def build_layered_ground(
             continue
         by_code.setdefault(WATER_CODE, []).append(polygon)
         bodies.append((polygon.simplify(0.2), float(body.level_nap)))
+    wall_bands = []
+    if walls:
+        from .werf import wall_band
+
+        for wall in walls:
+            band = wall_band(wall)
+            if band.is_empty:
+                continue
+            wall_bands.append(band)
+            local = shapely.transform(band, lambda c: c - [ox, oy])
+            by_code.setdefault(WALL_CODE, []).append(_polygonal(local))
     order = [_code(layer, material) for layer, material in PRIORITY]
     # Water after the paving, so a road over a culvert stays a road.
     order.insert(order.index(_code(GRASS, "Gras")), WATER_CODE)
+    # A wall before everything: it is where the street and the wharf meet.
+    order.insert(0, WALL_CODE)
     # Anything PRIORITY does not rank still gets drawn, last.
     order += sorted(code for code in by_code if code not in order)
     layers = [
@@ -594,6 +626,26 @@ def build_layered_ground(
         mesh_stats["mesher"] = "triangles"
         sizes = np.array([len(f) for f in faces], dtype=np.int64)
         loops = np.concatenate(faces).astype(np.int64) if faces else np.zeros(0, np.int64)
+    walled = 0
+    if wall_bands:
+        z, walled = _wall_edges(
+            points + [ox, oy], z, loops, sizes, np.asarray(codes) == WALL_CODE,
+            ground_at if ground_at is not None else terrain.sample,
+        )
+    shaded = 0
+    if under_decks:
+        def water_level_at(point, reach_m=30.0):
+            """The level of the water nearest a point, RD, within `reach_m`."""
+            local = shapely.Point(point[0] - ox, point[1] - oy)
+            near = [(poly.distance(local), level) for poly, level in bodies]
+            near = [n for n in near if n[0] <= reach_m]
+            return min(near)[1] if near else None
+
+        z, shaded = _under_decks(
+            points + [ox, oy], z, loops, sizes, (np.asarray(codes) // 16 == TERRAIN) & (np.asarray(codes) % 16 == 15),
+            under_decks, ground_at if ground_at is not None else terrain.sample,
+            water_level_at=water_level_at,
+        )
     face_layer, face_material = _split_code(codes)
     face_material = np.where(face_layer == TERRAIN, -1, face_material)
     face_layer, face_material, blunted = _blunt_walkway_tips(
@@ -647,6 +699,9 @@ def build_layered_ground(
         "outline_edges_missing": int(missing),
         "walkway_hairpins_removed": int(hairpins),
         "walkway_tips_blunted": int(blunted),
+        "retaining_walls": len(wall_bands),
+        "wall_edge_points_set": int(walled),
+        "points_under_bridges_set": int(shaded),
         "water_bodies": int(len(bodies)),
         **mesh_stats,
         "faces_by_layer": {
@@ -684,6 +739,131 @@ def build_layered_ground(
         origin=(ox, oy),
         stats=stats,
     )
+
+
+def _under_decks(xy, z, loops, sizes, wet_face, decks, ground_at, *, beyond_m: float = 0.6,
+                 reach_m: float = 60.0, water_level_at=None):
+    """The ground under bridge decks at its height either side of the bridge.
+
+    Each point under a deck that is not wholly under water is read where a
+    line from it along the water leaves the deck, both ways, `beyond_m`
+    past its edge: the wharf under a bridge is the wharf beside it, the
+    street at an abutment the street beside it. Where the two disagree the
+    lower wins: a wharf that goes under the bridge on one side and meets a
+    stair on the other still goes under it. Where both are water, the point
+    is under the water too, at the depth a canal bed is cut (`water_level_at`).
+    Returns the heights and how many points were set.
+    """
+    import shapely
+
+    xy = np.asarray(xy, dtype=np.float64)[:, :2]
+    z = np.asarray(z, dtype=np.float64).copy()
+    sizes = np.asarray(sizes, dtype=np.int64)
+    loops = np.asarray(loops, dtype=np.int64)
+    face_of = np.repeat(np.arange(len(sizes)), sizes)
+    dry = np.zeros(len(xy), dtype=bool)
+    dry[loops[~np.asarray(wet_face, dtype=bool)[face_of]]] = True
+    changed = 0
+    for deck, along in decks:
+        along = np.asarray(along, dtype=np.float64)
+        under = shapely.contains_xy(deck.buffer(-0.05), xy[:, 0], xy[:, 1])
+        # Under water only: the bed, which easing its banks against the
+        # ridge had lifted into a mound across the canal under the bridge.
+        # Near the deck too: the ridge spills past its outline, and a water
+        # point 0.6 m beside a bridge on the Oudegracht stood at 1.8 m, its
+        # faces a shoal across the canal under the arch.
+        if water_level_at is not None:
+            near = shapely.contains_xy(deck.buffer(NEAR_DECK_M), xy[:, 0], xy[:, 1])
+            for point in np.flatnonzero(near & ~dry).tolist():
+                level = water_level_at(xy[point])
+                if level is not None and z[point] > float(level) - DITCH_DEPTH_M:
+                    z[point] = float(level) - DITCH_DEPTH_M
+                    changed += 1
+        inside = under & dry
+        for point in np.flatnonzero(inside).tolist():
+            readings = []
+            for sign in (1.0, -1.0):
+                ray = shapely.LineString([xy[point], xy[point] + sign * along * reach_m])
+                inner = ray.intersection(deck)
+                if inner.is_empty:
+                    continue
+                parts = getattr(inner, "geoms", [inner])
+                # The stretch of the ray from the point to where it leaves.
+                first = min(parts, key=lambda g: g.distance(shapely.Point(xy[point])))
+                exit_at = max(np.hypot(*(np.asarray(first.coords) - xy[point]).T))
+                at = xy[point] + sign * along * (exit_at + beyond_m)
+                value = float(np.asarray(ground_at(np.array([at[0]]), np.array([at[1]])), dtype=np.float64)[0])
+                if np.isfinite(value):
+                    readings.append(value)
+            if readings:
+                z[point] = float(min(readings))
+                changed += 1
+            elif water_level_at is not None:
+                level = water_level_at(xy[point])
+                if level is not None:
+                    z[point] = min(float(z[point]), float(level) - DITCH_DEPTH_M)
+                    changed += 1
+    return z, changed
+
+
+def _wall_edges(xy, z, loops, sizes, on_wall, ground_at, *, reach_m: float = 0.8):
+    """Every point of a retaining wall's region at the ground beside it.
+
+    A point on the wall's edge is shared with the ground on one side: the
+    street or the wharf. It takes that ground's height, read `reach_m` out
+    towards each face beside it that is not wall, from the survey at its own
+    half metre: the grid the mesher reads smooths a four-metre step into a
+    slope. A point inside the region, shared with nothing else, takes the
+    highest of its neighbours: it is under the wall's top. Returns the heights
+    and how many points were set.
+    """
+    xy = np.asarray(xy, dtype=np.float64)[:, :2]
+    z = np.asarray(z, dtype=np.float64).copy()
+    sizes = np.asarray(sizes, dtype=np.int64)
+    loops = np.asarray(loops, dtype=np.int64)
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]]).astype(np.int64)
+    face_of = np.repeat(np.arange(len(sizes)), sizes)
+    on_wall = np.asarray(on_wall, dtype=bool)
+    centroids = np.zeros((len(sizes), 2))
+    np.add.at(centroids, face_of, xy[loops])
+    centroids /= sizes[:, None]
+    wall_points = np.unique(loops[on_wall[face_of]])
+    if not len(wall_points):
+        return z, 0
+    # For each wall point, the faces round it that are not wall.
+    beside: dict[int, list[int]] = {}
+    for loop in np.flatnonzero(np.isin(loops, wall_points) & ~on_wall[face_of]).tolist():
+        beside.setdefault(int(loops[loop]), []).append(int(face_of[loop]))
+    readings = []
+    for point, faces in beside.items():
+        out = centroids[faces] - xy[point]
+        norm = np.hypot(out[:, 0], out[:, 1])
+        out = out / np.maximum(norm, 1e-9)[:, None]
+        at = xy[point] + out * reach_m
+        readings.append((point, at, faces))
+    if readings:
+        flat = np.vstack([at for _, at, _ in readings])
+        values = np.asarray(ground_at(flat[:, 0], flat[:, 1]), dtype=np.float64)
+        k = 0
+        for point, at, faces in readings:
+            v = values[k:k + len(at)]
+            k += len(at)
+            if np.isfinite(v).any():
+                z[point] = float(np.nanmedian(v))
+            else:
+                # No survey there: the ground's own points round it, off the wall.
+                others = np.unique(np.concatenate([loops[starts[f]:starts[f] + sizes[f]] for f in faces]))
+                others = others[~np.isin(others, wall_points)]
+                if len(others):
+                    z[point] = float(np.median(z[others]))
+    inside = np.setdiff1d(wall_points, np.fromiter(beside.keys(), dtype=np.int64))
+    for point in inside.tolist():
+        faces = face_of[loops == point]
+        near = np.unique(np.concatenate([loops[starts[f]:starts[f] + sizes[f]] for f in faces]))
+        near = near[near != point]
+        if len(near):
+            z[point] = float(np.max(z[near]))
+    return z, len(beside) + len(inside)
 
 
 def _blunt_walkway_tips(points, loops, sizes, face_layer, face_material, *,

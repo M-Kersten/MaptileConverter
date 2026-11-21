@@ -407,3 +407,265 @@ class SourceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WerfTests(unittest.TestCase):
+    """Utrecht's Oudegracht: the street four metres over its wharf, the
+    cellars' wall between them, the bridges spanning street to street."""
+
+    @staticmethod
+    def _step(x, y):
+        """A canal street at 5.1 m north of y = 0, its wharf at 1.2 m south."""
+        y = np.asarray(y, dtype=float)
+        return np.where(y > 0.0, 5.1, 1.2) + 0.0 * np.asarray(x, dtype=float)
+
+    def test_retaining_walls_on_and_under_the_ground_are_read(self):
+        from src.geo import BBox
+        from src.werf import retaining_walls
+
+        square = {"type": "Polygon", "coordinates": [_ring(0, 0, 6, 0.3).tolist()]}
+        features = [
+            {"properties": {"type": "niet-bgt", "plus_type": "keermuur", "relatieve_hoogteligging": 0},
+             "geometry": square},
+            {"properties": {"type": "niet-bgt", "plus_type": "keermuur", "relatieve_hoogteligging": -1},
+             "geometry": square},
+            {"properties": {"type": "steiger", "relatieve_hoogteligging": 1}, "geometry": square},
+        ]
+        walls = retaining_walls(features, BBox(-10, -10, 10, 10))
+        self.assertEqual(len(walls), 2)  # the steiger is no wall
+
+    def test_a_cellar_wall_stands_from_the_wharf_to_the_street(self):
+        import shapely
+
+        from src.werf import FOOT_SINK_M, TOP_LIFT_M, build_werf_walls
+
+        wall = shapely.box(0.0, -0.15, 6.0, 0.15)
+        werf = build_werf_walls([wall], self._step)
+        self.assertGreater(len(werf), 0)
+        z = werf.tris[:, :, 2]
+        self.assertAlmostEqual(float(z.max()), 5.1 + TOP_LIFT_M, places=6)
+        self.assertAlmostEqual(float(z.min()), 1.2 - FOOT_SINK_M, places=6)
+        # The texture's foot on the wharf: v = 0 at 1.2 m, about 1 at the street.
+        v = werf.uvs[:, :, 1][werf.tris[:, :, 2] > 5.0]
+        np.testing.assert_allclose(v, (5.1 + TOP_LIFT_M - 1.2) / 4.0, atol=0.011)
+        foot = werf.uvs[:, :, 1][werf.tris[:, :, 2] < 1.0]
+        np.testing.assert_allclose(foot, -FOOT_SINK_M / 4.0, atol=1e-6)
+
+    def test_a_wall_too_low_to_be_a_werf_is_left_out(self):
+        import shapely
+
+        from src.werf import build_werf_walls
+
+        werf = build_werf_walls([shapely.box(0.0, -0.15, 6.0, 0.15)], lambda x, y: np.where(np.asarray(y) > 0, 1.4, 1.2))
+        self.assertEqual(len(werf), 0)
+        self.assertEqual(werf.counts["walls_too_low"], 1)
+
+    def test_the_ground_drops_at_the_wall(self):
+        """A strip of wall faces between a street and a wharf: their shared
+        points take the street's and the wharf's heights, not the grid's."""
+        from src.layered import _wall_edges
+
+        xy = np.array([
+            [0, 2], [4, 2],  # street, far
+            [0, 0.3], [4, 0.3],  # the wall's street edge
+            [0, -0.3], [4, -0.3],  # its wharf edge
+            [0, -2], [4, -2],  # wharf, far
+        ], dtype=float)
+        z = np.array([5.1, 5.1, 3.0, 3.0, 3.0, 3.0, 1.2, 1.2])  # the grid's smear
+        faces = [[2, 3, 1, 0], [4, 5, 3, 2], [6, 7, 5, 4]]
+        sizes = np.array([4, 4, 4])
+        loops = np.concatenate(faces)
+        z2, changed = _wall_edges(xy, z, loops, sizes, np.array([False, True, False]), self._step)
+        np.testing.assert_allclose(z2[[2, 3]], 5.1)
+        np.testing.assert_allclose(z2[[4, 5]], 1.2)
+        np.testing.assert_allclose(z2[[0, 1, 6, 7]], [5.1, 5.1, 1.2, 1.2])
+        self.assertEqual(changed, 4)
+
+
+class UnderBridgeTests(unittest.TestCase):
+    def test_the_wharf_runs_on_under_the_bridge(self):
+        """The survey draws a ridge across the canal under a bridge, at the
+        streets' height. The wharf under it is the wharf beside it."""
+        import shapely
+
+        from src.layered import _under_decks
+
+        # The canal runs along x; a wharf strip y in [3, 5] at 1.2 m beside it.
+        xy = np.array([
+            [-2, 3], [2, 3], [2, 5], [-2, 5],  # wharf under the deck
+            [-2, 0], [2, 0],  # the canal's edge, under water
+        ], dtype=float)
+        z = np.array([5.3, 5.3, 5.3, 5.3, 0.2, 0.2])  # the ridge, and the bed
+        faces = [[0, 1, 2, 3], [4, 5, 1, 0]]
+        sizes = np.array([4, 4])
+        loops = np.concatenate(faces)
+        wet_face = np.array([False, True])
+        deck = shapely.box(-5.0, -10.0, 5.0, 10.0)
+
+        def ground(x, y):
+            y = np.asarray(y, dtype=float)
+            return np.where((y >= 3) & (y <= 5), 1.2, np.nan) + 0.0 * np.asarray(x, dtype=float)
+
+        z2, changed = _under_decks(xy, z, loops, sizes, wet_face, [(deck, np.array([1.0, 0.0]))], ground)
+        np.testing.assert_allclose(z2[:4], 1.2)  # the quay's edge with it
+        np.testing.assert_allclose(z2[4:], 0.2)  # under water only: the bed
+        self.assertEqual(changed, 4)
+
+
+    def test_the_bed_beside_a_bridge_stays_under_the_water(self):
+        """The survey's ridge under a bridge spills past the deck: a water
+        point beside a bridge on the Oudegracht stood at 1.8 m, its faces a
+        shoal across the canal under the arch."""
+        import shapely
+
+        from src.layered import DITCH_DEPTH_M, NEAR_DECK_M, _under_decks
+
+        xy = np.array([
+            [0, -1.0],  # under the deck
+            [0, -6.6],  # 0.6 m beside it
+            [0, -6.0 - NEAR_DECK_M - 2.0],  # well clear of it
+        ], dtype=float)
+        z = np.array([5.0, 1.8, 1.8])
+        faces = [[0, 1, 2]]
+        deck = shapely.box(-8.0, -6.0, 8.0, 6.0)
+        z2, _ = _under_decks(
+            xy, z, np.concatenate(faces), np.array([3]), np.array([True]),
+            [(deck, np.array([0.0, 1.0]))], lambda x, y: np.full(np.shape(np.atleast_1d(x)), np.nan),
+            water_level_at=lambda point: -0.43,
+        )
+        np.testing.assert_allclose(z2[:2], -0.43 - DITCH_DEPTH_M)
+        self.assertEqual(z2[2], 1.8)  # out of the bridge's reach: as it was
+
+
+class BridgeBodyTests(unittest.TestCase):
+    """A bridge was a sheet at one height. It is a body: deck, sides, arch."""
+
+    @staticmethod
+    def _canal():
+        import shapely
+
+        # The canal runs along y; the bridge spans it along x.
+        wet = shapely.box(-3.0, -50.0, 3.0, 50.0)
+
+        def ground(x, y):
+            x = np.asarray(x, dtype=float)
+            return np.where(np.abs(x) > 3.0, 4.0, -1.0) + 0.0 * np.asarray(y, dtype=float)
+
+        return wet, ground
+
+    def test_a_canal_bridge_has_an_arch_and_meets_the_streets(self):
+        from src.structures import KIND_ARCH, KIND_BRIDGE_SIDE, KIND_DECK, bridge_body
+
+        wet, ground = self._canal()
+        deck = [_ring(-5.0, -2.0, 5.0, 2.0)]
+        made = dict((kind, tris) for tris, kind in bridge_body(
+            deck, 4.0, ground_at=ground, wet=wet, water_level=0.6, lift=0.05,
+        ))
+        self.assertEqual(set(made), {KIND_DECK, KIND_ARCH, KIND_BRIDGE_SIDE})
+        np.testing.assert_allclose(made[KIND_DECK][:, :, 2], 4.05)  # level with the street
+        arch = made[KIND_ARCH]
+        over_water = np.abs(arch[:, :, 0]) < 2.9
+        crown = arch[:, :, 2][np.abs(arch[:, :, 0]) < 0.3]
+        self.assertAlmostEqual(float(crown.max()), 4.0 - 0.9, delta=0.05)
+        self.assertGreater(float(arch[:, :, 2][over_water].min()), 0.6)  # springs above the water
+        # Over the streets the body goes down into the ground: an abutment.
+        self.assertLess(float(arch[:, :, 2][np.abs(arch[:, :, 0]) > 3.5].max()), 4.0)
+        # The sides run along the bridge's long edges, from the arch to the top.
+        side = made[KIND_BRIDGE_SIDE]
+        self.assertAlmostEqual(float(side[:, :, 2].max()), 4.05, places=6)
+
+    def test_a_wharf_passage_opens_under_the_abutment(self):
+        import shapely
+
+        from src.structures import KIND_ARCH, bridge_body
+
+        wet, ground = self._canal()
+
+        def wharf(x, y):
+            x = np.asarray(x, dtype=float)
+            return np.where((x > 3.0) & (x < 5.0), 1.0, ground(x, y))
+
+        passage = shapely.box(3.0, -10.0, 5.0, 10.0)
+        made = dict((kind, tris) for tris, kind in bridge_body(
+            [_ring(-7.0, -2.0, 7.0, 2.0)], 4.0, ground_at=wharf, wet=wet, water_level=0.6,
+            passages=[passage],
+        ))
+        arch = made[KIND_ARCH]
+        inside = (arch[:, :, 0] > 3.3) & (arch[:, :, 0] < 4.7)
+        np.testing.assert_allclose(arch[:, :, 2][inside], 1.0 + 2.5, atol=1e-6)
+
+    def test_a_pier_in_the_canal_splits_the_arch(self):
+        """Two arches, quay to pier and pier to quay, landing on the pier: one
+        arch over the whole canal had the pier cutting up through it."""
+        import shapely
+
+        from src.structures import KIND_ARCH, bridge_body
+
+        wet = shapely.box(-6.0, -50.0, 6.0, 50.0)
+
+        def ground(x, y):
+            x = np.asarray(x, dtype=float)
+            return np.where(np.abs(x) > 6.0, 4.5, -1.0) + 0.0 * np.asarray(y, dtype=float)
+
+        pier = shapely.box(-1.0, -4.0, 1.0, 4.0)
+        made = dict((kind, tris) for tris, kind in bridge_body(
+            [_ring(-8.0, -2.0, 8.0, 2.0)], 4.5, ground_at=ground, wet=wet, water_level=0.6,
+            piers=[pier],
+        ))
+        arch = made[KIND_ARCH]
+        x, z = arch[:, :, 0], arch[:, :, 2]
+        spring, crown = 0.6 + 0.3, 4.5 - 0.9
+        # On the pier, the arches' springing.
+        np.testing.assert_allclose(z[np.abs(x) < 0.9], spring, atol=1e-6)
+        # Each arch's crown is halfway between its quay and the pier.
+        for middle in (-3.5, 3.5):
+            near = np.abs(x - middle) < 0.25
+            self.assertAlmostEqual(float(z[near].max()), crown, delta=0.05)
+        # And it comes down to the springing at both ends of each arch.
+        for end in (-6.0, -1.0, 1.0, 6.0):
+            at = np.abs(x - end) < 1e-6
+            self.assertTrue(at.any())
+            self.assertAlmostEqual(float(z[at].min()), spring, delta=1e-6)
+
+    def test_a_pier_under_a_brick_arch_is_brick(self):
+        from src.structures import (
+            KIND_BRIDGE_SIDE, KIND_DECK, KIND_PIER, StructurePart, StructureSet, _build_geometry,
+        )
+
+        wet_rings = [np.array([[-6, -50], [6, -50], [6, 50], [-6, 50], [-6, -50]], dtype=float)]
+
+        class Water:
+            rings = wet_rings
+            level_nap = 0.6
+
+        class Terrain:
+            def sample(self, x, y):
+                x = np.asarray(x, dtype=float)
+                return np.where(np.abs(x) > 6.0, 4.5, -1.0) + 0.0 * np.asarray(y, dtype=float)
+
+            surface = sample
+
+        result = StructureSet(parts=[
+            StructurePart(kind=KIND_DECK, level=1, rings=[_ring(-8.0, -2.0, 8.0, 2.0)]),
+            StructurePart(kind=KIND_PIER, level=0, rings=[_ring(-1.0, -4.0, 1.0, 4.0)]),
+        ])
+        _build_geometry(result, Terrain(), lambda x, y: np.full(np.shape(np.atleast_1d(x)), 4.5),
+                        {}, water=[Water()])
+        self.assertEqual(result.counts.get("piers_under_arches"), 1)
+        built = set(np.unique(result.tri_kind).tolist())
+        self.assertNotIn(KIND_PIER, built)
+        self.assertIn(KIND_BRIDGE_SIDE, built)
+
+    def test_a_wide_crossing_is_a_slab(self):
+        import shapely
+
+        from src.structures import KIND_ARCH, bridge_body
+
+        wet = shapely.box(-40.0, -50.0, 40.0, 50.0)
+        made = dict((kind, tris) for tris, kind in bridge_body(
+            [_ring(-45.0, -5.0, 45.0, 5.0)], 9.0,
+            ground_at=lambda x, y: np.where(np.abs(np.asarray(x, float)) > 40.0, 9.0, -2.0),
+            wet=wet, water_level=0.0,
+        ))
+        over = made[KIND_ARCH][:, :, 2][np.abs(made[KIND_ARCH][:, :, 0]) < 39.0]
+        np.testing.assert_allclose(over, 9.0 - 0.9, atol=1e-6)

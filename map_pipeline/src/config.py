@@ -71,6 +71,10 @@ DEFAULTS: dict[str, Any] = {
         # from wall to wall. False kerbs every walkway, as the modellers'
         # hand-made file does.
         "flush_walkways": True,
+        # The walls between a canal street and its wharf (BGT keermuur): the
+        # ground drops at them, and a brick wall with the cellars' doors in it
+        # stands on each, as along Utrecht's Oudegracht (src/werf.py).
+        "werven": True,
         # Photographed paving (Poly Haven, CC0) on every road, walkway and
         # lawn, in the material the BGT says it is paved with and the colour
         # the street photos or the aerial show. False keeps the flat colours
@@ -418,6 +422,11 @@ DEFAULTS: dict[str, Any] = {
         # A railing along every side of a deck that is over water and not
         # already walled by a BGT parapet or fence.
         "railings": True,
+        # A bridge over water as a body: its deck meeting the streets at their
+        # height, brick sides, an arch over the water, abutments into the
+        # ground and the wharves' passages under it. False keeps the flat
+        # deck sheet (src/structures.py, bridge_body).
+        "bridge_bodies": True,
         # A deck floats this far over its measured height, so it does not fight
         # the road riding on it for the same depth.
         "deck_lift_m": 0.05,
@@ -916,6 +925,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     layered["water_surface"] = bool(layered.get("water_surface", True))
     layered["flush_walkways"] = bool(layered.get("flush_walkways", True))
     layered["paving"] = bool(layered.get("paving", True))
+    layered["werven"] = bool(layered.get("werven", True))
     layered["harbour"] = bool(layered.get("harbour", True))
     layered["water_level_offset_m"] = float(layered.get("water_level_offset_m", 0.0))
     for key in ("outline_m", "ditch_depth_m"):

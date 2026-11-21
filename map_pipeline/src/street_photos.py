@@ -137,7 +137,12 @@ def build_street_photos(
     aerial_path: Path | None = None,
     session=None,
     trees=None,
+    deck_at=None,
 ) -> StreetPhotoResult:
+    """`deck_at(x, y)`, the top of a bridge deck there or NaN, puts a photo
+    taken on a bridge on its deck: the survey under a bridge is the wharf or
+    the water, four metres down, and the camera under the deck saw nothing
+    the photo shows."""
     result = StreetPhotoResult()
     gathered: list[Photo] = []
 
@@ -211,7 +216,14 @@ def build_street_photos(
         SOURCE_MAPILLARY: float(photos_cfg.get("mapillary_camera_height_m", 2.0)),
         SOURCE_OWN: float(photos_cfg.get("own_camera_height_m", 1.6)),
     }
-    result.photos = with_height(inside, terrain.sample, heights)
+    def ground_at(x, y):
+        z = np.asarray(terrain.sample(x, y), dtype=np.float64)
+        if deck_at is None:
+            return z
+        deck = np.asarray(deck_at(x, y, 0.0), dtype=np.float64).reshape(z.shape)
+        return np.where(np.isfinite(deck), np.fmax(deck, z), z)
+
+    result.photos = with_height(inside, ground_at, heights)
     save_photos(result.photos, work_dir / "photos.json")
 
     if not result.photos:

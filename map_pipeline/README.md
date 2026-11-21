@@ -1083,6 +1083,7 @@ The layered style's settings, all optional:
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.flush_walkways` | true | a walkway the survey shows level with the road beside it is laid as road, without a kerb |
 | `layered.paving` | true | photographed paving per material, coloured from the street photos and the aerial; false keeps the flat colours |
+| `layered.werven` | true | the walls between canal streets and their wharves (BGT keermuur): the ground drops at them and a brick wall with cellar doors stands on each |
 | `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
 
 Over the Hazeldonk square kilometre the ground is 84,867 faces, 77% of them
@@ -1601,6 +1602,34 @@ does not permit extraction. What is above is the other route to the same
 density: every object is a known thing, in a named group, that a level designer
 can take apart.
 
+### Werven: the wharves and the cellar walls
+
+Along Utrecht's Oudegracht the street runs four metres over the water, the
+houses on one side and an iron railing on the other, and below the railing a
+second street: the wharf at the waterline, with the cellars under the street
+opening onto it. Round the Ganzenmarkt the survey has the street at 5.1 m NAP
+and the wharf at 1.2 m. The layered ground, reading a 4 m grid, made a bank
+of it, a slope from the street to the water, and the wharf was gone.
+
+The BGT draws the wall that holds the street up: `kunstwerkdeel`, plus-type
+`keermuur`, a strip 0.29 m wide (the median of 49 round the Ganzenmarkt) in
+pieces of about six metres, one per cellar (`src/werf.py`). Each strip on the
+ground is
+
+* a region of its own in the layered ground, widened 0.16 m either side so
+  the mesher keeps it, its edge on the street side at the street's height and
+  on the wharf side at the wharf's, each read from the half-metre survey just
+  beyond it: the ground drops at the wall;
+* a wall standing on it, from just under the wharf to flush with the street,
+  brick, an arched cellar door and an arched window to every six metres of
+  it (`<prefix>_Werfmuren`, its texture `werf_wall.png`).
+
+Steps down to a wharf run along the wall and no longer stand on it. Strips at
+level -1 are walls too: the cellar wall carried on into a bridge and the
+walls of the wharf's passage through it. Left out, the street sloped down to
+the wharf beside every bridge. `layered.werven: false` leaves the walls out
+and the ground as it was.
+
 ### Beyond the BGT: OpenStreetMap, Mapillary and the survey
 
 What makes a square a place is mostly what no register keeps. Three sources
@@ -1684,6 +1713,44 @@ part — not a surface to chase, because refining a road mesh against a raster o
 whatever the lidar hit drove it from 35k triangles to 510k and put one
 carriageway 95 m up. Where no plausible deck reading exists, the part is draped
 on the ground like any other road and the run says how many.
+
+**A canal bridge is a body.** A deck used to be a sheet at one height: from
+the water a slab floating over the canal, its ends a step off the street.
+Now (`structures.bridge_bodies`) each deck over water is cut into 0.4 m strips
+across its span, and each point given a top, the deck's level or the ground
+as drawn where that is higher, so the deck meets the street at the street's
+own height; and an underside: over the water an arch, springing 0.3 m above
+the water at the quays to 0.9 m under the deck at its crown; over the land
+the body goes down into the ground, an abutment; and where the BGT draws a
+passage under the bridge (`tunneldeel` at level -1, a wharf going through
+it) 2.5 m over the passage's floor. The sides and the arch are brick, the
+deck the paving the BGT gives the street on the bridge. A pier in the canal
+(BGT `pijler`) splits the arch: the two bridges over the south Oudegracht
+stand on one mid-canal, so each has two arches landing on a brick pier.
+Over more than 30 m of water it is a beam bridge: a slab 0.9 m thick. A tunnel part under a deck
+is that passage, and no longer a road tunnel eighteen metres deep.
+`structures.bridge_bodies: false` keeps the flat deck.
+
+**The ground under a bridge is the ground beside it.** The bare-earth survey
+cannot see under a deck: it is drawn in from the streets at either end, a
+ridge at street height across the canal, and the ground built on it put the
+wharf four metres up under every bridge and a mound in the canal's bed. Under
+a deck over water the ground is read beside the bridge, along the water, both
+ways: the wharf under it is the wharf beside it, and where the two sides
+disagree the lower wins, so a wharf that goes under the bridge stays open.
+Water under a deck stays under the water surface, and so does water within
+3 m of one: the survey's ridge spills past the deck's outline, and a point
+in the canal beside a bridge on the Oudegracht stood at 1.8 m, its faces a
+shoal across the water under the arch.
+
+**A wall on a bridge is its parapet.** The BGT draws the parapets of the
+Utrecht bridges as walls (`muur`) at level 1, with no height, and a wall is
+two metres: every bridge over the Oudegracht stood boxed in between brick
+walls a head taller than the people on it. A wall on a deck is a parapet of
+1 m now (`barriers.heights.parapet` changes it). A street photo taken on a
+bridge stands on its deck as well: placed on the survey, the camera stood on
+the wharf four metres down, inside the bridge, and was matched against walls
+it could not see.
 
 **A tunnel cannot be measured.** Nothing looks down and sees the Maastunnel. The
 BGT gives its footprint and the carriageway inside it, and an ordinal level of

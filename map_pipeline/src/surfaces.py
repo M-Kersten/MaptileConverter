@@ -192,6 +192,9 @@ class SurfaceSet:
     # The BGT's quay walls (scheiding kademuur), lines and polygons in RD, for
     # the layered style's quay faces (`harbour`).
     quays: list = field(default_factory=list)
+    # The BGT's retaining walls on the ground (kunstwerkdeel keermuur), shapely
+    # polygons in RD: the walls between a canal street and its wharf.
+    walls: list = field(default_factory=list)
 
     @property
     def water_area_m2(self) -> float:
@@ -673,6 +676,15 @@ def build_surfaces(
             result.quays = _quay_walls(bbox, fetch_kwargs) + _jetty_shores(
                 bbox, fetch_kwargs, result.water
             )
+        try:
+            from .werf import retaining_walls
+
+            walls, _ = fetch_current("kunstwerkdeel_vlak", bbox, **fetch_kwargs)
+            result.walls = retaining_walls(walls, bbox)
+            if result.walls:
+                LOG.info("%d retaining walls (keermuur)", len(result.walls))
+        except Exception as exc:  # noqa: BLE001 - the wharves are a refinement
+            LOG.warning("could not read BGT retaining walls: %s", exc)
 
     # Outside the water block, and guarded: land cover and water are
     # independently switchable, so this ran on a None grid whenever water was

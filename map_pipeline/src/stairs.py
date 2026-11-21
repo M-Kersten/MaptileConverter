@@ -130,16 +130,20 @@ def _ends(polygon, direction, ground_at, inset_m: float = 0.3, beyond_m: float |
     low = coords[s <= s.min() + 0.6]
     high = coords[s >= s.max() - 0.6]
 
-    def read(points, outward):
+    def read(points, outward, pick):
         for offset in ((beyond_m, -inset_m) if beyond_m else (-inset_m,)):
             at = points + outward * offset
             z = np.asarray(ground_at(at[:, 0], at[:, 1]), dtype=np.float64)
             if np.isfinite(z).any():
-                return float(np.nanmedian(z))
+                return float(pick(z))
         return None
 
-    z_low = read(low, -direction)
-    z_high = read(high, direction)
+    # Beyond the ends, the survey: its medians, steady against a parked
+    # bike. Inside, the ground as drawn: the lowest along the foot and the
+    # highest along the top, so no tread's corner is under it.
+    low_pick, high_pick = (np.nanmedian, np.nanmedian) if beyond_m else (np.nanmin, np.nanmax)
+    z_low = read(low, -direction, low_pick)
+    z_high = read(high, direction, high_pick)
     if z_low is None or z_high is None:
         return None
     return z_low, z_high
@@ -207,6 +211,9 @@ def public_flight(polygon, *, ground_at, survey_at, source: str, step_count=None
     # No tread under the ground it stands in: a flight the drawn ground does
     # not climb with is left as the ground.
     for rings, top in treads:
+        # Every corner: the deepest one is what the checks measure. (Flights
+        # are kept off the cellar walls' footprint, whose ground is the
+        # wall's own steep strip at the street's height.)
         ring = np.asarray(rings[0])[:, :2]
         z = np.asarray(ground_at(ring[:, 0], ring[:, 1]), dtype=np.float64)
         if np.isfinite(z).any() and float(np.nanmax(z) - top) > BURIED_M:

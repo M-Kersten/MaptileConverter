@@ -350,6 +350,10 @@ def _footprint_lookup(buildings):
     return under
 
 
+# A wall on a bridge deck (relatieve_hoogteligging above 0) is a parapet this
+# tall: the BGT gives no height, and a wall's two metres boxed the bridges in.
+PARAPET_M = 1.0
+
 # A canopy left smaller than this once the buildings are cut out of it is a
 # sliver along a facade, not a roof.
 CANOPY_MIN_M2 = 4.0
@@ -1109,6 +1113,7 @@ def build_barriers(
     stair_outlines=(),
     osm=None,
     survey_at=None,
+    blocked=None,
 ) -> BarrierSet:
     """Fetch every barrier collection and turn it into draped geometry.
 
@@ -1168,8 +1173,14 @@ def build_barriers(
         deck = np.asarray(deck_at(x, y), dtype=np.float64).reshape(below.shape)
         return np.where(np.isfinite(deck), np.fmax(deck, below), below)
 
-    def styled(table, collection, plus_type):
-        style = apply_height_override(table.get((collection, plus_type)), heights)
+    def styled(table, collection, plus_type, raised=False):
+        style = table.get((collection, plus_type))
+        if style is not None and raised and style.name == "wall":
+            # A wall on a bridge is its parapet: chest height, not a garden
+            # wall's two metres, which closed every Utrecht bridge in. Its
+            # own name, so `heights.parapet` sets it apart from the walls.
+            style = replace(style, name="parapet", height_m=PARAPET_M)
+        style = apply_height_override(style, heights)
         return None if style is not None and style.name in skipped else style
 
     chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray, BarrierStyle]] = []
@@ -1197,7 +1208,7 @@ def build_barriers(
             ground = on_deck if raised and deck_at is not None else terrain.surface
 
             if geometry_type in ("LineString", "MultiLineString"):
-                style = styled(LINE_STYLES, collection, plus_type)
+                style = styled(LINE_STYLES, collection, plus_type, raised)
                 if style is None:
                     continue
                 raw = (
@@ -1232,7 +1243,7 @@ def build_barriers(
                                     collision_chunks.append((c_verts, c_tris))
 
             elif geometry_type in ("Polygon", "MultiPolygon"):
-                style = styled(AREA_STYLES, collection, plus_type)
+                style = styled(AREA_STYLES, collection, plus_type, raised)
                 if style is None:
                     continue
                 for group in polygon_rings(geometry):
@@ -1309,6 +1320,7 @@ def build_barriers(
 
     flights = _public_flights(
         stair_outlines, osm, terrain.surface, survey_at, styled(AREA_STYLES, "gebouwinstallatie", "toegangstrap"),
+        blocked=blocked,
     )
     for flight, style in flights:
         for tread_rings, top_z in flight.treads:
@@ -1418,16 +1430,32 @@ def _stoop(rings, footprints_under, ground, surface_at):
     return stoop_flight(polygon, building=building, ground_at=ground, surface_at=surface_at)
 
 
-def _public_flights(stair_outlines, osm, ground, survey_at, style):
-    """Flights of public steps: the BGT's, and OpenStreetMap's it lacks."""
+def _public_flights(stair_outlines, osm, ground, survey_at, style, blocked=None):
+    """Flights of public steps: the BGT's, and OpenStreetMap's it lacks.
+
+    `blocked` is ground no step may stand on: the walls between a canal
+    street and its wharf, which a flight down to the wharf runs along.
+    """
     import shapely
 
     from .stairs import osm_step_outlines, public_flight
+    from .terrain_mesh import _polygonal
 
     if style is None:
         return []
+
+    keep_off = blocked.buffer(0.15) if blocked is not None and not blocked.is_empty else None
+
+    def clear(polygon):
+        # A hand's breadth off the wall: right against it, a tread's corner
+        # stands on the wall's own steep strip of ground.
+        if keep_off is None:
+            return polygon
+        return _polygonal(polygon.difference(keep_off))
+
     out = []
-    bgt = [p for p in stair_outlines or () if p is not None and not p.is_empty]
+    bgt = [clear(p) for p in stair_outlines or () if p is not None and not p.is_empty]
+    bgt = [p for p in bgt if not p.is_empty]
     for polygon in bgt:
         for part in getattr(polygon, "geoms", [polygon]):
             flight = public_flight(part, ground_at=ground, survey_at=survey_at, source="bgt")
@@ -1435,11 +1463,15 @@ def _public_flights(stair_outlines, osm, ground, survey_at, style):
                 out.append((flight, style))
     taken = shapely.union_all(np.array(bgt, dtype=object)).buffer(1.0) if bgt else None
     for outline, count in osm_step_outlines(osm, taken):
-        flight = public_flight(
-            outline, ground_at=ground, survey_at=survey_at, source="osm", step_count=count,
-        )
-        if flight is not None:
-            out.append((flight, style))
+        outline = clear(outline)
+        for part in getattr(outline, "geoms", [outline]):
+            if part.is_empty or part.area < 0.5:
+                continue
+            flight = public_flight(
+                part, ground_at=ground, survey_at=survey_at, source="osm", step_count=count,
+            )
+            if flight is not None:
+                out.append((flight, style))
     if out:
         LOG.info(
             "steps: %d flights cut into treads, %d from the BGT and %d from OpenStreetMap",

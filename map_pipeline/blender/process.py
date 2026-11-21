@@ -473,6 +473,26 @@ HARBOUR_OBJECTS = {
 RAILING_MATERIAL = ("Staal", (0.2, 0.22, 0.24), 0.4)
 
 
+def _werf_brick(scene: dict, work_dir: Path):
+    """The old brick of the cellar walls, as a material, or None without any."""
+    entry = (scene.get("layered") or {}).get("werf") or {}
+    name = entry.get("brick")
+    if not name or not (work_dir / name).is_file():
+        return None
+    existing = bpy.data.materials.get("M_werf_brick")
+    if existing is not None:
+        return existing
+    folder = Path(scene.get("_out_dir") or work_dir)
+    for file in (name, entry.get("brick_normal")):
+        if file and (work_dir / file).is_file() and (work_dir / file).resolve() != (folder / file).resolve():
+            shutil.copyfile(work_dir / file, folder / file)
+    normal = entry.get("brick_normal")
+    return make_textured_material(
+        "M_werf_brick", folder / name, 0.85,
+        folder / normal if normal and (folder / normal).is_file() else None,
+    )
+
+
 def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
     """Quay faces, jetties, pontoons and mooring posts: one object per kind."""
     import bmesh
@@ -498,13 +518,18 @@ def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
         )
         corners = sel.reshape(-1, 3)
         n = len(sel)
+        uvs = np.column_stack([corners[:, 0] / 2.0, corners[:, 1] / 2.0])
+        brick = _werf_brick(scene, work_dir) if kind == "quay" else None
+        if brick is not None:
+            # Where the streets have cellar walls the quays are their brick.
+            material, uvs = brick, _face_uv(sel, 4.0)
         obj = build_mesh_object(
             f"{prefix}_{word}",
             corners,
             np.arange(n * 3),
             np.arange(0, n * 3, 3),
             np.full(n, 3),
-            np.column_stack([corners[:, 0] / 2.0, corners[:, 1] / 2.0]),
+            uvs,
             np.zeros(n),
             [material],
             shade_smooth=False,
@@ -1296,7 +1321,13 @@ def build_layered(scene: dict, work_dir: Path, aerial_material) -> dict:
     curb_rgb = cfg.get("curb_rgb")
     curb_name = str(cfg.get("curb_material") or "Beton")
     if curb_rgb and curb_name in materials and curb_name not in paving:
-        materials[curb_name] = make_plain_material(curb_name, tuple(curb_rgb), 0.85)
+        # Recoloured in place: a second material of the same name would be
+        # "Beton.001", and whatever else looks "Beton" up -- the quays -- would
+        # keep the white.
+        bsdf = materials[curb_name].node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None:
+            bsdf.inputs["Base Color"].default_value = (*curb_rgb, 1.0)
+        materials[curb_name].diffuse_color = (*curb_rgb, 1.0)
     # What a viewport in solid mode shows: the paving's own colour.
     for name, entry in paving.items():
         if name in materials and entry.get("rgb"):
@@ -1413,6 +1444,71 @@ def split_pinches(points, loops, starts, sizes):
     if extra:
         points = np.vstack([points, np.array(extra)])
     return points, loops
+
+
+def build_werf(scene: dict, work_dir: Path, out_dir: Path, entry: dict, *, name: str):
+    """The walls between the canal streets and their wharves (`src/werf.py`).
+
+    Brick, a cellar door and a window to every six metres, from just under the
+    wharf to the street's edge. One object, one material: the texture tiles
+    along every wall, its UVs written by the pipeline in tiles.
+    """
+    data = np.load(work_dir / entry["file"])
+    tris = np.asarray(data["tris"], dtype=np.float64)
+    if not len(tris):
+        return None
+    uvs = np.asarray(data["uvs"], dtype=np.float64).reshape(-1, 2)
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    points = tris.reshape(-1, 3) - [origin_x, origin_y, z_offset]
+    texture, normal = entry.get("texture"), entry.get("normal")
+    material = None
+    if texture and (work_dir / texture).is_file():
+        for file in (texture, normal):
+            if file and (work_dir / file).is_file() and (work_dir / file).resolve() != (out_dir / file).resolve():
+                shutil.copyfile(work_dir / file, out_dir / file)
+        material = make_textured_material(
+            "M_werfmuur", out_dir / texture, 0.85,
+            out_dir / normal if normal and (out_dir / normal).is_file() else None,
+        )
+    else:
+        material = make_plain_material("M_werfmuur", (0.2, 0.09, 0.06), 0.85)
+    n = len(tris)
+    obj = build_mesh_object(
+        name,
+        points,
+        np.arange(n * 3),
+        np.arange(0, n * 3, 3),
+        np.full(n, 3),
+        uvs,
+        np.zeros(n),
+        [material],
+        shade_smooth=False,
+    )
+    obj["maptile_role"] = "werf_wall"
+    log(f"werven: {name}, {n} triangles")
+    return obj
+
+
+def _face_uv(triangles: np.ndarray, tile: float) -> np.ndarray:
+    """UVs per corner, projected along each triangle's own facing: from above
+    for what faces up or down, from the side for a wall, in tiles of `tile`
+    metres. A deck read from above was right; a bridge's side read from above
+    was its texture stretched into lines."""
+    tri = np.asarray(triangles, dtype=np.float64)
+    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
+    flat = np.abs(normal[:, 2]) >= 0.7
+    # Along the wall: the horizontal direction in its plane.
+    along = np.column_stack([-normal[:, 1], normal[:, 0]])
+    along /= np.maximum(np.linalg.norm(along, axis=1, keepdims=True), 1e-12)
+    u_wall = (tri[:, :, 0] * along[:, None, 0] + tri[:, :, 1] * along[:, None, 1])
+    uv = np.where(
+        flat[:, None, None],
+        tri[:, :, :2],
+        np.dstack([u_wall, tri[:, :, 2]]),
+    )
+    return (uv / float(tile)).reshape(-1, 2)
 
 
 def _paving_uv(points_xy: np.ndarray, loop_material: np.ndarray, tile_m: np.ndarray, bbox_local):
@@ -3003,6 +3099,25 @@ def build_structures(scene: dict, work_dir: Path, material):
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
     names = scene.get("structures", {}).get("kind_names", {})
+    entry = scene.get("structures", {})
+    # Brick for a bridge's sides and arch; its deck in the street's own paving.
+    brick = None
+    if entry.get("brick_texture") and (work_dir / entry["brick_texture"]).is_file():
+        folder = scene.get("_out_dir")
+        target = Path(folder) if folder else work_dir
+        for file in (entry.get("brick_texture"), entry.get("brick_normal")):
+            if file and (work_dir / file).is_file() and (work_dir / file).resolve() != (target / file).resolve():
+                shutil.copyfile(work_dir / file, target / file)
+        normal = entry.get("brick_normal")
+        brick = make_textured_material(
+            "M_bridge_brick", target / entry["brick_texture"], 0.85,
+            target / normal if normal and (target / normal).is_file() else None,
+        )
+    deck_material, deck_tile = None, 2.0
+    paving = (scene.get("_paving") or {}).get(entry.get("deck_paving") or "")
+    if paving:
+        deck_material = bpy.data.materials.get(entry["deck_paving"])
+        deck_tile = float(paving.get("tile_m", 2.0))
 
     local = triangles.copy()
     local[:, :, 0] -= origin_x
@@ -3030,13 +3145,16 @@ def build_structures(scene: dict, work_dir: Path, material):
         # corner of every face, so after a weld the UVs follow `indices` rather
         # than `corners` -- and the loop indices have to be `indices` too, or
         # they address a buffer that no longer exists at that length.
-        loop_xy = corners[indices][:, :2]
-        uvs = np.column_stack([loop_xy[:, 0] / 6.0, loop_xy[:, 1] / 6.0])
-        # A railing is painted steel, not the concrete of the deck it is on.
-        own = (
-            bpy.data.materials.get(RAILING_MATERIAL[0])
-            or make_plain_material(*RAILING_MATERIAL)
-        ) if label == "railing" else material
+        tile = 6.0
+        own = material
+        if label in ("bridge_side", "arch") and brick is not None:
+            own, tile = brick, 4.0
+        elif label == "deck" and deck_material is not None:
+            own, tile = deck_material, deck_tile
+        elif label == "railing":
+            # A railing is painted steel, not the concrete of the deck it is on.
+            own = bpy.data.materials.get(RAILING_MATERIAL[0]) or make_plain_material(*RAILING_MATERIAL)
+        uvs = _face_uv(corners[indices].reshape(-1, 3, 3), tile)
         objects.append(
             build_mesh_object(
                 f"Structures_{label}",
@@ -3496,6 +3614,7 @@ def main() -> int:
     aerial_texture, facade_textures, extra_textures = copy_textures(
         scene, work_dir, out_dir
     )
+    scene["_out_dir"] = str(out_dir)
 
     # Ground-storey textures are written last, so they are the trailing entries.
     n_ground = int(scene["facade"].get("ground_variants", 0))
@@ -3559,6 +3678,12 @@ def main() -> int:
             scene, work_dir, facade_materials, aerial_material, ground_materials,
             photo_materials=photo_materials,
         )
+
+    werf_entry = (scene.get("layered") or {}).get("werf") or {}
+    if layered is not None and werf_entry.get("file") and (work_dir / werf_entry["file"]).is_file():
+        prefix = str(scene["layered"].get("prefix") or "Area")
+        with _Layer(f"{prefix}_Werven"):
+            build_werf(scene, work_dir, out_dir, werf_entry, name=f"{prefix}_Werfmuren")
 
     if layered is not None and scene["layered"].get("water_surface", True):
         # The modellers' ground in flat colours, its water too: one object,

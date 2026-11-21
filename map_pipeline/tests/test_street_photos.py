@@ -611,6 +611,37 @@ class StageTests(unittest.TestCase):
         own = [p for p in result.photos if p.source == SOURCE_OWN][0]
         self.assertAlmostEqual(own.z, 1.6)
 
+    def test_a_photo_taken_on_a_bridge_stands_on_its_deck(self) -> None:
+        """The survey under a canal bridge is the wharf or the water, four
+        metres below the deck. A photo taken on the bridge was placed down
+        there, inside the bridge, and saw none of what it shows."""
+        from src.street_photos import build_street_photos
+
+        def deck_at(x, y, reach=0.5):
+            x = np.atleast_1d(np.asarray(x, dtype=float))
+            return np.where((x > 136000) & (x < 136010), 4.0, np.nan)
+
+        buildings = BuildingSet(buildings=[box_building("a", 136020, 455000, 136030, 455008)])
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            folder = tmp / "mine"
+            folder.mkdir()
+            for name, x in (("on_bridge", 136005.0), ("on_street", 136015.0)):
+                _jpeg(folder / f"{name}.jpg")
+                (folder / f"{name}.jpg.json").write_text(
+                    json.dumps({"x": x, "y": 454995.0, "heading": 0})
+                )
+            result = build_street_photos(
+                BBox(135980, 454980, 136050, 455030), tmp / "work", tmp / "out",
+                photos_cfg={"mapillary": False, "folder": str(folder), "refine": False},
+                buildings=buildings, terrain=_Terrain(), base_dir=tmp, deck_at=deck_at,
+            )
+        heights = {Path(p.id).stem.split(":")[-1]: p.z for p in result.photos}
+        on_bridge = [z for name, z in heights.items() if "on_bridge" in name]
+        on_street = [z for name, z in heights.items() if "on_street" in name]
+        self.assertAlmostEqual(on_bridge[0], 4.0 + 1.6)
+        self.assertAlmostEqual(on_street[0], 1.6)
+
     def test_mapillary_failure_does_not_fail_the_stage(self) -> None:
         import os
         from unittest import mock

@@ -195,6 +195,8 @@ def write_scene_description(
     rail_texture: Path | None = None,
     rail_kind_names: dict | None = None,
     structure_texture: Path | None = None,
+    structure_brick: tuple[Path, Path] | None = None,
+    deck_paving: str | None = None,
     structure_kind_names: dict | None = None,
     car_colours: int = 6,
     ground_variants: int = 0,
@@ -328,6 +330,13 @@ def write_scene_description(
                 "file": "structures.npz",
                 "texture": structure_texture.name,
                 "kind_names": structure_kind_names or {},
+                # Brick for the sides and arches of bridge bodies, and the
+                # ground's own paving for the top of their decks.
+                **(
+                    {"brick_texture": structure_brick[0].name, "brick_normal": structure_brick[1].name}
+                    if structure_brick else {}
+                ),
+                **({"deck_paving": deck_paving} if deck_paving else {}),
             }
             if structure_texture is not None
             else {}

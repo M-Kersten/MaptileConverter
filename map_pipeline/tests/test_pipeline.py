@@ -9834,6 +9834,53 @@ class TestCollisionLayer(unittest.TestCase):
         self.assertGreaterEqual(parapet[:, 2].min(), 2.5 - 0.3)
         self.assertLess(ground_wall[:, 2].min(), 0.0)
 
+    def test_a_wall_on_a_bridge_is_a_parapet_of_chest_height(self):
+        """The BGT draws a bridge's parapet as a wall, with no height. A wall
+        is two metres, and every bridge over the Oudegracht stood boxed in
+        between two brick walls a head taller than the people on it."""
+        import tempfile
+
+        import src.barriers as barriers_module
+        from src.geo import BBox
+
+        lines = [
+            {"properties": {"type": "muur", "relatieve_hoogteligging": 1},
+             "geometry": {"type": "LineString", "coordinates": [[40, 20], [40, 80]]}},
+            {"properties": {"type": "muur", "relatieve_hoogteligging": 0},
+             "geometry": {"type": "LineString", "coordinates": [[70, 20], [70, 80]]}},
+        ]
+
+        def fake_fetch(collection, bbox, class_field=None, **kw):
+            return (lines if collection == "scheiding_lijn" else []), {}
+
+        class Terrain:
+            def surface(self, x, y):
+                return np.zeros(np.shape(np.atleast_1d(x)))
+
+        def deck_at(x, y):
+            x = np.atleast_1d(np.asarray(x, float))
+            return np.where((x > 35) & (x < 45), 2.5, np.nan)
+
+        real = barriers_module.fetch_current
+        barriers_module.fetch_current = fake_fetch
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                built = barriers_module.build_barriers(
+                    BBox(0.0, 0.0, 100.0, 100.0), Path(tmp),
+                    barriers_cfg={"page_limit": 10, "timeout_s": 1,
+                                  "max_retries": 1, "max_pages": 1},
+                    terrain=Terrain(), deck_at=deck_at,
+                )
+        finally:
+            barriers_module.fetch_current = real
+        v = built.vertices
+        parapet = v[np.abs(v[:, 0] - 40) < 1]
+        ground_wall = v[np.abs(v[:, 0] - 70) < 1]
+        self.assertAlmostEqual(parapet[:, 2].max(), 2.5 + barriers_module.PARAPET_M, places=2)
+        self.assertAlmostEqual(ground_wall[:, 2].max(), 2.0, places=2)
+        self.assertIn("parapet", built.kind_names)
+        self.assertIn("wall", built.kind_names)
+
     def test_the_deck_surface_reaches_the_parapet_on_its_edge(self):
         """A wall is swept on both faces, and a parapet runs along the deck's
         very edge: read only inside the outline, one face stood on the deck

@@ -88,6 +88,7 @@ from src.imagery import build_aerial  # noqa: E402
 from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
 from src.rails import RailSet, build_rails, save_rails  # noqa: E402
 from src.structures import KIND_NAMES as STRUCTURE_KIND_NAMES  # noqa: E402
+from src.structures import deck_outlines  # noqa: E402
 from src.structures import (  # noqa: E402
     StructureSet,
     build_structures,
@@ -497,6 +498,35 @@ def _collision_metadata(work_dir: Path) -> dict:
     return {"collision": collision} if collision.get("objects") else {}
 
 
+def _deck_paving(surfaces) -> str | None:
+    """What the streets on the bridges are paved with: the BGT's road parts
+    above the ground, by the area of each material."""
+    import numpy as np
+
+    areas = [a for a in getattr(surfaces, "areas", None) or () if a.level >= 1]
+    if not areas:
+        return None
+    total: dict[str, float] = {}
+    for area in areas:
+        ring = np.asarray(area.rings[0], dtype=np.float64)
+        x, y = ring[:, 0], ring[:, 1]
+        size = 0.5 * abs(float((x * np.roll(y, -1) - y * np.roll(x, -1)).sum()))
+        total[area.material] = total.get(area.material, 0.0) + size
+    return max(total, key=total.get) if total else None
+
+
+def wall_footprints(surfaces):
+    """The cellar walls' footprints, as the werf walls stand on them."""
+    import numpy as np
+    import shapely
+
+    from src.werf import wall_band
+
+    bands = [wall_band(w) for w in getattr(surfaces, "walls", None) or ()]
+    bands = [b for b in bands if not b.is_empty]
+    return shapely.union_all(np.array(bands, dtype=object)) if bands else None
+
+
 def stair_outlines(surfaces) -> list:
     """The BGT's flights of public steps ("voetpad op trap"), as polygons."""
     import numpy as np
@@ -574,7 +604,7 @@ def street_details(config, work_dir, furniture, *, buildings, surfaces, terrain,
     return osm, found
 
 
-def layered_scene(config: PipelineConfig, ground, harbour=None, paving=None) -> dict:
+def layered_scene(config: PipelineConfig, ground, harbour=None, paving=None, werf_files=None) -> dict:
     """What the Blender stage needs to build the modellers' ground."""
     settings = config.layered
     curb = settings["curb"]
@@ -606,6 +636,15 @@ def layered_scene(config: PipelineConfig, ground, harbour=None, paving=None) -> 
         # Beside photographed paving the hand-made file's white kerb glares:
         # grey concrete, as kerbs are.
         "curb_rgb": [0.3, 0.3, 0.29] if paving else None,
+        # The walls between canal streets and their wharves (`src/werf.py`).
+        "werf": (
+            {
+                "file": "werf.npz", "texture": werf_files[0].name, "normal": werf_files[1].name,
+                # The quays of a street with cellar walls are its old brick too.
+                "brick": werf_files[2].name, "brick_normal": werf_files[3].name,
+            }
+            if werf_files else {}
+        ),
         "stats": {
             k: v for k, v in ground.stats.items()
             if k in ("faces", "vertices", "quad_share", "grid_error_max_m")
@@ -884,6 +923,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     ground_layers = None
     harbour = HarbourSet()
+    werf = None
+    werf_files = None
     if layered:
         with Stage("terrain and ground layers", next_step(), total):
             # The modellers' ground: a coarse terrain within tolerance of the
@@ -922,6 +963,15 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     and dtm_tif.is_file()
                     else None
                 ),
+                # The walls between a canal street and its wharf: the ground
+                # drops at them rather than down a bank.
+                walls=surfaces.walls if settings.get("werven", True) else (),
+                # The ground under a canal bridge is the ground beside it.
+                under_decks=(
+                    deck_outlines(config.bbox, structures_cfg=config.structures, water=surfaces.water)
+                    if want_structures and config.structures.get("bridges", True) and surfaces.water
+                    else ()
+                ),
             )
             terrain.mesh = ground_layers.mesh
             terrain.layers = ground_layers
@@ -936,6 +986,17 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     error["p99_m"],
                 )
             terrain.save(work_dir)
+            if surfaces.walls and settings.get("werven", True):
+                # A brick wall on each, from the wharf to the street, with
+                # the cellars' doors in it.
+                from src.werf import build_werf_walls, generate_werf_texture, save_werf
+
+                werf = build_werf_walls(surfaces.walls, ground_layers.surface_at)
+                if len(werf):
+                    from src.werf import generate_brick_texture
+
+                    save_werf(werf, work_dir / "werf.npz")
+                    werf_files = generate_werf_texture(work_dir) + generate_brick_texture(work_dir)
             if surfaces.water and bool(settings.get("harbour", True)):
                 # Quay faces, jetties, pontoons and mooring posts, at the
                 # water levels just read and the ground just built.
@@ -1092,6 +1153,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 base_dir=REPO_ROOT,
                 aerial_path=aerial.path,
                 trees=trees if len(trees) else None,
+                # A photo taken on a bridge stands on its deck.
+                deck_at=deck_at,
             )
             observed_plan, photo_textures = apply_street_photos(
                 buildings, street_photos, config, work_dir, out_dir,
@@ -1162,6 +1225,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # climbs: the BGT's, and OpenStreetMap's it lacks.
                 stair_outlines=stair_outlines(surfaces),
                 osm=osm if config.furniture.get("osm") else None,
+                blocked=wall_footprints(surfaces) if layered and config.layered.get("werven", True) else None,
                 survey_at=(
                     raster_sampler(work_dir / "ahn_dtm.tif")
                     if (work_dir / "ahn_dtm.tif").is_file() else None
@@ -1207,6 +1271,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
     structures = StructureSet()
     structure_texture = None
+    structure_brick = None
+    deck_paving = None
     if want_structures:
         with Stage("bridges and tunnels (BGT)", next_step(), total):
             # A bridge deck is a hard surface the surface model sees, so its
@@ -1235,6 +1301,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             if len(structures.tris):
                 save_structures(structures, work_dir / "structures.npz")
                 structure_texture = generate_structure_texture(work_dir)
+                if structures.counts.get("bridge_bodies"):
+                    from src.werf import generate_brick_texture
+
+                    structure_brick = generate_brick_texture(work_dir)
+                deck_paving = _deck_paving(surfaces)
 
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
@@ -1295,13 +1366,15 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             rail_texture=rail_texture,
             rail_kind_names={str(k): v for k, v in RAIL_KIND_NAMES.items()},
             structure_texture=structure_texture,
+            structure_brick=structure_brick,
+            deck_paving=deck_paving if ground_layers is not None else None,
             structure_kind_names={
                 str(k): v for k, v in STRUCTURE_KIND_NAMES.items()
             },
             ground_variants=ground_variants,
             photo_textures=photo_textures.pages if photo_textures is not None else None,
             layered=(
-                layered_scene(config, ground_layers, harbour, paving=paving_entry)
+                layered_scene(config, ground_layers, harbour, paving=paving_entry, werf_files=werf_files)
                 if ground_layers is not None
                 else None
             ),
