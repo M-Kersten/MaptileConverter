@@ -1638,12 +1638,16 @@ asphalt, water or a yard.
 
 **Steps** (`src/stairs.py`) are cut into treads: the BGT's flights of public
 steps (*voetpad op trap*), OpenStreetMap's `highway=steps` where the BGT has
-none, and the BGT's stoops. A flight climbs along its outline's long side,
-the survey just beyond each end saying which end is up and by how much, one
-riser of about 17 cm per tread and the top tread level with the ground above.
-A flight steeper than 51° is the quay wall beside it read as the flight, and
-stays flat. A stoop climbs to its building, as high as the surface model
-sees its landing, three steps where it cannot.
+none, and the BGT's stoops. A flight climbs along its outline's long side;
+the survey, read just beyond each end, says which end is up, and the ground
+as drawn at the two ends says how far, one riser of about 17 cm per tread,
+the top tread level with the ground above. The treads go down to the ground
+under each corner and no further. A flight steeper than 51° is the quay wall
+beside it read as the flight, and one the drawn ground does not climb with
+would be steps up to nothing or steps buried in it: both stay flat. A stoop
+climbs to its building, as high as the surface model sees its landing, three
+steps where it cannot, and stays the block it was on ground that slopes more
+than 40 cm under it.
 
 | Setting | Default | What it does |
 | --- | --- | --- |

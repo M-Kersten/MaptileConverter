@@ -957,6 +957,7 @@ def _extrude_rings(
     *,
     tolerance_m: float = 0.05,
     top_z: float | None = None,
+    base_on_ground: bool = False,
 ):
     """A polygon into a prism, as ``(vertices, triangles, uvs)``.
 
@@ -967,6 +968,9 @@ def _extrude_rings(
 
     `top_z` puts the top at a measured height -- a canopy read off the
     surface model -- rather than at the style's height above the ground.
+    With `base_on_ground` the bottom is then the ground under each vertex,
+    embedded, rather than the style's height below the top: a step of a
+    flight reaches down to the ground under it and no further.
 
     The base is sampled per vertex, not once for the whole outline. One height
     for the whole thing is the obvious shortcut and it fails exactly where
@@ -1015,6 +1019,9 @@ def _extrude_rings(
     if top_z is not None:
         low = np.full(len(flat), float(top_z) - style.height_m)
         high = np.full(len(flat), float(top_z))
+        if base_on_ground:
+            below = np.where(np.isfinite(ground), ground - EMBED_M, low)
+            low = np.minimum(below, high - 0.05)
     else:
         if style.lift_m > 0.0:
             # Flat, and clear of the ground at its worst corner. The median
@@ -1244,13 +1251,13 @@ def build_barriers(
                         if style.name == "steps" and footprints_under is not None:
                             flight = _stoop(rings, footprints_under, ground, surface_at)
                             if flight is not None:
-                                # Every tread down into the ground, so none
-                                # stands on air at the side of the flight.
-                                deep = replace(style, height_m=flight.rise_m + 0.3)
+                                # Every tread down into the ground under it,
+                                # so none stands on air at the side.
                                 for tread_rings, top_z in flight.treads:
                                     verts, tris, uvs = _extrude_rings(
-                                        tread_rings, ground, deep, step_m,
+                                        tread_rings, ground, style, step_m,
                                         tolerance_m=drape_tolerance_m, top_z=top_z,
+                                        base_on_ground=True,
                                     )
                                     if len(tris):
                                         chunks.append((verts, tris, uvs, style))
@@ -1304,11 +1311,10 @@ def build_barriers(
         stair_outlines, osm, terrain.surface, survey_at, styled(AREA_STYLES, "gebouwinstallatie", "toegangstrap"),
     )
     for flight, style in flights:
-        deep = replace(style, height_m=flight.rise_m + 0.3)
         for tread_rings, top_z in flight.treads:
             verts, tris, uvs = _extrude_rings(
-                tread_rings, terrain.surface, deep, step_m,
-                tolerance_m=drape_tolerance_m, top_z=top_z,
+                tread_rings, terrain.surface, style, step_m,
+                tolerance_m=drape_tolerance_m, top_z=top_z, base_on_ground=True,
             )
             if len(tris):
                 chunks.append((verts, tris, uvs, style))

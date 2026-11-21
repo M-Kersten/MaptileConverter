@@ -688,16 +688,18 @@ def build_layered_ground(
 
 def _blunt_walkway_tips(points, loops, sizes, face_layer, face_material, *,
                         limit_deg: float | None = None, rounds: int = 12):
-    """Faces at a needle tip of the walkway, handed to the ground beside them.
+    """Needles and slits in the walkway's outline, taken out after meshing.
 
     `_without_hairpins` takes the needles out of the BGT's outlines, but the
     mesher makes its own: an outline simplified one way on one side and
     another on the other leaves a wedge between them, and over the
     Ganzenmarkt one 0.6 m wide and 5 m long ended in a 7 degree tip, off
     which the curb generator's mitre flew 4.5 m. A tip is a vertex where the
-    walkway's faces meet in less than `limit_deg` all told; the walkway
-    faces there become whatever ground shares most edge with them, and it
-    goes round again, since the next vertex down may be the new tip.
+    walkway's faces meet in less than `limit_deg` all told, and its walkway
+    faces become whatever ground shares most edge with them. A slit is the
+    same the other way round, a sliver of road into the walkway, and its
+    faces become walkway. It goes round again, since the next vertex down
+    may be the new tip.
     Returns the layers, the materials and how many faces changed hands.
     """
     limit_deg = HAIRPIN_DEG if limit_deg is None else float(limit_deg)
@@ -712,51 +714,70 @@ def _blunt_walkway_tips(points, loops, sizes, face_layer, face_material, *,
     previous = np.arange(len(loops)) - 1
     previous[starts] = starts + sizes - 1
     xy = np.asarray(points, dtype=np.float64)[:, :2]
-    # The corner angle of every face at every one of its vertices.
-    a = xy[loops[previous]] - xy[loops]
-    b = xy[loops[following]] - xy[loops]
-    norms = np.hypot(*a.T) * np.hypot(*b.T)
-    corner = np.degrees(np.arccos(np.clip((a * b).sum(axis=1) / np.maximum(norms, 1e-12), -1.0, 1.0)))
+    # The inside angle of every face at every one of its vertices, past 180
+    # where a face is not convex: the turn from the edge in to the edge out,
+    # read the way the face winds.
+    into = xy[loops] - xy[loops[previous]]
+    out = xy[loops[following]] - xy[loops]
+    turn = np.arctan2(into[:, 0] * out[:, 1] - into[:, 1] * out[:, 0], (into * out).sum(axis=1))
+    cross = xy[loops, 0] * xy[loops[following], 1] - xy[loops[following], 0] * xy[loops, 1]
+    winding = np.sign(np.bincount(face_of, weights=cross, minlength=len(sizes)))
+    winding[winding == 0] = 1.0
+    corner = np.degrees(np.pi - turn * winding[face_of])
     # Each edge, by its two vertices, and the faces either side of it.
     pairs = np.sort(np.column_stack([loops, loops[following]]), axis=1)
     _, edge_id = np.unique(pairs, axis=0, return_inverse=True)
     edge_id = edge_id.ravel()
     order = np.argsort(edge_id, kind="stable")
+    total_all = np.bincount(loops, weights=corner, minlength=len(xy))
+    # A vertex the faces go all the way round; on the area's edge they do not.
+    interior = total_all > 359.0
     changed = 0
+
+    def across(face, want_walkway: bool):
+        """(layer, material) of the faces across this face's edges."""
+        out = []
+        for loop in range(starts[face], starts[face] + sizes[face]):
+            same = order[np.searchsorted(edge_id[order], edge_id[loop]):]
+            for other in same[:4].tolist():
+                if edge_id[other] != edge_id[loop]:
+                    break
+                neighbour = face_of[other]
+                if neighbour != face and (face_layer[neighbour] == WALKWAY) == want_walkway:
+                    out.append((int(face_layer[neighbour]), int(face_material[neighbour])))
+        return out
+
     for _ in range(rounds):
         walk = face_layer[face_of] == WALKWAY
         total = np.bincount(loops[walk], weights=corner[walk], minlength=len(xy))
         touched = np.bincount(loops[walk], minlength=len(xy)) > 0
-        tips = np.flatnonzero(touched & (total < limit_deg))
-        if not len(tips):
+        # A needle of walkway: its faces meet in less than the limit.
+        tips = touched & (total < limit_deg)
+        # A slit into the walkway, the same needle the other way round: what
+        # is not walkway meets in less than the limit, inside the area, and
+        # the kerb's mitre runs away up it just the same.
+        rest = total_all - total
+        slits = touched & interior & (rest > 1e-6) & (rest < limit_deg)
+        if not tips.any() and not slits.any():
             break
-        tip_set = np.zeros(len(xy), dtype=bool)
-        tip_set[tips] = True
-        faces = np.unique(face_of[walk & tip_set[loops]])
         moved = 0
-        for face in faces.tolist():
-            mine = np.arange(starts[face], starts[face] + sizes[face])
-            # The faces across this face's edges, and what they are.
-            across = []
-            for loop in mine.tolist():
-                same = order[np.searchsorted(edge_id[order], edge_id[loop]):]
-                for other in same[:4].tolist():
-                    if edge_id[other] != edge_id[loop]:
-                        break
-                    neighbour = face_of[other]
-                    if neighbour != face and face_layer[neighbour] != WALKWAY:
-                        across.append((int(face_layer[neighbour]), int(face_material[neighbour])))
-            if not across:
-                continue
-            values, counts = np.unique(np.array(across), axis=0, return_counts=True)
-            layer, material = values[int(np.argmax(counts))]
-            face_layer[face], face_material[face] = layer, material
-            moved += 1
+        for face in np.unique(face_of[walk & tips[loops]]).tolist():
+            found = across(face, want_walkway=False)
+            if found:
+                values, counts = np.unique(np.array(found), axis=0, return_counts=True)
+                face_layer[face], face_material[face] = values[int(np.argmax(counts))]
+                moved += 1
+        for face in np.unique(face_of[~walk & slits[loops]]).tolist():
+            found = across(face, want_walkway=True)
+            if found:
+                values, counts = np.unique(np.array(found), axis=0, return_counts=True)
+                face_layer[face], face_material[face] = values[int(np.argmax(counts))]
+                moved += 1
         if not moved:
             break
         changed += moved
     if changed:
-        LOG.info("layered ground: %d walkway faces at needle tips given to the ground beside them", changed)
+        LOG.info("layered ground: %d faces at needle tips and slits in the walkway changed hands", changed)
     return face_layer, face_material, changed
 
 

@@ -2203,6 +2203,52 @@ def _box(cx, cy, cz, sx, sy, sz, spin=0.0):
     return corners, faces
 
 
+def _bar(p0, p1, width):
+    """A square bar from p0 to p1, as (verts, faces): a box turned along it."""
+    p0 = np.asarray(p0, dtype=np.float64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    axis = p1 - p0
+    length = float(np.linalg.norm(axis))
+    if length < 1e-6:
+        return _box(*p0, width, width, width)
+    axis /= length
+    up = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    side = np.cross(axis, up)
+    side /= np.linalg.norm(side)
+    other = np.cross(axis, side)
+    half = width / 2.0
+    corners = []
+    for end in (p0, p1):
+        for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            corners.append(end + side * a * half + other * b * half)
+    _, faces = _box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+    return np.array(corners), faces
+
+
+def _bicycle(x, y, base, spin, colour):
+    """A parked bicycle: two wheels and a frame, in thin bars, along `spin`."""
+    d = np.array([np.cos(spin), np.sin(spin), 0.0])
+    across = np.array([-np.sin(spin), np.cos(spin), 0.0])
+    z = np.array([0.0, 0.0, 1.0])
+    o = np.array([x, y, base])
+    r = 0.33
+    pieces = []
+    for axle in (-0.52, 0.52):
+        centre = o + d * axle + z * r
+        ring = [centre + r * (np.cos(t) * d + np.sin(t) * z) for t in np.radians(np.arange(0, 360, 60))]
+        for a, b in zip(ring, ring[1:] + ring[:1]):
+            pieces.append((_bar(a, b, 0.035), colour))
+    rear, front = o + d * -0.52 + z * r, o + d * 0.52 + z * r
+    crank, seat, head = o + z * 0.3, o + d * -0.15 + z * 0.85, o + d * 0.36 + z * 0.82
+    for a, b in ((rear, crank), (crank, seat), (seat, rear), (seat, head), (crank, head), (head, front)):
+        pieces.append((_bar(a, b, 0.03), colour))
+    bar = head + z * 0.18
+    pieces.append((_bar(bar - across * 0.28, bar + across * 0.28, 0.03), colour))
+    pieces.append((_bar(head, bar, 0.03), colour))
+    pieces.append((_box(*(seat + z * 0.04), 0.24, 0.1, 0.05, spin), colour))
+    return pieces
+
+
 def _along(x, y, spin, a, c=0.0):
     """The point `a` along `spin` and `c` across it from (x, y)."""
     return (x + a * np.cos(spin) - c * np.sin(spin), y + a * np.sin(spin) + c * np.cos(spin))
@@ -2334,13 +2380,16 @@ def _furniture_pieces(kind, x, y, base, spin, uv, cfg, height=float("nan"),
     if kind == 14:  # bike rack, with the bikes parked in it
         stands = int(np.clip(size if np.isfinite(size) else 6, 2, 12))
         length = 0.6 * stands
-        pieces = [(_box(x, y, base + 0.35, length, 0.05, 0.7, spin), black)]
+        pieces = [(_box(x, y, base + 0.3, length, 0.05, 0.08, spin), metal)]
+        for i in range(stands):
+            sx, sy = _along(x, y, spin, -length / 2 + 0.3 + 0.6 * i)
+            pieces.append((_box(sx, sy, base + 0.2, 0.04, 0.5, 0.4, spin), metal))
         # Seven in ten stands taken: a Dutch rack is never empty.
         for i in range(stands):
             if (i * 7) % 10 >= 7:
                 continue
             bx, by = _along(x, y, spin, -length / 2 + 0.3 + 0.6 * i)
-            pieces.append((_box(bx, by, base + 0.5, 1.75, 0.06, 0.95, spin + np.pi / 2), black))
+            pieces += _bicycle(bx, by, base, spin + np.pi / 2, black)
         return pieces
     if kind == 15:  # litter bin
         return [

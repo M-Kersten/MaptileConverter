@@ -61,6 +61,61 @@ class NeedleTipTests(unittest.TestCase):
         self.assertEqual(changed, 1)
 
 
+    def test_a_slit_into_the_walkway_is_filled(self):
+        """The same needle the other way round: road cutting 5 m into a
+        walkway at 7 degrees. The kerb's mitre runs up a slit as far."""
+        from src.layered import ROAD, WALKWAY, _blunt_walkway_tips
+
+        points = np.array([
+            [0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0],
+            [4.7, 0.0], [5.0, 5.0], [5.3, 0.0],  # the slit, from the south edge up
+            [5.0, -3.0],
+        ])
+        faces = [
+            [0, 4, 5, 6, 1, 2, 3],  # walkway round the slit
+            [4, 6, 5],  # the slit: road
+            [4, 7, 6],  # road below the walkway
+            [0, 7, 4], [6, 7, 1],
+        ]
+        sizes = np.array([len(f) for f in faces])
+        loops = np.concatenate(faces)
+        layer = np.array([WALKWAY, ROAD, ROAD, ROAD, ROAD])
+        material = np.array([2, 1, 1, 1, 1])
+        new_layer, new_material, changed = _blunt_walkway_tips(points, loops, sizes, layer, material)
+        self.assertEqual(int(new_layer[1]), WALKWAY)
+        self.assertEqual(int(new_material[1]), 2)
+        self.assertEqual(int(new_layer[2]), ROAD)
+        self.assertEqual(changed, 1)
+
+
+class ClipTests(unittest.TestCase):
+    def test_a_moat_round_the_area_keeps_its_island_dry(self):
+        """Bourtange: the moat is one polygon round the fortress, the fortress
+        its hole, and both cross the edge of the area. Clipped ring by ring,
+        the hole was lost and half the town was carved down to the moat."""
+        import shapely
+
+        from src.geo import BBox
+        from src.surfaces import clip_polygon_to_bbox
+
+        moat = [_ring(-100, -100, 100, 100), _ring(-60, -60, 60, 60)]
+        area = BBox(-30, -80, 30, 0)  # half in the moat, half on the island
+        pieces = clip_polygon_to_bbox(moat, area)
+        cut = shapely.union_all([shapely.Polygon(p[0], p[1:]) for p in pieces])
+        self.assertAlmostEqual(cut.area, 60 * 20, delta=1e-6)  # only the moat
+        self.assertFalse(cut.contains(shapely.Point(0, -30)))  # the island
+        self.assertTrue(cut.contains(shapely.Point(0, -70)))
+
+    def test_a_polygon_inside_the_area_comes_back_whole(self):
+        from src.geo import BBox
+        from src.surfaces import clip_polygon_to_bbox
+
+        rings = [_ring(0, 0, 10, 10), _ring(2, 2, 4, 4)]
+        (piece,) = clip_polygon_to_bbox(rings, BBox(-50, -50, 50, 50))
+        self.assertEqual(len(piece), 2)
+        np.testing.assert_allclose(piece[1], rings[1])
+
+
 class PavingTests(unittest.TestCase):
     def test_the_street_photos_give_the_hue_and_the_aerial_the_brightness(self):
         from src.paving import target_colours
@@ -254,13 +309,27 @@ class StairTests(unittest.TestCase):
 
         flight = public_flight(outline, ground_at=ground, survey_at=ground, source="bgt")
         self.assertIsNotNone(flight)
-        self.assertAlmostEqual(flight.rise_m, 2.0, delta=0.05)
-        self.assertEqual(flight.risers, 12)
+        self.assertAlmostEqual(flight.rise_m, 1.95, delta=0.05)
+        self.assertEqual(flight.risers, 11)
         tops = [top for _, top in flight.treads]
         self.assertTrue(all(b > a for a, b in zip(tops, tops[1:])))
-        self.assertAlmostEqual(tops[-1], 2.0, delta=0.05)
+        self.assertAlmostEqual(tops[-1], 1.975, delta=0.05)
         lowest = min(flight.treads, key=lambda t: t[1])[0][0]
         self.assertLess(np.asarray(lowest)[:, 0].max(), 0.5)  # the first tread at the low end
+
+    def test_a_flight_the_drawn_ground_does_not_climb_is_left_flat(self):
+        """The survey sees steps; the drawn ground, within its tolerance, is
+        flat there. Treads on it would climb to nothing."""
+        import shapely
+
+        from src.stairs import public_flight
+
+        outline = shapely.box(0.0, 0.0, 4.0, 1.5)
+        flight = public_flight(
+            outline, ground_at=lambda x, y: np.zeros(np.shape(x)),
+            survey_at=lambda x, y: np.asarray(x, float) * 0.5, source="osm", step_count=10,
+        )
+        self.assertIsNone(flight)
 
     def test_flat_ground_and_impossible_steepness_make_no_flight(self):
         import shapely

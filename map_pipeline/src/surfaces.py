@@ -264,6 +264,48 @@ def clip_ring_to_bbox(ring: np.ndarray, bbox: BBox) -> np.ndarray:
     return np.vstack([points, points[0]])
 
 
+def clip_polygon_to_bbox(rings, bbox: BBox) -> list[list[np.ndarray]]:
+    """A polygon with its holes, cut to the bbox as a whole: rings per piece.
+
+    Ring by ring is wrong as soon as a hole crosses the edge. Bourtange's moat
+    is one polygon round the whole fortress, the fortress its hole; clipped
+    one ring at a time the hole and the outline both ran along the bbox edge,
+    and the polygon that came out covered the hole: half the fortress was
+    carved down to the moat, 3.2 m under its square. Each piece comes back
+    as its outline and its holes, closed.
+    """
+    import shapely
+
+    from .terrain_mesh import _polygonal
+
+    rings = [np.asarray(r, dtype=np.float64)[:, :2] for r in rings]
+    rings = [r for r in rings if len(r) >= 3]
+    if not rings:
+        return []
+    outer = rings[0]
+    if (
+        outer[:, 0].min() >= bbox.xmin and outer[:, 0].max() <= bbox.xmax
+        and outer[:, 1].min() >= bbox.ymin and outer[:, 1].max() <= bbox.ymax
+    ):
+        # Wholly inside: as it was, every hole with it.
+        closed = [r if np.allclose(r[0], r[-1], rtol=0.0, atol=1e-6) else np.vstack([r, r[:1]]) for r in rings]
+        return [closed]
+    try:
+        polygon = shapely.make_valid(shapely.Polygon(outer, rings[1:]))
+        cut = _polygonal(polygon.intersection(shapely.box(bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax)))
+    except Exception:  # noqa: BLE001 - a broken outline is left out, as a sliver would be
+        return []
+    out = []
+    for part in getattr(cut, "geoms", [cut]):
+        if part.is_empty or part.area <= 0.0:
+            continue
+        out.append(
+            [np.asarray(part.exterior.coords)[:, :2]]
+            + [np.asarray(r.coords)[:, :2] for r in part.interiors]
+        )
+    return out
+
+
 # Returns more than this above the lowest over a water are not the water: a
 # moored boat, a barge, a pontoon, a jetty. Lidar barely reflects off water --
 # 0 to 3% of a harbour basin has a return at all -- and most of the few it has
@@ -464,19 +506,16 @@ def build_surfaces(
         for rings, level, was_measured in zip(found, levels, measured):
             if not np.isfinite(level):
                 continue
-            clipped = [clip_ring_to_bbox(ring, bbox) for ring in rings]
-            clipped = [ring for ring in clipped if len(ring) >= 3]
-            if not clipped:
-                continue
-            area = ring_area(clipped[0]) - sum(ring_area(r) for r in clipped[1:])
-            result.water.append(
-                WaterBody(
-                    rings=clipped,
-                    level_nap=float(level),
-                    area_m2=float(max(area, 0.0)),
-                    measured=bool(was_measured),
+            for clipped in clip_polygon_to_bbox(rings, bbox):
+                area = ring_area(clipped[0]) - sum(ring_area(r) for r in clipped[1:])
+                result.water.append(
+                    WaterBody(
+                        rings=clipped,
+                        level_nap=float(level),
+                        area_m2=float(max(area, 0.0)),
+                        measured=bool(was_measured),
+                    )
                 )
-            )
 
         if result.water:
             levels = np.array([b.level_nap for b in result.water])
@@ -548,11 +587,7 @@ def build_surfaces(
                     if level < 0:
                         continue
                     for group in groups:
-                        clipped = [
-                            clip_ring_to_bbox(ring, bbox) for ring in group
-                        ]
-                        clipped = [r for r in clipped if len(r) >= 3]
-                        if clipped:
+                        for clipped in clip_polygon_to_bbox(group, bbox):
                             result.roads.append(
                                 RoadPart(clipped, target, level)
                             )
@@ -847,13 +882,13 @@ def _ground_areas(bbox: BBox, fetch_kwargs: dict, result: SurfaceSet) -> list:
             except (TypeError, ValueError):
                 level = 0
             for rings in polygon_rings(feature.get("geometry")):
-                clipped = [clip_ring_to_bbox(ring, bbox) for ring in rings]
-                clipped = [ring for ring in clipped if len(ring) >= 4]
-                if clipped:
-                    areas.append(GroundArea(
-                        clipped, kind[0], kind[1], level,
-                        functie=str(properties.get("functie") or ""),
-                    ))
+                for clipped in clip_polygon_to_bbox(rings, bbox):
+                    clipped = [ring for ring in clipped if len(ring) >= 4]
+                    if clipped:
+                        areas.append(GroundArea(
+                            clipped, kind[0], kind[1], level,
+                            functie=str(properties.get("functie") or ""),
+                        ))
     counts: dict[str, int] = {}
     for area in areas:
         name = LAYER_NAMES[area.layer]
@@ -1218,6 +1253,7 @@ __all__ = [
     "WaterBody",
     "blend_surface_detail",
     "build_surfaces",
+    "clip_polygon_to_bbox",
     "clip_ring_to_bbox",
     "road_class",
     "triangulate_water",

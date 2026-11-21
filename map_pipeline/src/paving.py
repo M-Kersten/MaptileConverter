@@ -313,6 +313,12 @@ def target_colours(
             base, source = np.asarray(photo[material]["rgb"], dtype=np.float64), "street photos"
         else:
             base, source = np.asarray(paving.rgb, dtype=np.float64), "typical"
+            if material in aerial and paving.aerial_share > 0:
+                # Part of the way to what the aerial sees: a typical brick
+                # brightened to Bourtange's aerial came out orange.
+                share = 0.8 * paving.aerial_share
+                base = base * (1.0 - share) + np.asarray(aerial[material], dtype=np.float64) * share
+                source = "typical, toward the aerial"
         if material in aerial and paving.aerial_share > 0:
             ratio = float(luminance(np.asarray(aerial[material], dtype=np.float64)[None])[0]) / max(
                 float(luminance(base[None])[0]), 1.0

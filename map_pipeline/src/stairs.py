@@ -35,6 +35,7 @@ STOOP_RISE_M = (0.17, 1.2)  # what a stoop to a front door can be
 STOOP_DEFAULT_M = 0.51  # three steps, where the survey cannot say
 OSM_WIDTH_M = 1.5
 MIN_RUN_M = 0.8
+BURIED_M = 0.25  # how far the drawn ground may stand over a tread's corner
 MAX_STEEPNESS = 1.25  # rise over run: 51 degrees, a steep wharf stair
 
 
@@ -116,7 +117,7 @@ def cut_flight(polygon, direction, z_low: float, rise: float, *, riser_m: float 
     return treads, risers
 
 
-def _ends(polygon, direction, ground_at, inset_m: float = 0.3, beyond_m: float = 0.7):
+def _ends(polygon, direction, ground_at, inset_m: float = 0.3, beyond_m: float | None = 0.7):
     """The ground at the low and the high end of the flight.
 
     Read just beyond each end, on the street the flight leaves and the wharf
@@ -130,7 +131,7 @@ def _ends(polygon, direction, ground_at, inset_m: float = 0.3, beyond_m: float =
     high = coords[s >= s.max() - 0.6]
 
     def read(points, outward):
-        for offset in (beyond_m, -inset_m):
+        for offset in ((beyond_m, -inset_m) if beyond_m else (-inset_m,)):
             at = points + outward * offset
             z = np.asarray(ground_at(at[:, 0], at[:, 1]), dtype=np.float64)
             if np.isfinite(z).any():
@@ -155,7 +156,7 @@ def long_axis(polygon) -> tuple[np.ndarray, float]:
     return longest / max(np.hypot(*longest), 1e-9), float(lengths.max()) / max(short, 1e-6)
 
 
-def public_flight(polygon, *, ground_at, survey_at, source: str, step_count=None) -> Flight | None:
+def public_flight(polygon, *, ground_at, survey_at, source: str, step_count=None) -> Flight | None:  # noqa: ARG001
     """A flight of public steps over its outline, or None if it is flat.
 
     A flight climbs along its outline's long side, the treads across it, and
@@ -185,16 +186,15 @@ def public_flight(polygon, *, ground_at, survey_at, source: str, step_count=None
     if best is None:
         return None
     direction = best[0]
-    ends = _ends(polygon, direction, ground_at) or _ends(polygon, direction, survey_at)
+    # The treads stand on the ground as it is drawn, so their heights are
+    # its: just inside each end. The survey said which end is up.
+    ends = _ends(polygon, direction, ground_at, inset_m=0.05, beyond_m=None)
     if ends is None:
         return None
     z_low, z_high = ends
     rise = z_high - z_low
-    if rise < MIN_RISE_M and abs(best[1]) >= MIN_RISE_M:
-        # The drawn ground smooths what the survey shows: trust the survey.
-        rise = abs(best[1])
-    if rise < MIN_RISE_M and step_count:
-        rise = RISER_M * float(step_count)
+    # Ground drawn flat under steps the survey sees would leave them climbing
+    # to nothing: the ground decides.
     if not MIN_RISE_M <= rise <= MAX_RISE_M:
         return None
     coords = np.asarray(polygon.exterior.coords)[:, :2] @ direction
@@ -204,6 +204,13 @@ def public_flight(polygon, *, ground_at, survey_at, source: str, step_count=None
     if run < MIN_RUN_M or rise > MAX_STEEPNESS * run:
         return None
     treads, risers = cut_flight(polygon, direction, z_low, rise)
+    # No tread under the ground it stands in: a flight the drawn ground does
+    # not climb with is left as the ground.
+    for rings, top in treads:
+        ring = np.asarray(rings[0])[:, :2]
+        z = np.asarray(ground_at(ring[:, 0], ring[:, 1]), dtype=np.float64)
+        if np.isfinite(z).any() and float(np.nanmax(z) - top) > BURIED_M:
+            return None
     return Flight(treads, rise, risers, source) if treads else None
 
 
@@ -232,6 +239,16 @@ def stoop_flight(polygon, *, building, ground_at, surface_at=None) -> Flight | N
     if not np.isfinite(z_street).any():
         return None
     z_low = float(np.nanmedian(z_street))
+    # On a slope the ground under the stoop's far end would stand over its
+    # treads: up to 40 cm the stoop starts from the highest ground under it,
+    # past that it stays the block it was.
+    under = _sample_inside(polygon, 0.2)
+    z_under = np.asarray(ground_at(under[:, 0], under[:, 1]), dtype=np.float64)
+    if np.isfinite(z_under).any():
+        top_ground = float(np.nanmax(z_under))
+        if top_ground - z_low > 0.4:
+            return None
+        z_low = max(z_low, top_ground - 0.05)
     rise = STOOP_DEFAULT_M
     if surface_at is not None:
         pts = _sample_inside(polygon, 0.2)
