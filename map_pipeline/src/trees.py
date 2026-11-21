@@ -526,15 +526,19 @@ def detect_trees(
     )
     taken: dict = {}
 
-    def claim(x, y, reach, store):
+    def reserve(x, y, reach):
         key = (int(x // grid_size), int(y // grid_size))
+        taken.setdefault(key, []).append((x, y, reach))
+
+    def claim(x, y, reach):
+        """Reserve a crown at (x, y) unless it stands in one already reserved."""
+        col, row = int(x // grid_size), int(y // grid_size)
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
-                for ox, oy, oreach in taken.get((key[0] + dx, key[1] + dy), ()):
+                for ox, oy, oreach in taken.get((col + dx, row + dy), ()):
                     if np.hypot(x - ox, y - oy) < max(reach, oreach):
                         return False
-        if store:
-            taken.setdefault(key, []).append((x, y, reach))
+        reserve(x, y, reach)
         return True
 
     # Registered trees are placed first and never displaced: where the BGT has
@@ -545,6 +549,12 @@ def detect_trees(
     # four metres across, and its canopy peak sits nowhere near the surveyed
     # trunk -- which is why a flat three-metre reservation left a quarter of
     # the detections sitting inside a tree that was already there.
+    #
+    # And every one of them reserves, inside another's reservation or not: all
+    # of them stay in the model. Made to claim its spot the way a seed does,
+    # the second of two registered trees 2.77 m apart in central Arnhem lost
+    # to the first and reserved nothing, and the detector found its crown
+    # again 0.77 m from its trunk.
     fixed = np.asarray(registered_xy, dtype=np.float64).reshape(-1, 2)
     if registered_reach is None:
         reserved = np.full(len(fixed), min_spacing_m)
@@ -553,11 +563,11 @@ def detect_trees(
             np.asarray(registered_reach, dtype=np.float64).ravel(), min_spacing_m
         )
     for (x, y), reach in zip(fixed, reserved):
-        claim(float(x), float(y), float(reach), store=True)
+        reserve(float(x), float(y), float(reach))
 
     keep_x, keep_y, keep_h = [], [], []
     for x, y, height, reach in zip(xs, ys, heights, spacing):
-        if not claim(float(x), float(y), float(reach), store=True):
+        if not claim(float(x), float(y), float(reach)):
             continue
         keep_x.append(float(x))
         keep_y.append(float(y))
