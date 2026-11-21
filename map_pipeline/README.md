@@ -196,6 +196,34 @@ corporate proxy, or on a machine where only the pipeline process has network —
 the page detects that at startup and routes tiles through the local server
 instead.
 
+### Street photos in the UI
+
+Tick **Straatfoto's** under Lagen and the map shows where Mapillary has photos
+in the square, light dots for 360 photos, with the count beside the layer.
+Under it, **Ook als textuur op de gevels** lets Mapillary's photos become wall
+textures as well as measurements; leave it off unless the model may be shared
+under CC BY-SA (see [Street photos](#street-photos)).
+
+**Eigen foto's** holds your own photos of the area, kept under
+`photos/<name>/` on the machine running the UI and used by every build with
+that name. Add them with **Foto's toevoegen** or drop them on the map. Each
+shows where it stands: whether its position came from the photo or from you,
+whether its heading is known, and what is missing. A photo the phone placed
+and turned needs nothing more. For the rest:
+
+- **Plaatsen**: click on the map where the photo was taken, then where the
+  camera looked. The photo's marker shows its heading as a line.
+- **Vastpinnen**: click the four corners of one wall in the photo, top left,
+  top right, bottom right, bottom left, then click that wall on the map. Top
+  is the wall's own roofline at its two ends. The pin fixes the camera exactly,
+  so it suits photos without GPS or with a compass that was off. The whole wall
+  has to be in the photo: a long block photographed from close by cannot be
+  pinned, its ends are not in the picture.
+
+**Bekijken** on a model built with photos shows a Straatfoto's section: how
+many photos there were, how many passed the check, how many walls were read
+and how many wear their photo, then the coverage map and the photo checks.
+
 ### The 3D view
 
 **In 3D** on a model's card, in its dialog or on a finished run opens the model

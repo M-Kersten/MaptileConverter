@@ -11,3 +11,6 @@ venv/
 
 # A personal Mapillary access token, read by src/mapillary.py. Never commit it.
 map_pipeline/mapillary_token.txt
+
+# Photos dropped on the page, one folder per area.
+map_pipeline/photos/

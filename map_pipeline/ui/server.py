@@ -93,10 +93,12 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     "rails":              {"c": 0.3, "a": 4.0,  "m": 0.0},
     # Two collections, plus the surface model when trees are off.
     "structures":         {"c": 0.5, "a": 6.0,  "m": 0.0},
-    # Mapillary answers a tile in two to four seconds and a square kilometre
-    # takes about 25 of them; scoring the views was 5 s over 300 m of central
-    # Arnhem, where 360 cameras have been down every street.
-    "photos":             {"c": 3.0, "a": 130.0, "m": 0.0},
+    # Mapillary's search, then checking each photo against the model (at
+    # most 250, a third of a second each), reading the walls, and baking the
+    # textures. Over 300 m of central Arnhem the whole stage took about two
+    # minutes with its photos cached; fetching full-size 360 photos for
+    # textures the first time adds minutes on top, which no area can predict.
+    "photos":             {"c": 60.0, "a": 240.0, "m": 0.0},
     "facade":             {"c": 1.0, "a": 0.0,  "m": 0.0},
     "scene":              {"c": 0.3, "a": 0.0,  "m": 0.0},
     "blender":            {"c": 2.0, "a": 8.0,  "m": 0.0},
@@ -413,6 +415,16 @@ def build_config(payload: dict) -> dict:
         }
 
     apply_selection(config, selected)
+
+    # Photos dropped on the page for this area are used whenever there are
+    # any; the Mapillary layer is a source of its own.
+    from src.photo_folder import folder_for, photos_in
+
+    name = str(payload.get("name", ""))
+    if name and area_name_ok(name) and photos_in(folder_for(REPO_ROOT, name)):
+        config.setdefault("photos", {})["folder"] = str(folder_for(REPO_ROOT, name))
+    if payload.get("photo_textures") in ("own", "all", "off"):
+        config.setdefault("photos", {})["textures"] = payload["photo_textures"]
     return config
 
 
@@ -505,6 +517,14 @@ def area_summary(name: str) -> dict | None:
                 {"name": path.stem, "url": f"/output/{name}/preview/{path.name}"}
             )
 
+    photo_checks = []
+    checks_dir = out_dir / "photo_checks"
+    if checks_dir.is_dir():
+        for path in sorted(checks_dir.glob("*.jpg")):
+            photo_checks.append(
+                {"name": path.stem, "url": f"/output/{name}/photo_checks/{path.name}"}
+            )
+
     return {
         "name": name,
         "modified": datetime.fromtimestamp(
@@ -514,6 +534,7 @@ def area_summary(name: str) -> dict | None:
         "validation": validation,
         "files": files,
         "previews": previews,
+        "photo_checks": photo_checks,
         "settings": area_settings(name),
         # Whether the 3D view can be opened, asked without starting anything:
         # "unavailable" is the one state where it cannot.
@@ -813,6 +834,7 @@ class Handler(BaseHTTPRequestHandler):
             ".json": "application/json; charset=utf-8",
             ".png": "image/png",
             ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
             ".fbx": "application/octet-stream",
             ".glb": "model/gltf-binary",
             ".txt": "text/plain; charset=utf-8",
@@ -866,6 +888,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route in ("/icon.svg", "/logo-dark.svg", "/logo-light.svg", "/viewer.js"):
             self.serve_file(UI_DIR / route.lstrip("/"), UI_DIR)
+            return
+
+        if route.startswith("/api/photos") or route == "/api/mapillary":
+            self.photos_get(route, query)
             return
 
         if route == "/api/viewer":
@@ -1131,9 +1157,95 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_json({"error": "not found"}, status=404)
 
+    # -- photos ----------------------------------------------------------
+
+    def _photo_folder(self, area: str):
+        from src.photo_folder import folder_for
+
+        if not area_name_ok(area):
+            raise ValueError("give the area a name of letters, digits, dots, dashes or underscores")
+        return folder_for(REPO_ROOT, area)
+
+    def photos_get(self, route: str, query: dict) -> None:
+        from src import photo_folder
+
+        try:
+            if route == "/api/mapillary":
+                sys.path.insert(0, str(REPO_ROOT))
+                from src.geo import BBox
+
+                box = BBox(*(float((query.get(k) or ["0"])[0]) for k in ("xmin", "ymin", "xmax", "ymax")))
+                if box.width > 2500 or box.height > 2500:
+                    self.send_json({"error": "zoom in: at most 2.5 km across"}, status=400)
+                    return
+                found = photo_folder.mapillary_points(box, REPO_ROOT / "work" / "_mapillary_preview")
+                self.send_json({**found, "count": found["total"]})
+                return
+            folder = self._photo_folder((query.get("area") or [""])[0])
+            name = (query.get("name") or [""])[0]
+            if route == "/api/photos":
+                self.send_json({"photos": photo_folder.describe(folder)})
+            elif route == "/api/photos/thumb":
+                self.send_bytes(photo_folder.thumbnail(folder, name), "image/jpeg")
+            elif route == "/api/photos/file":
+                self.serve_file(folder / photo_folder.safe_name(name), folder)
+            else:
+                self.send_json({"error": "not found"}, status=404)
+        except FileNotFoundError:
+            self.send_json({"error": "no such photo"}, status=404)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+        except Exception as exc:  # noqa: BLE001 - reported to the page, not swallowed
+            self.send_json({"error": str(exc)}, status=502)
+
+    def photos_post(self, route: str, query: dict) -> None:
+        from src import photo_folder
+
+        try:
+            if route == "/api/photos/upload":
+                folder = self._photo_folder((query.get("area") or [""])[0])
+                length = int(self.headers.get("Content-Length", 0))
+                if length > photo_folder.MAX_UPLOAD_BYTES:
+                    raise ValueError("a photo may be at most 80 MB")
+                data = self.rfile.read(length)
+                stored = photo_folder.save_upload(folder, (query.get("name") or ["photo.jpg"])[0], data)
+                self.send_json({"ok": True, "name": stored})
+                return
+            payload = self.read_json()
+            folder = self._photo_folder(str(payload.get("area", "")))
+            name = str(payload.get("name", ""))
+            if route == "/api/photos/pose":
+                heading = payload.get("heading")
+                side = photo_folder.set_pose(
+                    folder, name, x=float(payload["x"]), y=float(payload["y"]),
+                    heading=None if heading is None else float(heading),
+                )
+            elif route == "/api/photos/pin":
+                if payload.get("clear"):
+                    side = photo_folder.clear_pin(folder, name)
+                else:
+                    side = photo_folder.set_pin(
+                        folder, name, corners=payload["corners"],
+                        x=float(payload["x"]), y=float(payload["y"]),
+                    )
+            elif route == "/api/photos/delete":
+                photo_folder.delete_photo(folder, name)
+                side = {}
+            else:
+                self.send_json({"error": "not found"}, status=404)
+                return
+            self.send_json({"ok": True, "sidecar": side})
+        except FileNotFoundError:
+            self.send_json({"error": "no such photo"}, status=404)
+        except (ValueError, KeyError, TypeError) as exc:
+            self.send_json({"error": str(exc)}, status=400)
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
+        if route.startswith("/api/photos/"):
+            self.photos_post(route, urllib.parse.parse_qs(parsed.query))
+            return
 
         if route == "/api/run":
             try:

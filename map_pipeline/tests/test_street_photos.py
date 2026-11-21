@@ -1355,6 +1355,75 @@ class PinTests(unittest.TestCase):
         self.assertIn("corners", why)
 
 
+class PhotoFolderTests(unittest.TestCase):
+    def _jpeg_bytes(self, size=(400, 300), exif=None) -> bytes:
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", size, (100, 120, 140)).save(buffer, "JPEG", **({"exif": exif} if exif is not None else {}))
+        return buffer.getvalue()
+
+    def test_upload_place_pin_and_delete(self) -> None:
+        from src import photo_folder
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = photo_folder.folder_for(Path(tmp), "arnhem")
+            name = photo_folder.save_upload(folder, "../../Hof van IMG 1.JPG", self._jpeg_bytes(exif=_gps_exif(51.98, 5.91, 90.0, 26)))
+            self.assertEqual(name, "Hof_van_IMG_1.jpg")
+            again = photo_folder.save_upload(folder, "Hof van IMG 1.jpg", self._jpeg_bytes())
+            self.assertEqual(again, "Hof_van_IMG_1-1.jpg")
+            listed = {p["name"]: p for p in photo_folder.describe(folder)}
+            self.assertTrue(listed[name]["usable"])
+            self.assertIsNotNone(listed[name]["heading"])
+            self.assertFalse(listed[again]["usable"])  # no GPS, no sidecar
+            photo_folder.set_pose(folder, again, x=190900.0, y=443400.0, heading=45.0)
+            listed = {p["name"]: p for p in photo_folder.describe(folder)}
+            self.assertTrue(listed[again]["usable"])
+            self.assertAlmostEqual(listed[again]["heading"], 45.0, places=3)
+            self.assertTrue(listed[again]["placed_by_hand"])
+            photo_folder.set_pin(folder, again, corners=[[1, 2], [3, 4], [5, 6], [7, 8]], x=190910.0, y=443410.0)
+            side = photo_folder.read_sidecar(folder, again)
+            self.assertEqual(side["pin"]["corners"][2], [5.0, 6.0])
+            self.assertEqual(side["heading"], 45.0)  # the pose survives the pin
+            photo_folder.clear_pin(folder, again)
+            self.assertNotIn("pin", photo_folder.read_sidecar(folder, again))
+            thumb = photo_folder.thumbnail(folder, name)
+            self.assertTrue(thumb.startswith(b"\xff\xd8"))
+            photo_folder.delete_photo(folder, again)
+            self.assertEqual([p["name"] for p in photo_folder.describe(folder)], [name])
+
+    def test_refuses_what_is_not_a_photo(self) -> None:
+        from src import photo_folder
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "a"
+            with self.assertRaises(ValueError):
+                photo_folder.save_upload(folder, "script.py", b"print(1)")
+            with self.assertRaises(ValueError):
+                photo_folder.save_upload(folder, "fake.jpg", b"not an image at all")
+            with self.assertRaises(ValueError):
+                photo_folder.set_pin(folder, "x.exe", corners=[], x=0, y=0)
+
+    def test_build_uses_the_area_photos(self) -> None:
+        from unittest import mock
+
+        server = _server()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from src import photo_folder
+
+            photo_folder.save_upload(photo_folder.folder_for(root, "plein"), "a.jpg", self._jpeg_bytes())
+            with mock.patch.object(server, "REPO_ROOT", root):
+                config = server.build_config({
+                    "name": "plein", "bbox": {"xmin": 0, "ymin": 0, "xmax": 300, "ymax": 300},
+                    "photo_textures": "all",
+                })
+                bare = server.build_config({"name": "leeg", "bbox": {"xmin": 0, "ymin": 0, "xmax": 300, "ymax": 300}})
+        self.assertEqual(config["photos"]["folder"], str(root / "photos" / "plein"))
+        self.assertEqual(config["photos"]["textures"], "all")
+        self.assertNotIn("folder", bare.get("photos", {}))
+
+
 def _server():
     import importlib.util
 

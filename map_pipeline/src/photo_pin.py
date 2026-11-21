@@ -133,12 +133,24 @@ def pose_from_corners(
 
 def wall_corners(face, building) -> np.ndarray:
     """The four corners of a wall as a person sees them: top left, top
-    right, bottom right, bottom left, from outside. Its top is the eaves,
-    which is what someone marking a gable end clicks, not the ridge."""
-    top = float(building.wall_top_nap or face.z_max)
+    right, bottom right, bottom left, from outside.
+
+    The top of each end is the wall's own height there, read from its
+    triangles: that is the roofline someone clicks. The building's eaves
+    height is not, on a stepped building whose taller part is elsewhere,
+    and a gable's apex is in the middle, not at the ends. The bottom is the
+    street.
+    """
+    tangent = (face.end - face.start) / max(face.width_m, 1e-9)
+    corners = face.triangles.reshape(-1, 3)
+    along = (corners[:, :2] - face.start) @ tangent
+    near_start = along <= along.min() + 0.3
+    near_end = along >= along.max() - 0.3
+    top_start = float(corners[near_start, 2].max())
+    top_end = float(corners[near_end, 2].max())
     bottom = float(building.ground_z_nap)
     (x0, y0), (x1, y1) = face.start, face.end
-    return np.array([[x0, y0, top], [x1, y1, top], [x1, y1, bottom], [x0, y0, bottom]])
+    return np.array([[x0, y0, top_start], [x1, y1, top_end], [x1, y1, bottom], [x0, y0, bottom]])
 
 
 def nearest_face(faces, x: float, y: float, *, exposed_only: bool = True) -> int | None:

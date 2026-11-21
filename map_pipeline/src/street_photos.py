@@ -259,7 +259,9 @@ def build_street_photos(
     result.coverage = coverage
     write_coverage(coverage, work_dir / "photo_coverage.json")
 
-    if photos_cfg.get("read_facades", True) and result.alignments:
+    # Read when some photo is trusted: checked against the model, or pinned
+    # to a wall by hand, which skips the check.
+    if photos_cfg.get("read_facades", True) and any(p.verified for p in result.photos):
         read_facades(
             result, coverage, buildings, terrain, work_dir, out_dir,
             photos_cfg=photos_cfg, bbox=bbox, aerial_path=aerial_path, trees=trees,

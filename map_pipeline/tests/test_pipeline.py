@@ -11544,14 +11544,17 @@ class TestUIPage(unittest.TestCase):
         """The ask was fewer controls. What is left: where, which style, how
         much detail, which layers, and whether to add collision shapes and
         previews -- and, for the layered style only, the ground layout, asked
-        for so the grid and the ribcage can be built side by side."""
+        for so the grid and the ribcage can be built side by side. And two for
+        street photos: adding your own, and whether Mapillary's may become
+        wall textures, which is a licence decision no default can make."""
         self.assertNotIn('type="range"', self.html)
         controls = set(re.findall(r'<(?:input|select)[^>]*\bid="(\w+)"', self.html))
         groups = set(re.findall(r'<input type="radio" name="(\w+)"', self.html))
         # The model list's own search and style filter are not build settings.
         self.assertEqual(
             (controls | groups) - {"modelStyle", "modelFilter"},
-            {"q", "size", "name", "style", "detail", "mesher", "preview", "collision"},
+            {"q", "size", "name", "style", "detail", "mesher", "preview", "collision",
+             "photoInput", "mlyTextures"},
         )
 
     def test_the_styles_match_the_server(self):

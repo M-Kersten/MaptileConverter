@@ -256,6 +256,34 @@
   @keyframes pulse { to { opacity: .3; } }
   .optrow { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 15px; line-height: 20px; }
   .optrow label { flex: 1 1 auto; cursor: pointer; }
+  /* Street photos: markers on the map, the own-photo list, the pin dialog. */
+  #marks { position: absolute; inset: 0; pointer-events: none; }
+  #mlyCanvas { position: absolute; inset: 0; pointer-events: none; }
+  .pmark { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%;
+    background: var(--signal-bright); border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+  .pmark.sel { outline: 3px solid #fff; }
+  .pmark .ray { position: absolute; left: 5px; top: -22px; width: 2px; height: 22px; background: #fff;
+    transform-origin: 1px 29px; box-shadow: 0 0 3px rgba(0,0,0,.6); }
+  .pmark.pinned { background: #3ddc97; }
+  #mapHint { position: absolute; left: 50%; top: 92px; transform: translateX(-50%); padding: 10px 16px;
+    font-size: 14px; z-index: 5; }
+  .subopt { padding: 0 0 8px 22px; border: 0; font-size: 13px; }
+  .subopt label { color: var(--text-secondary); }
+  #ownPhotos { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+  .ophoto { display: flex; gap: 10px; align-items: flex-start; font-size: 13px; line-height: 17px;
+    padding-top: 6px; border-top: 1px solid var(--line); }
+  .ophoto img { width: 64px; height: 48px; object-fit: cover; border-radius: var(--radius-xs); flex: none; cursor: pointer; }
+  .ophoto .what { flex: 1 1 auto; min-width: 0; }
+  .ophoto .what b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .ophoto .what span { display: block; color: var(--text-muted); }
+  .ophoto .acts { display: flex; gap: 2px; margin: 2px 0 0 -8px; }
+  .ophoto .acts button { padding: 2px 8px; font-size: 12px; min-height: 0; }
+  #pinStage { position: relative; display: inline-block; max-width: 100%; cursor: crosshair; }
+  #pinStage img { display: block; max-width: 100%; max-height: 70vh; }
+  .pindot { position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%;
+    background: var(--signal-bright); color: #000; font: 600 12px/22px var(--mono); text-align: center;
+    border: 2px solid #fff; pointer-events: none; }
+  #pinOutline { position: absolute; inset: 0; pointer-events: none; }
   details.adv summary { cursor: pointer; font-size: 14px; color: var(--text-muted); padding: 4px 0; }
   .kv { font: 12px/18px var(--mono); color: var(--text-secondary); white-space: pre; overflow-x: auto; margin: 6px 0; }
   .kv b { color: var(--text-muted); font-weight: 400; }
@@ -457,6 +485,9 @@
   <div id="map">
     <div id="tiles"></div>
     <div id="sel"><div id="selLabel"></div></div>
+    <canvas id="mlyCanvas"></canvas>
+    <div id="marks"></div>
+    <div class="float" id="mapHint" hidden></div>
     <div id="zoomUI">
       <button id="zin" aria-label="Inzoomen">+</button>
       <button id="zout" aria-label="Uitzoomen">&minus;</button>
@@ -505,6 +536,17 @@
     <p class="muted caption">Grond, gebouwen en luchtfoto zitten er altijd in. Deze voegen de rest toe.</p>
     <div id="sources">beschikbaarheid controleren&hellip;</div>
     <div class="caption" id="sourcesNote"></div>
+
+    <span class="overline" style="margin-top:8px">Eigen foto's
+      <span class="help" tabindex="0" role="button" aria-label="Over eigen foto's"
+        data-tip="Foto's van plekken waar Mapillary niet kwam: een binnenplaats, een kade, een zijgevel. Een telefoon schrijft er meestal zelf de plek en de kijkrichting in; een 360-camera de plek. Ontbreekt iets, zet de foto dan zelf op de kaart met <b>Plaatsen</b>, of pin hem aan een muur met <b>Vastpinnen</b>: klik de vier hoeken van een muur in de foto en daarna die muur op de kaart. Ze horen bij de naam van het gebied.">?</span>
+    </span>
+    <div id="ownPhotos"></div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <label class="btn outline" for="photoInput" style="cursor:pointer">Foto's toevoegen</label>
+      <input type="file" id="photoInput" accept="image/jpeg,image/png" multiple hidden>
+      <span class="muted caption" id="ownPhotosNote"></span>
+    </div>
 
     <span class="overline" style="margin-top:8px">Uitvoer</span>
     <div class="optrow">
@@ -690,6 +732,24 @@
   <div class="dbody" id="out"></div>
 </dialog>
 
+<dialog id="pinDialog" aria-labelledby="pinTitle">
+  <div class="dhead">
+    <h2 id="pinTitle">Vastpinnen aan een muur</h2>
+    <div style="display:flex;gap:8px">
+      <button class="btn ghost" id="pinReset">Opnieuw</button>
+      <button class="btn ghost" id="pinClear">Pin weghalen</button>
+      <button class="btn primary" id="pinWall" disabled>Muur aanwijzen op de kaart</button>
+      <button class="btn ghost icon" id="pinClose" aria-label="Sluiten">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+  </div>
+  <div class="dbody">
+    <p class="muted small" style="margin:0 0 10px">Klik de vier hoeken van één muur, zoals je ze ziet: <b>linksboven, rechtsboven, rechtsonder, linksonder</b>. Boven is de dakgoot, onder de straat. Staat een hoek net buiten de foto, klik dan op de rand.</p>
+    <div id="pinStage"><img id="pinImg" alt=""><svg id="pinOutline"></svg></div>
+  </div>
+</dialog>
+
 <dialog id="logDialog" aria-labelledby="logTitle">
   <div class="dhead">
     <h2 id="logTitle">Logboek</h2>
@@ -836,6 +896,338 @@ function probeTileSource() {
   });
 }
 
+/* ---------------------------------------------------------------------------
+   Street photos.
+
+   Your own photos belong to the area's name: dropped here, they are stored
+   on the server under photos/<name>/ and a build with that name uses them.
+   Each can be put on the map by hand (two clicks: where it was taken, then
+   where it looked) or pinned to a wall (four corners in the photo, then the
+   wall on the map). Mapillary's coverage is drawn as dots once the
+   Straatfoto's layer is on.
+
+   State is declared with var: render() can run before this block's lines
+   have, and a let would not exist yet.
+--------------------------------------------------------------------------- */
+var ownPhotos = [];
+var mlyPoints = [];
+var mlyKey = "";
+var mlyTimer = null;
+var mlyTextures = false;
+var placing = null;        // { kind: "pose" | "wall", name, pos?, corners? }
+var selectedPhoto = "";
+var pinCorners = [];
+var pinName = "";
+
+function showError(message) {
+  $("banner").innerHTML = `<div class="err" style="margin-bottom:8px">${escapeHtml(message)}</div>`;
+}
+
+function areaName() {
+  const name = $("name").value.trim();
+  return /^[A-Za-z0-9._-]+$/.test(name) ? name : "";
+}
+
+function mapillarySubOption() {
+  const row = document.createElement("div");
+  row.className = "optrow subopt";
+  row.innerHTML = `<input type="checkbox" class="switch" id="mlyTextures">
+    <label for="mlyTextures">Ook als textuur op de gevels</label>
+    <span class="help" tabindex="0" role="button" aria-label="Over Mapillary als textuur"
+      data-tip="Gevels die een Mapillary-foto scherp en recht van voren ziet, krijgen die foto als textuur. Mapillary-foto's zijn <b>CC BY-SA 4.0</b>: een textuur ervan noem je met de fotografen (photo_credits.json) en deel je onder dezelfde licentie. Uit: Mapillary meet alleen kleur, ramen en verdiepingen, en alleen je eigen foto's worden textuur.">?</span>`;
+  const box = row.querySelector("input");
+  box.checked = mlyTextures;
+  box.onchange = () => { mlyTextures = box.checked; };
+  return row;
+}
+
+function mapillaryOn() {
+  const s = (sourceList || []).find(s => s.id === "mapillary");
+  return !!(s && sourceOn(s));
+}
+
+function hint(text) {
+  const el = $("mapHint");
+  if (!text) { el.hidden = true; return; }
+  el.innerHTML = text;
+  el.hidden = false;
+}
+
+async function loadOwnPhotos() {
+  const area = areaName();
+  if (!area) { ownPhotos = []; renderOwnPhotos(); renderMarkers(); return; }
+  try {
+    const r = await fetch(`/api/photos?area=${encodeURIComponent(area)}`);
+    const d = await r.json();
+    ownPhotos = d.photos || [];
+  } catch { ownPhotos = []; }
+  renderOwnPhotos();
+  renderMarkers();
+}
+
+/* The pipeline's reasons are English; the page says them in Dutch. */
+const PHOTO_PROBLEM = [
+  [/^no position/, "nog geen plek: zet hem op de kaart met Plaatsen, of pin hem vast"],
+  [/^unreadable GPS/, "de GPS-plek in de foto is onleesbaar: zet hem zelf op de kaart"],
+  [/^not an image/, "geen foto die gelezen kan worden"],
+];
+
+function photoStatus(p) {
+  if (!p.usable) {
+    const known = PHOTO_PROBLEM.find(([re]) => re.test(p.problem || ""));
+    return known ? known[1] : ("niet bruikbaar" + (p.problem ? ": " + p.problem : ""));
+  }
+  const bits = [];
+  bits.push(p.kind === "spherical" ? "360°" : "foto");
+  if (p.pinned) bits.push("vastgepind");
+  else if (p.placed_by_hand) bits.push("zelf geplaatst");
+  else bits.push("plek uit de foto");
+  if (p.heading == null && !p.pinned) bits.push("richting onbekend");
+  return bits.join(" · ");
+}
+
+function renderOwnPhotos() {
+  const host = $("ownPhotos");
+  const area = areaName();
+  host.innerHTML = "";
+  $("ownPhotosNote").textContent = area
+    ? (ownPhotos.length ? `${ownPhotos.length} bij "${area}"` : "")
+    : "geef het gebied eerst een naam";
+  for (const p of ownPhotos) {
+    const row = document.createElement("div");
+    row.className = "ophoto";
+    row.innerHTML = `<img alt="" loading="lazy" src="/api/photos/thumb?area=${encodeURIComponent(area)}&name=${encodeURIComponent(p.name)}">
+      <div class="what"><b title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</b><span>${escapeHtml(photoStatus(p))}</span>
+        <div class="acts">
+          <button class="btn ghost" data-act="place" title="Zet de foto op de kaart: klik waar hij genomen is, daarna waar de camera naar keek">Plaatsen</button>
+          <button class="btn ghost" data-act="pin" title="Klik de vier hoeken van een muur in de foto, daarna die muur op de kaart">Vastpinnen</button>
+          <button class="btn ghost" data-act="delete" title="Foto weghalen">Weghalen</button>
+        </div>
+      </div>`;
+    row.querySelector('[data-act="place"]').onclick = () => startPlacing(p.name);
+    row.querySelector('[data-act="pin"]').onclick = () => openPin(p.name);
+    row.querySelector('[data-act="delete"]').onclick = () => deletePhoto(p.name);
+    row.querySelector("img").onclick = () => {
+      selectedPhoto = p.name;
+      if (p.x != null) { view.x = p.x; view.y = p.y; render(); } else renderMarkers();
+    };
+    host.appendChild(row);
+  }
+}
+
+async function uploadPhotos(files) {
+  const area = areaName();
+  if (!area) { showError("Geef het gebied eerst een naam; de foto's horen bij die naam."); return; }
+  let done = 0;
+  for (const file of files) {
+    $("ownPhotosNote").textContent = `uploaden ${done + 1} van ${files.length}…`;
+    try {
+      const r = await fetch(`/api/photos/upload?area=${encodeURIComponent(area)}&name=${encodeURIComponent(file.name)}`,
+        { method: "POST", body: file });
+      const d = await r.json();
+      if (!r.ok) showError(`${file.name}: ${d.error || r.status}`);
+    } catch (err) { showError(`${file.name}: ${err}`); }
+    done++;
+  }
+  await loadOwnPhotos();
+}
+
+async function postPhoto(route, body) {
+  const r = await fetch(route, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ area: areaName(), ...body }) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) showError(d.error || `fout ${r.status}`);
+  return r.ok;
+}
+
+async function deletePhoto(name) {
+  if (!confirm(`${name} weghalen?`)) return;
+  await postPhoto("/api/photos/delete", { name });
+  await loadOwnPhotos();
+}
+
+function startPlacing(name) {
+  placing = { kind: "pose", name };
+  selectedPhoto = name;
+  hint(`<b>${escapeHtml(name)}</b>: klik op de kaart waar de foto genomen is. <span class="muted">Esc stopt.</span>`);
+}
+
+async function placingClick(p) {
+  if (placing.kind === "pose" && !placing.pos) {
+    placing.pos = p;
+    hint(`Klik nu waar de camera naar keek. <span class="muted">Esc stopt.</span>`);
+    renderMarkers();
+    return;
+  }
+  const job = placing;
+  placing = null;
+  hint("");
+  if (job.kind === "pose") {
+    const heading = (Math.atan2(p.x - job.pos.x, p.y - job.pos.y) * 180 / Math.PI + 360) % 360;
+    await postPhoto("/api/photos/pose", { name: job.name, x: job.pos.x, y: job.pos.y, heading });
+  } else if (job.kind === "wall") {
+    await postPhoto("/api/photos/pin", { name: job.name, corners: job.corners, x: p.x, y: p.y });
+  }
+  await loadOwnPhotos();
+}
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && placing) { placing = null; hint(""); renderMarkers(); }
+});
+
+function renderMarkers() {
+  const host = $("marks");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const p of ownPhotos) {
+    if (p.x == null) continue;
+    const at = toScreen(p.x, p.y);
+    const dot = document.createElement("div");
+    dot.className = "pmark" + (p.pinned ? " pinned" : "") + (p.name === selectedPhoto ? " sel" : "");
+    dot.style.left = at.sx + "px";
+    dot.style.top = at.sy + "px";
+    dot.title = p.name;
+    if (p.heading != null) {
+      const ray = document.createElement("div");
+      ray.className = "ray";
+      // Screen y points down, so a compass bearing is a plain rotation of
+      // an arrow drawn pointing up.
+      ray.style.transform = `rotate(${p.heading}deg)`;
+      dot.appendChild(ray);
+    }
+    host.appendChild(dot);
+  }
+  if (placing && placing.pos) {
+    const at = toScreen(placing.pos.x, placing.pos.y);
+    const dot = document.createElement("div");
+    dot.className = "pmark sel";
+    dot.style.left = at.sx + "px";
+    dot.style.top = at.sy + "px";
+    host.appendChild(dot);
+  }
+  drawMapillary();
+}
+
+function drawMapillary() {
+  const canvas = $("mlyCanvas");
+  if (!canvas) return;
+  const { w, h } = viewport();
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const g = canvas.getContext("2d");
+  g.clearRect(0, 0, w, h);
+  if (!mapillaryOn()) return;
+  const key = `${Math.round(sel.x)},${Math.round(sel.y)},${Math.round(sel.size)}`;
+  if (key !== mlyKey) {
+    mlyKey = key;
+    clearTimeout(mlyTimer);
+    mlyTimer = setTimeout(loadMapillary, 700);
+  }
+  for (const p of mlyPoints) {
+    const at = toScreen(p.x, p.y);
+    if (at.sx < -4 || at.sy < -4 || at.sx > w + 4 || at.sy > h + 4) continue;
+    g.fillStyle = p.pano ? "rgba(64, 200, 255, .9)" : "rgba(64, 140, 255, .65)";
+    g.beginPath();
+    g.arc(at.sx, at.sy, p.pano ? 2.4 : 1.8, 0, Math.PI * 2);
+    g.fill();
+  }
+}
+
+async function loadMapillary() {
+  if (!mapillaryOn() || sel.size > 2500) { mlyPoints = []; return; }
+  const half = sel.size / 2 + 40;
+  const q = new URLSearchParams({ xmin: sel.x - half, ymin: sel.y - half, xmax: sel.x + half, ymax: sel.y + half });
+  try {
+    const r = await fetch(`/api/mapillary?${q}`);
+    const d = await r.json();
+    mlyPoints = d.points || [];
+    const panos = d.panos ?? mlyPoints.filter(p => p.pano).length;
+    const s = (sourceList || []).find(s => s.id === "mapillary");
+    if (s) {
+      s.coverage = d.error ? "" : ` · ${nl(d.total ?? mlyPoints.length)} foto's hier, ${nl(panos)} in 360°`;
+      const who = document.querySelector('.src[data-id="mapillary"] .who');
+      if (who) who.textContent = `${datasetOf(s)}${s.missing === "token" ? " · geen sleutel" : ""}${s.coverage}`;
+    }
+  } catch { mlyPoints = []; }
+  renderMarkers();
+}
+
+function openPin(name) {
+  pinName = name;
+  pinCorners = [];
+  const img = $("pinImg");
+  img.src = `/api/photos/file?area=${encodeURIComponent(areaName())}&name=${encodeURIComponent(name)}`;
+  $("pinTitle").textContent = `Vastpinnen: ${name}`;
+  drawPin();
+  $("pinDialog").showModal();
+}
+
+function drawPin() {
+  const stage = $("pinStage"), img = $("pinImg");
+  stage.querySelectorAll(".pindot").forEach(d => d.remove());
+  const sx = img.clientWidth / (img.naturalWidth || 1), sy = img.clientHeight / (img.naturalHeight || 1);
+  const pts = pinCorners.map(([u, v]) => [u * sx, v * sy]);
+  pts.forEach(([x, y], i) => {
+    const d = document.createElement("div");
+    d.className = "pindot";
+    d.style.left = x + "px";
+    d.style.top = y + "px";
+    d.textContent = String(i + 1);
+    stage.appendChild(d);
+  });
+  const svg = $("pinOutline");
+  svg.setAttribute("width", img.clientWidth);
+  svg.setAttribute("height", img.clientHeight);
+  svg.innerHTML = pts.length > 1
+    ? `<polyline points="${pts.concat(pts.length === 4 ? [pts[0]] : []).map(p => p.join(",")).join(" ")}" fill="none" stroke="#fff" stroke-width="2" stroke-dasharray="6 4"/>`
+    : "";
+  $("pinWall").disabled = pinCorners.length !== 4;
+}
+
+$("pinImg").addEventListener("load", drawPin);
+$("pinStage").addEventListener("click", e => {
+  if (pinCorners.length >= 4) return;
+  const img = $("pinImg");
+  const rect = img.getBoundingClientRect();
+  // In the photo's own pixels, upright: the browser shows a phone photo the
+  // way its orientation flag says, and the pipeline reads it the same way.
+  const u = (e.clientX - rect.left) / rect.width * img.naturalWidth;
+  const v = (e.clientY - rect.top) / rect.height * img.naturalHeight;
+  pinCorners.push([Math.round(u * 10) / 10, Math.round(v * 10) / 10]);
+  drawPin();
+});
+$("pinReset").onclick = () => { pinCorners = []; drawPin(); };
+$("pinClose").onclick = () => $("pinDialog").close();
+$("pinClear").onclick = async () => {
+  await postPhoto("/api/photos/pin", { name: pinName, clear: true });
+  $("pinDialog").close();
+  await loadOwnPhotos();
+};
+$("pinWall").onclick = () => {
+  placing = { kind: "wall", name: pinName, corners: pinCorners.slice() };
+  $("pinDialog").close();
+  hint(`<b>${escapeHtml(pinName)}</b>: klik op de kaart op de muur waarvan je de hoeken aanwees. <span class="muted">Esc stopt.</span>`);
+};
+
+$("photoInput").addEventListener("change", e => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  if (files.length) uploadPhotos(files);
+});
+
+// Photos dropped anywhere on the map go to the area too.
+$("map").addEventListener("dragover", e => { e.preventDefault(); });
+$("map").addEventListener("drop", e => {
+  e.preventDefault();
+  const files = [...(e.dataTransfer?.files || [])].filter(f => /\.(jpe?g|png)$/i.test(f.name));
+  if (files.length) uploadPhotos(files);
+});
+
+var ownPhotosTimer = null;
+$("name").addEventListener("input", () => {
+  clearTimeout(ownPhotosTimer);
+  ownPhotosTimer = setTimeout(loadOwnPhotos, 500);
+});
+
 function render() {
   const { w, h } = viewport();
   if (!w || !h) { updateBboxInfo(); return; }
@@ -881,6 +1273,7 @@ function render() {
   selEl.style.width = px + "px";
   selEl.style.height = px + "px";
   selLabelEl.textContent = `${$("name").value.trim() || "gebied"} · ${Math.round(sel.size)} m`;
+  renderMarkers();
 
   $("mapUI").textContent =
     `RD ${view.x.toFixed(0)}, ${view.y.toFixed(0)}   z${view.z}   ${r.toFixed(2)} m/px`;
@@ -941,9 +1334,11 @@ mapEl.addEventListener("pointerup", e => {
   drag = null;
   mapEl.classList.remove("dragging");
   if (wasClick) {
-    // A click without a drag places the selection.
+    // A click without a drag places the selection, unless a photo is being
+    // put on the map, which takes the click instead.
     const rect = mapEl.getBoundingClientRect();
     const p = toRD(e.clientX - rect.left, e.clientY - rect.top);
+    if (placing) { placingClick(p); return; }
     sel.x = p.x; sel.y = p.y;
     render();
   }
@@ -1012,6 +1407,7 @@ $("q").addEventListener("input", () => {
           resultsEl.style.display = "none";
           $("q").value = item.label;
           $("name").value = slug(item.label);
+          loadOwnPhotos();
           updateAreaPlain();
           fitToSelection();
         };
@@ -1438,6 +1834,7 @@ function rebuild(a) {
     $("size").value = Math.round(sel.size);
   }
   $("name").value = a.name;
+  loadOwnPhotos();
   const s = a.settings || {};
   setRadio("mesher", s.mesher || "quads");
   if (s.style) { setRadio("style", s.style); applyStyle(); }
@@ -1479,6 +1876,29 @@ function showResult(area) {
         <img src="${p.url}?t=${Date.now()}" alt="${escapeHtml(p.name)}"></a>`);
     }
     parts.push(`</div></section>`);
+  }
+  const sp = area.metadata && area.metadata.street_photos;
+  if (sp || (area.photo_checks && area.photo_checks.length)) {
+    const lines = [];
+    if (sp) {
+      lines.push(`${sp.photos ?? 0} foto's rond het gebied` +
+        (sp.from_mapillary ? ` (${sp.from_mapillary} van Mapillary${sp.own ? `, ${sp.own} eigen` : ""})` : ""));
+      if (sp.pose_check) lines.push(`${sp.pose_check.verified} van ${sp.pose_check.checked} gecontroleerd en goed bevonden`);
+      if (sp.facades) lines.push(`${sp.facades.walls_read} muren gelezen van ${sp.facades.buildings_read} gebouwen`);
+      if (sp.photo_textures) lines.push(`${sp.photo_textures.walls} muren dragen hun eigen foto, op ${sp.photo_textures.pages} pagina's`);
+      if (sp.coverage) lines.push(`${Math.round(100 * sp.coverage.share_texture_ready)}% van de zichtbare gevels kan een foto dragen, ${Math.round(100 * sp.coverage.share_measurable)}% kan gemeten worden`);
+    }
+    parts.push(`<section><h3>Straatfoto's</h3><p class="small" style="margin:6px 0">${lines.map(escapeHtml).join("<br>")}</p>`);
+    const coverage = (area.files || []).find(f => f.name === "photo_coverage.png");
+    const shots = [...(coverage ? [{ name: "dekking", url: coverage.url }] : []), ...(area.photo_checks || [])];
+    if (shots.length) {
+      parts.push(`<p class="muted small" style="margin:6px 0">De dekking: groen kan een foto dragen, oranje kan gemeten worden. De controles: magenta waar Mapillary de camera zette, groen waar de controle hem neerzette; <i>wall_</i> zijn rechtgetrokken gevels met de gemeten traveeën en verdiepingen.</p><div class="shots">`);
+      for (const p of shots) {
+        parts.push(`<a href="${p.url}" target="_blank" title="${escapeHtml(p.name)}"><img src="${p.url}?t=${Date.now()}" alt="${escapeHtml(p.name)}" loading="lazy"></a>`);
+      }
+      parts.push(`</div>`);
+    }
+    parts.push(`</section>`);
   }
   if (area.files && area.files.length) {
     parts.push(`<section><h3>Bestanden</h3>
@@ -1590,7 +2010,9 @@ $("run").onclick = async () => {
     ...(styleValue() === "layered" ? { mesher: mesherValue() } : {}),
     sources: selectedSources(),
     preview: $("preview").checked,
-    collision: $("collision").checked
+    collision: $("collision").checked,
+    // Whose photos may become wall textures: Mapillary's only when asked.
+    photo_textures: mlyTextures ? "all" : "own"
   };
 
   $("banner").innerHTML = "";
@@ -1742,7 +2164,7 @@ function renderSources() {
         locked ? " · niet in deze stijl" :
         s.missing === "token" ? " · geen sleutel" :
         s.ok === false ? " · onbereikbaar" :
-        s.degraded ? " · via reserve" : ""}</span>`;
+        s.degraded ? " · via reserve" : ""}${escapeHtml(s.coverage || "")}</span>`;
 
     const box = document.createElement("input");
     box.type = "checkbox";
@@ -1762,11 +2184,14 @@ function renderSources() {
     row.append(dot, name, box);
     row.title = `${s.label}: ${s.contributes}\n${s.host || "?"}: ${s.detail || "niet gecontroleerd"}`;
     host.appendChild(row);
+    if (s.id === "mapillary") host.appendChild(mapillarySubOption());
   }
   updateSourceStates();
 }
 
 function updateSourceStates() {
+  // The Mapillary dots follow the layer: switching it on fetches them.
+  renderMarkers();
   const byId = Object.fromEntries(sourceList.map(s => [s.id, s]));
   for (const row of document.querySelectorAll(".src")) {
     const s = byId[row.dataset.id];
@@ -2170,6 +2595,7 @@ function openFromAddress() {
 updateBboxInfo();
 applyStyle();
 checkServices();
+loadOwnPhotos();
 loadAreas().then(() => { openFromAddress(); return resumeRunning(); });
 
 probeTileSource().then(source => {
