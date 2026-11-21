@@ -932,9 +932,9 @@ function mapillarySubOption() {
   const row = document.createElement("div");
   row.className = "optrow subopt";
   row.innerHTML = `<input type="checkbox" class="switch" id="mlyTextures">
-    <label for="mlyTextures">Ook als textuur op de gevels</label>
-    <span class="help" tabindex="0" role="button" aria-label="Over Mapillary als textuur"
-      data-tip="Gevels die een Mapillary-foto scherp en recht van voren ziet, krijgen die foto als textuur. Mapillary-foto's zijn <b>CC BY-SA 4.0</b>: een textuur ervan noem je met de fotografen (photo_credits.json) en deel je onder dezelfde licentie. Uit: Mapillary meet alleen kleur, ramen en verdiepingen, en alleen je eigen foto's worden textuur.">?</span>`;
+    <label for="mlyTextures">Foto's zelf op de gevels plakken</label>
+    <span class="help" tabindex="0" role="button" aria-label="Over foto's als textuur"
+      data-tip="Uit (standaard): elke gevel wordt getekend, met de verdiepingen, ramen, deur en winkelpui die de foto's meten, en de rest uit BAG en 3DBAG, in hetzelfde detail als de rest van het model. Aan: gevels die een foto scherp en recht van voren ziet, krijgen die foto zelf als textuur. Mapillary-foto's zijn <b>CC BY-SA 4.0</b>: zo'n textuur noem je met de fotografen (photo_credits.json) en deel je onder dezelfde licentie.">?</span>`;
   const box = row.querySelector("input");
   box.checked = mlyTextures;
   box.onchange = () => { mlyTextures = box.checked; };
@@ -1885,7 +1885,9 @@ function showResult(area) {
         (sp.from_mapillary ? ` (${sp.from_mapillary} van Mapillary${sp.own ? `, ${sp.own} eigen` : ""})` : ""));
       if (sp.pose_check) lines.push(`${sp.pose_check.verified} van ${sp.pose_check.checked} gecontroleerd en goed bevonden`);
       if (sp.facades) lines.push(`${sp.facades.walls_read} muren gelezen van ${sp.facades.buildings_read} gebouwen`);
-      if (sp.photo_textures) lines.push(`${sp.photo_textures.walls} muren dragen hun eigen foto, op ${sp.photo_textures.pages} pagina's`);
+      if (sp.photo_textures && sp.photo_textures.walls) lines.push(`${sp.photo_textures.walls} muren dragen hun eigen foto`);
+      const dw = area.metadata.drawn_walls;
+      if (dw) lines.push(`${dw.walls} gevels getekend: ${dw.measured || 0} zoals de foto's ze maten, ${dw["data+colour"] || 0} uit BAG en 3DBAG in de gemeten kleuren, ${dw.data || 0} uit BAG en 3DBAG`);
       if (sp.coverage) lines.push(`${Math.round(100 * sp.coverage.share_texture_ready)}% van de zichtbare gevels kan een foto dragen, ${Math.round(100 * sp.coverage.share_measurable)}% kan gemeten worden`);
     }
     parts.push(`<section><h3>Straatfoto's</h3><p class="small" style="margin:6px 0">${lines.map(escapeHtml).join("<br>")}</p>`);
@@ -2012,7 +2014,7 @@ $("run").onclick = async () => {
     preview: $("preview").checked,
     collision: $("collision").checked,
     // Whose photos may become wall textures: Mapillary's only when asked.
-    photo_textures: mlyTextures ? "all" : "own"
+    photo_textures: mlyTextures ? "all" : "off"
   };
 
   $("banner").innerHTML = "";

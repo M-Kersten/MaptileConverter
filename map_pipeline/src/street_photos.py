@@ -69,6 +69,8 @@ class StreetPhotoResult:
     facades: dict = field(default_factory=dict)
     # Photo id -> brightness gain against the aerial.
     gains: dict = field(default_factory=dict)
+    # Face index -> facade_layout.FacadeLayout: each read wall's layout.
+    layouts: dict = field(default_factory=dict)
 
     @property
     def uses_mapillary(self) -> bool:
@@ -317,7 +319,7 @@ def bake_photo_textures(
     from .facade_capture import crowns_from_trees, parking_lookup
     from .photo_textures import PhotoTextureSet, bake_textures
 
-    if result.coverage is None or str(photos_cfg.get("textures", "own")).lower() == "off":
+    if result.coverage is None or str(photos_cfg.get("textures", "off")).lower() == "off":
         return PhotoTextureSet()
     parking = None
     if surfaces is not None and getattr(surfaces, "class_grid", None) is not None and terrain is not None:
@@ -336,6 +338,48 @@ def bake_photo_textures(
         parking=parking,
         session=session,
     )
+
+
+def _read_layout(face, face_index, building, photos, pixels, *, index, crowns, gain, photos_cfg):
+    """One wall's layout (`facade_layout`), read off each of its photos
+    straightened on its own at four centimetres a pixel, its colours brought
+    to the aerial's brightness like the wall's measured colour is."""
+    from .facade_capture import rectify_view
+    from .facade_layout import M_PER_PX, measure_layout
+    from .photo_colour import wall_gain
+
+    views = []
+    for photo in photos[:4]:
+        try:
+            image = pixels.get(photo.path)
+        except OSError:
+            continue
+        rgb, weight = rectify_view(
+            face, face_index, photo, image, m_per_px=M_PER_PX, faces_index=index,
+            crowns=crowns, target_px_per_m=1.0 / M_PER_PX,
+        )
+        if float(weight.mean()) >= 0.02:
+            views.append((rgb, weight))
+    if not views:
+        return None
+    layout = measure_layout(
+        views, face=face_index, m_per_px=M_PER_PX, width_m=face.width_m,
+        z_min=face.z_min, z_max=face.z_max, ground_z=building.ground_z_nap,
+        eave_z=float(building.wall_top_nap or building.roof_max_nap),
+        function=building.function, year=building.build_year,
+    )
+    if layout is None:
+        return None
+    # All the way to the aerial's sunlit brightness: the drawn wall is lit
+    # by the model's own sun, and a wall photographed in shade would be
+    # shaded twice.
+    lift = wall_gain(layout.wall_rgb, gain, strength=1.0)
+    layout.wall_rgb = _scaled(layout.wall_rgb, lift)
+    layout.frame_rgb = _scaled(layout.frame_rgb, lift)
+    if layout.fascia:
+        z0, z1, rgb = layout.fascia
+        layout.fascia = (z0, z1, _scaled(rgb, lift))
+    return layout
 
 
 def walls_to_read(coverage: Coverage, buildings, limit: int, per_building: int = 4):
@@ -447,6 +491,13 @@ def read_facades(
         if len(sheet) < 12 and measurement.wall_rgb is not None:
             sheet.append((wall, measurement, building))
         save_wall_image(wall, walls_dir / f"{building.identifier}_{face_index}.jpg")
+        if photos_cfg.get("read_layouts", True):
+            layout = _read_layout(
+                face, face_index, building, photos, pixels, index=index, crowns=crowns,
+                gain=float(np.median(used)), photos_cfg=photos_cfg,
+            )
+            if layout is not None:
+                result.layouts[face_index] = layout
 
     for building_index, walls in walls_by_building.items():
         building = buildings.buildings[building_index]

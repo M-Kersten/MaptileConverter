@@ -3559,8 +3559,12 @@ def copy_textures(
         (copy(name), copy(normal) if normal else None)
         for name, normal in zip(scene["facade"]["files"], normals)
     ]
-    # Atlas pages of walls wearing their own photos, if any.
-    scene["_photo_pages"] = [copy(name) for name in scene["facade"].get("photo_files", [])]
+    # Atlas pages of walls drawn for themselves (or wearing their photos),
+    # each with its normal map where it has one.
+    photo_files = scene["facade"].get("photo_files", [])
+    photo_normals = scene["facade"].get("photo_normal_files") or [""] * len(photo_files)
+    scene["_photo_pages"] = [copy(name) for name in photo_files]
+    scene["_photo_normals"] = [copy(name) if name else None for name in photo_normals]
 
     extras: dict[str, Path] = {}
     for key, section in (
@@ -3650,8 +3654,11 @@ def main() -> int:
     # One material per atlas page, not per building: a few draw calls for
     # every photographed wall in the area.
     photo_materials = [
-        make_textured_material(f"M_{page.stem}", page, roughness=0.85)
-        for page in scene.get("_photo_pages", [])
+        make_textured_material(f"M_{page.stem}", page, roughness=0.85, normal_path=normal)
+        for page, normal in zip(
+            scene.get("_photo_pages", []),
+            scene.get("_photo_normals") or [None] * len(scene.get("_photo_pages", [])),
+        )
     ]
 
     # Each layer its own collection in the .blend and its own parent in the

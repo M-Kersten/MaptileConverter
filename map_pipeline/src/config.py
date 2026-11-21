@@ -222,6 +222,20 @@ DEFAULTS: dict[str, Any] = {
         # How far the photograph is pulled towards the era's colour. 0 keeps
         # the photograph as shot, 1 lands it exactly on the palette.
         "photo_tint": 0.6,
+        # Draw every exposed wall for itself (src/wall_atlas.py): storeys
+        # fitted to its height, windows centred in its bays, a door, a shop
+        # front where the BAG says shop; and where the street photos read a
+        # wall well enough, its measured layout and colours. False keeps the
+        # era tiles on every wall.
+        "drawn_walls": True,
+        # The most walls drawn, measured walls first, then the largest; the
+        # rest keep their era tile. 25 px/m draws a 6 cm window frame.
+        "drawn_walls_max": 1500,
+        "drawn_px_per_m": 25.0,
+        "drawn_page_px": 4096,
+        # How well a wall has to be read before its own layout is drawn
+        # rather than the registers' in the colours it was seen in.
+        "drawn_min_quality": 0.5,
     },
     "trees": {
         "enabled": True,
@@ -520,6 +534,9 @@ DEFAULTS: dict[str, Any] = {
         # columns, storeys -- and draw those buildings from what was read
         # rather than from their era's average.
         "read_facades": True,
+        # Read each read wall's layout too -- its window rows and columns,
+        # storeys, door and shop front -- for the drawn walls.
+        "read_layouts": True,
         "read_max_walls": 400,
         "read_m_per_px": 0.05,
         # Bring every photo to the aerial's brightness, measured on the
@@ -532,11 +549,12 @@ DEFAULTS: dict[str, Any] = {
         # The most textures the measured facades may add. Buildings that
         # measured alike share one.
         "observed_styles_max": 24,
-        # Whose photos may become wall textures: "own" only yours, "all"
-        # Mapillary's too, "off" none. A texture made from a Mapillary photo
-        # is CC BY-SA 4.0: it has to be credited and shared alike, which is
-        # why it is not the default.
-        "textures": "own",
+        # Whose photos may be pasted on walls as they are: "own" only yours,
+        # "all" Mapillary's too, "off" none. Off by default: the walls are
+        # drawn from what the photos measured (facade.drawn_walls), and a
+        # photograph's detail next to the model's own reads as uncanny. A
+        # texture made from a Mapillary photo is also CC BY-SA 4.0.
+        "textures": "off",
         "textures_max_walls": 300,
         # Sharpest a photo texture is made, in pixels per metre of wall.
         "texture_max_px_per_m": 60.0,
@@ -667,6 +685,9 @@ def detail_settings(detail: str, side_m: float) -> dict:
             "texture_px": int(preset["facade_px"]),
             "buildings_per_look": int(preset["buildings_per_look"]),
             "normal_map": bool(preset["normal_map"]),
+            # Drawn walls as sharp as the era tiles: 12 px/m for a draft,
+            # 25 standard, 40 high (more fills pages faster than it shows).
+            "drawn_px_per_m": min(40.0, 25.0 * int(preset["facade_px"]) / 512.0),
         },
     }
 

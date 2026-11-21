@@ -96,6 +96,11 @@ class Placement:
 class PhotoTextureSet:
     pages: list[Path] = field(default_factory=list)
     page_sizes: list[tuple[int, int]] = field(default_factory=list)
+    # A normal map per page, or None: drawn walls have one, photos do not.
+    normal_pages: list = field(default_factory=list)
+    # How many walls were drawn, by where their layout came from (see
+    # wall_atlas.draw_walls); empty when none were.
+    drawn: dict = field(default_factory=dict)
     # Face key -> placement.
     placements: dict = field(default_factory=dict)
     # Face key -> the photos it was made from.
@@ -109,10 +114,12 @@ class PhotoTextureSet:
     def stats(self) -> dict:
         shares = list(self.seen_share.values())
         return {
-            "walls": len(self.placements),
+            # Walls wearing their photos; drawn walls are counted apart.
+            "walls": sum(1 for key in self.placements if self.sources.get(key)),
             "pages": len(self.pages),
             "photos": len({pid for ids in self.sources.values() for pid in ids}),
             "median_photographed_share": round(float(np.median(shares)), 3) if shares else 0.0,
+            **({"drawn_walls": dict(self.drawn)} if self.drawn else {}),
         }
 
 
@@ -349,7 +356,7 @@ def bake_textures(
     from .photo_colour import wall_gain
 
     textures = PhotoTextureSet()
-    setting = str(photos_cfg.get("textures", "own"))
+    setting = str(photos_cfg.get("textures", "off"))
     by_id = {p.id: p for p in result.photos}
     chosen = texture_walls(coverage, by_id, setting, int(photos_cfg.get("textures_max_walls", 300)))
     if not chosen:

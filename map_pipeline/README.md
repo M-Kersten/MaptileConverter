@@ -221,8 +221,12 @@ and turned needs nothing more. For the rest:
   pinned, its ends are not in the picture.
 
 **Bekijken** on a model built with photos shows a Straatfoto's section: how
-many photos there were, how many passed the check, how many walls were read
-and how many wear their photo, then the coverage map and the photo checks.
+many photos there were, how many passed the check, how many walls were read,
+how many walls were drawn and from what (as the photos measured them, from
+BAG and 3DBAG in the colours the photos read, or from BAG and 3DBAG alone),
+then the coverage map and the photo checks. The **Foto's zelf op de gevels
+plakken** switch under Mapillary pastes the photos themselves on the walls
+they see well (`photos.textures` `all`); off, the walls are drawn.
 With **Voorbeeldbeelden renderen** on, the checks include `match_*.jpg`: a
 street photo next to the model rendered from the same spot, for up to four
 walls, those wearing a photo first. It is the quickest way to see whether the
@@ -468,6 +472,10 @@ Other knobs worth knowing:
 | `facade.ground_floor_height_m` | `3.6` | Where that cut sits above each building's own ground level. |
 | `facade.photo_textures` | `true` | Photographed CC0 masonry under the generated windows, downloaded once and cached in `work/_textures/`. |
 | `facade.photo_tint` | `0.6` | How far each photograph is pulled towards its era colour. `0` keeps it as shot, `1` lands it exactly on the palette. |
+| `facade.drawn_walls` | `true` | Draw every exposed wall for itself: storeys fitted to its height, windows centred in its bays, a door, a shop front where the BAG says shop; where the street photos read a wall well enough, its measured layout and colours. `false` keeps the era tiles everywhere. |
+| `facade.drawn_walls_max` | `1500` | The most walls drawn, measured walls first, then the largest. The rest keep their era tile. |
+| `facade.drawn_px_per_m` | `25` | How finely drawn walls are drawn: 25 px/m draws a 6 cm window frame. |
+| `facade.drawn_min_quality` | `0.5` | How well the photos have to read a wall before its own layout is drawn rather than the registers' in its measured colours. |
 | `facade.monumental_tile_m` | `7.0` | Bay width for churches, towers and civic halls. |
 | `facade.monumental_bay_m` | `9.0` | Bay height for the same — a church bay, not a storey. |
 | `facade.industrial_tile_m` | `9.0` | Bay width for sheds and depots. |
@@ -2018,7 +2026,65 @@ one window per bay, so a terrace of paired windows comes out evenly spaced, an
 office of ribbon glazing reads unreliably, and a white block with a red awning
 on every storey can be read as either. The photo textures are for those.
 
-**Walls that wear their photos.** A wall a checked photo sees sharply,
+**Walls drawn from what the photos measured.** Pasting the photographs on
+the walls put a photograph's detail, its parked bicycles and reflections and
+half-hidden people, next to the model's own drawn detail, and the mix reads
+as uncanny. So by default (`facade.drawn_walls`) the photos are used as a
+measurement and every exposed wall is drawn for itself
+(`src/facade_layout.py`, `src/wall_atlas.py`), at the same level of detail as
+any other wall in the model: 25 px per metre (`drawn_px_per_m`), a 6 cm
+window frame, 4 cm glazing bars, an 8 cm sill standing proud of the window,
+on photographed masonry at its true size.
+
+Each read wall is straightened from each of its photos on its own, at 4 cm a
+pixel; fused into one picture they ghost wherever they disagree by a few
+centimetres. From the sharpest view, the others standing in where it sees
+nothing, the reader scores every pixel by how unlike the wall it is (glass
+is darker or bluer than brick, a frame paler, and a stone plinth or a
+plastered ground storey counts as a second wall colour when it runs across
+the wall in bands) and fits the structure rather than looking for a rhythm:
+the height is split into alternating wall and window bands and the width
+into piers and window columns, each by an exact one-dimensional segmentation.
+A canal house two windows wide has no rhythm to find; it has two windows.
+Each row and column then meet in a cell that holds a window when it looks
+like one, holds wall when it plainly is, and follows its column where no
+photo saw it; windows are lined up per row and per column; storeys follow
+from the rows; and the columns and storeys carry on over the part of the
+wall no photo saw, in the measured rhythm. The ground storey is read on its
+own: a shop front, glass between piers under a fascia, or a house front, a
+door and windows, decided by what the BAG says the building is for and by
+how much glass the photos see down there.
+
+A reading has to explain its picture to be drawn: its windows unlike the
+wall, the piers between them like it (a tree, a sign or a missed window
+stands in a pier; a cornice or a sill does not), enough of the wall seen,
+two windows or more, and rows for a fair share of the storeys the wall's
+height holds (`drawn_min_quality`, 0.5). Street photos mostly see walls
+past parked bicycles, terraces, trees and construction fences, so this is a
+strict bar: over the Ganzenmarkt 6 of the 102 walls read pass it, and 447
+walls of the buildings they belong to take their colours and storey height.
+The rest are laid out from the registers, in the
+colours and material the photos did read reliably: the colour from the
+sunlit half of the building's walls, and never darker than its material
+plausibly is (street photos are exposed for the sky, and the pale stone of
+the Winkel van Sinkel read as charcoal). A storey height the photos measured
+holds for all of a building's walls.
+
+**Walls no photo saw** are laid out from the registers too: storeys to the
+eaves at the era's height (a metre taller before 1920 for shops, offices and
+public buildings, and taller again for a palace of a building over 600 m²),
+3DBAG's own storey count where it is believable for the building's age,
+windows centred in bays of the era's width, attic windows in a gable, a
+shop front where the BAG says shop, and a door per house along a terrace.
+One building wears one palette on all its walls. The measured walls go
+first, then the largest, up to `drawn_walls_max` (1500); the rest keep their
+era tile. All of them are packed onto 4096 px pages, `drawn_wall_00.jpg` with
+a normal map beside it, read by the model exactly as the photo textures
+were. `output/<area>/facade_layouts.json` lists every drawn wall: where its
+layout came from, its quality, its storeys and every opening in metres.
+
+**Walls that wear their photos.** Only when asked for (`photos.textures`
+`own` or `all`): a wall a checked photo sees sharply,
 square-on and mostly unobstructed is textured with the photo itself. It is
 straightened as for reading, but at up to 60 px per metre
 (`texture_max_px_per_m`) and from the full-size photos: a 360 photo is fetched
@@ -2054,7 +2120,7 @@ beside the FBX and in the 3D view in the browser. Over 300 m of central Arnhem
 120 walls went onto 9 pages from 185 photos.
 
 **Licence.** `photos.textures` decides whose photos may become textures:
-`own` (the default) only your own, `all` Mapillary's as well, `off` none. A
+`off` (the default) none, `own` only your own, `all` Mapillary's as well. A
 texture made from a Mapillary photo is a derivative of a CC BY-SA 4.0 image:
 it has to be credited and shared under the same licence. `photo_credits.json`
 lists every photo used and its author, and `ATTRIBUTION.txt` says so when

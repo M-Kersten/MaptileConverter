@@ -201,6 +201,7 @@ def write_scene_description(
     car_colours: int = 6,
     ground_variants: int = 0,
     photo_textures: list[Path] | None = None,
+    photo_normals: list | None = None,
     layered: dict | None = None,
 ) -> Path:
     """Write scene.json: everything the Blender stage needs, and nothing else.
@@ -243,6 +244,10 @@ def write_scene_description(
             # Atlas pages of walls that wear their own street photos, read by
             # the buildings' per-triangle photo page and UVs.
             "photo_files": [path.name for path in (photo_textures or [])],
+            # A normal map per page, or "" for a page of photographs.
+            "photo_normal_files": [
+                path.name if path else "" for path in (photo_normals or [None] * len(photo_textures or []))
+            ],
             "ground_floor_height_m": float(
                 facade_cfg.get("ground_floor_height_m", 3.6)
             ),

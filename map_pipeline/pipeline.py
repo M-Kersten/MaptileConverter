@@ -688,6 +688,17 @@ def apply_street_photos(
         photos_cfg=config.photos, terrain=terrain, trees=trees, surfaces=surfaces,
         observed=observed, n_variants=variants,
     )
+    if config.facade.get("drawn_walls", True):
+        # Every exposed wall drawn for itself, as the photos measured it where
+        # they read it well; a photo texture, where asked for, keeps its wall.
+        from src.wall_atlas import combine, draw_walls
+
+        drawn = draw_walls(
+            buildings, faces, work_dir, out_dir, facade_cfg=config.facade,
+            layouts=street_photos.layouts, facades=street_photos.facades,
+            skip_keys=textures.placements.keys(),
+        )
+        textures = combine(textures, drawn)
     if observed is None and not len(textures):
         return None, textures
 
@@ -718,6 +729,34 @@ def apply_street_photos(
             len(observed.face_tile_m), changed,
         )
     return observed, textures
+
+
+def draw_walls_without_photos(buildings, config: PipelineConfig, work_dir: Path, out_dir: Path):
+    """The drawn walls for a run without street photos: every exposed wall
+    laid out from the registers. Rewrites the buildings file to wear them.
+    Returns the texture set, empty when there is nothing to draw."""
+    from src.buildings import assign_facade_slots, save_buildings
+    from src.facade import LookPlan
+    from src.photo_coverage import _SegmentIndex, mark_exposed, wall_faces
+    from src.photo_textures import PhotoTextureSet
+    from src.wall_atlas import draw_walls
+
+    if not config.facade.get("drawn_walls", True):
+        return PhotoTextureSet()
+    faces = wall_faces(buildings)
+    mark_exposed(faces, _SegmentIndex(faces))
+    textures = draw_walls(buildings, faces, work_dir, out_dir, facade_cfg=config.facade)
+    if not len(textures):
+        return textures
+    variants = int(config.facade["variants"])
+    style_index, plan = assign_facade_slots(buildings, variants, config.facade)
+    if buildings.facade_looks and tuple(plan.per_era) != tuple(buildings.facade_looks):
+        plan = LookPlan(buildings.facade_looks)
+    save_buildings(
+        buildings, work_dir / "buildings.npz", style_index=style_index,
+        facade_cfg=config.facade, photo_textures=textures,
+    )
+    return textures
 
 
 def run(config: PipelineConfig, args: argparse.Namespace) -> int:
@@ -1307,6 +1346,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     structure_brick = generate_brick_texture(work_dir)
                 deck_paving = _deck_paving(surfaces)
 
+    if photo_textures is None:
+        # No street photos: the walls are still drawn, from the registers.
+        photo_textures = draw_walls_without_photos(buildings, config, work_dir, out_dir)
+
     with Stage("facade textures", next_step(), total):
         facade_cfg = dict(config.facade)
         facade_cfg["ground_by_function"] = bool(len(usage))
@@ -1373,6 +1416,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             },
             ground_variants=ground_variants,
             photo_textures=photo_textures.pages if photo_textures is not None else None,
+            photo_normals=photo_textures.normal_pages if photo_textures is not None else None,
             layered=(
                 layered_scene(config, ground_layers, harbour, paving=paving_entry, werf_files=werf_files)
                 if ground_layers is not None
@@ -1418,6 +1462,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                         **({"photo_textures": photo_textures.stats()}
                            if photo_textures is not None and len(photo_textures) else {}),
                     }} if want_photos else {}
+                ),
+                # Every wall drawn for itself, and from what.
+                **(
+                    {"drawn_walls": dict(photo_textures.drawn)}
+                    if photo_textures is not None and getattr(photo_textures, "drawn", None) else {}
                 ),
                 # What was taken out of the aerial and what was left in it.
                 # Anyone lighting this model needs to know the photo is no
