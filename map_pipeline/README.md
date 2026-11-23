@@ -33,7 +33,7 @@ output/<area_name>/
 ├── furniture.png    metal and wood atlas
 ├── vehicle.png      car paint, hull and timber atlas
 ├── rail.png         ballast with sleepers, and rail steel
-├── structure.png    concrete for decks, piers and tunnel walls
+├── structure.png    concrete for decks, piers, tunnel walls and passages
 └── ATTRIBUTION.txt  source credits
 ```
 
@@ -516,6 +516,7 @@ Other knobs worth knowing:
 | `buildings.sources` | `["api", "tiles"]` | Which of 3DBAG's two services to try, in order. `["tiles"]` skips the flaky API entirely. See [When 3DBAG is down](#when-3dbag-is-down). |
 | `buildings.tiles_version` | `v20250903` | Which dated 3DBAG release the static tiles come from. Bumped by hand; releases are listed at 3dbag.nl/en/download. |
 | `buildings.probe_timeout_s` | `8.0` | How long to knock on the API before giving up and using the tiles. |
+| `buildings.passages.enabled` | `true` | A tunnel through the base of every building standing over a road or water at ground level. See [Under a building](#under-a-building). |
 | `terrain.grid_m` | `2.0` | Ground grid spacing; set by `detail`. See [Terrain](#terrain). |
 | `terrain.feature_edges` | `["water", "roads", "buildings"]` | Which outlines the terrain's edges follow, each with a row of quads alongside. `[]` gives the plain grid. |
 | `aerial.deshadow` | `1.0` | How much of the flown sun to take back out of the photo, 0 to 1. See [The flown sun](#the-flown-sun-and-taking-it-back-out). `0` leaves it as flown. |
@@ -542,6 +543,7 @@ src/furniture.py   BGT lampposts, bollards, signs and benches
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
 src/structures.py  bridge decks and piers, and tunnels below ground
+src/passages.py    tunnels through buildings standing over a road or water
 src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
@@ -1771,6 +1773,65 @@ this pipeline that is drawn rather than measured, and `metadata.json` says so.
 
 Tunnels get side walls but no ceiling, deliberately: a roofed tunnel is
 invisible in the model it was just added to.
+
+### Under a building
+
+3DBAG stands every building on the ground over its whole footprint, and that
+footprint is the BAG's view from above. Where a building spans a street or a
+canal, the block comes down on top of it. Hoog Catharijne in Utrecht is where
+that shows: the Catharijnesingel ran into a brick wall, the road under the
+shopping centre ran into a facade, and Utrecht Centraal's hall stood on its
+own tracks.
+
+The BGT draws the ground at ground level, so a `wegdeel` or `waterdeel` at
+`relatieve_hoogteligging` 0 inside a BAG footprint is ground the building
+stands over. Wherever one does, the building gets a tunnel through its base
+(`src/passages.py`):
+
+* the walls are opened where the road or water crosses them or runs along the
+  outline, below a ceiling height, so the facade over a tunnel mouth stays as
+  a lintel;
+* a roof lower than that ceiling is cut away over the passage, which is then
+  open to the sky;
+* the hole is lined: side walls where the passage meets the rest of the
+  building, and a ceiling over it, in the concrete the bridges and tunnels are
+  drawn in, as a material slot of the building's own `Pand_*` object.
+
+Paving and station platforms (`onbegroeidterreindeel`, and `kunstwerkdeel`
+of type `perron`) widen a passage that a road, track or water makes, so the
+station hall spans its platforms as well as its tracks. On their own they make
+none: a paved yard under a building is no road through it. Footbridges and
+decks (level above 0) and tunnels (below 0) are left to the structures.
+
+The ceiling height is drawn, like a tunnel's depth: lidar does not see under a
+building, and neither 3DBAG nor the BAG records an underpass. It is a clearance
+above the highest ground under the passage, by what passes under it, and stays
+half a metre under the lowest roof over it:
+
+| `buildings.passages` | Default | |
+| --- | --- | --- |
+| `clearance_m.road` | 4.5 | carriageways, bus and tram lanes, parking |
+| `clearance_m.rail` | 6.0 | room for the catenary |
+| `clearance_m.path` | 3.0 | footpaths and cycle paths |
+| `clearance_m.water` | 3.0 | above the banks |
+| `clearance_m.paved` | 3.0 | paving and platforms beside one of the above |
+| `min_headroom_m` | 2.2 | less than this under the roof and the building is left whole, and counted |
+| `min_width_m`, `min_area_m2` | 1.0, 4.0 | narrower or smaller is BGT and BAG disagreeing about a facade |
+| `slab_m` | 0.5 | between the ceiling and the lowest roof |
+| `enabled` | true | |
+
+Several polygons side by side under one building, a carriageway with the
+pavements either side, are one tunnel at the height the tallest of them needs.
+The BGT and the BAG disagree about where a facade is by tens of centimetres
+all over the country, so a pavement grazing a wall is no passage: anything
+narrower than `min_width_m` is dropped before anything is cut. A pavement two
+metres in under a cantilevered storey is one, and comes out as an arcade.
+
+Over a 500 m square round Hoog Catharijne that is 55 passages under 25
+buildings, 4.1 ha in all, most of it the station hall and the streets under
+the shopping centre. The check `passages_under_buildings_open` reads the cut
+geometry back and fails if any wall or roof still stands in a passage below its
+ceiling; `metadata.json` carries the counts under `buildings.passages`.
 
 ## Railways
 

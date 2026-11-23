@@ -290,6 +290,51 @@ def check_buildings_on_terrain(
     )
 
 
+def check_passages(report: CheckReport, buildings) -> None:
+    """Where a road or water runs under a building, nothing of the building
+    stands in it: no wall across it and no roof over it below the ceiling.
+
+    The passages are cut by construction; this reads the cut geometry back,
+    so a change that leaves a facade standing across a tunnel mouth fails here
+    rather than in a render.
+    """
+    from .passages import blocked
+
+    stats = getattr(buildings, "passages", None)
+    if stats is None:
+        return
+    by_id = {b.identifier: b for b in buildings.buildings}
+    walls = roofs = shut = 0
+    first = None
+    for identifier, region, top, _ground in stats.cut:
+        building = by_id.get(identifier)
+        if building is None:
+            continue
+        standing, low = blocked(building, region, top)
+        walls += standing
+        roofs += low
+        if standing or low:
+            shut += 1
+            spot = region.representative_point()
+            first = first or f"{identifier} at RD {spot.x:.0f}, {spot.y:.0f}"
+    report.add(
+        "passages_under_buildings_open",
+        shut == 0,
+        (
+            f"{stats.passages} passages under {stats.buildings} buildings, "
+            f"{stats.area_m2:.0f} m2, none with a wall or roof in the way"
+            + (
+                f"; {stats.too_low} left shut, too low to pass under"
+                if stats.too_low else ""
+            )
+            if shut == 0
+            else f"{shut} of {stats.passages} passages still have {walls} wall "
+            f"triangles and {roofs} roof points in them below the ceiling, "
+            f"first {first}"
+        ),
+    )
+
+
 def _closest_pair(points: np.ndarray, involving: np.ndarray, *, within: float) -> float:
     """The shortest distance between two points, one of them `involving`.
 
@@ -1549,6 +1594,7 @@ __all__ = [
     "check_fbx_reimport",
     "check_harbour",
     "check_layered",
+    "check_passages",
     "check_roads",
     "check_terrain",
     "check_terrain_mesh",

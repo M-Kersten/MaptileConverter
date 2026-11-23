@@ -74,6 +74,11 @@ class Building:
     ground_wall_tris: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float64)
     )
+    # The lining of a tunnel through the building where a road or water runs
+    # under it: side walls and a ceiling, in concrete (`passages`).
+    passage_tris: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3, 3), dtype=np.float64)
+    )
 
     @property
     def height_m(self) -> float:
@@ -121,6 +126,8 @@ class BuildingSet:
     # The facade stage has to generate exactly these textures, in this order,
     # or a building wears the wrong wall. See facade.LookPlan.
     facade_looks: tuple[int, ...] = ()
+    # Where roads and water run under buildings (`passages.PassageStats`).
+    passages: object | None = None
 
     def __len__(self) -> int:
         return len(self.buildings)
@@ -137,6 +144,7 @@ class BuildingSet:
             "pages_fetched": self.pages_fetched,
             "source": self.source,
             **({"source_version": self.source_version} if self.source_version else {}),
+            **({"passages": self.passages.summary()} if self.passages is not None else {}),
             "skipped_no_geometry": self.skipped_no_geometry,
             "skipped_degenerate": self.skipped_degenerate,
             "degenerate_source_surfaces": self.degenerate_surfaces,
@@ -1070,8 +1078,8 @@ def save_buildings(
     wear a photo; their triangles get the atlas page they are on and their
     own texture coordinates.
     """
-    wall_chunks, roof_chunks, ground_chunks = [], [], []
-    wall_owner, roof_owner, ground_owner = [], [], []
+    wall_chunks, roof_chunks, ground_chunks, passage_chunks = [], [], [], []
+    wall_owner, roof_owner, ground_owner, passage_owner = [], [], [], []
 
     for index, building in enumerate(buildings.buildings):
         if len(building.wall_tris):
@@ -1084,6 +1092,11 @@ def save_buildings(
             ground_chunks.append(building.ground_wall_tris)
             ground_owner.append(
                 np.full(len(building.ground_wall_tris), index, dtype=np.int32)
+            )
+        if len(building.passage_tris):
+            passage_chunks.append(building.passage_tris)
+            passage_owner.append(
+                np.full(len(building.passage_tris), index, dtype=np.int32)
             )
 
     def stack(chunks: list[np.ndarray]) -> np.ndarray:
@@ -1152,6 +1165,9 @@ def save_buildings(
         ground_wall_tris=grounds,
         ground_wall_building=ground_ids,
         ground_wall_u=fitted_u[len(walls) * 3 :],
+        # The lining of the passages under buildings, in a material of its own.
+        passage_tris=stack(passage_chunks),
+        passage_building=stack_ids(passage_owner),
         build_year=np.array(
             [b.build_year or 0 for b in buildings.buildings], dtype=np.int32
         ),
@@ -1260,8 +1276,14 @@ def build_buildings(
     ground_floor_height_m: float | None = None,
     usage=None,
     facade_cfg: dict | None = None,
+    passage_areas=None,
 ) -> BuildingSet:
-    """Fetch, clean, ground, and cache the buildings for `bbox`."""
+    """Fetch, clean, ground, and cache the buildings for `bbox`.
+
+    `passage_areas`, the roads and water at ground level
+    (`passages.fetch_passage_areas`), get a tunnel through every building
+    they run under.
+    """
     result = fetch_buildings(
         bbox, buildings_cfg=buildings_cfg, work_dir=work_dir
     )
@@ -1290,6 +1312,15 @@ def build_buildings(
             result,
             terrain_sampler,
             skirt_m=float(buildings_cfg["ground_skirt_m"]),
+        )
+
+    # After the skirt, which sets how far down a passage's side walls go, and
+    # before the ground storey is split off, so a wall is only cut once.
+    if passage_areas and terrain_sampler is not None:
+        from .passages import cut_passages
+
+        result.passages = cut_passages(
+            result, passage_areas, terrain_sampler, buildings_cfg.get("passages")
         )
 
     if usage is not None and len(usage):

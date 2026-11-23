@@ -1674,6 +1674,34 @@ def wall_uvs(
     return np.column_stack([u, v])
 
 
+def concrete_uvs(triangles: np.ndarray, tile_m: float = 6.0) -> np.ndarray:
+    """Metre UVs for a tiling concrete, one pair per corner.
+
+    A ceiling is mapped from above; a wall along itself and up, so the
+    shuttering lines of the texture run level along it rather than smeared
+    down it, as a top-down map would leave them.
+    """
+    triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 3)
+    if not len(triangles):
+        return np.zeros((0, 2))
+    normal = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    length = np.linalg.norm(normal, axis=1)
+    length[length == 0] = 1.0
+    level = np.abs(normal[:, 2]) / length > 0.7
+    # Along a wall: its horizontal direction, from its normal.
+    along = np.column_stack([-normal[:, 1], normal[:, 0]])
+    norm = np.linalg.norm(along, axis=1)
+    norm[norm == 0] = 1.0
+    along /= norm[:, None]
+    u = np.where(
+        level[:, None],
+        triangles[:, :, 0],
+        triangles[:, :, 0] * along[:, None, 0] + triangles[:, :, 1] * along[:, None, 1],
+    )
+    v = np.where(level[:, None], triangles[:, :, 1], triangles[:, :, 2])
+    return np.column_stack([u.ravel(), v.ravel()]) / float(tile_m)
+
+
 def build_buildings(
     scene: dict,
     work_dir: Path,
@@ -1681,12 +1709,17 @@ def build_buildings(
     aerial_material,
     ground_materials: list | None = None,
     photo_materials: list | None = None,
+    passage_material=None,
 ):
     """One object per building, with facade and aerial material slots.
 
     Walls that wear their own street photos take an atlas page's material
     and the texture coordinates the photo stage worked out for them,
     instead of the facade's.
+
+    A building with a road or a canal under it also carries the tunnel's
+    lining (`src/passages.py`) in `passage_material`, the concrete the
+    bridges and tunnels are drawn in.
     """
     data = np.load(work_dir / scene["buildings"]["file"])
     wall_tris = data["wall_tris"]
@@ -1698,6 +1731,16 @@ def build_buildings(
     ground_owner = (
         data["ground_wall_building"] if has_ground else np.zeros((0,), dtype=np.int32)
     )
+    has_passages = (
+        "passage_tris" in data.files and len(data["passage_tris"]) > 0
+    )
+    passage_tris = data["passage_tris"] if has_passages else np.zeros((0, 3, 3))
+    passage_owner = (
+        data["passage_building"] if has_passages else np.zeros((0,), dtype=np.int32)
+    )
+    if has_passages and passage_material is None:
+        # Only without the concrete texture: the colour of its base.
+        passage_material = make_plain_material("M_structure", (0.30, 0.30, 0.29), 0.8)
     ground_style = (
         data["ground_style"]
         if "ground_style" in data.files
@@ -1728,7 +1771,9 @@ def build_buildings(
     walls = to_local(wall_tris)
     roofs = to_local(roof_tris)
     grounds = to_local(ground_tris)
+    passages = to_local(passage_tris)
     n_walls, n_roofs, n_grounds = len(walls), len(roofs), len(grounds)
+    n_passages = len(passages)
     if n_walls + n_roofs + n_grounds == 0:
         raise SystemExit("buildings.npz holds no triangles")
 
@@ -1793,8 +1838,11 @@ def build_buildings(
     photo_slot_base = len(materials)
     photo_materials = list(photo_materials or [])
     materials.extend(photo_materials)
+    passage_slot = len(materials)
+    if n_passages:
+        materials.append(passage_material)
 
-    parts = [chunk for chunk in (walls, roofs, grounds) if len(chunk)]
+    parts = [chunk for chunk in (walls, roofs, grounds, passages) if len(chunk)]
     triangles = np.concatenate(parts, axis=0)
 
     uv_chunks = []
@@ -1825,9 +1873,11 @@ def build_buildings(
                 storey,
             )
         )
+    if n_passages:
+        uv_chunks.append(concrete_uvs(passages))
     uvs = np.concatenate(uv_chunks, axis=0)
 
-    material_indices = np.empty(n_walls + n_roofs + n_grounds, dtype=np.int32)
+    material_indices = np.empty(n_walls + n_roofs + n_grounds + n_passages, dtype=np.int32)
     if n_walls:
         if "wall_style" in data.files and len(facade_materials) > 1:
             # Per wall, where the street photos read walls of one building
@@ -1843,9 +1893,12 @@ def build_buildings(
             material_indices[:n_walls] = 0
     material_indices[n_walls : n_walls + n_roofs] = aerial_slot
     if n_grounds:
-        material_indices[n_walls + n_roofs :] = ground_slot_base + np.clip(
-            ground_style[ground_owner], 0, max(0, len(ground_materials) - 1)
+        material_indices[n_walls + n_roofs : n_walls + n_roofs + n_grounds] = (
+            ground_slot_base
+            + np.clip(ground_style[ground_owner], 0, max(0, len(ground_materials) - 1))
         )
+    if n_passages:
+        material_indices[n_walls + n_roofs + n_grounds :] = passage_slot
 
     # Walls wearing their photos: the atlas page's material and its UVs.
     if photo_materials and "wall_photo_page" in data.files:
@@ -1867,7 +1920,8 @@ def build_buildings(
 
     owner = np.concatenate(
         [chunk for chunk, count in ((wall_owner, n_walls), (roof_owner, n_roofs),
-                                    (ground_owner, n_grounds)) if count]
+                                    (ground_owner, n_grounds),
+                                    (passage_owner, n_passages)) if count]
     ).astype(np.int64)
     ids = (
         [str(i) for i in data["building_ids"]]
@@ -1925,6 +1979,11 @@ def build_buildings(
     log(
         f"buildings: {len(objects)} objects, {n_walls} wall triangles, "
         f"{n_roofs} roof triangles, {n_grounds} ground-storey triangles"
+        + (
+            f", {n_passages} passage triangles under "
+            f"{len(np.unique(passage_owner))} buildings"
+            if n_passages else ""
+        )
     )
     return objects
 
@@ -3592,6 +3651,10 @@ def copy_textures(
             "normal_path": copy(normal) if normal and (work_dir / normal).is_file() else None,
         }
     scene["_paving"] = paving
+    # The lining of the passages under buildings is the tunnels' concrete.
+    passage = scene.get("buildings", {}).get("passage_texture")
+    if passage and (work_dir / passage).is_file():
+        extras["passage"] = copy(passage)
     return aerial_dst, facades, extras
 
 
@@ -3680,10 +3743,20 @@ def main() -> int:
                 work_dir,
                 lambda name: make_textured_material(name, aerial_texture, roughness=0.85),
             )
+    # Cast concrete: the bridges and tunnels, and the lining of the passages
+    # cut under buildings. One texture, so one material.
+    concrete = extra_textures.get("structure") or extra_textures.get("passage")
+    structure_material = (
+        make_textured_material("M_structure", concrete, roughness=0.8)
+        if concrete is not None
+        else None
+    )
+
     with _Layer("Buildings", "Buildings"):
         build_buildings(
             scene, work_dir, facade_materials, aerial_material, ground_materials,
             photo_materials=photo_materials,
+            passage_material=structure_material,
         )
 
     werf_entry = (scene.get("layered") or {}).get("werf") or {}
@@ -3771,13 +3844,7 @@ def main() -> int:
 
     if "structure" in extra_textures:
         with _Layer("Structures", "Structures"):
-            build_structures(
-                scene,
-                work_dir,
-                make_textured_material(
-                    "M_structure", extra_textures["structure"], roughness=0.8
-                ),
-            )
+            build_structures(scene, work_dir, structure_material)
 
     # After everything visible, because the proxies are built from the same
     # intermediates and the log reads better with them at the end.
