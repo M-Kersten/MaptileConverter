@@ -2340,7 +2340,10 @@ went wrong without it:
   trees reserve theirs before any seed is taken, every one of them, even
   where two surveyed trees stand inside each other's crowns — with a token three-metre
   reservation instead, a quarter of the detections landed inside a tree the model
-  already had.
+  already had. Every registered tree reserves, also one standing inside another's
+  reservation. Made to claim its spot like a seed, the second of two trees 2.77 m
+  apart in central Arnhem reserved nothing, and the detector found its crown
+  again 0.77 m from its trunk.
 
 **A found tree is not allowed to stand on a carriageway.** A tall rough thing
 on a road is a lorry, a bus, scaffolding or a crane far more often than a tree:

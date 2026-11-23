@@ -779,6 +779,44 @@ class TestTreeDetection(unittest.TestCase):
         )
         self.assertGreater(len(token), 0, "the fixture cannot show a difference")
 
+    def test_a_registered_tree_inside_another_crown_still_reserves_its_own(self):
+        """Central Arnhem: two registered trees 2.77 m apart, both small, both
+        reserving the three-metre floor. The second had to claim its spot the
+        way a seed does, lost to the first and reserved nothing, and the
+        detector found its crown again 0.77 m from its trunk. The spacing check
+        failed the build on that pair. Both trees are in the model, so both
+        reserve, in whichever order the register lists them."""
+        from src.trees import detect_trees
+
+        settings = dict(min_height_m=2.5, crown_radius_ratio=0.26, min_roughness_m=0.3)
+        grid = self._put(self._blank(), 45.0, 50.0, 3.1, radius=2.0)
+        alone, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=np.zeros((0, 2)), **settings
+        )
+        self.assertEqual(len(alone), 1, f"the crown came out as {len(alone)} trees")
+
+        # The second trunk 0.77 m west of the canopy peak, the first 2.77 m
+        # further west: 3.54 m from the peak, outside its own reservation.
+        second = alone[0] - [0.77, 0.0]
+        first = second - [2.77, 0.0]
+        reach = np.array([0.26 * 3.1, 0.26 * 3.1])
+        beyond, _ = detect_trees(
+            grid, self.BOUNDS, registered_xy=first[None], registered_reach=reach[:1],
+            **settings,
+        )
+        self.assertEqual(len(beyond), 1, "the first tree covers the crown by itself")
+
+        for order in ([first, second], [second, first]):
+            found, _ = detect_trees(
+                grid, self.BOUNDS, registered_xy=np.array(order),
+                registered_reach=reach, **settings,
+            )
+            gaps = np.round(np.hypot(*(found - second).T), 2).tolist()
+            self.assertEqual(
+                gaps, [], "the second tree's crown was found again, at these "
+                "distances in metres from its trunk",
+            )
+
     def test_a_smooth_tall_thing_is_not_a_tree(self):
         """What roughness is for. A crown is a mess of leaves at half-metre
         scale where a made thing is a surface: at a registered tree roughness

@@ -576,6 +576,12 @@ def detect_trees(
     # four metres across, and its canopy peak sits nowhere near the surveyed
     # trunk -- which is why a flat three-metre reservation left a quarter of
     # the detections sitting inside a tree that was already there.
+    #
+    # And every one of them reserves, inside another's reservation or not: all
+    # of them stay in the model. Made to claim its spot the way a seed does,
+    # the second of two registered trees 2.77 m apart in central Arnhem lost
+    # to the first and reserved nothing, and the detector found its crown
+    # again 0.77 m from its trunk.
     fixed = np.asarray(registered_xy, dtype=np.float64).reshape(-1, 2)
     if registered_reach is None:
         reserved = np.full(len(fixed), min_spacing_m)
