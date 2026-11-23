@@ -1659,6 +1659,9 @@ const SOURCE_NAME = {
   terrain: "Hoogte", aerial: "Luchtfoto", buildings: "Gebouwen", usage: "Gebouwfunctie",
   trees: "Bomen", water: "Water en kades", land_cover: "Bodembedekking",
   furniture: "Straatmeubilair", signs: "Verkeersborden", barriers: "Muren, hekken en hagen",
+  markings: "Rijstroken en oversteken", signals: "Verkeerslichten", covers: "Putdeksels en kolken",
+  chargers: "Laadpalen", waterworks: "Bruggen, sluizen en stuwen",
+  landmarks: "Kerken en monumenten",
   vehicles: "Auto's en boten", structures: "Bruggen en tunnels", rails: "Spoor",
   mapillary: "Straatfoto's"
 };
@@ -1756,6 +1759,7 @@ function settingsForEstimate() {
     land_cover: chosen.has("land_cover"), furniture: chosen.has("furniture"),
     signs: chosen.has("signs"),
     barriers: chosen.has("barriers"),
+    traffic: ["signs", "markings", "signals", "covers"].some(id => chosen.has(id)),
     vehicles: chosen.has("vehicles"), rails: chosen.has("rails"),
     structures: chosen.has("structures"),
     usage: chosen.has("usage"), mapillary: chosen.has("mapillary")
@@ -2487,6 +2491,7 @@ const LAYER_NAME = {
   "Terrain": "Grond", "Terrain Cutout": "Gras", "Roads": "Wegen", "Buildings": "Gebouwen",
   "Water": "Water", "Trees": "Bomen", "Street furniture": "Straatmeubilair",
   "Traffic signs": "Verkeersborden",
+  "Traffic": "Lichten en markering", "Landmarks": "Molens en windturbines",
   "Barriers": "Muren, hekken en hagen", "Vehicles": "Auto's en boten", "Rail": "Spoor",
   "Structures": "Bruggen en tunnels", "Collision": "Collision shapes"
 };
@@ -2501,6 +2506,8 @@ const LAYER_ITEM = { "Buildings": "Gebouw", "Trees": "Boom", "Roads": "Weg" };
 const PROPERTY = {
   bag_id: ["BAG-pand", v => String(v).replace(/^NL\.IMBAG\.Pand\./, "")],
   build_year: ["bouwjaar", v => String(v)],
+  landmark: ["gebouwtype", v => String(v)],
+  rijksmonument: ["rijksmonument", v => String(v)],
   height_m: ["hoogte", v => `${String(v).replace(".", ",")} m`],
   detected: ["herkomst", v => (v ? "gevonden in het hoogtemodel" : "BGT-bomenregister")],
   kind: ["soort", v => String(v)]

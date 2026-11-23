@@ -503,6 +503,15 @@ def _werf_brick(scene: dict, work_dir: Path):
     )
 
 
+# Lock gates are tarred timber, their balance beams painted white, a weir is
+# steel: no texture says any of that better than the colour does.
+PLAIN_STRUCTURES = {
+    "lock_gate": ("Sluisdeur", (0.07, 0.05, 0.035), 0.8),
+    "lock_beam": ("Balans", (0.82, 0.82, 0.8), 0.6),
+    "weir": ("Stuw", (0.23, 0.25, 0.26), 0.5),
+}
+
+
 def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
     """Quay faces, jetties, cranes, containers and the rest: one object per kind.
 
@@ -1959,16 +1968,27 @@ def build_buildings(
     )
     # Matches src/buildings.py.
     ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
-    special = (archetype == ARCH_MONUMENTAL) | (archetype == ARCH_INDUSTRIAL)
+    # The Python side says per building how high one tile is (0: a storey)
+    # and where it cut the ground storey off. An older buildings.npz has
+    # neither, and only the two archetypes that were special then.
+    bay_from_scene = data["bay_height_m"] if "bay_height_m" in data.files else None
+    if bay_from_scene is not None:
+        special = bay_from_scene > 0
+    else:
+        special = (archetype == ARCH_MONUMENTAL) | (archetype == ARCH_INDUSTRIAL)
 
     # Which buildings actually had a ground storey taken off them. A church and
     # a warehouse keep their wall whole, so their base is still the ground.
-    was_split = (
-        has_ground & ~special & (wall_height_m > ground_floor_m * 1.2)
-        if has_ground
-        else np.zeros(len(ground_z_nap), dtype=bool)
-    )
-    cut_m = np.where(was_split, ground_floor_m, 0.0)
+    if "ground_cut_m" in data.files and has_ground:
+        cut_m = np.asarray(data["ground_cut_m"], dtype=np.float64)
+        was_split = cut_m > 0
+    else:
+        was_split = (
+            has_ground & ~special & (wall_height_m > ground_floor_m * 1.2)
+            if has_ground
+            else np.zeros(len(ground_z_nap), dtype=bool)
+        )
+        cut_m = np.where(was_split, ground_floor_m, 0.0)
     wall_base_z = ground_z_local + cut_m
     # What is left for the storeys above the shopfront.
     upper_height = np.maximum(wall_height_m - cut_m, 0.1)
@@ -1991,11 +2011,12 @@ def build_buildings(
     # few tall bays instead. Dividing its height by three is what turned the
     # Dom into thirty-six rows of domestic windows.
     if special.any():
-        bay_height = np.where(
+        bay_height = bay_from_scene if bay_from_scene is not None else np.where(
             archetype == ARCH_INDUSTRIAL,
             float(facade_cfg.get("industrial_bay_m", 6.0)),
             float(facade_cfg.get("monumental_bay_m", 9.0)),
         )
+        bay_height = np.where(bay_height > 0, bay_height, 1.0)
         # One tile per bay, with the bay count rounded so the top of the wall
         # lands on a tile edge.
         bays = np.maximum(1.0, np.round(wall_height_m / bay_height))
@@ -2121,6 +2142,9 @@ def build_buildings(
     )
     years = data["build_year"] if "build_year" in data.files else None
     heights = data["height_m"] if "height_m" in data.files else None
+    landmarks = data["landmark"] if "landmark" in data.files else None
+    monuments = data["monument"] if "monument" in data.files else None
+    kind_labels = data["kind_label"] if "kind_label" in data.files else None
 
     # One object per building, so a building is something you click on, move,
     # delete or swap, and its own GameObject in Unity. The triangles of each
@@ -2165,6 +2189,16 @@ def build_buildings(
             obj["build_year"] = int(years[index])
         if heights is not None:
             obj["height_m"] = round(float(heights[index]), 2)
+        # What the registers call it, and its rijksmonument number: a
+        # postprocessor can swap a named church for a modelled one by this.
+        if landmarks is not None and str(landmarks[index]):
+            obj["landmark"] = str(landmarks[index])
+        if monuments is not None and int(monuments[index]):
+            obj["rijksmonument"] = int(monuments[index])
+        # What kind of building it is (kerk, school, schuur), from the
+        # registers, OpenStreetMap or the BAG's empty units.
+        if kind_labels is not None and str(kind_labels[index]):
+            obj["kind"] = str(kind_labels[index])
         objects.append(obj)
 
     log(
@@ -2241,7 +2275,6 @@ def _tree_dice(x, y):
         value = np.sin(seed * 0.0001 + salt) * 43758.5453
         out.append(float(value - np.floor(value)))
     return out
-
 
 
 def _lobed_crown(shape, faces, lobes, crown_r, crown_h, squash, spin):
@@ -2620,6 +2653,51 @@ def _figure(x, y, z, height, spin, colour):
     return pieces
 
 
+def _ring_solid(cx, cy, cz, axis, side, radius, half, sides=8, rim=0.0):
+    """A closed n-sided prism: a post, a bin, a bicycle wheel.
+
+    `axis` is the unit vector it runs along and `side` a unit vector across
+    it; the prism spans `half` either way of (cx, cy, cz) along `axis`. With
+    `axis` straight up it is a post standing on cz - half. A `rim` makes it a
+    ring that thick instead, open in the middle: a wheel, not a disc.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    side = np.asarray(side, dtype=np.float64)
+    third = np.cross(axis, side)
+    angles = np.linspace(0.0, 2.0 * np.pi, sides, endpoint=False)
+    ring = np.cos(angles)[:, None] * side + np.sin(angles)[:, None] * third
+    centre = np.array([cx, cy, cz], dtype=np.float64)
+    low = centre - axis * half + ring * radius
+    high = centre + axis * half + ring * radius
+    faces = []
+    for k in range(sides):
+        n = (k + 1) % sides
+        faces.append([k, n, sides + n])
+        faces.append([k, sides + n, sides + k])
+    if rim <= 0.0:
+        vertices = np.vstack([low, high])
+        for k in range(1, sides - 1):
+            faces.append([sides, sides + k, sides + k + 1])
+            faces.append([0, k + 1, k])
+        return vertices, np.asarray(faces, dtype=np.int64)
+    inner = max(radius - rim, 0.01)
+    low_in = centre - axis * half + ring * inner
+    high_in = centre + axis * half + ring * inner
+    vertices = np.vstack([low, high, low_in, high_in])
+    a, b, c = sides, 2 * sides, 3 * sides
+    for k in range(sides):
+        n = (k + 1) % sides
+        # The inside of the ring faces the middle.
+        faces.append([b + k, c + n, b + n])
+        faces.append([b + k, c + k, c + n])
+        # The two faces of the ring, between its outer and inner edges.
+        faces.append([a + k, a + n, c + n])
+        faces.append([a + k, c + n, c + k])
+        faces.append([k, b + n, n])
+        faces.append([k, b + k, b + n])
+    return vertices, np.asarray(faces, dtype=np.int64)
+
+
 def _furniture_pieces(kind, x, y, base, spin, uv, cfg, height=float("nan"),
                       size=float("nan"), lift=float("nan")):
     """The boxes one piece of street furniture is made of.
@@ -2825,6 +2903,109 @@ def _furniture_pieces(kind, x, y, base, spin, uv, cfg, height=float("nan"),
             (_box(x, y, z, 0.22, 0.22, 0.38, spin), black),
             (_box(x, y, z - 0.02, 0.16, 0.16, 0.24, spin), white),
         ]
+    # The BGT and NDW kinds the furniture stage adds (`furniture.KIND_CONTAINER`
+    # and on): boxes laid out along `spin`, X along the street, +Y towards it.
+    cos_s, sin_s = np.cos(spin), np.sin(spin)
+    up = np.array([0.0, 0.0, 1.0])
+    along = np.array([cos_s, sin_s, 0.0])
+    across = np.array([-sin_s, cos_s, 0.0])
+
+    def at(dx, dy):
+        return x + dx * cos_s - dy * sin_s, y + dx * sin_s + dy * cos_s
+
+    def box(dx, dy, z, sx, sy, sz, patch, turn=0.0):
+        px, py = at(dx, dy)
+        return (_box(px, py, base + z, sx, sy, sz, spin + turn), uv[patch])
+
+    def post(dx, dy, z0, z1, radius, patch, sides=8):
+        px, py = at(dx, dy)
+        half = (z1 - z0) / 2.0
+        return (
+            _ring_solid(px, py, base + z0 + half, up, along, radius, half, sides),
+            uv[patch],
+        )
+
+    def wheel(dx, dy, radius, patch):
+        px, py = at(dx, dy)
+        return (
+            _ring_solid(px, py, base + radius, along, across, radius, 0.02, 6, 0.05),
+            uv[patch],
+        )
+
+    if kind == 27:  # roll container: a box with a lid
+        return [
+            box(0.0, 0.0, 0.62, 1.37, 1.07, 1.0, "grey"),
+            box(0.0, 0.04, 1.16, 1.4, 1.12, 0.08, "green"),
+            box(0.0, 0.0, 0.06, 1.2, 0.9, 0.12, "black"),
+        ]
+    if kind == 28:  # camera: a pole, an arm, a white housing over the street
+        return [
+            post(0.0, 0.0, 0.0, 4.8, 0.06, "grey"),
+            box(0.3, 0.0, 4.7, 0.6, 0.06, 0.06, "grey"),
+            box(0.62, 0.0, 4.6, 0.34, 0.14, 0.15, "white"),
+        ]
+    if kind == 29:  # direction sign: two white blades on a post
+        return [
+            post(0.0, 0.0, 0.0, 2.6, 0.05, "grey"),
+            box(0.65, 0.0, 2.35, 1.2, 0.05, 0.32, "white"),
+            box(-0.55, 0.0, 1.95, 1.0, 0.05, 0.3, "white"),
+        ]
+    if kind == 30:  # billboard: a lit panel on a foot
+        return [
+            box(0.0, 0.0, 0.15, 1.4, 0.32, 0.3, "grey"),
+            box(0.0, 0.0, 1.3, 1.3, 0.25, 2.0, "white"),
+            box(0.0, 0.0, 2.33, 1.36, 0.3, 0.06, "grey"),
+        ]
+    if kind == 31:  # information board: a board on two posts
+        return [
+            box(-0.55, 0.0, 0.9, 0.08, 0.08, 1.8, "wood"),
+            box(0.55, 0.0, 0.9, 0.08, 0.08, 1.8, "wood"),
+            box(0.0, 0.0, 1.45, 1.2, 0.05, 0.8, "green"),
+        ]
+    if kind == 32:  # parking meter: a grey pillar with a blue head
+        return [
+            box(0.0, 0.0, 0.75, 0.38, 0.3, 1.5, "grey"),
+            box(0.0, 0.02, 1.55, 0.42, 0.34, 0.12, "blue"),
+            box(0.0, 0.16, 1.2, 0.22, 0.02, 0.18, "black"),
+        ]
+    if kind == 33:  # public toilet: a green drum under a cap
+        return [
+            post(0.0, 0.0, 0.0, 2.1, 0.9, "green", 10),
+            post(0.0, 0.0, 2.1, 2.25, 1.0, "green", 10),
+        ]
+    if kind == 34:  # bicycle locker: a long box with a rounded back
+        return [
+            box(0.0, 0.0, 0.65, 2.0, 1.2, 1.3, "grey"),
+            box(0.0, 0.0, 1.36, 1.9, 0.9, 0.12, "grey"),
+        ]
+    if kind == 35:  # mooring bollard: short, wide, cast iron
+        return [
+            post(0.0, 0.0, 0.0, 0.5, 0.14, "black"),
+            post(0.0, 0.0, 0.5, 0.6, 0.19, "black"),
+        ]
+    if kind == 36:  # hectometre post: a white post and a green plate
+        return [
+            box(0.0, 0.0, 0.55, 0.08, 0.08, 1.1, "white"),
+            box(0.0, 0.0, 1.2, 0.3, 0.04, 0.35, "green"),
+        ]
+    if kind == 37:  # charging point: pillars, one for every two connectors
+        pillars = int(min(4, max(1, np.ceil(float((size if np.isfinite(size) and size > 0 else 0) or 2) / 2.0))))
+        out = []
+        for k in range(pillars):
+            dx = (k - (pillars - 1) / 2.0) * 1.4
+            out += [
+                box(dx, 0.0, 0.65, 0.4, 0.25, 1.3, "white"),
+                box(dx, 0.0, 1.33, 0.42, 0.27, 0.06, "green"),
+                box(dx, 0.13, 1.0, 0.24, 0.02, 0.2, "black"),
+            ]
+        return out
+    if kind == 38:  # bus stop: a pole with its sign, the timetable below
+        return [
+            post(0.0, 0.0, 0.0, 2.9, 0.05, "grey"),
+            box(0.25, 0.0, 2.55, 0.5, 0.04, 0.55, "white"),
+            box(0.25, 0.0, 2.88, 0.5, 0.045, 0.1, "blue"),
+            box(0.0, 0.06, 1.4, 0.35, 0.06, 0.5, "white"),
+        ]
     # Anything unmapped would be a guess. Drawing nothing is the honest answer.
     return []
 
@@ -2961,6 +3142,10 @@ def build_furniture(scene: dict, work_dir: Path, material):
 
     ground = data["ground_z_nap"]
     kinds = data["kind"]
+    # Which way each piece faces, where the street says; NaN where it does
+    # not, and the dice decide. An older furniture.npz has neither array.
+    spins = data["spin"] if "spin" in data.files else np.full(len(xy), np.nan)
+    sizes = data["size"] if "size" in data.files else np.zeros(len(xy))
     origin_x, origin_y = scene["origin_rd"]
     z_offset = float(scene["ground_z_offset_nap"])
     cfg = scene.get("furniture", {})
@@ -2973,7 +3158,7 @@ def build_furniture(scene: dict, work_dir: Path, material):
     spins, heights, sizes, lifts = column("spin"), column("height_m"), column("size"), column("z_m")
 
     # Where each material sits in the atlas, from the scene file rather than
-    # duplicated here. Falls back to the old two-patch split so an older
+    # duplicated here. Falls back to the built-in table so an older
     # scene.json still renders.
     table = cfg.get("atlas_uv") or {}
     uv = {
@@ -2981,16 +3166,29 @@ def build_furniture(scene: dict, work_dir: Path, material):
         for name, default in (
             # V from the bottom of the image: the first row is written at
             # the top. See `furniture_uv`.
-            ("metal", (0.125, 0.875)), ("wood", (0.375, 0.875)),
-            ("brick", (0.625, 0.875)), ("concrete", (0.875, 0.875)),
-            ("hedge", (0.125, 0.625)), ("paint", (0.375, 0.625)),
-            ("stone", (0.625, 0.625)), ("glass", (0.875, 0.625)),
-            ("bronze", (0.125, 0.375)), ("canvas", (0.375, 0.375)),
-            ("rattan", (0.625, 0.375)), ("terracotta", (0.875, 0.375)),
-            ("red", (0.125, 0.125)), ("white", (0.375, 0.125)),
-            ("black", (0.625, 0.125)), ("water", (0.875, 0.125)),
+            ("metal", (0.1, 0.9)), ("wood", (0.3, 0.9)),
+            ("brick", (0.5, 0.9)), ("concrete", (0.7, 0.9)),
+            ("hedge", (0.9, 0.9)), ("paint", (0.1, 0.7)),
+            ("stone", (0.3, 0.7)), ("glass", (0.5, 0.7)),
+            ("bronze", (0.7, 0.7)), ("canvas", (0.9, 0.7)),
+            ("rattan", (0.1, 0.5)), ("terracotta", (0.3, 0.5)),
+            ("red", (0.5, 0.5)), ("white", (0.7, 0.5)),
+            ("black", (0.9, 0.5)), ("water", (0.1, 0.3)),
+            ("green", (0.3, 0.3)), ("blue", (0.5, 0.3)),
+            ("yellow", (0.7, 0.3)), ("grey", (0.9, 0.3)),
+            ("orange", (0.1, 0.1)),
         )
     }
+    # A patch the scene names and this table does not.
+    for name, value in table.items():
+        uv.setdefault(name, np.asarray(value, dtype=np.float64))
+    # An atlas from before the colour patches: stand the nearest old patch in.
+    for name, stand_in in (
+        ("black", "metal"), ("white", "glass"), ("red", "brick"), ("green", "hedge"),
+        ("blue", "glass"), ("yellow", "wood"), ("grey", "concrete"), ("orange", "brick"),
+    ):
+        if table and name not in table:
+            uv[name] = uv[stand_in]
 
     # One object per group, so a designer can hide the summer terraces or
     # the signs on the facades in one click; one material for all of them.
@@ -3052,7 +3250,6 @@ def build_furniture(scene: dict, work_dir: Path, material):
     return made[0]
 
 
-
 def build_signs(scene: dict, work_dir: Path, material):
     """Traffic signs: poles, faces and backs, built on the Python side.
 
@@ -3089,6 +3286,103 @@ def build_signs(scene: dict, work_dir: Path, material):
         f"traffic signs: {len(data['pole_xy'])} poles, {len(sizes)} faces"
     )
     return obj
+
+
+TRAFFIC_OBJECTS = (
+    # npz prefix, object name
+    ("signs", "TrafficSigns"),
+    ("signals", "TrafficLights"),
+    ("markings", "RoadMarkings"),
+    ("symbols", "RoadSymbols"),
+    ("covers", "StreetCovers"),
+)
+# Drawn through the alpha-cut material: a symbol is white paint on a cell
+# that is otherwise transparent.
+CUTOUT_TRAFFIC = ("symbols",)
+
+
+def build_traffic(scene: dict, work_dir: Path, material, cutout_material=None) -> list:
+    """Signs, lights, road paint and covers, one object each.
+
+    The meshes arrive finished from `src/traffic.py`, in RD and NAP: all that
+    is left to do here is move them to the model's origin. They share one
+    atlas, and all but the symbols one material.
+    """
+    traffic_file = scene.get("traffic", {}).get("file")
+    if not traffic_file or not (work_dir / traffic_file).is_file():
+        return []
+
+    data = np.load(work_dir / traffic_file)
+    origin_x, origin_y = scene["origin_rd"]
+    shift = np.array([origin_x, origin_y, float(scene["ground_z_offset_nap"])])
+
+    objects = []
+    for prefix, name in TRAFFIC_OBJECTS:
+        if f"{prefix}_faces" not in data.files:
+            continue
+        if prefix in CUTOUT_TRAFFIC and cutout_material is None:
+            continue
+        faces = np.asarray(data[f"{prefix}_faces"], dtype=np.int64)
+        if not len(faces):
+            continue
+        vertices = np.asarray(data[f"{prefix}_vertices"], dtype=np.float64) - shift
+        uv = np.asarray(data[f"{prefix}_uv"], dtype=np.float64)
+        n_triangles = len(faces)
+        loops = faces.reshape(-1)
+        objects.append(
+            build_mesh_object(
+                name,
+                vertices,
+                loops,
+                np.arange(0, n_triangles * 3, 3),
+                np.full(n_triangles, 3),
+                uv[loops],
+                np.zeros(n_triangles),
+                [cutout_material if prefix in CUTOUT_TRAFFIC else material],
+                shade_smooth=False,
+            )
+        )
+        log(f"{name}: {n_triangles} triangles")
+    return objects
+
+
+LANDMARK_OBJECTS = {
+    # npz key: object name, plain material
+    "sails": ("WindmillSails", ("Wieken", (0.12, 0.09, 0.07), 0.8)),
+    "turbines": ("WindTurbines", ("Windturbine", (0.86, 0.87, 0.88), 0.4)),
+}
+# The doors of sheds, barns and kiosks (src/doors.py): part of the buildings.
+DOOR_OBJECTS = {
+    "doors": ("Doors", ("Deur", (0.16, 0.13, 0.1), 0.7)),
+    "steel_doors": ("SteelDoors", ("Staaldeur", (0.3, 0.32, 0.31), 0.45)),
+    "door_frames": ("DoorFrames", ("Kozijn", (0.82, 0.81, 0.77), 0.55)),
+}
+
+
+def build_landmarks(scene: dict, work_dir: Path, objects_by_key: dict | None = None) -> list:
+    """Windmill sails and wind turbines, built in RD by `src/landmarks.py`;
+    with `objects_by_key`, the other meshes the same file carries."""
+    landmark_file = scene.get("landmarks", {}).get("file")
+    if not landmark_file or not (work_dir / landmark_file).is_file():
+        return []
+    data = np.load(work_dir / landmark_file)
+    origin_x, origin_y = scene["origin_rd"]
+    shift = np.array([origin_x, origin_y, float(scene["ground_z_offset_nap"])])
+    objects = []
+    for key, (name, plain) in (objects_by_key or LANDMARK_OBJECTS).items():
+        if key not in data.files or not len(data[key]):
+            continue
+        triangles = np.asarray(data[key], dtype=np.float64) - shift
+        corners, indices = _weld_corners(triangles.reshape(-1, 3))
+        n_triangles = len(triangles)
+        material = bpy.data.materials.get(plain[0]) or make_plain_material(*plain)
+        objects.append(build_mesh_object(
+            name, corners, indices, np.arange(0, n_triangles * 3, 3),
+            np.full(n_triangles, 3), _box_uvs(triangles, 4.0),
+            np.zeros(n_triangles), [material], shade_smooth=False,
+        ))
+        log(f"{name}: {n_triangles} triangles")
+    return objects
 
 
 def _hull(cx, cy, cz, length, beam, depth, freeboard, spin):
@@ -3375,11 +3669,33 @@ def _rail_quads(triangles, uv):
     return np.asarray(corners), np.asarray(corner_uv), np.asarray(sizes, dtype=np.int64)
 
 
+def _box_uvs(triangles: np.ndarray, scale: float) -> np.ndarray:
+    """Metre UVs projected along each triangle's own main axis, (n*3, 2).
+
+    A deck is mapped from above, a wall from the side it faces. Mapping
+    everything from above, as this used to, smeared a pier's or an arch's
+    walls into vertical streaks: every point straight above another has the
+    same x and y.
+    """
+    edges_a = triangles[:, 1] - triangles[:, 0]
+    edges_b = triangles[:, 2] - triangles[:, 0]
+    normal = np.abs(np.cross(edges_a, edges_b))
+    flat = triangles.reshape(-1, 3)
+    uvs = flat[:, :2].copy()
+    facing_x = np.repeat((normal[:, 0] >= normal[:, 1]) & (normal[:, 0] > normal[:, 2]), 3)
+    facing_y = np.repeat((normal[:, 1] > normal[:, 0]) & (normal[:, 1] > normal[:, 2]), 3)
+    uvs[facing_x] = flat[facing_x][:, [1, 2]]
+    uvs[facing_y] = flat[facing_y][:, [0, 2]]
+    return uvs / float(scale)
+
+
 def build_structures(scene: dict, work_dir: Path, material):
-    """Bridge decks, the piers under them, and tunnels below the ground.
+    """Bridge decks, the piers under them, tunnels below the ground, and the
+    gates of locks and the crests of weirs.
 
     One object per kind, so a deck can be given a drivable collider and a pier
-    cannot, and so the tunnel is selectable on its own.
+    cannot, and so the tunnel is selectable on its own. The sides and arch of
+    a canal bridge are brick, with their own material.
     """
     structures_file = scene.get("structures", {}).get("file")
     if not structures_file or not (work_dir / structures_file).is_file():
@@ -3448,6 +3764,10 @@ def build_structures(scene: dict, work_dir: Path, material):
         elif label == "railing":
             # A railing is painted steel, not the concrete of the deck it is on.
             own = bpy.data.materials.get(RAILING_MATERIAL[0]) or make_plain_material(*RAILING_MATERIAL)
+        elif label in PLAIN_STRUCTURES:
+            # Lock gates, their balance beams and weirs: a colour each.
+            plain = PLAIN_STRUCTURES[label]
+            own = bpy.data.materials.get(plain[0]) or make_plain_material(*plain)
         elif label == "tunnel_road":
             # A tunnel's floor is the road through it.
             own = (
@@ -3890,6 +4210,7 @@ def copy_textures(
         ("furniture", "furniture"),
         ("sign", "signs"),
         ("fence", "barriers"),
+        ("traffic", "traffic"),
         ("vehicle", "vehicles"),
         ("rail", "rails"),
         ("structure", "structures"),
@@ -4036,6 +4357,7 @@ def main() -> int:
             passage_material=structure_material,
             roof_materials=roof_materials, report=roof_report,
         )
+        build_landmarks(scene, work_dir, DOOR_OBJECTS)
 
     werf_entry = (scene.get("layered") or {}).get("werf") or {}
     if layered is not None and werf_entry.get("file") and (work_dir / werf_entry["file"]).is_file():
@@ -4119,6 +4441,22 @@ def main() -> int:
             rail = build_guardrails(scene, work_dir, prefix)
             if rail is not None:
                 layered["guardrail_object"] = rail.name
+    if "traffic" in extra_textures:
+        with _Layer("Traffic", "Traffic"):
+            build_traffic(
+                scene,
+                work_dir,
+                make_textured_material(
+                    "M_traffic", extra_textures["traffic"], roughness=0.6
+                ),
+                make_cutout_material(
+                    "M_traffic_symbols", extra_textures["traffic"], roughness=0.7
+                ),
+            )
+
+    with _Layer("Landmarks", "Landmarks"):
+        build_landmarks(scene, work_dir)
+
 
     if "vehicle" in extra_textures:
         # Car paint is the one glossy thing out here.

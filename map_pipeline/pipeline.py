@@ -78,6 +78,7 @@ from src.sources import (  # noqa: E402
 )
 from src.facade import (  # noqa: E402
     CAR_PAINT,
+    GROUND_STYLES,
     LookPlan,
     generate_facade_textures,
     generate_fence_texture,
@@ -98,6 +99,15 @@ from src.signs import (  # noqa: E402
     save_signs,
     write_sign_list,
 )
+from src.furniture import KIND_CHARGER, fetch_chargers  # noqa: E402
+from src.osm_ways import fetch_osm_ways  # noqa: E402
+from src.traffic import (  # noqa: E402
+    TrafficSet,
+    build_traffic,
+    generate_traffic_texture,
+    road_index,
+    write_traffic_list,
+)
 from src.imagery import build_aerial  # noqa: E402
 from src.rails import KIND_NAMES as RAIL_KIND_NAMES  # noqa: E402
 from src.rails import RailSet, build_rails, save_rails  # noqa: E402
@@ -108,7 +118,11 @@ from src.structures import (  # noqa: E402
     build_structures,
     deck_surface,
     save_structures,
+    write_bridge_list,
 )
+from src.waterworks import fetch_waterworks  # noqa: E402
+from src.doors import door_meshes  # noqa: E402
+from src.landmarks import fetch_landmarks, landmark_meshes, save_landmarks  # noqa: E402
 from src.surfaces import (  # noqa: E402
     CLASS_NAMES,
     SurfaceSet,
@@ -149,6 +163,7 @@ from src.validate import (  # noqa: E402
     check_furniture,
     check_passages,
     check_roof_atlas,
+    check_traffic,
     check_rails,
     check_signs,
     check_structures,
@@ -228,6 +243,10 @@ def write_timings(
             "surfaces": bool(config.surfaces["water"] or config.surfaces["land_cover"]),
             "furniture": bool(config.furniture["enabled"]),
             "signs": bool(config.signs["enabled"]),
+            "traffic": any(
+                bool(config.traffic.get(key))
+                for key in ("signals", "markings", "covers")
+            ),
             "barriers": bool(config.barriers["enabled"]),
             "usage": bool(config.usage["enabled"]),
             # Rendering previews costs more than every data stage put together,
@@ -911,6 +930,10 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     )
     want_furniture = bool(config.furniture["enabled"] or config.furniture.get("osm"))
     want_signs = bool(config.signs["enabled"])
+    # Lights and road paint; the signs are the signs stage's.
+    want_traffic = any(
+        bool(config.traffic.get(key)) for key in ("signals", "markings", "covers")
+    )
     want_barriers = bool(config.barriers["enabled"])
     want_usage = bool(config.usage["enabled"])
     want_vehicles = bool(config.vehicles["cars"] or config.vehicles["boats"])
@@ -930,7 +953,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     total = 7 + sum(
         (
             want_trees, want_surfaces, want_furniture, want_signs, want_barriers,
-            want_usage, want_roofs,
+            want_usage, want_roofs, want_traffic,
             want_vehicles, want_rails, want_structures, want_photos,
         )
     ) + (0 if args.skip_blender else 1)
@@ -1033,6 +1056,17 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     "max_pages": int(config.surfaces["max_pages"]),
                 },
             )
+        landmarks = (
+            fetch_landmarks(config.bbox, cache_dir=work_dir / "_bgt")
+            if bool(config.facade.get("landmarks", True)) else None
+        )
+        # OpenStreetMap, read once for everything here that needs its roads,
+        # nodes and buildings: what the buildings are and what their ground
+        # floors are, and later the road paint and the lights. The same cached
+        # tiles the street objects read. A failed read is empty.
+        street_osm = None
+        if bool(config.facade.get("landmarks", True)) or want_traffic:
+            street_osm = fetch_osm_ways(config.bbox.buffered(30.0), cache_dir=work_dir / "_osm")
         buildings = build_buildings(
             config.bbox,
             work_dir,
@@ -1047,7 +1081,18 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             usage=usage if len(usage) else None,
             facade_cfg=config.facade,
             passage_areas=passage_areas,
+            # Churches, towers and rijksmonumenten, from TOP10NL and the
+            # monument register; a failure costs only the improvement.
+            landmarks=landmarks,
+            osm=street_osm if bool(config.facade.get("landmarks", True)) else None,
         )
+        # Sails on the windmills the register names, and the wind turbines;
+        # a door in the closed walls of every shed, barn and kiosk.
+        landmark_file = None
+        shapes = landmark_meshes(buildings, landmarks, terrain)
+        shapes.update(door_meshes(buildings, osm=street_osm, terrain=terrain))
+        if shapes:
+            landmark_file = save_landmarks(shapes, work_dir / "landmarks.npz")
 
     roof_atlas = RoofAtlas(None, note="switched off (buildings.roof_cm is 0)")
     if want_roofs:
@@ -1348,32 +1393,6 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     crowns=crowns_from_trees(trees) if len(trees) else [],
                 )
 
-    furniture = FurnitureSet()
-    furniture_texture = None
-    osm = None
-    if want_furniture:
-        with Stage("street furniture (BGT, OpenStreetMap, Mapillary)", next_step(), total):
-            furniture = (
-                build_furniture(
-                    config.bbox,
-                    work_dir,
-                    furniture_cfg=config.furniture,
-                    terrain=terrain,
-                )
-                if config.furniture["enabled"]
-                else FurnitureSet()
-            )
-            osm, found = street_details(
-                config, work_dir, furniture,
-                buildings=buildings, surfaces=surfaces, terrain=terrain,
-                surface_at=surface_at, street_photos=street_photos,
-            )
-            if found is not None:
-                furniture = found
-                save_furniture(furniture, work_dir / "furniture.npz")
-            if len(furniture):
-                furniture_texture = generate_furniture_texture(work_dir)
-
     signs = SignSet()
     sign_texture = None
     if want_signs:
@@ -1401,17 +1420,104 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 save_signs(signs, work_dir / "signs.npz")
                 write_sign_list(signs, config.geo, out_dir)
                 sign_texture = signs.atlas.path
-                # The BGT's bare post where NDW has the pole with its signs.
-                dropped = drop_covered_posts(furniture, signs, sign_kind=KIND_SIGN)
-                if dropped:
-                    furniture.counts[FURNITURE_KINDS[KIND_SIGN]] = int(
-                        (furniture.kind == KIND_SIGN).sum()
-                    )
-                    save_furniture(furniture, work_dir / "furniture.npz")
-                    LOG.info(
-                        "dropped %d BGT sign posts that an NDW pole stands on",
-                        dropped,
-                    )
+
+    # After the signs, whose give-way signs get their teeth painted here, and
+    # before the furniture: the signal poles this draws with their lights
+    # are BGT points the furniture stage would otherwise draw blank.
+    traffic = TrafficSet()
+    traffic_texture = None
+    if want_traffic:
+        with Stage("traffic lights and road markings (OSM, BGT)", next_step(), total):
+            traffic = build_traffic(
+                config.bbox,
+                work_dir,
+                traffic_cfg=config.traffic,
+                terrain=terrain,
+                # A zebra on a bridge lies on the deck, not on the canal bed.
+                deck_at=(
+                    (lambda x, y: deck_at(x, y, reach=0.0)) if deck_at is not None else None
+                ),
+                # Cached by the ground stage when it read it; an empty network
+                # on failure, and the signs then find their road without it.
+                network=fetch_centrelines(
+                    config.bbox,
+                    url=str(config.surfaces.get("nwb_url", NWB_URL)),
+                    timeout=float(config.surfaces["timeout_s"]),
+                    max_retries=int(config.surfaces["max_retries"]),
+                    cache_dir=work_dir / "_bgt",
+                ),
+                osm=street_osm,
+                signs=signs,
+            )
+            if len(traffic):
+                traffic_texture = generate_traffic_texture(work_dir)
+                write_traffic_list(traffic, config.geo, out_dir)
+
+    furniture = FurnitureSet()
+    furniture_texture = None
+    osm = None
+    if want_furniture:
+        with Stage("street furniture (BGT, NDW, OpenStreetMap, Mapillary)", next_step(), total):
+            roads = traffic.roads
+            if roads is None:
+                roads = road_index(
+                    fetch_centrelines(
+                        config.bbox,
+                        url=str(config.surfaces.get("nwb_url", NWB_URL)),
+                        timeout=float(config.surfaces["timeout_s"]),
+                        max_retries=int(config.surfaces["max_retries"]),
+                        cache_dir=work_dir / "_bgt",
+                    ),
+                    street_osm,
+                )
+            furniture = (
+                build_furniture(
+                    config.bbox,
+                    work_dir,
+                    furniture_cfg=config.furniture,
+                    terrain=terrain,
+                    # The signal poles the traffic stage drew with their lights.
+                    skip_types=traffic.replaces,
+                    # Each piece turned to its road, and off the carriageway.
+                    roads=roads,
+                    buildings=buildings,
+                    carriageway=traffic.carriageway,
+                    # OpenStreetMap's objects come in below, with Mapillary's,
+                    # by `street_details`: one merge for both.
+                    osm=None,
+                    chargers=(
+                        fetch_chargers(config.bbox, cache_dir=work_dir / "_bgt")
+                        if bool(config.furniture.get("chargers", True))
+                        else None
+                    ),
+                )
+                if config.furniture["enabled"]
+                else FurnitureSet()
+            )
+            osm, found = street_details(
+                config, work_dir, furniture,
+                buildings=buildings, surfaces=surfaces, terrain=terrain,
+                surface_at=surface_at, street_photos=street_photos,
+            )
+            if found is not None:
+                furniture = found
+                save_furniture(furniture, work_dir / "furniture.npz")
+            if len(furniture):
+                furniture_texture = generate_furniture_texture(work_dir)
+
+    if len(signs) and len(furniture):
+        # The BGT's bare post where NDW has the pole with its signs.
+        dropped = drop_covered_posts(furniture, signs, sign_kind=KIND_SIGN)
+        if dropped:
+            furniture.counts[FURNITURE_KINDS[KIND_SIGN]] = int(
+                (furniture.kind == KIND_SIGN).sum()
+            )
+            save_furniture(furniture, work_dir / "furniture.npz")
+            LOG.info(
+                "dropped %d BGT sign posts that an NDW pole stands on",
+                dropped,
+            )
+
 
     barriers = BarrierSet()
     fence_texture = None
@@ -1489,11 +1595,16 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 timeout=float(config.terrain["timeout_s"]),
                 max_retries=int(config.terrain["max_retries"]),
             )
+            waterworks = (
+                fetch_waterworks(config.bbox, cache_dir=work_dir / "_bgt")
+                if bool(config.structures.get("water_boards", True)) else None
+            )
             structures = build_structures(
                 config.bbox,
                 work_dir,
                 structures_cfg=config.structures,
                 terrain=terrain,
+                waterworks=waterworks,
                 dsm_sampler=raster_sampler(dsm_path) if dsm_path else None,
                 # The layered style cuts canal beds below the water; a pier
                 # stands on the bed, not on the surveyed ground above it.
@@ -1509,6 +1620,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
                     structure_brick = generate_brick_texture(work_dir)
                 deck_paving = _deck_paving(surfaces)
+            if structures.bridges or structures.locks or structures.weirs:
+                write_bridge_list(structures, config.geo, out_dir)
 
             if len(structures.tunnels):
                 # A height field cannot have a hole in its side: the ground
@@ -1557,7 +1670,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             observed=observed_plan.styles if observed_plan else None,
         )
         ground_variants = (
-            (2 if len(usage) else 1) if config.facade["ground_floor"] else 0
+            (len(GROUND_STYLES) if len(usage) else 1) if config.facade["ground_floor"] else 0
         )
         paving_entry: dict = {}
         if ground_layers is not None and config.layered.get("paving", True):
@@ -1589,6 +1702,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             water_texture=water_texture,
             furniture_texture=furniture_texture,
             sign_texture=sign_texture,
+            traffic_texture=traffic_texture,
+            landmark_file=landmark_file,
             surfaces_cfg=config.surfaces,
             surface_class_names={
                 int(k): v for k, v in CLASS_NAMES.items()
@@ -1645,6 +1760,8 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
                 "traffic_signs": signs.stats(),
+                "landmarks": dict(getattr(buildings, "landmark_stats", {}) or {}),
+                "traffic": traffic.stats(),
                 "barriers": barriers.stats(),
                 **({"guardrails": guardrails.stats()} if len(guardrails) else {}),
                 "vehicles": vehicles.stats(),
@@ -1702,7 +1819,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         write_attribution(
             out_dir,
             mapillary=street_photos.uses_mapillary,
-            osm=SOURCE_OSM in drawn_from or bool(barriers.counts.get("flights_from_osm")),
+            # The buildings' kinds and ground floors, and the road paint and
+            # lights, read OpenStreetMap too.
+            osm=SOURCE_OSM in drawn_from or bool(barriers.counts.get("flights_from_osm"))
+            or traffic.used_osm
+            or bool(
+                (getattr(buildings, "landmark_stats", {}) or {}).get("from_osm")
+                or (getattr(buildings, "landmark_stats", {}) or {}).get("ground_floors")
+            ),
             mapillary_objects=SOURCE_MAPILLARY in drawn_from,
             mapillary_textures=bool(
                 photo_textures is not None
@@ -1710,6 +1834,17 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     pid.startswith("mly_")
                     for ids in photo_textures.sources.values() for pid in ids
                 )
+            ),
+            chargers=bool(len(furniture) and (furniture.kind == KIND_CHARGER).any()),
+            extra=tuple(
+                key for key, used in (
+                    ("waterworks", bool(structures.bridges and any(
+                        b.get("source") == "water board" for b in structures.bridges
+                    )) or bool(structures.locks or structures.weirs)),
+                    ("top10nl", bool((getattr(buildings, "landmark_stats", {}) or {}).get("typed"))),
+                    ("monuments", bool((getattr(buildings, "landmark_stats", {}) or {}).get("monuments"))),
+                    ("turbines", bool(landmarks and landmarks.turbines)),
+                ) if used
             ),
         )
 
@@ -1752,6 +1887,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             )
         check_furniture(report, furniture if want_furniture else None, config.bbox)
         check_signs(report, signs if want_signs else None, config.bbox)
+        check_traffic(report, traffic if want_traffic else None, config.bbox)
         # Against what they were placed on: the model's own surface, which
         # is the road where there is one and the terrain as drawn elsewhere.
         check_barriers(

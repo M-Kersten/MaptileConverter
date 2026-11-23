@@ -29,13 +29,18 @@ output/<area_name>/
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
 ├── vehicles.json    car and boat positions and headings, same idea
 ├── signs.json       every traffic sign: code, value, plates, facing
+├── traffic.json     the traffic lights and the crossings, for prefabs and
+│                    for traffic logic
+├── waterworks.json  every bridge over water with its clearance, and the locks
+│                    and weirs
 ├── landcover.png    surface class per pixel, registered to the same bbox
 ├── landcover.json   what the class values mean
 ├── facade*.png      generated facade textures, referenced by the FBX
 ├── tree.png         bark and foliage atlas
 ├── water.png        canal water
-├── furniture.png    metal and wood atlas
+├── furniture.png    materials and colours atlas for street furniture
 ├── signs.png        every sign face and plate the area needs, cut out
+├── traffic.png      road paint, symbols and signal lamps
 ├── vehicle.png      car paint, hull and timber atlas
 ├── rail.png         ballast with sleepers, and rail steel
 ├── structure.png    concrete for decks, piers, tunnel walls and passages
@@ -560,7 +565,7 @@ Other knobs worth knowing:
 | `surfaces.land_cover` | `true` | Classify the ground and export the class map. |
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
-| `furniture.enabled` | `true` | Lampposts, bollards, sign posts and benches. |
+| `furniture.enabled` | `true` | Lampposts, bollards, sign posts, benches and the rest of the BGT's street furniture. |
 | `signs.enabled` | `true` | Traffic signs from the NDW register. See [Traffic signs](#traffic-signs). |
 | `signs.municipalities` | `[]` | CBS codes (`GM0344`) to read instead of asking PDOK which municipalities the area touches. |
 | `signs.cache_days` | `30` | How long a municipality's register is reused. NDW rebuilds it monthly. |
@@ -570,6 +575,16 @@ Other knobs worth knowing:
 | `signs.overhead_clearance_m` | `4.6` | Where an overhead sign hangs. A height limit hangs just above its own number. |
 | `signs.commons` | `true` | Fetch the RVV artwork from Wikimedia Commons. Off, every face is drawn. |
 | `signs.unknown` | `true` | Draw the signs NDW has no code for, as a blank plate. |
+| `furniture.chargers` | `true` | Public charging points from NDW. |
+| `furniture.max_bicycles` | `1500` | The most bicycles drawn in racks. |
+| `traffic.markings` | `true` | Lane lines, zebras and speed-hump blocks from OpenStreetMap, and the give-way teeth under the signs. See [Lights and road markings](#lights-and-road-markings). |
+| `traffic.signals` | `true` | Traffic lights on the BGT's signal poles. |
+| `traffic.covers` | `true` | Manhole lids, gully grates and hydrant lids from the BGT. |
+| `traffic.parking_bays` | `true` | White lines between the stalls of every BGT parking bay. |
+| `structures.water_boards` | `true` | Read the water boards' register for bridge clearances, locks and weirs. |
+| `structures.locks_and_weirs` | `true` | Build lock gates and weirs from that register. |
+| `facade.landmarks` | `true` | Read what each building is from OpenStreetMap, TOP10NL and the monument register, and the wind turbine register. See [What a building is](#what-a-building-is). |
+| `traffic.marking_lift_m` | `0.03` | How far paint lies above the road. Raise it if markings flicker at long range in your renderer. |
 | `export.collision` | `false` | Add invisible `Collision_*` shapes for physics. See [Collision shapes](#collision-shapes). |
 | `export.collision_tree_crowns` | `true` | Whether a tree's collider includes its canopy. `false` leaves the trunk alone, at a quarter of the triangles. |
 | `barriers.collision_thickness_m` | `0.30` | The thinnest a collider may be, which is not the thinnest a fence may look: a 6 cm panel is thin enough to tunnel through at 50 Hz. |
@@ -700,6 +715,13 @@ src/roads.py       road ladders: stations, cross-sections, kerbs, objects
 src/furniture.py   BGT lampposts, bollards, signs and benches
 src/signs.py       NDW traffic signs: poles, facing from NWB, stacking, mesh
 src/sign_faces.py  the sign artwork: Commons thumbnails, drawn stand-ins, atlas
+src/osm_ways.py    OpenStreetMap's roads, tagged nodes and buildings, from src/osm.py's tiles
+src/traffic.py     traffic lights, road paint, manholes and gullies
+src/ogcapi.py      paging an OGC API collection over an RD bbox
+src/waterworks.py  the water boards' bridges, locks and weirs, and their geometry
+src/landmarks.py   TOP10NL types, rijksmonumenten, windmill sails, wind turbines
+src/kinds.py       what kind of building each is, from OSM, TOP10NL, the monuments and the BAG
+src/doors.py       a door to every closed building, on the wall that faces its road
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
 src/structures.py  bridge decks and piers, and tunnels below ground
@@ -782,10 +804,12 @@ outliner and an empty that everything in it hangs from:
 | `Terrain Cutout` | layered style: the grass object |
 | `Terrain` | survey style: one object, the ground; its edges follow the outlines (see [Terrain](#terrain)) |
 | `Roads` | survey style: one object per street, junction and paving area (see [Roads](#roads)) |
-| `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
+| `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year`, `height_m` and `kind` as custom properties; `Doors`, `SteelDoors` and `DoorFrames` |
 | `Water` | water surfaces and beds |
 | `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
 | `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named; in the layered style `Barriers` also holds the motorway's guardrails, `<Prefix>_Geleiderail` |
+| `Traffic` | `TrafficLights`, `RoadMarkings`, `RoadSymbols` and `StreetCovers` |
+| `Landmarks` | `WindmillSails` and `WindTurbines` |
 | `Collision` | the physics proxies, hidden; see [Collision shapes](#collision-shapes) |
 
 **Trees are instances.** Ten thousand trees share twelve meshes: three kinds,
@@ -1837,7 +1861,7 @@ deck.
 None of this is structurally important, which is exactly the point. A street
 with nothing on it reads as a model; the same street with lampposts along the
 kerb, a wall between the plots and a hedge behind it reads as a place. Everything
-here shares one 16-patch atlas and one material, so a few thousand objects cost
+here shares one 25-patch atlas (the materials and the colours) and one material, so a few thousand objects cost
 one draw call. Its patches are addressed with V counted up from the bottom of
 the image, as Blender reads it; counted from the top, as the image is written,
 every lookup read the patch from the other row — metal came out hedge green, a
@@ -1863,6 +1887,39 @@ Bold is what was being fetched and thrown away. The walls and fences are the
 bulk of it — three thousand objects that divide one plot from the next, without
 which a street is a row of buildings standing in a field. The quay walls matter
 more still: an Utrecht canal without its wall is a trench.
+
+### More than one municipality registers
+
+What a municipality puts in the BGT differs a great deal. Rotterdam registers
+litter bins, roll containers, parking meters, cameras, direction signs and 245
+lights hung on facades in one 600 m square; Utrecht registers none of those.
+All of them are drawn now where they exist, with a shape of their own, and two
+more sources fill in behind the BGT:
+
+| Source | What it adds | Utrecht centre km² |
+|---|---|---|
+| NDW charging point register (CC0) | public charging points, one pillar per two connectors | 39 locations |
+| OpenStreetMap (ODbL) | bicycle racks with their capacity, litter bins, post boxes, artworks, bus stops, cameras, information boards, fountains | 166 bins, 37 racks with 500 bicycles, 20 cameras, 10 bus stops |
+| OpenStreetMap cafes and restaurants with `outdoor_seating` | a terrace in front of the facade: tables, chairs, a parasol each | 22 terraces round the Neude alone |
+
+An OpenStreetMap object is kept only where the BGT has nothing of the same kind
+within a few metres (`furniture.OSM_WANTED` gives the radius per kind), and only
+outdoors: one inside a building footprint is in a station hall or a garage. A
+mural is an artwork but not one that stands in the street; an underground
+bicycle garage is bicycle parking but not one you see. Positions from NDW and
+OpenStreetMap are an address or a mapper's click, so one that lands on the
+carriageway is moved to the kerb.
+
+**Every piece faces its street.** The nearest NWB section or OpenStreetMap road
+within 25 m decides it: a bench runs along the road with its back to the
+houses, a lamppost's arm reaches out over the carriageway, a bicycle rack runs
+along the kerb with the bicycles across it, a sign's face looks along the road.
+A BGT light point within 1.5 m of a facade hangs on it as a wall lamp. Where no
+road is near, a piece is turned at random, as everything used to be.
+
+Bicycles are capped at `furniture.max_bicycles` (1500): near a station
+OpenStreetMap counts racks by the thousand, and every bicycle is about eighty
+triangles.
 
 **Nothing here carries a height.** The BGT surveys where a wall is and never how
 tall, so heights come from a table by type in `barriers.LINE_STYLES` and
@@ -2175,6 +2232,81 @@ layer is one object, `TrafficSigns`, in one collection, at one draw call.
 its plates and texts, its facing as a Unity Y rotation and what that facing
 came from, for a simulation that needs to know what the signs say.
 
+## Lights and road markings
+
+The BGT draws the carriageway and stops there. A street built from it alone is
+grey from kerb to kerb, and the only trace of traffic on it used to be a handful
+of blank sign posts. The signs are the signs stage's ([Traffic signs](#traffic-signs)).
+Over the Utrecht centre square kilometre the registers below hold the rest,
+and all of it is now in the model:
+
+| What | Source | In the square |
+| --- | --- | --- |
+| Lane counts, crossings and how they are marked, speed humps | OpenStreetMap (ODbL) | 570 m of lane line, 15 crossings, 23 humps |
+| Signal poles | BGT `paal` | 8, plus 11 placed at junctions OpenStreetMap tags as signalled |
+| Manholes and gullies | BGT `put` | 1074 and 2005 |
+
+**Lane lines** are not surveyed by anyone. OpenStreetMap has the lane count,
+and the BGT has the kerbs, so a line is put where the count says it must be:
+the carriageway is measured kerb to kerb at every dash and divided by the
+number of lanes. Where the measured width is not what that many lanes need —
+at a junction, a bus bay, a flare — the dash is left out, which is why the
+lines stop at a junction instead of running across it. Ways tagged
+`lane_markings=no` get none.
+
+**Crossings** are painted as OpenStreetMap tags them: a zebra as half-metre
+stripes from kerb to kerb, a signalled crossing as two dashed lines. A speed
+hump gets the row of white blocks on its ramp.
+
+**Give-way teeth and stop lines** are in no register, but the signs that
+require them are, and the signs stage has placed them. Every B6 gets a row of teeth across the lane it governs, at
+the sign, pointing at the driver; every B7 a line. On a carriageway wide enough
+for two directions that is the right-hand half.
+
+**Traffic lights** stand on the BGT's `verkeersregelinstallatiepaal` points,
+which used to be drawn as one more blank sign post, and face the traffic that
+has the pole on its right. Not every municipality surveys them, so a junction
+OpenStreetMap tags `highway=traffic_signals` with no surveyed pole within 30 m
+gets one pole per approach, on the kerb, six metres back from the middle of
+the junction. An approach is a way bringing traffic in: a road that ends at
+the junction brings it one way only. Every approach gets a solid stop line
+across its lanes, a metre and a half before the light.
+
+**Parking bays** get white lines between their stalls. The BGT draws a row of
+bays as one polygon, so the stalls are cut the way the vehicle stage parks its
+cars: nose to tail in a strip by the kerb, side by side across a deeper bay,
+back to back in a car park. 1616 stall lines in 219 bays over the Utrecht
+square.
+
+**Road symbols** are textured quads with transparent surroundings, in their
+own object `RoadSymbols` with an alpha-cut material: a bicycle every 50 m on
+each BGT cycle track that NWB or OpenStreetMap runs a cycle path along, and
+"BUS" on bus lanes. A track wide enough for both directions gets one each way,
+on the right-hand half.
+
+**Hydrants** are under the pavement in the Netherlands: a small lid with a
+yellow frame round it, from the BGT's `brandkraan / -put` points, 188 of them
+over the Utrecht square.
+
+**Manholes and gullies** lie flat on the road where the BGT has them, the
+gullies turned along the nearest road.
+
+`traffic.json` lists every light and crossing, in RD and in the model frame
+(`signs.json` the signs). The meshes
+make the FBX look right; the list says what each thing is, which is what a
+traffic simulation needs, or a swap for your own prefabs.
+
+What this does not have: turn arrows, edge lines, cycle-lane colour and the
+markings of parking bays. OpenStreetMap carries `turn:lanes` on six ways in the
+square, too few to be worth a pictogram yet. Outside the Randstad the lane
+tagging thins out, and a road with no lane count gets no lines.
+
+OpenStreetMap is read from its main API rather than Overpass, which office
+proxies refuse often enough that a run could not depend on it, and from the
+same cached tiles as the street objects (`src/osm.py`): one download for
+both. These sources are soft: when one is not answering, the run says so and
+builds the rest.
+
 ## Bridges and tunnels
 
 The parts of the ground that are not the ground. Until now both were dropped:
@@ -2371,6 +2503,51 @@ the shopping centre. The check `passages_under_buildings_open` reads the cut
 geometry back and fails if any wall or roof still stands in a passage below its
 ceiling; `metadata.json` carries the counts under `buildings.passages`.
 
+### What is under a deck
+
+A deck used to be a sheet: its road surface and nothing under it, so from a
+boat every bridge was a plank at street level. Every deck now has a body. Its
+sides run down from the deck's edge and its underside closes it.
+
+**The water boards know the room under a bridge.** Every water board keeps a
+register of the structures in its water, published together through PDOK as
+IMWA. Over the Utrecht centre square kilometre all fourteen bridges are in it,
+with the height of the underside in NAP, the clear width of the opening, the
+length along the water and the material, and every one is masonry. Each IMWA
+bridge point lands on a BGT deck, so the two are matched by position.
+
+| Deck | Underside | Body |
+|---|---|---|
+| over water, masonry in the register or not in it | the register's height at the crown, or 0.9 m under the deck | brick arches, split at the piers ("A canal bridge is a body" under [Bridges and tunnels](#bridges-and-tunnels)); a beam over more than 30 m of water |
+| over water, another material in the register, or a bridge that opens | the register's height | a concrete beam |
+| over land | the deck less `deck_thickness_m` (0.8) | concrete slab |
+
+The register gives the height; the shape is the canal bridge's own: its arches
+span across the water and land on the BGT's piers, as described there.
+
+**`waterworks.json`** lists every bridge over water with its underside, the
+water level, the clearance between them, the span and where the numbers came
+from (`source`: "water board" or "estimated"), and the locks and weirs below.
+It is what a boat simulation needs, and the mesh cannot tell it: over the
+Oudegracht the four bridges clear the water by 4.2 to 4.5 m.
+
+### Locks and weirs
+
+The register places every lock and weir as a point. A lock's chamber is found
+in the water itself: walking along the channel from the point, the lock is
+where the water narrows to the register's width (or, without one, the
+narrowest stretch near the point). A narrow stretch longer than 12 m is the
+chamber, with a pair of mitre gates at each end; shorter ones are the heads,
+with a pair in each. The gates point at the higher water where the levels
+either side differ, and each leaf carries a white balance beam reaching five
+metres past its heel over the quay. Over the Weerdsluis that is two pairs of
+gates 13 m apart across an 8 m chamber.
+
+A weir is a plate across its ditch at the register's crest height, where that
+is within two metres of the water, with a frame over it for the kinds that are
+wound up and down. There are 211 in the 10 by 10 km round Utrecht and none in
+its centre.
+
 ## Railways
 
 BGT `spoor`, and the first linear dataset here. Everything else arrives as
@@ -2455,15 +2632,110 @@ Four checks cover the part that could silently go wrong: that boats are inside a
 water polygon, that their heights match a real water level, that cars are on
 ground, and that nothing landed outside the area.
 
+## What a building is
+
+3DBAG gives every building its shape and the BAG its use; neither says that
+one of them is a church. Four sources say more, and `src/kinds.py` reads them
+into a `kind` per building ("church", "school", "barn", "garages"), each filling
+in only what an earlier one left empty:
+
+- **OpenStreetMap** tags the building itself. Its Dutch buildings were imported
+  from the BAG with the building id as `ref:bag`, so a tag joins to a 3DBAG
+  building on its key, exactly: `building=church`, `building=garages`,
+  `man_made=water_tower`, a mosque as `amenity=place_of_worship` with
+  `religion=muslim`, the roof over a petrol station's pumps as
+  `building=roof` with `amenity=fuel`.
+- **TOP10NL** types its buildings: church, mosque, tower, water tower,
+  windmill, greenhouse, car park, school, hospital, sports hall, station, town
+  hall, silo, tank. Its polygons are generalised, and a church in a terrace is
+  often one polygon with the block ("huizenblok|kerk"), so a type only passes
+  to a building that is most of its polygon.
+- **The national monument register** places every rijksmonument with its
+  category: a religious monument is a church, a mill a windmill. A monument
+  point inside a footprint is exact where TOP10NL is not: 162 of the 179 along
+  the Oudegracht stretch land on a building.
+- **The BAG** for the rest, by its purposes and its empty buildings; see
+  [Building function](#building-function).
+
+The points OpenStreetMap places inside a building say what its ground floor
+is: a cafe, a hotel lobby, a supermarket, a fire station's doors. A hotel's
+lobby outranks the bar in it.
+
+Each kind is built with a wall of its own (`src/facade.py`):
+
+| Kind | Wall |
+| --- | --- |
+| church | brick, tall pointed lancets, buttresses between the bays, no shopfront at its foot |
+| mosque | pale render, round-headed windows |
+| synagogue, and an old tower, station, town hall, museum or castle | the monumental wall |
+| school, hospital | bands of windows, three mullions to a pane |
+| sports hall, swimming pool, stadium, riding hall | cladding, a high band of glass |
+| greenhouse | glass in a light frame, from the ground to the eaves |
+| car park | open decks where the windows would be |
+| water tower, lighthouse, chimney, windmill, fort, prison | closed brick |
+| silo, bunker, transformer house, pumping station | closed concrete panels |
+| barn, stable | vertical boards, small windows high up |
+| shed | boards, nothing else |
+| garages | a roller door to every box |
+
+A church, a mosque or a hall is laid out in bays of its own height rather than
+in storeys, so a lancet is one tall window and not three stacked ones; a school
+and a car park keep their storeys.
+
+**A petrol station's canopy is open.** The BAG registers the roof over the
+pumps as a building, and 3DBAG extrudes it from the ground into a closed box.
+Its walls are cut back to a fascia, a soffit closes it underneath, and posts
+hold it up.
+
+**Doors.** A closed wall reads as a block, and one door says what it is.
+Drawn into the wall texture it would repeat every few metres all the way
+round, so every shed, barn, kiosk and closed tower gets one of geometry
+instead (`src/doors.py`): on the wall that looks at the nearest road, on a
+barn's gable, never on a wall another building stands against. A wooden door
+has a pale frame, a barn's is two leaves, a kiosk's is flush steel. They are
+part of `Buildings`, as `Doors`, `SteelDoors` and `DoorFrames`.
+
+**Ground floors follow what is inside.** A cafe or restaurant gets an open
+front, a hotel a lobby band of glass, a supermarket a closed front with its
+entrance, a fire station red roller doors. A cafe OpenStreetMap seats outside
+(`outdoor_seating`) gets a terrace in front of it from the street objects:
+tables, chairs and a parasol each, in `Street furniture`.
+
+Every building carries its kind into the model in Dutch as the custom property
+`kind` ("kerk", "schuur of stal", "garageboxen"), every rijksmonument its
+number as `rijksmonument`, and a named landmark its name as `landmark`, next to
+`bag_id`, so a postprocessor can swap the Domtoren for a modelled one by name.
+A monument the BAG gives no year gets a historic wall.
+
+**Windmills and wind turbines** are drawn from the registers too. A building
+whose kind is windmill gets four sails on its cap, facing the prevailing
+south-westerly, sized to the body 3DBAG has. Every wind turbine in RIVM's
+register gets a tower to its registered hub height and a three-bladed rotor of
+its registered diameter. They are in the `Landmarks` collection, as
+`WindmillSails` and `WindTurbines`.
+
 ## Building function
 
 3DBAG says how tall a building is and when it was built, but not what it is for.
-The BAG does: every verblijfsobject carries a `gebruiksdoel` and a
-`pandidentificatie`, which is the same building id 3DBAG uses, so the two join
-on a key rather than by geometry. Over the demo area that resolves a function
-for about 2200 buildings from 6500 units.
+The BAG does. Its `pand` layer carries, per building, the purposes of every
+unit in it (`gebruiksdoel`) and how many units it has
+(`aantal_verblijfsobjecten`), under the same building id 3DBAG uses, so the two
+join on a key rather than by geometry.
 
-It decides which ground storey a building gets. Shopfronts along a residential
+The eleven purposes are kept apart. They used to be six: assembly, education,
+health care, sport, lodging and detention were all "public", which made a
+school, a hospital and a restaurant the same building. Now a school gets the
+school wall, so does a big hospital, a big low sports building the hall, and a
+prison the closed wall.
+
+**A building with no units** has nothing anyone lives, works or shops in: a
+garden shed, a garage, a transformer kiosk, a barn. It used to fall back on the
+housing facade, so every shed had a front door and bay windows, and there are
+hundreds of them in a model. Now one under 120 m² with walls under 5 m is a
+shed, long and low a row of garages, and anything bigger up to 2500 m² and
+14 m high a barn. Bigger than that, it keeps the wall its shape gives it.
+
+The function also decides which ground storey a building gets. Shopfronts along a residential
 street look as wrong as a blank wall along a shopping street, so only retail and
 public buildings get them; housing gets doors and windows. Where a building holds
 several uses, the most street-facing one wins — a shop under flats is a shop at
@@ -3434,6 +3706,19 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
   covers both.
 - **Traffic sign artwork**: the RVV 1990 signs from Wikimedia Commons, public
   domain because a regulation carries no copyright (Auteurswet article 11).
+**Public charging points** — NDW charging point register (CC0)
+- **Bridge clearances, locks and weirs** — the water boards' register (IMWA),
+  Het Waterschapshuis via PDOK (CC BY-SA 4.0); `waterworks.json` is shared
+  under the same licence
+- **Building types** — BRT TOP10NL, Kadaster via PDOK (CC BY 4.0)
+- **Rijksmonumenten** — national monument register, Rijksdienst voor het
+  Cultureel Erfgoed
+- **Wind turbines** — RIVM Atlas Leefomgeving
+- **Lane counts, crossings, speed humps, signalled junctions and building
+  kinds** —
+  © OpenStreetMap contributors (ODbL). Credited in `ATTRIBUTION.txt` only when
+  a model actually contains OpenStreetMap data; the ODbL asks that you keep
+  that credit with the model.
 - **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution
   is required for these; they are credited because it is the decent thing, and
   listed here so you know nothing in the model carries an obligation you did not

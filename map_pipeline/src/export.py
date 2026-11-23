@@ -42,6 +42,27 @@ ATTRIBUTION = {
         "Road centrelines and street names from the NWB (Nationaal Wegenbestand) "
         "by Rijkswaterstaat, via PDOK (CC0)."
     ),
+    "chargers": (
+        "Public charging points from the NDW charging point register, CC0. "
+        "https://opendata.ndw.nu"
+    ),
+    "waterworks": (
+        "Bridge clearances and openings, locks and weirs from the water boards' "
+        "register (IMWA), Het Waterschapshuis via PDOK, CC BY-SA 4.0. "
+        "waterworks.json is shared under the same licence."
+    ),
+    "top10nl": (
+        "Building types (churches, towers, car parks) from BRT TOP10NL, "
+        "Kadaster via PDOK, CC BY 4.0."
+    ),
+    "monuments": (
+        "Rijksmonumenten from the national monument register, Rijksdienst "
+        "voor het Cultureel Erfgoed. https://monumentenregister.cultureelerfgoed.nl"
+    ),
+    "turbines": (
+        "Wind turbines, hub heights and rotor diameters from RIVM's Atlas "
+        "Leefomgeving. https://www.atlasleefomgeving.nl"
+    ),
     "textures": (
         "Wall surfaces under the generated facades, and the photographed paving, "
         "from Poly Haven (CC0, no attribution required). https://polyhaven.com"
@@ -55,7 +76,8 @@ ATTRIBUTION = {
         "Mapillary's map features (CC BY-SA 4.0). https://www.mapillary.com"
     ),
     "osm": (
-        "Terraces, statues, steps and street furniture from OpenStreetMap: "
+        "Terraces, statues, steps, street furniture, lane counts, crossings, "
+        "speed humps, signalled junctions and building kinds from OpenStreetMap: "
         "© OpenStreetMap contributors, available under the Open Database "
         "Licence (ODbL). https://www.openstreetmap.org/copyright"
     ),
@@ -217,6 +239,8 @@ def write_scene_description(
     water_texture: Path | None = None,
     furniture_texture: Path | None = None,
     sign_texture: Path | None = None,
+    traffic_texture: Path | None = None,
+    landmark_file: Path | None = None,
     surfaces_cfg: dict | None = None,
     road_class_names: dict | None = None,
     surface_class_names: dict | None = None,
@@ -353,6 +377,16 @@ def write_scene_description(
             if sign_texture is not None
             else {}
         ),
+        # Lights, road paint and covers arrive as finished meshes: the
+        # Blender stage only moves them to the model's origin. The signs
+        # are the signs stage's, above.
+        "traffic": (
+            {"file": "traffic.npz", "texture": traffic_texture.name}
+            if traffic_texture is not None
+            else {}
+        ),
+        # Windmill sails and wind turbines, as triangles.
+        "landmarks": {"file": landmark_file.name} if landmark_file is not None else {},
         # Barriers share the furniture atlas, so they are gated on the same
         # texture existing rather than on one of their own.
         "barriers": (
@@ -437,13 +471,16 @@ def write_scene_description(
 
 def write_attribution(
     out_dir: Path, *, mapillary: bool = False, mapillary_textures: bool = False,
-    osm: bool = False, mapillary_objects: bool = False,
+    osm: bool = False, mapillary_objects: bool = False, chargers: bool = False,
+    extra: tuple[str, ...] = (),
 ) -> Path:
     """Drop the source credits next to the model.
 
     3DBAG asks for a copyright notice on reuse, and the AHN and aerial layers
     are CC BY 4.0, so the credits travel with the output. Mapillary photos are
-    CC BY-SA 4.0 and are credited when a run used them.
+    CC BY-SA 4.0 and are credited when a run used them. NDW's charging points,
+    the water boards, TOP10NL, the monument register and RIVM's turbines are
+    credited when they went in (`chargers`, `extra`).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "ATTRIBUTION.txt"
@@ -456,6 +493,15 @@ def write_attribution(
         f"BGT:       {ATTRIBUTION['bgt']}",
         f"BAG:       {ATTRIBUTION['bag']}",
         f"NWB:       {ATTRIBUTION['roads']}",
+        *([f"Chargers:  {ATTRIBUTION['chargers']}"] if chargers else []),
+        *[
+            f"{label:<10} {ATTRIBUTION[key]}"
+            for key, label in (
+                ("waterworks", "Water:"), ("top10nl", "TOP10NL:"),
+                ("monuments", "Monuments:"), ("turbines", "Turbines:"),
+            )
+            if key in extra
+        ],
         f"Textures:  {ATTRIBUTION['textures']}",
         f"Signs:     {ATTRIBUTION['signs']}",
         f"Sign art:  {ATTRIBUTION['sign_art']}",

@@ -40,6 +40,9 @@ KIND_TUNNEL_WALL = 3
 KIND_RAILING = 4
 KIND_BRIDGE_SIDE = 5
 KIND_ARCH = 6
+KIND_LOCK_GATE = 7
+KIND_LOCK_BEAM = 8
+KIND_WEIR = 9
 
 KIND_NAMES = {
     KIND_DECK: "deck",
@@ -49,13 +52,16 @@ KIND_NAMES = {
     KIND_RAILING: "railing",
     KIND_BRIDGE_SIDE: "bridge_side",
     KIND_ARCH: "arch",
+    KIND_LOCK_GATE: "lock_gate",
+    KIND_LOCK_BEAM: "lock_beam",
+    KIND_WEIR: "weir",
 }
 
 # A bridge is a body, not a sheet: its deck this thick at the crown of its
 # arch, the arch springing this far above the water, a passage under it for
 # a wharf this high, and the body cut into strips this wide along its span so
 # its arch is a curve.
-DECK_THICKNESS_M = 0.9
+ARCH_CROWN_M = 0.9
 SPRING_ABOVE_WATER_M = 0.3
 PASSAGE_HEIGHT_M = 2.5
 MIN_ARCH_RISE_M = 0.6
@@ -111,12 +117,19 @@ class StructureSet:
     # to open at the mouths and the track to follow the floor.
     tunnels: object = field(default_factory=lambda: _empty_plan())
     bbox: tuple | None = None
+    # One record per deck over water: its opening, and the room under it.
+    bridges: list[dict] = field(default_factory=list)
+    locks: list[dict] = field(default_factory=list)
+    weirs: list[dict] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.parts)
 
     def count_of(self, kind: int) -> int:
         return sum(1 for part in self.parts if part.kind == kind)
+
+    def count_of_tris(self, kind: int) -> int:
+        return int((self.tri_kind == kind).sum()) if len(self.tri_kind) else 0
 
     def stats(self) -> dict:
         out: dict = {
@@ -296,7 +309,7 @@ def _earcut_polygon(polygon) -> tuple[np.ndarray, np.ndarray]:
 
 def bridge_body(
     rings, level: float, *, ground_at, wet=None, water_level: float | None = None,
-    passages=(), piers=(), lift: float = 0.05,
+    passages=(), piers=(), lift: float = 0.05, crown_nap: float | None = None, arch: bool = True,
 ):
     """A bridge as a body: ``[(triangles, kind)]`` for its deck, sides and arch.
 
@@ -308,7 +321,7 @@ def bridge_body(
     * a top: the deck's level, or the ground as drawn where that is higher,
       so where the deck meets the street it is at the street's height;
     * an underside: over the water an arch, springing `SPRING_ABOVE_WATER_M`
-      above the water at the quays to `DECK_THICKNESS_M` under the deck at its
+      above the water at the quays to `ARCH_CROWN_M` under the deck at its
       crown; over the land the body goes down into the ground, an abutment;
       and where the BGT draws a passage under it (``tunneldeel`` at level -1,
       a wharf going under the bridge) the underside is `PASSAGE_HEIGHT_M` over
@@ -320,9 +333,13 @@ def bridge_body(
     Each stretch of water between a quay and a pier, or two piers, has its
     own arch, and the arches land on the pier at their springing.
 
+    The water boards' register (`waterworks`), where it has the bridge, gives
+    ``crown_nap``, the underside at its highest, and ``arch``: False for a
+    bridge it says is not masonry, or one that opens, which is a beam.
+
     The sides follow the outline from the underside to the top. A bridge over
     more than `MAX_ARCH_SPAN_M` of water is a beam bridge: a slab
-    `DECK_THICKNESS_M` thick.
+    `ARCH_CROWN_M` thick.
     """
     import shapely
 
@@ -349,9 +366,11 @@ def bridge_body(
         if water_level is None:
             probe = np.asarray(over.representative_point().coords)
             water_level = float(np.nanmin(ground_at(probe[:, 0], probe[:, 1])))
-        crown = level - DECK_THICKNESS_M
+        crown = level - ARCH_CROWN_M
+        if crown_nap is not None and crown_nap > float(water_level) + 0.5:
+            crown = min(float(crown_nap), level - MIN_CROWN_M)
         spring = float(water_level) + SPRING_ABOVE_WATER_M
-        if w1 - w0 <= MAX_ARCH_SPAN_M and crown - spring >= MIN_ARCH_RISE_M:
+        if arch and w1 - w0 <= MAX_ARCH_SPAN_M and crown - spring >= MIN_ARCH_RISE_M:
             cuts = []
             for pier in piers or ():
                 on = pier.intersection(over)
@@ -397,7 +416,7 @@ def bridge_body(
         elif not over.is_empty:
             # A beam bridge: a slab over the water.
             wet_here = shapely.contains_xy(over.buffer(0.05), xy[:, 0], xy[:, 1])
-            z = np.where(wet_here, level - DECK_THICKNESS_M, z)
+            z = np.where(wet_here, crown if crown_nap is not None else level - ARCH_CROWN_M, z)
         for area, floor in floors:
             inside = shapely.contains_xy(area, xy[:, 0], xy[:, 1])
             z = np.where(inside, np.fmax(z, floor + PASSAGE_HEIGHT_M), z)
@@ -444,12 +463,17 @@ def bridge_body(
                 sides.append(np.stack([low_a, low_b, hi_b], axis=1))
                 sides.append(np.stack([low_a, hi_b, hi_a], axis=1))
     out = []
+    # Brick where there is an arch, and on a beam bridge unless the register
+    # says the bridge is not masonry or it opens (`arch` False): concrete.
+    brick = bool(arches) or arch
     if tops:
         out.append((np.concatenate(tops), KIND_DECK))
     if bottoms:
-        out.append((np.concatenate(bottoms), KIND_ARCH))
+        out.append((np.concatenate(bottoms), KIND_ARCH if arches else (
+            KIND_BRIDGE_SIDE if brick else KIND_DECK
+        )))
     if sides:
-        out.append((np.concatenate(sides), KIND_BRIDGE_SIDE))
+        out.append((np.concatenate(sides), KIND_BRIDGE_SIDE if brick else KIND_DECK))
     return out
 
 
@@ -735,8 +759,13 @@ def build_structures(
     dsm_sampler=None,
     ground_at=None,
     water=None,
+    waterworks=None,
 ) -> StructureSet:
     """Fetch bridge and tunnel parts and build them into geometry.
+
+    `waterworks`, the water boards' register (`waterworks.fetch_waterworks`),
+    gives a bridge over water its real underside and opening, and says which
+    are masonry and get an arch.
 
     `water`, the WaterBody list, puts railings along the sides of every deck
     that are over water and not already walled by a BGT barrier
@@ -818,7 +847,7 @@ def build_structures(
                     if not polygon.is_empty:
                         tunnel_polygons.append(polygon)
 
-    if not result.parts or terrain is None:
+    if (not result.parts and not waterworks) or terrain is None:
         if not result.parts:
             LOG.info("no bridges or tunnels in this area")
         return result
@@ -833,7 +862,7 @@ def build_structures(
         railing_cover = _railing_cover(bbox, water, fetch_kwargs)
     _build_geometry(
         result, terrain, dsm_sampler, structures_cfg, ground_at=ground_at,
-        railing_cover=railing_cover, water=water,
+        railing_cover=railing_cover, water=water, waterworks=waterworks,
     )
     return result
 
@@ -1034,9 +1063,73 @@ def _deck_railings(rings, level: float, terrain, lift: float, cover, add) -> flo
     return total
 
 
+# Brick over the top of an arch, at its thinnest.
+MIN_CROWN_M = 0.35
+
+
+def _slices(polygon, axis: np.ndarray, centre: np.ndarray, cuts) -> list:
+    """`polygon` cut into strips at distances `cuts` along `axis`."""
+    import shapely
+
+    across = np.array([-axis[1], axis[0]])
+    coords = shapely.get_coordinates(polygon)
+    along = (coords - centre) @ axis
+    low, high = float(along.min()), float(along.max())
+    edges = [low, *[c for c in sorted(cuts) if low + 1e-6 < c < high - 1e-6], high]
+    far = float(np.ptp(coords, axis=0).max()) + 10.0
+    pieces = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        strip = shapely.Polygon([
+            centre + axis * a - across * far, centre + axis * b - across * far,
+            centre + axis * b + across * far, centre + axis * a + across * far,
+        ])
+        for piece in shapely.get_parts(polygon.intersection(strip)):
+            if piece.geom_type == "Polygon" and piece.area > 1e-4:
+                pieces.append(piece)
+    return pieces
+
+
+def _match_water_bridge(polygon, bridges, reach: float = 2.0):
+    """The water board's bridge standing on this deck, if any."""
+    import shapely
+
+    best = None
+    for bridge in bridges or []:
+        point = shapely.Point(*bridge.xy)
+        distance = polygon.distance(point)
+        if distance <= reach and (best is None or distance < best[0]):
+            best = (distance, bridge)
+    return best[1] if best is not None else None
+
+
+def _bridge_record(outline, level, water_nap, register, made, movable) -> dict:
+    """One bridge over water for waterworks.json: its deck, the water, and
+    the room under it, from the register where it has the bridge."""
+    inside = outline.representative_point()
+    bottom = min(float(t[:, :, 2].min()) for t, kind in made if kind in (KIND_ARCH, KIND_DECK))
+    under = [t for t, kind in made if kind == KIND_ARCH]
+    crown = max(float(t[:, :, 2].max()) for t in under) if under else bottom
+    record = {
+        "rd": [round(float(inside.x), 3), round(float(inside.y), 3)],
+        "deck_nap": round(float(level), 2),
+        "water_nap": None if water_nap is None else round(float(water_nap), 2),
+        "movable": bool(movable),
+        "arched": any(kind == KIND_ARCH for _, kind in made),
+        "crown_nap": round(crown, 2),
+        "clearance_m": None if water_nap is None else round(crown - float(water_nap), 2),
+        "source": "water board" if register is not None else "estimated",
+    }
+    if register is not None:
+        record.update({
+            "code": register.code, "material": register.material, "type": register.kind,
+            "manager": register.manager,
+        })
+    return record
+
+
 def _build_geometry(
     result: StructureSet, terrain, dsm_sampler, structures_cfg: dict, *, ground_at=None,
-    railing_cover=None, water=None,
+    railing_cover=None, water=None, waterworks=None,
 ) -> None:
     """Give every part a height and turn it into triangles."""
     import shapely
@@ -1078,6 +1171,8 @@ def _build_geometry(
         for p in result.parts if p.kind == KIND_PIER
     ] if bodies else []
     arched_decks = []
+    # The water boards' bridges, matched to a deck for its clearance.
+    water_bridges = getattr(waterworks, "bridges", None) or []
 
     # ---- bridges ---------------------------------------------------------
     # Every part's height first, so each deck knows where its neighbours are.
@@ -1136,11 +1231,19 @@ def _build_geometry(
             if bodies and part.level >= 1 and wet is not None:
                 outline = shapely.make_valid(shapely.Polygon(np.asarray(part.rings[0])[:, :2]))
             if outline is not None and outline.intersects(wet):
+                water_nap = level_under(outline)
+                register = _match_water_bridge(outline, water_bridges)
+                soffit = getattr(register, "soffit_nap", None)
+                may_arch = not part.movable and (register is None or register.masonry)
                 made = bridge_body(
                     part.rings, level, ground_at=surface, wet=wet,
-                    water_level=level_under(outline) if wet is not None else None,
-                    passages=passages, piers=piers, lift=lift,
+                    water_level=water_nap, passages=passages, piers=piers, lift=lift,
+                    crown_nap=soffit, arch=may_arch,
                 )
+                if made:
+                    result.bridges.append(_bridge_record(
+                        outline, level, water_nap, register, made, part.movable,
+                    ))
             if made:
                 for triangles, kind in made:
                     add(triangles, kind)
@@ -1181,6 +1284,45 @@ def _build_geometry(
     result.counts["decks_without_a_reading"] = guessed
     result.counts["bridge_bodies"] = arched
 
+    # ---- locks and weirs --------------------------------------------------
+    if waterworks is not None and water and bool(structures_cfg.get("locks_and_weirs", True)):
+        from .waterworks import lock_geometry, water_geometry, water_level_at, weir_geometry
+
+        wet_all = wet if wet is not None else water_geometry(water)
+
+        def levels(xy):
+            return water_level_at(water, xy)
+
+        def ground(x, y):
+            built = ground_at(x, y) if ground_at is not None else None
+            surveyed = np.asarray(terrain.sample(x, y), dtype=np.float64)
+            return surveyed if built is None else np.fmax(surveyed, np.asarray(built, dtype=np.float64))
+
+        if wet_all is not None:
+            kinds_of = {"gate": KIND_LOCK_GATE, "beam": KIND_LOCK_BEAM, "weir": KIND_WEIR}
+            for lock in waterworks.locks:
+                try:
+                    pieces, record = lock_geometry(lock, wet_all, levels, ground)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("could not build lock %s: %s", lock.name, exc)
+                    continue
+                for triangles, name in pieces:
+                    add(triangles, kinds_of[name])
+                if record is not None:
+                    result.locks.append(record)
+            for weir in waterworks.weirs:
+                try:
+                    pieces, record = weir_geometry(weir, wet_all, levels)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("could not build a weir: %s", exc)
+                    continue
+                for triangles, name in pieces:
+                    add(triangles, kinds_of[name])
+                if record is not None:
+                    result.weirs.append(record)
+        result.counts["locks"] = len(result.locks)
+        result.counts["weirs"] = len(result.weirs)
+
     # ---- tunnels ---------------------------------------------------------
     tunnel_parts = [p for p in result.parts if p.kind == KIND_TUNNEL_ROAD]
     if len(result.tunnels):
@@ -1203,6 +1345,12 @@ def _build_geometry(
     if tris:
         result.tris = np.concatenate(tris)
         result.tri_kind = np.concatenate(kinds)
+    if result.bridges:
+        result.counts["bridges_over_water"] = len(result.bridges)
+        result.counts["arched_bridges"] = sum(1 for b in result.bridges if b.get("arched"))
+        result.counts["bridges_from_water_board"] = sum(
+            1 for b in result.bridges if b.get("source") == "water board"
+        )
 
     LOG.info(
         "structures: %d decks (%d measured from the surface model, %d without "
@@ -1214,6 +1362,47 @@ def _build_geometry(
         len(tunnel_parts),
         len(result.tris),
     )
+
+
+def write_bridge_list(
+    structures: StructureSet, geo, out_dir: Path, filename: str = "waterworks.json"
+) -> Path:
+    """Every bridge over water, with the room a boat has under it, and the
+    locks and weirs.
+
+    `clearance_m` is from the water's surface to the underside at its highest:
+    the water board's figure where it has one, the deck less its thickness
+    where it does not, which `source` says.
+    """
+    import json
+
+    def local(records):
+        out = []
+        for record in records:
+            x, y = geo.rd_to_local(record["rd"][0], record["rd"][1])
+            out.append({**record, "local": {"x": round(float(x), 3), "z": round(float(y), 3)}})
+        return out
+
+    payload = {
+        "crs": "EPSG:28992",
+        "note": (
+            "local.x / local.z are metres in the model frame. Heights are NAP; "
+            "subtract metadata.ground_z_offset_nap for local Y. clearance_m is "
+            "crown_nap less water_nap."
+        ),
+        "source": "BGT overbruggingsdeel, water board register (IMWA) via PDOK",
+        "bridges": local(structures.bridges),
+        "locks": local(structures.locks),
+        "weirs": local(structures.weirs),
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / filename
+    path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    LOG.info(
+        "wrote %s (%d bridges, %d locks, %d weirs)",
+        path, len(structures.bridges), len(structures.locks), len(structures.weirs),
+    )
+    return path
 
 
 def save_structures(structures: StructureSet, path: Path) -> Path:
@@ -1229,7 +1418,11 @@ __all__ = [
     "KIND_ARCH",
     "KIND_BRIDGE_SIDE",
     "KIND_DECK",
+    "KIND_LOCK_BEAM",
+    "KIND_LOCK_GATE",
+    "KIND_WEIR",
     "bridge_body",
+    "write_bridge_list",
     "deck_corner_heights",
     "deck_outlines",
     "KIND_NAMES",

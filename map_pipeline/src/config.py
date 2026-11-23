@@ -227,6 +227,9 @@ DEFAULTS: dict[str, Any] = {
         "roof_padding_px": 4,
     },
     "facade": {
+        # Churches, towers and rijksmonumenten from TOP10NL and the monument
+        # register, so a church gets a church's wall whatever its storeys.
+        "landmarks": True,
         # One storey per texture tile vertically, so windows line up per floor
         # whatever the building height.
         "floor_height_m": 3.0,
@@ -422,6 +425,18 @@ DEFAULTS: dict[str, Any] = {
     },
     "furniture": {
         "enabled": True,
+        # OpenStreetMap fills in what the municipality did not register:
+        # bicycle racks, litter bins, post boxes. Only where the BGT has no
+        # object of the same kind close by.
+        "osm": True,
+        # Public charging points from NDW's national register.
+        "chargers": True,
+        # Tables, chairs and parasols in front of every cafe OpenStreetMap
+        # says has seats outside.
+        "terraces": True,
+        # A ceiling on bicycles in racks, which are the one piece of
+        # furniture that comes by the thousand near a station.
+        "max_bicycles": 1500,
         "page_limit": 1000,
         "timeout_s": 180,
         "max_retries": 4,
@@ -480,6 +495,28 @@ DEFAULTS: dict[str, Any] = {
         # or offline, every face is drawn here instead.
         "commons": True,
         "commons_pause_s": 1.0,
+    },
+    "traffic": {
+        # What the road tells a driver besides its signs (those are the signs
+        # stage's, `signs`). Each is its own source and checkbox; see
+        # src/traffic.py.
+        #
+        # Signal poles from the BGT, and from OpenStreetMap where a
+        # municipality did not survey them.
+        "signals": True,
+        # Lane lines, zebras and humps from OpenStreetMap, give-way teeth and
+        # stop lines under the signs that require them.
+        "markings": True,
+        # Manhole lids and gully grates from the BGT.
+        "covers": True,
+        "page_limit": 1000,
+        "timeout_s": 180,
+        "max_retries": 4,
+        "max_pages": 200,
+        # How far paint lies above the road it is on. Enough to stay clear of
+        # the surface in a depth buffer, too little to cast a shadow.
+        "marking_lift_m": 0.03,
+        "cover_lift_m": 0.015,
     },
     "barriers": {
         # Walls, fences, hedges and the small structures bolted onto buildings.
@@ -544,6 +581,9 @@ DEFAULTS: dict[str, Any] = {
         # from the water, the quay and the road under a viaduct. The surface
         # model sees only the top, so this is chosen; 0 is the old flat sheet.
         "deck_thickness_m": 0.8,
+        # The water boards' register of bridges, locks and weirs: a bridge's
+        # clearance over the water, and the locks' gates and weirs' crests.
+        "water_boards": True,
         # Used only when the surface model has no reading over a deck, which is
         # rare. A Dutch road bridge clears what it crosses by about this much.
         "fallback_clearance_m": 5.0,
@@ -905,6 +945,7 @@ class PipelineConfig:
     surfaces: dict[str, Any]
     furniture: dict[str, Any]
     signs: dict[str, Any]
+    traffic: dict[str, Any]
     barriers: dict[str, Any]
     vehicles: dict[str, Any]
     rails: dict[str, Any]
@@ -938,6 +979,7 @@ class PipelineConfig:
             "surfaces": self.surfaces,
             "furniture": self.furniture,
             "signs": self.signs,
+            "traffic": self.traffic,
             "barriers": self.barriers,
             "vehicles": self.vehicles,
             "rails": self.rails,
@@ -1178,6 +1220,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         surfaces=merged["surfaces"],
         furniture=merged["furniture"],
         signs=merged["signs"],
+        traffic=merged["traffic"],
         barriers=merged["barriers"],
         vehicles=merged["vehicles"],
         rails=merged["rails"],

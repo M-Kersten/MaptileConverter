@@ -285,7 +285,8 @@ def check_buildings_on_terrain(
             f"all {len(buildings)} building bases reach the terrain"
             if not floating
             else f"{len(floating)} buildings float, worst by "
-            f"{max(gap for _, gap in floating):.2f} m"
+            f"{max(gap for _, gap in floating):.2f} m "
+            f"({max(floating, key=lambda f: f[1])[0]})"
         ),
     )
 
@@ -699,6 +700,47 @@ def check_signs(report: CheckReport, signs, bbox: BBox) -> None:
             bool((tops > 1.5).all() and (tops < 8.0).all()),
             f"pole tops {tops.min():.1f} to {tops.max():.1f} m above the ground",
         )
+
+
+def check_traffic(report: CheckReport, traffic, bbox: BBox) -> None:
+    """Signs, lights and paint are inside the area and made of real triangles."""
+    if traffic is None or not len(traffic):
+        report.add(
+            "traffic_present", True, "no signs, lights or road markings",
+            severity="warning",
+        )
+        return
+
+    report.add(
+        "traffic_present",
+        True,
+        ", ".join(
+            f"{v} {k.replace('_', ' ')}" for k, v in traffic.counts.items() if v
+        ),
+    )
+    inside = True
+    sound = True
+    for vertices, faces, uv in traffic.meshes.values():
+        if not len(vertices):
+            continue
+        # A crossing at the edge reaches a stripe past it; half a road is
+        # the most that can.
+        inside &= bool(
+            (vertices[:, 0] >= bbox.xmin - 10).all()
+            and (vertices[:, 0] <= bbox.xmax + 10).all()
+            and (vertices[:, 1] >= bbox.ymin - 10).all()
+            and (vertices[:, 1] <= bbox.ymax + 10).all()
+        )
+        sound &= bool(
+            np.isfinite(vertices).all()
+            and len(uv) == len(vertices)
+            and (faces >= 0).all()
+            and (faces < len(vertices)).all()
+            and (uv >= 0).all()
+            and (uv <= 1).all()
+        )
+    report.add("traffic_inside_bbox", inside, "every sign and line is inside the bbox")
+    report.add("traffic_mesh_sound", sound, "finite vertices, valid faces and UVs")
 
 
 def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None, mouths=None) -> None:
@@ -1652,6 +1694,11 @@ def check_layered(
                 False,
                 "the curb generator needs Blender 5, so the walkways are flat",
                 severity="warning",
+            )
+        elif not int(built.get("kerbed_objects", 0)) and not int(built.get("walkway_faces", 0)):
+            # Greenhouses and fields: a road with a verge and no pavement.
+            report.add(
+                "walkways_have_kerbs", True, "no walkways in this area", severity="warning",
             )
         else:
             raw = int(built.get("walkway_faces", 0))

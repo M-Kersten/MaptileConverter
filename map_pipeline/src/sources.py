@@ -133,7 +133,10 @@ SOURCES: tuple[Source, ...] = (
         contributes=(
             "lampposts, bollards, sign posts, benches, bus shelters, "
             "advertising columns, art and monuments, playgrounds, cabinets, "
-            "waste points, flagpoles and catenary masts"
+            "waste points, flagpoles and catenary masts, litter bins, "
+            "containers, cameras, direction signs, billboards, parking "
+            "meters, toilets, fountains and lamps on facades; bicycle racks, "
+            "post boxes and the rest from OpenStreetMap where the BGT has none"
         ),
         toggles=(("furniture", "enabled"),),
         url_path=("trees", "api_url"),
@@ -178,6 +181,51 @@ SOURCES: tuple[Source, ...] = (
         note="sign artwork from Wikimedia Commons, drawn here when that is unreachable",
     ),
     Source(
+        id="markings",
+        label="Lanes and crossings (OpenStreetMap)",
+        provider="OpenStreetMap",
+        contributes=(
+            "lane lines from the lane count, zebras and dashed crossings, "
+            "and the white blocks on speed humps"
+        ),
+        toggles=(("traffic", "markings"),),
+        fallback_url="https://api.openstreetmap.org/api/0.6/map",
+        probe_url="https://api.openstreetmap.org/api/0.6/capabilities",
+        soft=True,
+        note="ODbL: credited in ATTRIBUTION.txt when used",
+    ),
+    Source(
+        id="signals",
+        label="Traffic lights (BGT)",
+        provider="PDOK",
+        contributes=(
+            "a signal head on every surveyed signal pole, and on the junctions "
+            "OpenStreetMap tags as signalled where none was surveyed"
+        ),
+        toggles=(("traffic", "signals"),),
+        url_path=("trees", "api_url"),
+    ),
+    Source(
+        id="covers",
+        label="Manholes and gullies (BGT)",
+        provider="PDOK",
+        contributes="manhole lids and gully grates, flat on the road",
+        toggles=(("traffic", "covers"),),
+        url_path=("trees", "api_url"),
+    ),
+    Source(
+        id="chargers",
+        label="Charging points (NDW)",
+        provider="NDW",
+        contributes="public charging points, one pillar per two connectors",
+        toggles=(("furniture", "chargers"),),
+        fallback_url="https://opendata.ndw.nu/charging_point_locations.geojson.gz",
+        # The file is five megabytes; the directory listing answers the same
+        # question in a few kilobytes.
+        probe_url="https://opendata.ndw.nu/",
+        soft=True,
+    ),
+    Source(
         id="barriers",
         label="Walls, fences and hedges (BGT)",
         provider="PDOK",
@@ -210,6 +258,31 @@ SOURCES: tuple[Source, ...] = (
         toggles=(("structures", "bridges"), ("structures", "tunnels")),
         url_path=("trees", "api_url"),
         note="deck heights come from the AHN surface model",
+    ),
+    Source(
+        id="waterworks",
+        label="Bridges, locks and weirs (water boards)",
+        provider="Het Waterschapshuis",
+        contributes=(
+            "the underside height, opening and material of every bridge the "
+            "water boards register, so masonry bridges get their arches; lock "
+            "gates and weirs"
+        ),
+        toggles=(("structures", "water_boards"),),
+        fallback_url="https://api.pdok.nl/hwh/waterschappen-kunstwerken-imwa/ogc/v2",
+        soft=True,
+    ),
+    Source(
+        id="landmarks",
+        label="Churches and monuments (TOP10NL, RCE)",
+        provider="Kadaster / Rijksdienst voor het Cultureel Erfgoed",
+        contributes=(
+            "which buildings are churches, towers and car parks, and which are "
+            "rijksmonumenten, so they get the facade that fits"
+        ),
+        toggles=(("facade", "landmarks"),),
+        fallback_url="https://api.pdok.nl/kadaster/brt-top10nl/ogc/v1",
+        soft=True,
     ),
     Source(
         id="rails",

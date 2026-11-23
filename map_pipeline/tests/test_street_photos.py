@@ -1166,16 +1166,16 @@ class ObservedStyleTests(unittest.TestCase):
                 facade_cfg={"tile_width_m": 4.0},
                 face_style={front.key: 9}, face_tile_width={front.key: 2.5},
             )
-            data = np.load(path)
-            wall_style = data["wall_style"]
-            normals = np.cross(data["wall_tris"][:, 1] - data["wall_tris"][:, 0],
-                               data["wall_tris"][:, 2] - data["wall_tris"][:, 0])
-            facing_south = normals[:, 1] < 0
-            self.assertTrue(np.all(wall_style[facing_south] == 9))
-            self.assertTrue(np.all(wall_style[~facing_south] == 3))
-            # 10 m front at a measured 2.5 m bay: four bays across.
-            u = data["wall_u"].reshape(-1, 3)[facing_south]
-            self.assertAlmostEqual(float(u.max() - u.min()), 4.0, places=6)
+            with np.load(path) as data:
+                wall_style = data["wall_style"]
+                normals = np.cross(data["wall_tris"][:, 1] - data["wall_tris"][:, 0],
+                                   data["wall_tris"][:, 2] - data["wall_tris"][:, 0])
+                facing_south = normals[:, 1] < 0
+                self.assertTrue(np.all(wall_style[facing_south] == 9))
+                self.assertTrue(np.all(wall_style[~facing_south] == 3))
+                # 10 m front at a measured 2.5 m bay: four bays across.
+                u = data["wall_u"].reshape(-1, 3)[facing_south]
+                self.assertAlmostEqual(float(u.max() - u.min()), 4.0, places=6)
 
     def test_facade_u_runs_left_to_right_from_outside(self) -> None:
         from src.facade_uv import fit_wall_u

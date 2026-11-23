@@ -73,6 +73,30 @@ class FacadeStyle:
     # this style wants other than the run's setting. A style measured from
     # street photos wants its colour to show.
     tint: float | None = None
+    # "round" or "pointed": a church window ends in a point, a hall's or a
+    # mosque's in a curve.
+    arch_kind: str = "round"
+    # Piers standing proud of the wall at both edges of the tile, as a
+    # fraction of its width: a church's buttresses, a hall's columns.
+    buttress: float = 0.0
+    # One window across the whole tile, edge to edge, so the windows of one
+    # tile run into the next: a school's or a hospital's ribbon of glass, a
+    # glasshouse's wall, a car park's open deck.
+    band: bool = False
+    # Glazing bars across a band, per tile.
+    mullions: int = 2
+    # Frame and sill round each opening. Off for an open deck.
+    framed: bool = True
+    # Vertical boarding, one board every this fraction of the tile: a barn,
+    # a shed.
+    planks: float = 0.0
+    # Horizontal panel joints, every this fraction of the tile height: the
+    # cladding of a sports hall.
+    cladding: float = 0.0
+    # "roller": a roller door filling the tile, ribbed; one per garage.
+    door: str = ""
+    # Glass with no sky gradient, as dark as an opening: an open deck.
+    opening: bool = False
 
     @property
     def family(self) -> str:
@@ -208,7 +232,215 @@ EXTRA_STYLES: dict[str, FacadeStyle] = {
         tile_width_m=9.0,
         tile_height_m=6.0,
     ),
+    # A Dutch church: brick, tall lancets ending in a point, buttresses
+    # between the bays. One tile is one bay, a whole wall high.
+    "church": FacadeStyle(
+        name="church",
+        label="church: brick, pointed lancet windows, buttresses",
+        wall_rgb=(132, 86, 70),
+        trim_rgb=(170, 160, 146),
+        glass_rgb=(54, 62, 72),
+        windows_across=1,
+        window_width_frac=0.30,
+        window_height_frac=0.62,
+        sill_frac=0.18,
+        grain=0.12,
+        arch=1.0,
+        arch_kind="pointed",
+        buttress=0.16,
+        storey_band=False,
+        tile_width_m=6.0,
+        tile_height_m=11.0,
+    ),
+    # Rendered white or cream, round-headed windows in pairs, no buttresses.
+    "mosque": FacadeStyle(
+        name="mosque",
+        label="mosque: light render, round-headed windows",
+        wall_rgb=(222, 214, 196),
+        trim_rgb=(186, 160, 110),
+        glass_rgb=(52, 74, 92),
+        windows_across=2,
+        window_width_frac=0.18,
+        window_height_frac=0.50,
+        sill_frac=0.22,
+        grain=0.05,
+        arch=1.0,
+        storey_band=False,
+        tile_width_m=5.0,
+        tile_height_m=7.0,
+    ),
+    # A school, a hospital: ribbons of glass along every storey.
+    "school": FacadeStyle(
+        name="school",
+        label="school or hospital: window bands",
+        wall_rgb=(168, 120, 98),
+        trim_rgb=(228, 228, 224),
+        glass_rgb=(70, 92, 108),
+        windows_across=1,
+        window_width_frac=1.0,
+        window_height_frac=0.50,
+        sill_frac=0.30,
+        grain=0.07,
+        band=True,
+        mullions=3,
+        tile_width_m=4.0,
+    ),
+    # A sports hall, a pool, a supermarket box: cladding, glass high up.
+    "hall": FacadeStyle(
+        name="hall",
+        label="hall: panel cladding, a band of glass under the eaves",
+        wall_rgb=(150, 156, 160),
+        trim_rgb=(200, 204, 206),
+        glass_rgb=(84, 104, 118),
+        windows_across=1,
+        window_width_frac=1.0,
+        window_height_frac=0.14,
+        sill_frac=0.80,
+        grain=0.04,
+        band=True,
+        mullions=4,
+        cladding=0.125,
+        storey_band=False,
+        tile_width_m=8.0,
+        tile_height_m=7.0,
+    ),
+    # All glass, aluminium bars every half metre or so.
+    "glasshouse": FacadeStyle(
+        name="glasshouse",
+        label="glasshouse: glass walls on a low plinth",
+        wall_rgb=(196, 198, 196),
+        trim_rgb=(214, 218, 220),
+        glass_rgb=(172, 196, 196),
+        windows_across=1,
+        window_width_frac=1.0,
+        window_height_frac=0.90,
+        sill_frac=0.08,
+        grain=0.02,
+        band=True,
+        mullions=6,
+        storey_band=False,
+        tile_width_m=3.2,
+        tile_height_m=4.0,
+    ),
+    # A car park: open decks, a concrete parapet, nothing glazed.
+    "parking": FacadeStyle(
+        name="parking",
+        label="car park: open decks between concrete parapets",
+        wall_rgb=(172, 170, 164),
+        trim_rgb=(172, 170, 164),
+        glass_rgb=(38, 40, 42),
+        windows_across=1,
+        window_width_frac=1.0,
+        window_height_frac=0.52,
+        sill_frac=0.36,
+        grain=0.05,
+        band=True,
+        framed=False,
+        opening=True,
+        tile_width_m=5.0,
+    ),
+    # Water towers, chimneys, windmills, forts: brick, and no window grid.
+    "closed": FacadeStyle(
+        name="closed",
+        label="closed brick: a tower, a chimney, a mill, a fort",
+        wall_rgb=(140, 88, 70),
+        trim_rgb=(196, 186, 170),
+        glass_rgb=(50, 56, 62),
+        windows_across=0,
+        window_width_frac=0.0,
+        window_height_frac=0.0,
+        sill_frac=0.0,
+        grain=0.12,
+        storey_band=False,
+        tile_width_m=4.0,
+        tile_height_m=4.0,
+    ),
+    # Silos, tanks, bunkers, transformer houses: concrete or steel, blank.
+    "technical": FacadeStyle(
+        name="technical",
+        label="closed concrete: a silo, a tank, a bunker, a substation",
+        wall_rgb=(168, 168, 164),
+        trim_rgb=(150, 150, 146),
+        glass_rgb=(60, 64, 66),
+        windows_across=0,
+        window_width_frac=0.0,
+        window_height_frac=0.0,
+        sill_frac=0.0,
+        grain=0.06,
+        cladding=0.25,
+        storey_band=False,
+        tile_width_m=4.0,
+        tile_height_m=4.0,
+    ),
+    # A barn or stable: dark boarding, a row of small windows high up.
+    "barn": FacadeStyle(
+        name="barn",
+        label="barn: dark boarding, small windows high up",
+        wall_rgb=(64, 54, 46),
+        trim_rgb=(196, 190, 176),
+        glass_rgb=(40, 46, 50),
+        windows_across=2,
+        window_width_frac=0.10,
+        window_height_frac=0.10,
+        sill_frac=0.62,
+        grain=0.06,
+        planks=0.04,
+        storey_band=False,
+        tile_width_m=6.0,
+        tile_height_m=5.0,
+    ),
+    # A shed: boarded, closed; its door is a piece of its own.
+    "outbuilding": FacadeStyle(
+        name="outbuilding",
+        label="shed: boarding, no windows",
+        wall_rgb=(88, 70, 54),
+        trim_rgb=(170, 160, 146),
+        glass_rgb=(44, 48, 52),
+        windows_across=0,
+        window_width_frac=0.0,
+        window_height_frac=0.0,
+        sill_frac=0.0,
+        grain=0.06,
+        planks=0.035,
+        storey_band=False,
+        tile_width_m=4.0,
+        tile_height_m=3.0,
+    ),
+    # A row of garages: a roller door per bay.
+    "garages": FacadeStyle(
+        name="garages",
+        label="garages: a roller door per bay",
+        wall_rgb=(150, 104, 84),
+        trim_rgb=(188, 190, 188),
+        glass_rgb=(44, 48, 52),
+        windows_across=0,
+        window_width_frac=0.0,
+        window_height_frac=0.0,
+        sill_frac=0.0,
+        grain=0.10,
+        door="roller",
+        storey_band=False,
+        tile_width_m=2.8,
+        tile_height_m=2.6,
+    ),
 }
+
+# Which archetype (src/buildings.py) wears which special style, whether its
+# ground storey is cut off, and how high one tile of it is (0: a storey).
+# The archetypes not listed are the era styles: stacks of storeys.
+SPECIAL_ORDER: tuple[str, ...] = (
+    "monumental", "industrial", "church", "mosque", "school", "hall",
+    "glasshouse", "parking", "closed", "technical", "barn", "outbuilding",
+    "garages",
+)
+ARCHETYPE_STYLE: dict[int, str] = {
+    4: "industrial", 5: "monumental", 6: "church", 7: "mosque", 8: "school",
+    9: "hall", 10: "glasshouse", 11: "parking", 12: "closed", 13: "technical",
+    14: "barn", 15: "outbuilding", 16: "garages",
+}
+# Archetypes laid out storey by storey rather than in bays, with no ground
+# storey of their own: a school's ribbons run down to the ground.
+STOREY_SPECIALS = frozenset({8, 11})
 
 
 # The ground storey is what makes a street read as a street: shopfronts and
@@ -243,7 +475,68 @@ GROUND_STYLES: tuple[FacadeStyle, ...] = (
         sill_frac=0.05,
         grain=0.05,
     ),
+    # A cafe or restaurant: dark timber frames, glass nearly to the pavement.
+    FacadeStyle(
+        name="ground_horeca",
+        label="ground floor, cafe and restaurant fronts",
+        wall_rgb=(96, 62, 46),
+        trim_rgb=(52, 40, 32),
+        glass_rgb=(70, 66, 58),
+        windows_across=2,
+        window_width_frac=0.42,
+        window_height_frac=0.70,
+        sill_frac=0.04,
+        grain=0.06,
+    ),
+    # A hotel: a lobby glazed floor to ceiling.
+    FacadeStyle(
+        name="ground_lobby",
+        label="ground floor, glazed lobby",
+        wall_rgb=(120, 118, 114),
+        trim_rgb=(70, 72, 74),
+        glass_rgb=(66, 84, 96),
+        windows_across=1,
+        window_width_frac=1.0,
+        window_height_frac=0.86,
+        sill_frac=0.02,
+        grain=0.03,
+        band=True,
+        mullions=3,
+    ),
+    # A supermarket: blank wall, a band of glass along the top.
+    FacadeStyle(
+        name="ground_closed",
+        label="ground floor, closed with a high band of glass",
+        wall_rgb=(156, 150, 140),
+        trim_rgb=(196, 196, 192),
+        glass_rgb=(70, 86, 98),
+        windows_across=1,
+        window_width_frac=1.0,
+        window_height_frac=0.2,
+        sill_frac=0.66,
+        grain=0.05,
+        band=True,
+        mullions=2,
+    ),
+    # A fire station or a workshop: roller doors.
+    FacadeStyle(
+        name="ground_doors",
+        label="ground floor, roller doors",
+        wall_rgb=(150, 104, 84),
+        trim_rgb=(186, 34, 30),
+        glass_rgb=(44, 48, 52),
+        windows_across=0,
+        window_width_frac=0.0,
+        window_height_frac=0.0,
+        sill_frac=0.0,
+        grain=0.08,
+        door="roller",
+        tile_width_m=4.0,
+    ),
 )
+
+# The ground storey each street use gets, by index into GROUND_STYLES.
+GROUND_HOME, GROUND_RETAIL, GROUND_HORECA, GROUND_LOBBY, GROUND_CLOSED, GROUND_DOORS = range(6)
 
 # Kept for callers that want the single default ground storey.
 GROUND_STYLE = GROUND_STYLES[1]
@@ -347,11 +640,62 @@ def render_facade_layers(
         canvas[band_px:lip, :] = np.clip(canvas[band_px:lip, :] * 1.10, 0, 255)
         relief[:band_px, :] = RELIEF_BAND
 
+    # Boarding and cladding, drawn into the wall before anything is cut in.
+    if style.planks > 0:
+        pitch = max(3, int(round(style.planks * width)))
+        gap = max(1, pitch // 10)
+        for x in range(0, width, pitch):
+            canvas[:, x : x + gap] = np.clip(canvas[:, x : x + gap] * 0.62, 0, 255)
+            relief[:, x : x + gap] = RELIEF_GLASS
+        # Each board a shade of its own.
+        shades = 1.0 + 0.08 * (rng.random(width // pitch + 1) - 0.5)
+        canvas *= np.repeat(shades, pitch)[:width][None, :, None]
+    if style.cladding > 0:
+        pitch = max(3, int(round(style.cladding * height)))
+        for y in range(0, height, pitch):
+            canvas[y : y + max(1, pitch // 14)] = np.clip(
+                canvas[y : y + max(1, pitch // 14)] * 0.7, 0, 255
+            )
+            relief[y : y + max(1, pitch // 14)] = RELIEF_GLASS
+    wall_layer = canvas.copy()
+
+    # Piers at both edges, half on each side of the tile seam, so a row of
+    # tiles has one pier between every two bays.
+    if style.buttress > 0:
+        half = max(2, int(round(style.buttress * width / 2.0)))
+        for x0, x1 in ((0, half), (width - half, width)):
+            canvas[:, x0:x1] = np.clip(canvas[:, x0:x1] * 1.08, 0, 255)
+            relief[:, x0:x1] = RELIEF_BAND + 0.1
+        # A shadow on the wall beside each pier.
+        canvas[:, half : half + 2] = np.clip(canvas[:, half : half + 2] * 0.7, 0, 255)
+        canvas[:, width - half - 2 : width - half] = np.clip(
+            canvas[:, width - half - 2 : width - half] * 0.7, 0, 255
+        )
+        wall_layer = canvas.copy()
+
+    if style.door == "roller":
+        # A roller door across most of the tile, ribbed, under a lintel.
+        x0, x1 = int(round(width * 0.08)), int(round(width * 0.92))
+        y0, y1 = 0, int(round(height * 0.82))
+        canvas[y0:y1, x0:x1] = style.trim_rgb
+        relief[y0:y1, x0:x1] = RELIEF_FRAME
+        rib = max(2, int(round(height * 0.035)))
+        for y in range(y0, y1, rib * 2):
+            canvas[y : y + rib, x0:x1] = _shade(style.trim_rgb, 0.86)
+            relief[y : y + rib, x0:x1] = RELIEF_GLASS
+        lintel = max(2, int(round(height * 0.04)))
+        canvas[y1 : y1 + lintel, x0 - 2 : x1 + 2] = _shade(style.wall_rgb, 0.75)
+        relief[y1 : y1 + lintel, x0 - 2 : x1 + 2] = RELIEF_SILL
+
+    if style.windows_across <= 0:
+        return np.clip(canvas, 0, 255).astype(np.uint8), relief
+
     # Windows.
     cell_width = width / style.windows_across
     # Capped against the cell so windows always keep a wall margin, which is
-    # what makes the tile wrap seamlessly.
-    win_w = min(style.window_width_frac * width, cell_width * 0.8)
+    # what makes the tile wrap seamlessly. A band runs to the tile's edges on
+    # purpose: the next tile carries it on.
+    win_w = width if style.band else min(style.window_width_frac * width, cell_width * 0.8)
     win_h = style.window_height_frac * height
     sill = style.sill_frac * height
     frame_px = max(1, int(round(0.012 * size_px)))
@@ -373,7 +717,10 @@ def render_facade_layers(
         arch_mask = None
         if style.arch > 0:
             span = x1 - x0
-            rise = int(round(style.arch * span * 0.5))
+            # A round head rises half its span; a pointed (equilateral) one
+            # nearly its whole span.
+            rise_per_span = np.sqrt(3.0) / 2.0 if style.arch_kind == "pointed" else 0.5
+            rise = int(round(style.arch * span * rise_per_span))
             head = min(y1, y0 + int(round(win_h)))
             arch_top = head
             arch_base = max(y0, head - rise)
@@ -388,27 +735,56 @@ def render_facade_layers(
                 # this array is the bottom of the tile, so dy grows upwards.
                 dy = (rows - arch_base) / max(1, arch_top - arch_base)
                 dx = np.abs(cols - centre_x) / max(1e-6, radius)
-                outside = (dx ** 2 + dy ** 2) > 1.0
+                if style.arch_kind == "pointed":
+                    # Two arcs, each centred on the opposite springing point,
+                    # meeting at the crown: an equilateral Gothic head.
+                    height_px = max(1, arch_top - arch_base)
+                    x_rel = (cols - x0) / max(1e-6, span)
+                    y_rel = (rows - arch_base) / height_px * (np.sqrt(3.0) / 2.0)
+                    outside = (
+                        ((x_rel - 1.0) ** 2 + y_rel ** 2 > 1.0)
+                        | (x_rel ** 2 + y_rel ** 2 > 1.0)
+                    )
+                else:
+                    outside = (dx ** 2 + dy ** 2) > 1.0
                 arch_mask = (arch_base, arch_top, outside)
 
         # Frame first, then glass inset into it.
-        canvas[y0:y1, x0:x1] = style.trim_rgb
-        relief[y0:y1, x0:x1] = RELIEF_FRAME
-
-        gx0, gx1 = x0 + frame_px, x1 - frame_px
-        gy0, gy1 = y0 + frame_px, y1 - frame_px
+        if style.framed:
+            canvas[y0:y1, x0:x1] = style.trim_rgb
+            relief[y0:y1, x0:x1] = RELIEF_FRAME
+            gx0, gx1 = x0 + frame_px, x1 - frame_px
+            gy0, gy1 = y0 + frame_px, y1 - frame_px
+        else:
+            gx0, gx1, gy0, gy1 = x0, x1, y0, y1
         if gx1 - gx0 < 2 or gy1 - gy0 < 2:
             continue
 
         glass = np.zeros((gy1 - gy0, gx1 - gx0, 3), dtype=np.float64)
         glass[:, :] = style.glass_rgb
-        # A vertical gradient reads as sky reflected in the upper pane.
-        ramp = np.linspace(1.35, 0.72, gy1 - gy0)[::-1][:, None, None]
-        glass *= ramp
-        # Faint per-window variation so a wall is not a perfect grid.
-        glass *= 1.0 + 0.06 * (rng.random() - 0.5)
+        if not style.opening:
+            # A vertical gradient reads as sky reflected in the upper pane.
+            ramp = np.linspace(1.35, 0.72, gy1 - gy0)[::-1][:, None, None]
+            glass *= ramp
+            # Faint per-window variation so a wall is not a perfect grid.
+            glass *= 1.0 + 0.06 * (rng.random() - 0.5)
         canvas[gy0:gy1, gx0:gx1] = glass
         relief[gy0:gy1, gx0:gx1] = RELIEF_GLASS
+
+        if style.band and style.framed:
+            # Glazing bars across the ribbon, and none at the seam: the frame
+            # at the tile's edge is the bar between this tile and the next.
+            for k in range(1, max(1, style.mullions)):
+                bar = x0 + int(round(k * (x1 - x0) / style.mullions))
+                canvas[gy0:gy1, bar : bar + frame_px] = style.trim_rgb
+                relief[gy0:gy1, bar : bar + frame_px] = RELIEF_FRAME
+            if style.framed and not style.opening:
+                sill_y0 = max(0, y0 - max(1, frame_px))
+                canvas[sill_y0:y0, x0:x1] = _shade(style.trim_rgb, 0.88)
+                relief[sill_y0:y0, x0:x1] = RELIEF_SILL
+            continue
+        if style.opening:
+            continue
 
         # Mullion splitting the pane, skipped when the window is small.
         if gx1 - gx0 > 8 * frame_px:
@@ -605,29 +981,27 @@ class LookPlan:
     def archetype_slot(self, archetype: int) -> int | None:
         """Slot for an archetype with its own composition, else None.
 
-        Only the two the era styles get wrong are special-cased. Housing,
-        offices and shops are all stacks of storeys, so era is the better
-        predictor for them. Neither gets looks: there is rarely more than one
-        church or gasholder in an area, so there is nothing to repeat.
+        Housing, offices and shops are all stacks of storeys, so era is the
+        better predictor for them. The rest -- a church, a shed, a car park --
+        each get the one composition that describes them, and no looks: there
+        is rarely more than one church or gasholder in an area, so there is
+        nothing to repeat.
         """
-        # Matches src/buildings.py.
-        ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
-        if archetype == ARCH_MONUMENTAL:
-            return self.wall_slots
-        if archetype == ARCH_INDUSTRIAL:
-            return self.wall_slots + 1
-        return None
+        name = ARCHETYPE_STYLE.get(int(archetype))
+        if name is None:
+            return None
+        return self.wall_slots + SPECIAL_ORDER.index(name)
 
     @property
     def total_slots(self) -> int:
-        return self.wall_slots + 2
+        return self.wall_slots + len(SPECIAL_ORDER)
 
     def styles(self) -> list["FacadeStyle"]:
         """Every wall style in slot order: the eras' looks, then the specials."""
         out: list[FacadeStyle] = []
         for era, looks in enumerate(self.per_era):
             out.extend(looks_for_style(STYLES[era], looks))
-        return out + [EXTRA_STYLES["monumental"], EXTRA_STYLES["industrial"]]
+        return out + [EXTRA_STYLES[name] for name in SPECIAL_ORDER]
 
     def summary(self) -> str:
         return ", ".join(
@@ -997,6 +1371,56 @@ def generate_structure_texture(
     return path
 
 
+def generate_masonry_texture(
+    work_dir: Path, size_px: int = 512, seed: int = 91, tile_m: float = 2.0
+) -> Path:
+    """Brick in running bond, for the arches and walls of masonry bridges.
+
+    One tile is `tile_m` square. A Dutch waal brick is about 21 by 5 cm and a
+    course with its joint 6.25 cm, so a two-metre tile holds 32 courses and
+    nine and a half bricks across each.
+    """
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    px_per_m = size_px / tile_m
+    course = 0.0625 * px_per_m
+    brick = 0.22 * px_per_m
+    joint = max(1.0, 0.01 * px_per_m)
+    rows = np.arange(size_px)
+    cols = np.arange(size_px)
+    course_index = (rows // course).astype(int)
+    canvas = np.zeros((size_px, size_px, 3), dtype=np.float64)
+
+    palette = np.array([
+        (138, 66, 48), (150, 74, 54), (124, 60, 46), (160, 86, 62), (112, 58, 48),
+    ], dtype=np.float64)
+    courses = int(np.ceil(size_px / course)) + 1
+    per_course = int(np.ceil(size_px / brick)) + 2
+    colours = palette[rng.integers(0, len(palette), size=(courses, per_course))]
+    colours *= rng.uniform(0.9, 1.08, size=(courses, per_course, 1))
+
+    for r in range(courses):
+        y0, y1 = int(r * course), int(min(size_px, (r + 1) * course))
+        if y0 >= size_px:
+            break
+        # Half a brick along on every other course: running bond.
+        shift = (brick / 2.0) if r % 2 else 0.0
+        index = ((cols + shift) // brick).astype(int)
+        canvas[y0:y1] = colours[r, index][None, :, :]
+        in_joint = ((cols + shift) % brick) < joint
+        canvas[y0:y1, in_joint] = (186, 180, 168)
+        canvas[y0:min(size_px, y0 + int(np.ceil(joint)))] = (186, 180, 168)
+
+    grain = _value_noise((size_px, size_px), cells=max(8, size_px // 16), rng=rng)
+    canvas *= 1.0 + 0.10 * (grain - 0.5)[:, :, None] * 2.0
+    work_dir.mkdir(parents=True, exist_ok=True)
+    path = work_dir / "masonry.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), mode="RGB").save(path)
+    LOG.info("wrote %s (running bond brick, %.0f m tile, %dpx)", path.name, tile_m, size_px)
+    return path
+
+
 def generate_rail_texture(
     work_dir: Path, size_px: int = 256, seed: int = 63
 ) -> Path:
@@ -1052,7 +1476,7 @@ def generate_rail_texture(
     return path
 
 
-# The furniture atlas is a 4x4 grid of flat patches, addressed by the UV centre
+# The furniture atlas is a 5x5 grid of flat patches, addressed by the UV centre
 # of a cell rather than by a real mapping: every piece of street detail is a
 # handful of boxes and none of them wants a unique texture. One atlas means one
 # material, and one material means a couple of thousand objects cost one draw
@@ -1077,10 +1501,17 @@ FURNITURE_PATCHES = (
     ("white", (226, 226, 222), 0.05, 8),     # sign faces, table tops
     ("black", (32, 33, 35), 0.12, 8),        # bike racks, bicycles, bins
     ("water", (64, 104, 118), 0.10, 10),     # fountain basins
+    # Colours for the BGT objects the furniture stage added: the green
+    # toilet and bin, the orange post box, the grey cabinet and meter.
+    ("green", (32, 84, 58), 0.10, 6),        # fir-green bins and toilets
+    ("blue", (30, 70, 140), 0.06, 6),        # bicycle frames, info boards
+    ("yellow", (226, 182, 40), 0.08, 6),     # hydrant marks
+    ("grey", (120, 124, 126), 0.10, 6),      # cabinets, meters, lockers
+    ("orange", (238, 112, 22), 0.06, 6),     # post boxes
 )
 
-FURNITURE_COLUMNS = 4
-FURNITURE_ROWS = 4
+FURNITURE_COLUMNS = 5
+FURNITURE_ROWS = 5
 
 
 def furniture_uv(name: str) -> tuple[float, float]:
@@ -1191,8 +1622,17 @@ def generate_furniture_texture(
 __all__ = [
     "CAR_PAINT",
     "FURNITURE_PATCHES",
+    "ARCHETYPE_STYLE",
+    "GROUND_CLOSED",
+    "GROUND_DOORS",
+    "GROUND_HOME",
+    "GROUND_HORECA",
+    "GROUND_LOBBY",
+    "GROUND_RETAIL",
     "GROUND_STYLE",
     "GROUND_STYLES",
+    "SPECIAL_ORDER",
+    "STOREY_SPECIALS",
     "MAX_LOOKS_PER_ERA",
     "LookPlan",
     "look_for_building",
@@ -1203,6 +1643,7 @@ __all__ = [
     "furniture_uv",
     "generate_fence_texture",
     "generate_furniture_texture",
+    "generate_masonry_texture",
     "generate_rail_texture",
     "generate_structure_texture",
     "generate_vehicle_texture",

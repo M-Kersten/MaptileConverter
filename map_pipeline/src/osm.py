@@ -23,6 +23,7 @@ under the ODbL, and a model drawn from it says so.
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import time
@@ -41,6 +42,8 @@ API_URL = "https://api.openstreetmap.org/api/0.6/map"
 # Degrees per tile side: about 280 m by 330 m here, small enough that a busy
 # city centre stays well under the API's 50,000-node limit.
 TILE_DEG = 0.004
+# Bumped when what a cached tile keeps changes.
+CACHE_VERSION = "osm5"
 ATTRIBUTION = "© OpenStreetMap contributors (ODbL). https://www.openstreetmap.org/copyright"
 
 
@@ -152,6 +155,102 @@ def _tiles(box: BBox, step: float = TILE_DEG):
             )
 
 
+def xml_elements(payload: bytes) -> list[dict]:
+    """The API's XML as OSM JSON elements: nodes with lat/lon, ways with
+    their node ids, each with its tags."""
+    root = ET.fromstring(payload)
+    out: list[dict] = []
+    for element in root:
+        tags = {t.get("k"): t.get("v") for t in element.findall("tag")}
+        if element.tag == "node":
+            node = {"type": "node", "id": int(element.get("id")),
+                    "lat": float(element.get("lat")), "lon": float(element.get("lon"))}
+            if tags:
+                node["tags"] = tags
+            out.append(node)
+        elif element.tag == "way":
+            way = {"type": "way", "id": int(element.get("id")),
+                   "nodes": [int(nd.get("ref")) for nd in element.findall("nd")]}
+            if tags:
+                way["tags"] = tags
+            out.append(way)
+    return out
+
+
+def _wanted(elements: list[dict]) -> list[dict]:
+    """What the cache keeps of a tile: the ways and tagged nodes anything in
+    the pipeline reads (`classify` here, `osm_ways.keep_way` and its node
+    keys for the road detail and the buildings), and the nodes those ways
+    run through. Untagged buildings, four fifths of a city, are dropped."""
+    from .osm_ways import NODE_KEYS, keep_way
+
+    ways = [
+        e for e in elements
+        if e["type"] == "way" and e.get("tags")
+        and (keep_way(e["tags"]) or classify(
+            e["tags"], len(e["nodes"]) > 3 and e["nodes"][0] == e["nodes"][-1]
+        ) is not None)
+    ]
+    used = {n for way in ways for n in way["nodes"]}
+    nodes = [
+        e for e in elements
+        if e["type"] == "node" and (
+            e["id"] in used
+            or (e.get("tags") and (
+                any(k in e["tags"] for k in NODE_KEYS) or classify(e["tags"], False) is not None
+            ))
+        )
+    ]
+    return nodes + ways
+
+
+def tile_elements(
+    bbox_rd: BBox,
+    *,
+    cache_dir: Path,
+    api_url: str = API_URL,
+    timeout: float = 120.0,
+    max_retries: int = 3,
+    max_age_days: float = 30.0,
+    pause_s: float = 1.0,
+) -> tuple[list[dict], int]:
+    """Every element the pipeline reads over the area, and the tile count.
+
+    One download per tile, cached for `max_age_days`, for every reader of
+    OpenStreetMap: the street objects here and the roads, crossings and
+    buildings in `osm_ways`. Elements in two tiles are returned once.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    seen: dict[tuple[str, int], dict] = {}
+    tiles = 0
+    for tile in _tiles(rd_bbox_to_wgs84(bbox_rd)):
+        key = "_".join(f"{v:.5f}" for v in tile.as_tuple())
+        cached = cache_dir / f"{CACHE_VERSION}_{key}.json.gz"
+        if cached.is_file() and (time.time() - cached.stat().st_mtime) / 86400.0 <= max_age_days:
+            with gzip.open(cached, "rt", encoding="utf-8") as handle:
+                elements = json.load(handle)
+        else:
+            response = get_with_retry(
+                api_url,
+                params={"bbox": ",".join(f"{v:.6f}" for v in tile.as_tuple())},
+                timeout=timeout,
+                max_retries=max_retries,
+                description="OpenStreetMap map download",
+            )
+            elements = _wanted(xml_elements(response.content))
+            staging = cached.with_suffix(".part")
+            with gzip.open(staging, "wt", encoding="utf-8") as handle:
+                json.dump(elements, handle)
+            staging.replace(cached)
+            # One request at a time, with room between them: the API's usage
+            # policy asks for no more.
+            time.sleep(pause_s)
+        tiles += 1
+        for element in elements:
+            seen.setdefault((element["type"], int(element["id"])), element)
+    return list(seen.values()), tiles
+
+
 def fetch_osm(
     bbox_rd: BBox,
     *,
@@ -165,49 +264,42 @@ def fetch_osm(
     """The features of the area the model can use, from cached tiles."""
     from .photos import lonlat_to_rd
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    seen: dict[str, OsmFeature] = {}
-    result = OsmSet()
-    for tile in _tiles(rd_bbox_to_wgs84(bbox_rd)):
-        key = "_".join(f"{v:.5f}" for v in tile.as_tuple())
-        cached = cache_dir / f"{key}.json"
-        if cached.is_file() and (time.time() - cached.stat().st_mtime) / 86400.0 <= max_age_days:
-            raw = json.loads(cached.read_text(encoding="utf-8"))
+    elements, tiles = tile_elements(
+        bbox_rd, cache_dir=cache_dir, api_url=api_url, timeout=timeout,
+        max_retries=max_retries, max_age_days=max_age_days, pause_s=pause_s,
+    )
+    lonlat = {e["id"]: (e["lon"], e["lat"]) for e in elements if e["type"] == "node"}
+    result = OsmSet(tiles=tiles)
+    found = []
+    for element in elements:
+        tags = element.get("tags")
+        if not tags:
+            continue
+        if element["type"] == "node":
+            osm_id, coords, closed = f"n{element['id']}", [lonlat[element["id"]]], False
         else:
-            response = get_with_retry(
-                api_url,
-                params={"bbox": ",".join(f"{v:.6f}" for v in tile.as_tuple())},
-                timeout=timeout,
-                max_retries=max_retries,
-                description="OpenStreetMap map download",
-            )
-            raw = [
-                [osm_id, tags, coords, closed]
-                for osm_id, tags, coords, closed in parse_osm_xml(response.content)
-                if classify(tags, closed) is not None
-            ]
-            cached.write_text(json.dumps(raw), encoding="utf-8")
-            # One request at a time, with room between them: the API's usage
-            # policy asks for no more.
-            time.sleep(pause_s)
-        result.tiles += 1
-        for osm_id, tags, coords, closed in raw:
-            if osm_id in seen:
+            refs = element["nodes"]
+            coords = [lonlat[r] for r in refs if r in lonlat]
+            if len(coords) < 2:
                 continue
-            kind = classify(tags, closed)
-            if kind is None:
-                continue
-            lon = np.array([c[0] for c in coords])
-            lat = np.array([c[1] for c in coords])
-            x, y = lonlat_to_rd(lon, lat)
-            xy = np.column_stack([np.atleast_1d(x), np.atleast_1d(y)])
-            seen[osm_id] = OsmFeature(osm_id, kind, tags, xy, closed)
+            osm_id, closed = f"w{element['id']}", len(refs) > 3 and refs[0] == refs[-1]
+        kind = classify(tags, closed)
+        if kind is None:
+            continue
+        lon = np.array([c[0] for c in coords])
+        lat = np.array([c[1] for c in coords])
+        x, y = lonlat_to_rd(lon, lat)
+        xy = np.column_stack([np.atleast_1d(x), np.atleast_1d(y)])
+        found.append(OsmFeature(osm_id, kind, tags, xy, closed))
     reach = bbox_rd.buffered(5.0)
     result.features = [
-        f for f in seen.values()
+        f for f in found
         if reach.xmin <= f.centroid[0] <= reach.xmax and reach.ymin <= f.centroid[1] <= reach.ymax
     ]
     return result
 
 
-__all__ = ["ATTRIBUTION", "OsmFeature", "OsmSet", "classify", "fetch_osm", "parse_osm_xml"]
+__all__ = [
+    "ATTRIBUTION", "OsmFeature", "OsmSet", "classify", "fetch_osm", "parse_osm_xml",
+    "tile_elements", "xml_elements",
+]

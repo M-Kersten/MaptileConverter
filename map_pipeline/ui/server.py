@@ -93,11 +93,16 @@ STAGE_COSTS: dict[str, dict[str, float]] = {
     # sampling it at the registered points costs about three seconds a square
     # kilometre, measured.
     "trees":              {"c": 1.0, "a": 26.0, "m": 0.0},
-    "furniture":          {"c": 0.5, "a": 3.0,  "m": 0.0},
+    # Seven BGT collections, and the national charging point file, five
+    # megabytes whatever the area. 4 s over a 300 m square, measured.
+    "furniture":          {"c": 3.0, "a": 6.0,  "m": 0.0},
     # One download per municipality a month (Utrecht is 18 MB), then the
     # faces: drawn in a second, or fetched from Commons at one a second the
     # first time an area needs them and from the cache after that.
     "signs":              {"c": 8.0, "a": 4.0,  "m": 0.0},
+    # Lights, road paint and covers: BGT reads and the OpenStreetMap tiles
+    # the street objects share. Not measured since the signs left it.
+    "traffic":            {"c": 2.0, "a": 8.0,  "m": 0.0},
     # Five collections, and more features than any other BGT stage: 3013
     # separations over one square kilometre of Utrecht. Cheaper than that
     # sounds -- measured at 7.4 s for the demo square, fetch included -- because
@@ -164,6 +169,11 @@ def estimate_seconds(payload: dict, speed: float = 1.0) -> dict:
         "trees": on("trees"),
         "furniture": on("furniture"),
         "signs": on("signs"),
+        "traffic": (
+            any(on(i) for i in ("markings", "signals", "covers"))
+            if "sources" in payload
+            else on("traffic")
+        ),
         "barriers": on("barriers"),
         "vehicles": on("vehicles"),
         "rails": on("rails"),
@@ -235,6 +245,8 @@ def measured_speed_factor() -> tuple[float, int]:
                 "land_cover": drivers.get("surfaces", True),
                 "furniture": drivers.get("furniture", True),
                 "signs": drivers.get("signs", True),
+                # Runs from before this stage existed did not do it.
+                "traffic": drivers.get("traffic", False),
                 "barriers": drivers.get("barriers", True),
                 "usage": drivers.get("usage", True),
                 "preview": drivers.get("preview", False),
@@ -1490,6 +1502,7 @@ class Handler(BaseHTTPRequestHandler):
                     "land_cover": flag("land_cover"),
                     "furniture": flag("furniture"),
                     "signs": flag("signs"),
+                    "traffic": flag("traffic"),
                     "barriers": flag("barriers"),
                     "usage": flag("usage"),
                     # The page sends these too; leaving them out here counted

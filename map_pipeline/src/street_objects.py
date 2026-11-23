@@ -428,10 +428,28 @@ def water_lookup(water_bodies):
 
 
 def from_furniture(furniture) -> list[StreetObject]:
-    """The BGT's furniture, as street objects."""
+    """The BGT's furniture, as street objects.
+
+    Keeps what the furniture stage knew of each: the way it faces (turned to
+    its road) and its size (a rack's bicycles, a charger's connectors).
+    """
+    xy = np.asarray(furniture.xy).reshape(-1, 2)
+    n = len(xy)
+
+    def per_object(values):
+        values = getattr(furniture, values, None)
+        if values is None or len(values) != n:
+            return np.full(n, np.nan)
+        return np.asarray(values, dtype=np.float64)
+
+    spin, size = per_object("spin"), per_object("size")
+    # 0 there is "one of itself"; here a size of 0 means small, NaN unknown.
+    size = np.where(size > 0, size, np.nan)
     out = []
-    for (x, y), kind in zip(np.asarray(furniture.xy).reshape(-1, 2), np.asarray(furniture.kind)):
-        out.append(StreetObject(int(kind), float(x), float(y), SOURCE_BGT))
+    for i, ((x, y), kind) in enumerate(zip(xy, np.asarray(furniture.kind))):
+        out.append(StreetObject(
+            int(kind), float(x), float(y), SOURCE_BGT, spin=float(spin[i]), size=float(size[i]),
+        ))
     return out
 
 

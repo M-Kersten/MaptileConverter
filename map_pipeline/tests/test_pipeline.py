@@ -341,16 +341,19 @@ class TestArchetypes(unittest.TestCase):
         self.assertEqual(classify_archetype(block), ARCH_APARTMENT)
 
     def test_the_special_archetypes_get_their_own_style_slots(self):
-        from src.facade import style_for_archetype, wall_styles
+        from src.facade import ARCHETYPE_STYLE, SPECIAL_ORDER, style_for_archetype, wall_styles
 
         self.assertIsNone(style_for_archetype(0, 5))  # house: era decides
         self.assertEqual(style_for_archetype(5, 5), 5)  # monumental
         self.assertEqual(style_for_archetype(4, 5), 6)  # industrial
 
         styles = wall_styles(5)
-        self.assertEqual(len(styles), 7)
+        self.assertEqual(len(styles), 5 + len(SPECIAL_ORDER))
         self.assertEqual(styles[5].name, "monumental")
         self.assertEqual(styles[6].name, "industrial")
+        # Every archetype with a wall of its own finds that wall.
+        for archetype, name in ARCHETYPE_STYLE.items():
+            self.assertEqual(styles[style_for_archetype(archetype, 5)].name, name)
 
     def test_slots_stay_put_when_the_era_count_changes(self):
         """Blender addresses these by index, so they cannot shift about."""
@@ -3460,13 +3463,13 @@ class TestFacadeLooks(unittest.TestCase):
         """Blender addresses a style by index, so the layout is a contract:
         era * looks + look, then the two specials. An extra look must not move
         an era, and an extra era must not move the specials."""
-        from src.facade import style_for_archetype, wall_styles
+        from src.facade import SPECIAL_ORDER, style_for_archetype, wall_styles
 
         ARCH_INDUSTRIAL, ARCH_MONUMENTAL = 4, 5
         for variants in (1, 3, 5):
             for looks in (1, 2, 4):
                 styles = wall_styles(variants, looks)
-                self.assertEqual(len(styles), variants * looks + 2)
+                self.assertEqual(len(styles), variants * looks + len(SPECIAL_ORDER))
                 monumental = style_for_archetype(
                     ARCH_MONUMENTAL, variants, looks
                 )
@@ -3480,9 +3483,9 @@ class TestFacadeLooks(unittest.TestCase):
     def test_the_old_two_argument_calls_still_work(self):
         """Both functions are called with one argument elsewhere, and a
         default of one look is what keeps that meaning the same thing."""
-        from src.facade import style_for_archetype, wall_styles
+        from src.facade import SPECIAL_ORDER, style_for_archetype, wall_styles
 
-        self.assertEqual(len(wall_styles(5)), 7)
+        self.assertEqual(len(wall_styles(5)), 5 + len(SPECIAL_ORDER))
         self.assertEqual(style_for_archetype(5, 5), 5)
         self.assertEqual(style_for_archetype(4, 5), 6)
 
@@ -3566,9 +3569,11 @@ class TestFacadeLooks(unittest.TestCase):
         photograph and fell back to drawn brick -- so one house in three had
         real grain and its neighbours did not."""
         from src.facade import GROUND_STYLES, wall_styles
-        from src.textures import WALL_TEXTURES
+        from src.textures import DRAWN_STYLES, WALL_TEXTURES
 
         for style in list(wall_styles(5, 4)) + list(GROUND_STYLES):
+            if style.family in DRAWN_STYLES:
+                continue  # planks and glass are drawn, not photographed
             self.assertIn(
                 style.family, WALL_TEXTURES,
                 f"{style.name} resolves to {style.family!r}, which has no "
@@ -3734,6 +3739,7 @@ class TestFacadeLooks(unittest.TestCase):
         allocation spends a dozen textures on sixteen pre-1920 houses and
         still leaves the interbellum era repeating."""
         from src.buildings import assign_facade_slots
+        from src.facade import SPECIAL_ORDER
 
         # The measured Bronbeek era counts.
         mix = []
@@ -3751,8 +3757,9 @@ class TestFacadeLooks(unittest.TestCase):
             plan.per_era, (1, 12, 3, 1, 1),
             "the looks were not allocated by how many buildings wear them",
         )
-        # 20 textures, not the 62 a flat twelve would cost.
-        self.assertEqual(plan.total_slots, 20)
+        # 18 era looks, not the 60 a flat twelve would cost, and the walls
+        # of the buildings that are something else.
+        self.assertEqual(plan.total_slots, 18 + len(SPECIAL_ORDER))
         busiest = max(np.bincount(slots))
         self.assertLess(
             busiest, 120,
@@ -3761,6 +3768,7 @@ class TestFacadeLooks(unittest.TestCase):
 
     def test_a_sparse_era_is_not_given_looks_it_cannot_use(self):
         from src.buildings import assign_facade_slots
+        from src.facade import SPECIAL_ORDER
 
         # Three pre-1920 houses and nothing else.
         _, plan = assign_facade_slots(
@@ -3770,7 +3778,7 @@ class TestFacadeLooks(unittest.TestCase):
             5, {"looks_per_era": 12, "buildings_per_look": 80},
         )
         self.assertEqual(plan.per_era, (1, 1, 1, 1, 1))
-        self.assertEqual(plan.total_slots, 7)
+        self.assertEqual(plan.total_slots, 5 + len(SPECIAL_ORDER))
 
     def test_an_archetype_special_takes_no_era_look(self):
         """A church does not make the houses around it repeat less."""
@@ -3857,9 +3865,9 @@ class TestFacadeLooks(unittest.TestCase):
 
     def test_the_shipped_budget_is_the_measured_one(self):
         """80 is not arbitrary: it is what puts the busiest Bronbeek wall on
-        81 of 1322 buildings rather than 967, at 20 textures."""
+        81 of 1322 buildings rather than 967, at 18 era textures."""
         from src.config import DEFAULTS
-        from src.facade import LookPlan
+        from src.facade import SPECIAL_ORDER, LookPlan
 
         budget = DEFAULTS["facade"]["buildings_per_look"]
         self.assertEqual(budget, 80)
@@ -3868,7 +3876,7 @@ class TestFacadeLooks(unittest.TestCase):
             cap=DEFAULTS["facade"]["looks_per_era"], target=budget,
         )
         self.assertEqual(plan.per_era, (1, 12, 3, 1, 1))
-        self.assertEqual(plan.total_slots, 20)
+        self.assertEqual(plan.total_slots, 18 + len(SPECIAL_ORDER))
         self.assertLess(max(967 / 12, 240 / 3), 100)
 
     def test_the_pipeline_hands_the_plan_to_the_texture_stage(self):
@@ -3978,7 +3986,7 @@ class TestFacade(unittest.TestCase):
         self.assertGreater(relief.max(), 0.55)
 
     def test_normal_map_written_alongside_colour(self):
-        from src.facade import generate_facade_textures
+        from src.facade import SPECIAL_ORDER, generate_facade_textures
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {
@@ -3987,9 +3995,9 @@ class TestFacade(unittest.TestCase):
                 "ground_floor": False,
             }
             pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
-            # One era variant, plus the monumental and industrial styles that
-            # every run carries.
-            self.assertEqual(len(pairs), 3)
+            # One era variant, plus the walls of churches, schools, sheds and
+            # the other buildings that every run carries.
+            self.assertEqual(len(pairs), 1 + len(SPECIAL_ORDER))
             colour, normal = pairs[0]
             self.assertTrue(colour.is_file())
             self.assertIsNotNone(normal)
@@ -4002,7 +4010,7 @@ class TestFacade(unittest.TestCase):
 
     def test_ground_floor_texture_is_written_last(self):
         """The Blender stage addresses it as the trailing material slot."""
-        from src.facade import generate_facade_textures
+        from src.facade import SPECIAL_ORDER, generate_facade_textures
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {
@@ -4011,8 +4019,8 @@ class TestFacade(unittest.TestCase):
                 "ground_floor": True,
             }
             pairs = generate_facade_textures(Path(tmp), facade_cfg=cfg)
-            # Two era variants, the two archetype styles, then the ground.
-            self.assertEqual(len(pairs), 5)
+            # Two era variants, the archetype styles, then the ground.
+            self.assertEqual(len(pairs), 2 + len(SPECIAL_ORDER) + 1)
             self.assertEqual(pairs[-1][0].name, "facade_ground.png")
 
 
@@ -4021,9 +4029,11 @@ class TestPhotoTextures(unittest.TestCase):
 
     def test_every_style_has_a_texture_mapped(self):
         from src.facade import GROUND_STYLES, STYLES, wall_styles
-        from src.textures import WALL_TEXTURES
+        from src.textures import DRAWN_STYLES, WALL_TEXTURES
 
         for style in wall_styles(len(STYLES)) + list(GROUND_STYLES):
+            if style.name in DRAWN_STYLES:
+                continue
             self.assertIn(style.name, WALL_TEXTURES, f"{style.name} has no surface")
 
     def test_a_texture_is_tiled_to_its_real_world_size(self):
@@ -7445,7 +7455,7 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(
             set(bgt[0].split(",")),
             {"trees", "water", "land_cover", "furniture", "barriers",
-             "vehicles", "rails", "structures",
+             "vehicles", "rails", "structures", "signals", "covers",
              # NDW's fallback is the BGT's own sign posts.
              "signs"},
         )
@@ -12917,19 +12927,27 @@ class TestStreetDetail(unittest.TestCase):
 
         from src.furniture import KIND_NAMES, WANTED
 
+        from src.facade import FURNITURE_PATCHES
+        from src.furniture import MOUNTED_KINDS
+
         source = (REPO_ROOT / "blender" / "process.py").read_text()
         namespace = {"np": np}
-        for name in ("_box", "_furniture_pieces"):
+        for name in ("_box", "_bar", "_along", "_bicycle", "_figure", "_ring_solid",
+                     "_furniture_pieces"):
             body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
             self.assertIsNotNone(body, f"{name} moved")
             exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
 
-        uv = {n: np.array([0.5, 0.5]) for n in
-              ("metal", "wood", "brick", "concrete", "hedge", "paint", "stone", "glass")}
+        uv = {n: np.array([0.5, 0.5]) for n, *_rest in FURNITURE_PATCHES}
         for kind in sorted(KIND_NAMES):
             pieces = namespace["_furniture_pieces"](kind, 0.0, 0.0, 0.0, 0.3, uv, {})
             self.assertTrue(pieces, f"{KIND_NAMES[kind]} has no proxy shape")
             corners = np.vstack([p[0][0] for p in pieces])
+            if kind in MOUNTED_KINDS:
+                # Hung on a facade: off the ground, and below the gutter.
+                self.assertGreater(float(corners[:, 2].min()), 3.0, KIND_NAMES[kind])
+                self.assertLess(float(corners[:, 2].max()), 6.0, KIND_NAMES[kind])
+                continue
             self.assertAlmostEqual(
                 float(corners[:, 2].min()), 0.0, places=6,
                 msg=f"{KIND_NAMES[kind]} does not stand on the ground",
@@ -12949,14 +12967,16 @@ class TestStreetDetail(unittest.TestCase):
         "unknown" is how a model ends up with seventy identical sheds."""
         import re
 
+        from src.facade import FURNITURE_PATCHES
+
         source = (REPO_ROOT / "blender" / "process.py").read_text()
         namespace = {"np": np}
-        for name in ("_box", "_furniture_pieces"):
+        for name in ("_box", "_bar", "_along", "_bicycle", "_figure", "_ring_solid",
+                     "_furniture_pieces"):
             body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
             exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
 
-        uv = {n: np.array([0.5, 0.5]) for n in
-              ("metal", "wood", "brick", "concrete", "hedge", "paint", "stone", "glass")}
+        uv = {n: np.array([0.5, 0.5]) for n, *_rest in FURNITURE_PATCHES}
         self.assertEqual(namespace["_furniture_pieces"](99, 0, 0, 0, 0, uv, {}), [])
 
     def test_the_atlas_has_a_patch_for_every_material_in_use(self):
@@ -13765,10 +13785,13 @@ class TestUIServer(unittest.TestCase):
         # Dom quarter square kilometre, 30 s over the square kilometre of
         # config.json, where the 48 Mpx budget caps it.
         roofs_km, roofs_quarter = 30.0, 16.0
+        # And the lights and road markings stage, as the server estimates it
+        # (2 s + 8 s a square kilometre): not measured since the signs left it.
+        traffic_km, traffic_quarter = 10.0, 4.0
         measured = [
-            (seconds(1000, 4096, preview=True), 468 + mesh + roofs_km),
-            (seconds(1000, 4096, preview=False), 218 + mesh + roofs_km),
-            (seconds(500, 2048, preview=False), 75 + mesh / 4 + roofs_quarter),
+            (seconds(1000, 4096, preview=True), 468 + mesh + roofs_km + traffic_km),
+            (seconds(1000, 4096, preview=False), 218 + mesh + roofs_km + traffic_km),
+            (seconds(500, 2048, preview=False), 75 + mesh / 4 + roofs_quarter + traffic_quarter),
         ]
         for predicted, actual in measured:
             self.assertLess(
@@ -15249,6 +15272,1423 @@ class TestUnityPackage(unittest.TestCase):
             self.assertRegex(
                 process, rf'\w+\["{re.escape(key)}"\] = ', f"process.py no longer sets {key}"
             )
+
+class TestTraffic(unittest.TestCase):
+    """Signs, lights and paint: built from fixtures, with no service asked."""
+
+    @staticmethod
+    def _road(width=7.0, length=200.0):
+        """A straight east-west carriageway as one BGT wegdeel feature."""
+        half = width / 2.0
+        ring = [[0, -half], [length, -half], [length, half], [0, half], [0, -half]]
+        return {
+            "properties": {"functie": "rijbaan lokale weg", "relatieve_hoogteligging": 0},
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+        }
+
+    @staticmethod
+    def _osm(tags, node_tags=None, length=200.0):
+        from src.osm_ways import OsmData, OsmNode, OsmWay
+
+        points = np.array([[0.0, 0.0], [length / 2.0, 0.0], [length, 0.0]])
+        data = OsmData(ways=[OsmWay(id=1, points=points, node_ids=(1, 2, 3), tags=tags)])
+        if node_tags is not None:
+            data.nodes.append(OsmNode(id=2, xy=(length / 2.0, 0.0), tags=node_tags))
+        return data
+
+    @staticmethod
+    def _flat(x, y):
+        return np.zeros(np.broadcast(np.asarray(x), np.asarray(y)).shape)
+
+    def test_osm_elements_become_highways_in_rd(self):
+        from src.osm_ways import parse_elements
+
+        elements = [
+            {"type": "node", "id": 1, "lon": 5.1100, "lat": 52.0850},
+            {"type": "node", "id": 2, "lon": 5.1110, "lat": 52.0850,
+             "tags": {"highway": "crossing", "crossing:markings": "zebra", "name": "x"}},
+            {"type": "node", "id": 3, "lon": 5.1120, "lat": 52.0850},
+            {"type": "way", "id": 9, "nodes": [1, 2, 3],
+             "tags": {"highway": "tertiary", "lanes": "2"}},
+            # A building is the registers' business.
+            {"type": "way", "id": 10, "nodes": [1, 2, 3], "tags": {"building": "yes"}},
+        ]
+        data = parse_elements(elements)
+        self.assertEqual([w.id for w in data.ways], [9])
+        way = data.ways[0]
+        # 0.001 degrees of longitude at 52 N is about 68 m, running east.
+        self.assertAlmostEqual(way.points[1, 0] - way.points[0, 0], 68.5, delta=1.0)
+        self.assertLess(abs(way.points[1, 1] - way.points[0, 1]), 2.0)
+        self.assertTrue(130000 < way.points[0, 0] < 140000)
+        self.assertEqual(len(data.nodes), 1)
+        # Kept whole: a rack's capacity is a tag of its own.
+        self.assertEqual(
+            data.nodes[0].tags,
+            {"highway": "crossing", "crossing:markings": "zebra", "name": "x"},
+        )
+        self.assertEqual([w.id for w in data.ways_through()[2]], [9])
+
+    def test_osm_outage_is_empty_not_fatal(self):
+        from unittest import mock
+
+        from src import osm
+        from src.osm_ways import fetch_osm_ways
+
+        def down(*args, **kwargs):
+            raise OSError("no route to host")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(osm, "get_with_retry", down):
+            data = fetch_osm_ways(BBox(136000, 455000, 136500, 455500), cache_dir=Path(tmp))
+        self.assertFalse(data)
+        self.assertEqual(data.source, "unavailable")
+
+    def test_every_sign_series_has_a_face(self):
+        from src.traffic import SHAPES, SIGN_FACES, face_cell, face_key, ATLAS_GRID
+
+        for code in ("A1", "B6", "C2", "D2", "E9", "F6", "G11", "H1", "J16", "K14", "L8"):
+            self.assertIsNotNone(face_key(code), code)
+        self.assertEqual(face_key("A1", "30"), "A1-30")
+        self.assertEqual(face_key("A1", "45"), "A1")
+        self.assertEqual(face_key("E8-vracht"), "E")
+        self.assertEqual(face_key("C22b"), "C")
+        self.assertIsNone(face_key("onbekend-x"[0:0]))
+        self.assertIsNone(face_key("9x"))
+        cells = [face_cell(key) for key in SIGN_FACES]
+        self.assertEqual(len(set(cells)), len(cells))
+        self.assertLess(max(cells), ATLAS_GRID * ATLAS_GRID)
+        for shape, _, _ in SIGN_FACES.values():
+            outline = SHAPES[shape]
+            # Counter-clockwise, or the plate faces away from its traffic.
+            x, y = outline[:, 0], outline[:, 1]
+            area = 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+            self.assertGreater(area, 0.0, shape)
+            self.assertLessEqual(float(np.abs(outline).max()), 1.0 + 1e-9)
+
+    def test_atlas_puts_each_colour_where_its_uv_points(self):
+        from PIL import Image
+
+        from src.traffic import FLAT_CELLS, face_uv, flat_uv, generate_traffic_texture, SHAPES
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = np.asarray(Image.open(generate_traffic_texture(Path(tmp))), dtype=float)
+        height, width = image.shape[:2]
+
+        def pixel(u, v):
+            return image[int((1.0 - v) * height), int(u * width)]
+
+        for name, (_, colour) in FLAT_CELLS.items():
+            np.testing.assert_allclose(pixel(*flat_uv(name))[:3], colour, atol=3, err_msg=name)
+        # No entry: red at the rim, the white bar through the middle.
+        rim = face_uv("C2", SHAPES["disc"] * 0.85)
+        self.assertGreater(pixel(*rim[4])[0], 150)
+        self.assertLess(pixel(*rim[4])[1], 80)
+        centre = face_uv("C2", np.zeros((1, 2)))[0]
+        self.assertGreater(float(pixel(*centre).min()), 200)
+        # A blue sign is blue.
+        blue = face_uv("G11", np.array([[0.8, 0.8]]))[0]
+        self.assertGreater(pixel(*blue)[2], pixel(*blue)[0] + 80)
+
+    def test_carriageway_is_measured_kerb_to_kerb(self):
+        from src.traffic import carriageways
+
+        tunnel = self._road()
+        tunnel["properties"]["relatieve_hoogteligging"] = -1
+        tunnel["geometry"]["coordinates"][0] = [
+            [x, y + 100] for x, y in tunnel["geometry"]["coordinates"][0]
+        ]
+        footway = {
+            "properties": {"functie": "voetpad"},
+            "geometry": {"type": "Polygon",
+                         "coordinates": [[[0, 3.5], [200, 3.5], [200, 6], [0, 6], [0, 3.5]]]},
+        }
+        road, cycle = carriageways([self._road(), tunnel, footway])
+        self.assertTrue(road)
+        self.assertFalse(cycle)
+        lo, hi = road.section((100.0, 1.0), (0.0, 1.0))
+        self.assertAlmostEqual(lo, -4.5, delta=0.05)
+        self.assertAlmostEqual(hi, 2.5, delta=0.05, msg="stops at the kerb, not the footway")
+        self.assertIsNone(road.section((100.0, 30.0), (0.0, 1.0)), "not on a road")
+        self.assertIsNone(road.section((100.0, 100.0), (0.0, 1.0)), "the tunnel is not up here")
+        # Looking along the road finds no kerb at all.
+        self.assertIsNone(road.section((100.0, 0.0), (1.0, 0.0)))
+
+    def test_lane_lines_follow_the_lane_count(self):
+        from src.traffic import GroundPaint, carriageways, paint_lanes
+
+        road, _ = carriageways([self._road(7.0)])
+        paint = GroundPaint()
+        stats = paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "2"}), road)
+        self.assertEqual(stats["laned_ways"], 1)
+        self.assertGreater(stats["lane_line_m"], 80.0)
+        vertices, faces, _ = paint.mesh(self._flat, 0.03).arrays()
+        # One line, down the middle, a hand's width wide and just off the road.
+        self.assertLess(float(np.abs(vertices[:, 1]).max()), 0.06)
+        np.testing.assert_allclose(vertices[:, 2], 0.03)
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        self.assertTrue((normals[:, 2] > 0).all(), "paint faces up")
+
+        # Three lanes need two lines; a road only wide enough for one lane gets none.
+        paint = GroundPaint()
+        road9, _ = carriageways([self._road(9.6)])
+        paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "3", "oneway": "yes"}), road9)
+        ys = paint.mesh(self._flat, 0.0).arrays()[0][:, 1]
+        self.assertEqual(sorted(set(np.round(np.round(ys / 1.6) * 1.6, 1))), [-1.6, 1.6])
+        for tags, width in (
+            ({"highway": "tertiary", "lanes": "2"}, 3.5),
+            ({"highway": "tertiary", "lanes": "2"}, 14.0),
+            ({"highway": "tertiary", "lanes": "2", "lane_markings": "no"}, 7.0),
+            ({"highway": "tertiary", "lanes": "1"}, 7.0),
+            ({"highway": "footway", "lanes": "2"}, 7.0),
+        ):
+            paint = GroundPaint()
+            narrow, _ = carriageways([self._road(width)])
+            paint_lanes(paint, self._osm(tags), narrow)
+            self.assertEqual(len(paint), 0, (tags, width))
+        # A line stops short of a zebra.
+        paint = GroundPaint()
+        paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "2"}), road,
+                    crossings=[{"rd": [100.0, 0.0]}])
+        xs = paint.mesh(self._flat, 0.0).arrays()[0][:, 0]
+        self.assertFalse(((xs > 97.5) & (xs < 102.5)).any())
+        self.assertTrue((xs < 90).any() and (xs > 110).any())
+        # And nothing outside the area, however far the way runs.
+        paint = GroundPaint()
+        paint_lanes(paint, self._osm({"highway": "tertiary", "lanes": "2"}), road,
+                    BBox(0, -10, 50, 10))
+        self.assertLess(float(paint.mesh(self._flat, 0.0).arrays()[0][:, 0].max()), 52.0)
+
+    def test_crossings_are_painted_as_tagged(self):
+        from src.traffic import GroundPaint, carriageways, crossing_style, paint_crossings
+
+        self.assertEqual(crossing_style({"crossing:markings": "zebra"}), "zebra")
+        self.assertEqual(crossing_style({"crossing": "zebra"}), "zebra")
+        self.assertEqual(crossing_style({"crossing": "uncontrolled"}), "zebra")
+        self.assertEqual(
+            crossing_style({"crossing": "traffic_signals", "crossing:markings": "zebra"}), "zebra"
+        )
+        self.assertEqual(crossing_style({"crossing": "traffic_signals"}), "dashes")
+        self.assertEqual(crossing_style({"crossing:markings": "dashes"}), "dashes")
+        self.assertEqual(crossing_style({"crossing": "unmarked"}), "")
+        self.assertEqual(crossing_style({"crossing:markings": "no", "crossing": "marked"}), "")
+
+        road, cycle = carriageways([self._road(7.0)])
+        paint = GroundPaint()
+        stats, records = paint_crossings(
+            paint,
+            self._osm({"highway": "tertiary"}, {"highway": "crossing", "crossing:markings": "zebra"}),
+            road, cycle,
+        )
+        self.assertEqual(stats["zebras"], 1)
+        self.assertEqual(records[0]["style"], "zebra")
+        self.assertAlmostEqual(records[0]["width_m"], 7.0, delta=0.1)
+        vertices = paint.mesh(self._flat, 0.0).arrays()[0]
+        # Across the whole road but not onto the kerb, and 4 m along it.
+        self.assertLess(float(np.abs(vertices[:, 1]).max()), 3.5)
+        self.assertGreater(float(np.abs(vertices[:, 1]).max()), 3.0)
+        self.assertAlmostEqual(float(np.ptp(vertices[:, 0])), 4.0, places=6)
+        self.assertAlmostEqual(float(vertices[:, 0].mean()), 100.0, delta=0.01)
+
+        # A hump gets its blocks; a bare crossing gets nothing.
+        for node_tags, key in (({"traffic_calming": "hump"}, "humps"),
+                               ({"highway": "crossing", "crossing": "traffic_signals"},
+                                "dashed_crossings")):
+            paint = GroundPaint()
+            stats, _ = paint_crossings(paint, self._osm({"highway": "tertiary"}, node_tags), road, cycle)
+            self.assertEqual(stats[key], 1, node_tags)
+            self.assertGreater(len(paint), 0)
+        paint = GroundPaint()
+        paint_crossings(
+            paint, self._osm({"highway": "tertiary"}, {"highway": "crossing", "crossing": "unmarked"}),
+            road, cycle,
+        )
+        self.assertEqual(len(paint), 0)
+
+    def test_give_way_teeth_cross_the_lane_and_point_at_the_driver(self):
+        from src.traffic import GroundPaint, Sign, carriageways, paint_give_way
+
+        road, cycle = carriageways([self._road(7.0)])
+        east = np.array([1.0, 0.0])
+        signs = [Sign((60.0, -4.5), "B6"), Sign((60.5, 4.5), "B6"), Sign((120.0, -4.5), "B7"),
+                 Sign((150.0, -4.5), "C2")]
+        directions = np.array([east, east, east, east])
+        points = [np.array([60.0, 0.0]), np.array([60.5, 0.0]), np.array([120.0, 0.0]),
+                  np.array([150.0, 0.0])]
+        paint = GroundPaint()
+        stats = paint_give_way(paint, signs, directions, points, road, cycle)
+        self.assertEqual(stats, {"give_way_lines": 1, "stop_lines": 1},
+                         "two signs on one lane are one line")
+        vertices, faces, _ = paint.mesh(self._flat, 0.0).arrays()
+        teeth = vertices[vertices[:, 0] < 100.0]
+        # Driving east keeps right: the southern half, and the points face west.
+        self.assertLess(float(teeth[:, 1].max()), 0.01)
+        self.assertGreater(float(teeth[:, 1].min()), -3.5)
+        self.assertAlmostEqual(float(teeth[:, 0].min()), 60.0 - 0.6, places=6)
+        self.assertAlmostEqual(float(teeth[:, 0].max()), 60.0, places=6)
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        self.assertTrue((normals[:, 2] > 0).all())
+        # A lane too narrow for two directions is crossed whole.
+        lane, _ = carriageways([self._road(3.5)])
+        paint = GroundPaint()
+        paint_give_way(paint, signs[:1], directions[:1], points[:1], lane, cycle)
+        ys = paint.mesh(self._flat, 0.0).arrays()[0][:, 1]
+        self.assertGreater(float(ys.max()), 1.0)
+        self.assertLess(float(ys.min()), -1.0)
+
+    def test_signals_stand_right_of_their_traffic(self):
+        from src.traffic import RoadIndex, carriageways, place_signals, signal_mesh
+
+        line = np.array([[0.0, 0.0], [200.0, 0.0]])
+        roads = RoadIndex([line])
+        road, _ = carriageways([self._road(7.0)])
+        osm = self._osm({"highway": "tertiary"}, {"highway": "traffic_signals"})
+        # A surveyed pole south of the road serves traffic driving east.
+        positions, directions, stats = place_signals(np.array([[100.0, -4.2]]), osm, roads, road)
+        self.assertEqual(stats, {"surveyed": 1, "from_osm": 0}, "the survey wins near its poles")
+        np.testing.assert_allclose(directions[0], [1.0, 0.0], atol=1e-9)
+        # None surveyed: one pole per approach, each on its own kerb.
+        positions, directions, stats = place_signals(np.zeros((0, 2)), osm, roads, road)
+        self.assertEqual(stats["from_osm"], 2)
+        for position, direction in zip(positions, directions):
+            rightward = np.array([direction[1], -direction[0]])
+            self.assertAlmostEqual(float((position - [100.0, 0.0]) @ rightward), 4.2, delta=0.1)
+        one_way = self._osm({"highway": "tertiary", "oneway": "yes"}, {"highway": "traffic_signals"})
+        self.assertEqual(place_signals(np.zeros((0, 2)), one_way, roads, road)[2]["from_osm"], 1)
+
+        vertices, faces, uv = signal_mesh(positions[:1], directions[:1], np.array([1.0])).arrays()
+        self.assertAlmostEqual(float(vertices[:, 2].min()), 1.0, places=6)
+        self.assertAlmostEqual(float(vertices[:, 2].max()), 1.0 + 3.4, delta=0.01)
+        from src.traffic import flat_uv
+        for colour in ("red", "amber", "green"):
+            self.assertTrue((np.abs(uv - flat_uv(colour)).sum(axis=1) < 1e-9).any(), colour)
+
+    def test_covers_lie_where_the_bgt_has_them(self):
+        from src.traffic import GroundPaint, RoadIndex, paint_covers
+
+        def put(kind, x, y):
+            return {"properties": {"plus_type": kind},
+                    "geometry": {"type": "Point", "coordinates": [x, y]}}
+
+        paint = GroundPaint()
+        stats = paint_covers(
+            paint,
+            [put("inspectie- / rioolput", 10, 0), put("kolk", 20, 3), put("niet-bgt", 30, 0),
+             put("kolk", 500, 0)],
+            BBox(0, -10, 100, 10),
+            RoadIndex([np.array([[0.0, 0.0], [0.0, 100.0]])]),
+        )
+        self.assertEqual(stats, {"manholes": 1, "gullies": 1, "hydrants": 0})
+        vertices = paint.mesh(self._flat, 0.015).arrays()[0]
+        gully = vertices[vertices[:, 0] > 15]
+        # Lengthways along the road, which here runs north.
+        self.assertGreater(float(np.ptp(gully[:, 1])), float(np.ptp(gully[:, 0])))
+
+    def test_stage_builds_from_fixtures_and_survives_outages(self):
+        from unittest import mock
+
+        from src import traffic as module
+        from src.signs import Sign, SignSet
+        from src.traffic import build_traffic, write_traffic_list
+        from src.validate import CheckReport, check_traffic
+
+        bbox = BBox(0, -50, 200, 50)
+        osm = self._osm({"highway": "tertiary", "lanes": "2"},
+                        {"highway": "crossing", "crossing:markings": "zebra"})
+
+        def fetch_bgt(collection, bbox, **kwargs):
+            if collection == "wegdeel":
+                return [self._road(7.0)], None
+            if collection == "paal":
+                return [{"properties": {"plus_type": "verkeersregelinstallatiepaal"},
+                         "geometry": {"type": "Point", "coordinates": [100.0, -4.2]}}], None
+            if collection == "put":
+                return [{"properties": {"plus_type": "kolk"},
+                         "geometry": {"type": "Point", "coordinates": [40.0, 3.3]}}], None
+            raise AssertionError(collection)
+
+        class Terrain:
+            def surface(self, x, y):
+                return np.full(np.broadcast(np.asarray(x), np.asarray(y)).shape, 5.0)
+
+        # As the signs stage places them: the traffic drives east, so the
+        # faces look west, back down the road.
+        signs = SignSet(signs=[Sign(60.0, -4.5, "B6", facing=np.pi),
+                               Sign(30.0, -4.5, "A1", black="30", facing=np.pi)])
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("src.osm_ways.fetch_osm_ways", lambda *a, **k: osm):
+            result = build_traffic(
+                bbox, Path(tmp), traffic_cfg={}, terrain=Terrain(), fetch_bgt=fetch_bgt,
+                deck_at=lambda x, y: np.where(np.asarray(x) > 150, 9.0, np.nan),
+                signs=signs,
+            )
+            self.assertTrue((Path(tmp) / "traffic.npz").is_file())
+            with np.load(Path(tmp) / "traffic.npz") as saved:
+                for name in ("signals", "markings", "covers"):
+                    self.assertGreater(len(saved[f"{name}_faces"]), 0, name)
+                    self.assertEqual(len(saved[f"{name}_uv"]), len(saved[f"{name}_vertices"]))
+            listed = json.loads(
+                write_traffic_list(result, GeoContext.from_bbox(bbox), Path(tmp)).read_text()
+            )
+        self.assertNotIn("signs", result.meshes)
+        self.assertEqual(result.counts["signals"], 1)
+        self.assertEqual(result.counts["zebras"], 1)
+        self.assertEqual(result.counts["give_way_lines"], 1)
+        self.assertEqual(result.counts["gullies"], 1)
+        self.assertTrue(result.used_osm)
+        # The sign posts are the signs stage's to drop; the signal poles here.
+        self.assertEqual(result.replaces, {"verkeersregelinstallatiepaal"})
+        markings = result.meshes["markings"][0]
+        # On the ground at 5 m, on the bridge deck at 9 m beyond x = 150.
+        np.testing.assert_allclose(markings[markings[:, 0] < 150, 2], 5.03)
+        np.testing.assert_allclose(markings[markings[:, 0] > 150, 2], 9.03)
+        self.assertEqual(listed["signals"][0]["local"]["x"], listed["signals"][0]["rd"][0] - 100.0)
+        self.assertEqual(len(listed["crossings"]), 1)
+
+        report = CheckReport()
+        check_traffic(report, result, bbox)
+        self.assertTrue(all(check.passed for check in report.checks), report.checks)
+
+        # Every service away: an empty result, and no exception.
+        def down(*args, **kwargs):
+            raise OSError("unreachable")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("src.osm.get_with_retry", down), \
+                mock.patch.object(module, "get_with_retry", down):
+            empty = build_traffic(bbox, Path(tmp), traffic_cfg={}, terrain=Terrain(), fetch_bgt=down)
+            self.assertEqual(len(empty), 0)
+            self.assertFalse((Path(tmp) / "traffic.npz").exists())
+
+    def test_furniture_leaves_what_traffic_drew(self):
+        from unittest import mock
+
+        from src import furniture
+        from src.config import DEFAULTS
+
+        def fetch(collection, bbox, **kwargs):
+            if collection != "paal":
+                return [], None
+            return [
+                {"properties": {"plus_type": kind},
+                 "geometry": {"type": "Point", "coordinates": [10.0 + i, 10.0]}}
+                for i, kind in enumerate(
+                    ("lichtmast", "verkeersbordpaal", "verkeersregelinstallatiepaal")
+                )
+            ], None
+
+        class Terrain:
+            def surface(self, x, y):
+                return np.zeros(len(x))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(furniture, "fetch_current", fetch):
+            everything = furniture.build_furniture(
+                BBox(0, 0, 100, 100), Path(tmp), furniture_cfg=DEFAULTS["furniture"], terrain=Terrain()
+            )
+            rest = furniture.build_furniture(
+                BBox(0, 0, 100, 100), Path(tmp), furniture_cfg=DEFAULTS["furniture"], terrain=Terrain(),
+                skip_types={"verkeersbordpaal", "verkeersregelinstallatiepaal"},
+            )
+        self.assertEqual(len(everything), 3)
+        self.assertEqual(len(rest), 1)
+
+    def test_sources_and_config_carry_the_three_layers(self):
+        """Lights, paint and covers are the traffic stage's; the signs stay
+        the signs stage's own source and setting."""
+        from src.config import DEFAULTS
+        from src.sources import BY_ID, apply_selection, down_sources, enabled_sources
+        import copy
+
+        for key in ("signals", "markings", "covers"):
+            self.assertIs(DEFAULTS["traffic"][key], True)
+            self.assertIn(key, BY_ID)
+        self.assertNotIn("signs", DEFAULTS["traffic"])
+        self.assertEqual(BY_ID["signs"].toggles, (("signs", "enabled"),))
+        self.assertTrue(BY_ID["markings"].soft and BY_ID["chargers"].soft)
+        self.assertFalse(BY_ID["buildings"].soft)
+        config = apply_selection(copy.deepcopy(DEFAULTS), {"markings"})
+        self.assertTrue(config["traffic"]["markings"])
+        self.assertFalse(config["traffic"]["covers"])
+        ids = {s.id for s in enabled_sources(config)}
+        self.assertIn("markings", ids)
+        self.assertNotIn("covers", ids)
+        down = down_sources(DEFAULTS, {}, [BY_ID["markings"]])
+        self.assertEqual([s.id for s in down], ["markings"])
+
+    def test_attribution_credits_openstreetmap_only_when_used(self):
+        from src.export import write_attribution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = write_attribution(Path(tmp)).read_text(encoding="utf-8")
+            credited = write_attribution(Path(tmp), osm=True).read_text(encoding="utf-8")
+        self.assertNotIn("OpenStreetMap", plain)
+        self.assertIn("OpenStreetMap contributors", credited)
+        self.assertIn("ODbL", credited)
+        self.assertIn("NDW", credited)
+
+    def test_blender_stage_knows_the_traffic_objects(self):
+        from src.traffic import OBJECTS
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text(encoding="utf-8")
+        for name in OBJECTS:
+            self.assertIn(f'("{name}", ', source)
+        self.assertIn('("traffic", "traffic")', source, "the atlas is copied beside the FBX")
+
+
+class TestStreetFurniture(unittest.TestCase):
+    """The furniture stage's sources, merging and facing, without a service."""
+
+    @staticmethod
+    def _blender(*names):
+        import re
+
+        source = (REPO_ROOT / "blender" / "process.py").read_text()
+        namespace = {"np": np}
+        for name in ("_box", "_ring_solid", "_furniture_pieces", *names):
+            body = re.search(rf"\ndef {name}\(.*?\n(?=\ndef )", source, re.S)
+            exec(body.group(0), namespace)  # noqa: S102 - our own source, in a test
+        return namespace
+
+    def test_ring_solids_face_outwards(self):
+        """Posts, bins and wheels are seen from outside; a face wound the
+        wrong way is a hole in Unity, which culls back faces."""
+        ring = self._blender()["_ring_solid"]
+        for axis, side in (((0, 0, 1), (1, 0, 0)), ((1, 0, 0), (0, 1, 0))):
+            vertices, faces = ring(2.0, 3.0, 4.0, np.array(axis, float), np.array(side, float),
+                                   0.5, 0.25, 8)
+            centre = vertices.mean(axis=0)
+            tri = vertices[faces]
+            normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            outward = tri.mean(axis=1) - centre
+            self.assertTrue(((normals * outward).sum(axis=1) > 0).all(), axis)
+            self.assertEqual(len(faces), 8 * 2 + 6 * 2)
+
+    def test_a_wheel_is_a_ring_seen_from_outside(self):
+        ring = self._blender()["_ring_solid"]
+        axis = np.array([1.0, 0.0, 0.0])
+        vertices, faces = ring(0.0, 0.0, 0.5, axis, np.array([0.0, 1.0, 0.0]), 0.33, 0.02, 6, 0.05)
+        self.assertEqual(len(faces), 6 * 8)
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        centres = tri.mean(axis=1) - np.array([0.0, 0.0, 0.5])
+        along = centres @ axis
+        radial = centres - along[:, None] * axis
+        distance = np.linalg.norm(radial, axis=1)
+        unit = normals / np.linalg.norm(normals, axis=1)[:, None]
+        cap = np.abs(unit @ axis) > 0.9
+        # Centroids of the outer faces sit at 0.29 m, of the inner at 0.25.
+        outer = ~cap & (distance > 0.27)
+        inner = ~cap & (distance <= 0.27)
+        self.assertEqual((int(outer.sum()), int(inner.sum()), int(cap.sum())), (12, 12, 24))
+        self.assertTrue(((normals[outer] * radial[outer]).sum(axis=1) > 0).all())
+        self.assertTrue(((normals[inner] * radial[inner]).sum(axis=1) < 0).all())
+        self.assertTrue(((normals[cap] @ axis) * along[cap] > 0).all())
+
+    def test_points_on_the_road_go_to_the_kerb(self):
+        from src.traffic import carriageways
+
+        road, _ = carriageways([{
+            "properties": {"functie": "rijbaan lokale weg"},
+            "geometry": {"type": "Polygon",
+                         "coordinates": [[[0, -3.5], [100, -3.5], [100, 3.5], [0, 3.5], [0, -3.5]]]},
+        }])
+        moved = road.push_off((50.0, 2.5))
+        self.assertAlmostEqual(float(moved[1]), 3.5 + 0.6, delta=0.05)
+        self.assertAlmostEqual(float(moved[0]), 50.0, delta=0.05)
+        self.assertIsNone(road.push_off((50.0, 10.0)), "already off the road")
+
+    def test_furniture_faces_its_street(self):
+        from src.furniture import (
+            KIND_BENCH, KIND_FLAGPOLE, KIND_LAMP, facing_spin,
+        )
+        from src.traffic import RoadIndex
+
+        roads = RoadIndex([np.array([[0.0, 0.0], [100.0, 0.0]])])
+        # A bench north of an east-west road runs along it, its front south.
+        spin = facing_spin(KIND_BENCH, (50.0, 4.0), roads)
+        x_axis = np.array([np.cos(spin), np.sin(spin)])
+        front = np.array([-x_axis[1], x_axis[0]])
+        self.assertAlmostEqual(abs(x_axis[0]), 1.0, places=6)
+        np.testing.assert_allclose(front, [0.0, -1.0], atol=1e-9)
+        # The same bench south of the road turns round.
+        spin = facing_spin(KIND_BENCH, (50.0, -4.0), roads)
+        np.testing.assert_allclose(
+            [-np.sin(spin), np.cos(spin)], [0.0, 1.0], atol=1e-9
+        )
+        # A lamp's arm reaches over the road.
+        spin = facing_spin(KIND_LAMP, (50.0, 4.0), roads)
+        np.testing.assert_allclose([np.cos(spin), np.sin(spin)], [0.0, -1.0], atol=1e-9)
+        # Nothing says which way a flagpole faces, or a bench in a park.
+        self.assertTrue(np.isnan(facing_spin(KIND_FLAGPOLE, (50.0, 4.0), roads)))
+        self.assertTrue(np.isnan(facing_spin(KIND_BENCH, (50.0, 400.0), roads)))
+        self.assertTrue(np.isnan(facing_spin(KIND_BENCH, (50.0, 4.0), None)))
+
+    def test_openstreetmap_tags_and_what_they_refuse(self):
+        from src.furniture import (
+            KIND_ART, KIND_BIKE_RACK, KIND_BIN, KIND_CAMERA, KIND_INFO_BOARD,
+            KIND_PARKING_METER, osm_kind,
+        )
+
+        self.assertEqual(osm_kind({"amenity": "waste_basket"})[0], KIND_BIN)
+        self.assertEqual(osm_kind({"tourism": "artwork", "artwork_type": "statue"})[0], KIND_ART)
+        self.assertIsNone(osm_kind({"tourism": "artwork", "artwork_type": "mural"}))
+        self.assertEqual(osm_kind({"amenity": "bicycle_parking"})[0], KIND_BIKE_RACK)
+        self.assertIsNone(osm_kind({"amenity": "bicycle_parking", "bicycle_parking": "underground"}))
+        self.assertIsNone(osm_kind({"amenity": "bicycle_parking", "level": "-1"}))
+        self.assertEqual(osm_kind({"tourism": "information", "information": "board"})[0], KIND_INFO_BOARD)
+        self.assertIsNone(osm_kind({"tourism": "information", "information": "office"}))
+        self.assertEqual(
+            osm_kind({"amenity": "vending_machine", "vending": "parking_tickets"})[0],
+            KIND_PARKING_METER,
+        )
+        self.assertIsNone(osm_kind({"amenity": "vending_machine", "vending": "drinks"}))
+        self.assertEqual(osm_kind({"man_made": "surveillance"})[0], KIND_CAMERA)
+        self.assertIsNone(osm_kind({"man_made": "surveillance", "camera:mount": "wall"}))
+        self.assertIsNone(osm_kind({"shop": "bakery"}))
+
+    def test_other_sources_fill_in_behind_the_bgt(self):
+        from src.furniture import KIND_BENCH, KIND_BIN, _Item, merge_sources
+
+        bgt = [_Item(0.0, 0.0, KIND_BENCH, "bgt")]
+        extra = [
+            _Item(2.0, 0.0, KIND_BENCH, "osm"),    # the same bench, mapped twice
+            _Item(30.0, 0.0, KIND_BENCH, "osm"),   # a bench the BGT lacks
+            _Item(1.0, 0.0, KIND_BIN, "osm"),      # a bin beside the bench
+            _Item(1.5, 0.0, KIND_BIN, "osm"),      # and the same bin again
+        ]
+        kept = merge_sources(bgt, extra)
+        self.assertEqual(
+            sorted((i.kind, i.x) for i in kept),
+            sorted([(KIND_BENCH, 0.0), (KIND_BENCH, 30.0), (KIND_BIN, 1.0)]),
+        )
+
+    def test_chargers_are_read_with_their_connectors(self):
+        from src.furniture import KIND_CHARGER, parse_chargers
+
+        def location(lon, lat, *totals):
+            return {
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {"availabilities": [{"total": t} for t in totals]},
+            }
+
+        items = parse_chargers(
+            [location(5.11, 52.085, 2, 1), location(5.11, 52.086), location(4.0, 51.0, 2)],
+            BBox(130000, 450000, 140000, 460000),
+        )
+        self.assertEqual([i.kind for i in items], [KIND_CHARGER, KIND_CHARGER])
+        self.assertEqual([i.size for i in items], [3.0, 1.0])
+        self.assertTrue(all(130000 < i.x < 140000 for i in items))
+
+    def test_light_points_hang_on_facades(self):
+        import shapely
+
+        from src.furniture import (
+            KIND_LAMP, KIND_WALL_LAMP, Footprints, _hang_on_walls, _Item,
+        )
+
+        house = shapely.box(0.0, 0.0, 10.0, 8.0)
+        footprints = Footprints(polygons=[house])
+        self.assertTrue(footprints.inside((5.0, 4.0)))
+        self.assertFalse(footprints.inside((5.0, 9.0)))
+        items = [
+            _Item(5.0, 8.6, KIND_LAMP, "bgt_light_point"),    # on the north facade
+            _Item(5.0, 30.0, KIND_LAMP, "bgt_light_point"),   # out in the street
+            _Item(40.0, 40.0, KIND_LAMP, "bgt"),              # a mast
+            _Item(40.3, 40.0, KIND_LAMP, "bgt_light_point"),  # the same light again
+        ]
+        hung = _hang_on_walls(items, footprints)
+        self.assertEqual(hung, 1)
+        self.assertEqual(len(items), 3)
+        wall = [i for i in items if i.kind == KIND_WALL_LAMP][0]
+        # The arm reaches out of the house: north.
+        np.testing.assert_allclose([np.cos(wall.spin), np.sin(wall.spin)], [0.0, 1.0], atol=1e-6)
+        self.assertEqual(
+            sorted(i.kind for i in items), sorted([KIND_WALL_LAMP, KIND_LAMP, KIND_LAMP])
+        )
+
+    def test_a_bicycle_parking_area_becomes_racks(self):
+        from src.furniture import KIND_BIKE_RACK, _osm_items
+        from src.osm_ways import OsmData, OsmWay
+
+        ring = np.array([[0.0, 0.0], [21.0, 0.0], [21.0, 4.5], [0.0, 4.5], [0.0, 0.0]])
+        osm = OsmData(areas=[OsmWay(1, ring, (1, 2, 3, 4, 1),
+                                    {"amenity": "bicycle_parking", "capacity": "40"})])
+        items = _osm_items(osm, BBox(-10, -10, 40, 40))
+        self.assertTrue(items)
+        self.assertTrue(all(i.kind == KIND_BIKE_RACK for i in items))
+        self.assertEqual(sum(i.size for i in items), 40)
+        # Two rows of racks across the 4.5 m, running the long way.
+        self.assertEqual(len({round(i.y, 3) for i in items}), 2)
+        self.assertTrue(all(abs(np.cos(i.spin)) > 0.99 for i in items))
+
+    def test_hydrant_lids_get_a_yellow_frame(self):
+        from src.traffic import GroundPaint, RoadIndex, flat_uv, paint_covers
+
+        paint = GroundPaint()
+        stats = paint_covers(
+            paint,
+            [{"properties": {"plus_type": "brandkraan / -put"},
+              "geometry": {"type": "Point", "coordinates": [10.0, 0.0]}}],
+            BBox(0, -10, 100, 10),
+            RoadIndex([np.array([[0.0, 0.0], [100.0, 0.0]])]),
+        )
+        self.assertEqual(stats["hydrants"], 1)
+        vertices, _faces, uv = paint.mesh(lambda x, y: np.zeros(np.shape(x)), 0.0).arrays()
+        yellow = np.abs(uv - flat_uv("yellow")).sum(axis=1) < 1e-9
+        self.assertTrue(yellow.any() and (~yellow).any())
+        # The frame goes round the lid, it does not lie under it.
+        self.assertLess(float(vertices[yellow, 0].min()), float(vertices[~yellow, 0].min()))
+
+
+class TestRoadPaint(unittest.TestCase):
+    """Stop lines, parking stalls and road symbols, from fixtures."""
+
+    @staticmethod
+    def _surface(ring, function="rijbaan lokale weg"):
+        return {
+            "properties": {"functie": function, "relatieve_hoogteligging": 0},
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+        }
+
+    def _road(self, width=7.0, length=200.0, function="rijbaan lokale weg"):
+        h = width / 2.0
+        return self._surface(
+            [[0, -h], [length, -h], [length, h], [0, h], [0, -h]], function
+        )
+
+    @staticmethod
+    def _flat(x, y):
+        return np.zeros(np.broadcast(np.asarray(x), np.asarray(y)).shape)
+
+    def test_a_signalled_junction_lights_its_approaches_only(self):
+        from src.osm_ways import OsmData, OsmNode, OsmWay
+        from src.traffic import SIGNAL_SETBACK_M, RoadIndex, carriageways, place_signals
+
+        # An east-west road through the junction at (100, 0), and a road
+        # from the south that ends there.
+        through = OsmWay(1, np.array([[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]]), (1, 2, 3),
+                         {"highway": "tertiary"})
+        ending = OsmWay(2, np.array([[100.0, -100.0], [100.0, 0.0]]), (4, 2),
+                        {"highway": "residential"})
+        osm = OsmData(ways=[through, ending],
+                      nodes=[OsmNode(2, (100.0, 0.0), {"highway": "traffic_signals"})])
+        road, _ = carriageways([self._road(7.0)])
+        stops: list = []
+        positions, directions, stats = place_signals(
+            np.zeros((0, 2)), osm, RoadIndex([through.points]), road, stops=stops
+        )
+        # Two ways in from the east-west road, one from the south; none for
+        # traffic leaving southwards.
+        self.assertEqual(stats["from_osm"], 3)
+        self.assertEqual(len(stops), 3)
+        for stop, direction in zip(stops, directions):
+            np.testing.assert_allclose(
+                stop + direction * SIGNAL_SETBACK_M, [100.0, 0.0], atol=1e-9
+            )
+        self.assertTrue(any(np.allclose(d, [0.0, 1.0]) for d in directions))
+        self.assertFalse(any(np.allclose(d, [0.0, -1.0]) for d in directions))
+
+    def test_stop_lines_cross_the_lanes_the_light_stops(self):
+        from src.traffic import (
+            KERB_INSET_M, STOP_BEFORE_M, GroundPaint, carriageways, paint_stop_lines,
+        )
+
+        road, cycle = carriageways([self._road(7.0)])
+        east = np.array([1.0, 0.0])
+        paint = GroundPaint()
+        stats = paint_stop_lines(
+            paint, [np.array([60.0, 0.0]), np.array([61.0, 0.0]), None],
+            np.array([east, east, east]), road, cycle,
+        )
+        self.assertEqual(stats["stop_lines_at_lights"], 1, "two heads, one line")
+        vertices = paint.mesh(self._flat, 0.0).arrays()[0]
+        self.assertAlmostEqual(float(vertices[:, 0].mean()), 60.0 - STOP_BEFORE_M, places=6)
+        # The right-hand half of the road, short of the kerb.
+        self.assertAlmostEqual(float(vertices[:, 1].min()), -3.5 + KERB_INSET_M, delta=0.03)
+        self.assertAlmostEqual(float(vertices[:, 1].max()), 0.0, delta=0.03)
+
+    def test_parking_bays_are_cut_into_stalls(self):
+        from src.traffic import GroundPaint, paint_parking_bays
+
+        strip = self._surface(
+            [[0, 10], [22.4, 10], [22.4, 12], [0, 12], [0, 10]], "parkeervlak"
+        )
+        deep = self._surface(
+            [[0, 20], [13, 20], [13, 25], [0, 25], [0, 20]], "parkeervlak"
+        )
+        paint = GroundPaint()
+        stats = paint_parking_bays(paint, [strip, deep, self._road()], BBox(-10, -10, 100, 100))
+        self.assertEqual(stats["parking_bays"], 2)
+        # Four stalls nose to tail: three lines between them. Five side by
+        # side: four.
+        self.assertEqual(stats["stall_lines"], 3 + 4)
+        vertices = paint.mesh(self._flat, 0.0).arrays()[0]
+        in_strip = vertices[vertices[:, 1] < 15]
+        self.assertTrue(set(np.round(np.unique(np.round(in_strip[:, 0], 1)), 0)) >= {6.0, 11.0, 17.0})
+        self.assertGreater(float(in_strip[:, 1].min()), 10.0)
+        self.assertLess(float(in_strip[:, 1].max()), 12.0)
+
+    def test_cycle_tracks_get_bicycles_pointing_the_way_they_ride(self):
+        from src.osm_ways import OsmData, OsmWay
+        from src.traffic import (
+            GroundPaint, carriageways, cell_rect, paint_symbols, symbol_cell,
+        )
+
+        track = self._road(2.0, function="fietspad")
+        road, cycle = carriageways([track])
+        osm = OsmData(ways=[OsmWay(1, np.array([[0.0, 0.0], [200.0, 0.0]]), (1, 2),
+                                   {"highway": "cycleway", "oneway": "yes"})])
+        paint = GroundPaint()
+        stats = paint_symbols(paint, osm, None, road, cycle)
+        self.assertEqual(stats["bike_symbols"], 4)
+        vertices, faces, uv = paint.mesh(self._flat, 0.0).arrays()
+        u0, v0, u1, v1 = cell_rect(symbol_cell("bike"))
+        self.assertTrue(((uv[:, 0] >= u0) & (uv[:, 0] <= u1)).all())
+        # The top of the symbol is at the far end: east, the way it is ridden.
+        top = uv[:, 1] > (v0 + v1) / 2.0
+        first = vertices[:4]
+        self.assertGreater(float(first[top[:4], 0].mean()), float(first[~top[:4], 0].mean()))
+        tri = vertices[faces]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        self.assertTrue((normals[:, 2] > 0).all())
+        # Wide enough and two-way: one each way.
+        _, wide = carriageways([self._road(3.0, function="fietspad")])
+        osm.ways[0].tags["oneway"] = "no"
+        paint = GroundPaint()
+        self.assertEqual(paint_symbols(paint, osm, None, road, wide)["bike_symbols"], 8)
+
+    def test_symbols_are_white_on_nothing(self):
+        from PIL import Image
+
+        from src.traffic import (
+            ATLAS_GRID, FLAT_CELLS, cell_rect, generate_traffic_texture, symbol_cell,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = np.asarray(Image.open(generate_traffic_texture(Path(tmp))))
+        self.assertEqual(image.shape[2], 4)
+        size = image.shape[0]
+
+        def pixel(u, v):
+            return image[min(size - 1, int((1.0 - v) * size)), min(size - 1, int(u * size))]
+
+        u0, v0, u1, v1 = cell_rect(symbol_cell("arrow"))
+        self.assertEqual(int(pixel(u0 + 0.002, v0 + 0.002)[3]), 0, "the corner is clear")
+        shaft = pixel((u0 + u1) / 2.0, v0 + (v1 - v0) * 0.3)
+        self.assertEqual(int(shaft[3]), 255)
+        self.assertGreater(int(shaft[:3].min()), 240)
+        cell = FLAT_CELLS["white"][0]
+        self.assertEqual(int(pixel(*[(a + b) / 2 for a, b in zip(cell_rect(cell)[:2], cell_rect(cell)[2:])])[3]), 255)
+        self.assertEqual(size, ATLAS_GRID * 128)
+
+
+class TestWaterBridges(unittest.TestCase):
+    """Bridge bodies, arches and the water boards' register, from fixtures."""
+
+    class _Terrain:
+        def __init__(self, z=2.0):
+            self.z = z
+
+        def sample(self, x, y):
+            return np.full(np.broadcast(np.asarray(x), np.asarray(y)).shape, self.z)
+
+    @staticmethod
+    def _canal(width=10.0, level=0.6):
+        """A canal running north-south, `width` wide, centred on x = 0."""
+        from src.surfaces import WaterBody
+
+        h = width / 2.0
+        ring = np.array([[-h, -100.0], [h, -100.0], [h, 100.0], [-h, 100.0], [-h, -100.0]])
+        return [WaterBody(rings=[ring], level_nap=level, area_m2=width * 200.0, measured=True)]
+
+    def test_the_shortest_line_across_a_canal_is_square_to_it(self):
+        from src.waterworks import narrowest_crossing, water_geometry
+
+        wet = water_geometry(self._canal(10.0))
+        width, axis, middle = narrowest_crossing(wet, (2.0, 30.0))
+        self.assertAlmostEqual(width, 10.0, delta=0.05)
+        self.assertAlmostEqual(abs(float(axis[0])), 1.0, places=3)
+        np.testing.assert_allclose(middle, [0.0, 30.0], atol=0.05)
+        self.assertIsNone(narrowest_crossing(wet, (40.0, 30.0)), "on land")
+
+    def test_the_register_sets_the_arch_and_its_clearance(self):
+        """The water board's soffit is the crown of the arch `bridge_body`
+        draws; a bridge it says is not masonry, or one that opens, is a beam
+        at that height."""
+        import shapely
+
+        from src.structures import KIND_ARCH, _bridge_record, _wet, bridge_body
+        from src.waterworks import WaterBridge
+
+        water = self._canal(10.0, level=0.6)
+        wet, _ = _wet(water)
+        ground = self._Terrain(2.0).sample
+        # A street 8 m wide crossing the canal east-west, on a deck from
+        # x = -9 to 9.
+        ring = np.array([[-9.0, -4.0], [9.0, -4.0], [9.0, 4.0], [-9.0, 4.0], [-9.0, -4.0]])
+
+        def under(made):
+            arch = [t for t, kind in made if kind == KIND_ARCH]
+            return np.concatenate(arch).reshape(-1, 3) if arch else np.zeros((0, 3))
+
+        guessed = bridge_body([ring], 5.3, ground_at=ground, wet=wet, water_level=0.6)
+        registered = bridge_body([ring], 5.3, ground_at=ground, wet=wet, water_level=0.6,
+                                 crown_nap=4.2)
+        # Unregistered: the crown a deck's thickness under the deck.
+        self.assertAlmostEqual(float(under(guessed)[:, 2].max()), 5.3 - 0.9, delta=0.02)
+        # Registered: the crown at the soffit over the middle of the canal,
+        # and lower towards the banks.
+        points = under(registered)
+        self.assertAlmostEqual(float(points[np.abs(points[:, 0]) < 0.5, 2].max()), 4.2, delta=0.02)
+        self.assertLess(float(points[np.abs(points[:, 0]) > 4.5, 2].max()), 3.0)
+
+        board = WaterBridge((0.5, 0.0), "B1", soffit_nap=4.2, span_m=12.0, length_m=8.0,
+                            material="metselwerk", kind="", manager="HDSR")
+        self.assertTrue(board.masonry)
+        record = _bridge_record(shapely.Polygon(ring), 5.3, 0.6, board, registered, False)
+        self.assertTrue(record["arched"])
+        self.assertEqual(record["source"], "water board")
+        self.assertAlmostEqual(record["clearance_m"], 4.2 - 0.6, delta=0.02)
+        self.assertEqual(record["code"], "B1")
+
+        # Not masonry, or movable: a beam whose underside is the soffit.
+        beam = bridge_body([ring], 5.3, ground_at=ground, wet=wet, water_level=0.6,
+                           crown_nap=4.2, arch=False)
+        self.assertFalse(under(beam).size)
+        corners = np.concatenate([t for t, _ in beam]).reshape(-1, 3)
+        over_water = corners[np.abs(corners[:, 0]) < 4.5]
+        self.assertAlmostEqual(float(over_water[:, 2].min()), 4.2, delta=0.02)
+
+    def test_a_lock_gets_gates_at_its_heads(self):
+        import shapely
+
+        from src.surfaces import WaterBody
+        from src.waterworks import Lock, lock_geometry, water_geometry
+
+        # A 30 m canal either side of a lock chamber 8 m wide and 40 m long.
+        canal = shapely.union_all([
+            shapely.box(-15.0, -120.0, 15.0, -20.0),
+            shapely.box(-4.0, -20.5, 4.0, 20.5),
+            shapely.box(-15.0, 20.0, 15.0, 120.0),
+        ])
+        rings = [np.asarray(canal.exterior.coords)]
+        water = [WaterBody(rings=rings, level_nap=0.5, area_m2=canal.area, measured=True)]
+        wet = water_geometry(water)
+        levels = {"north": 1.2, "south": 0.5}
+
+        def level_at(xy):
+            return levels["north"] if xy[1] > 0 else levels["south"]
+
+        def ground(x, y):
+            return np.full(np.shape(x), 2.0)
+
+        lock = Lock((0.0, 0.0), "Test", "schutsluis naar een zijde", 8.0, None)
+        pieces, record = lock_geometry(lock, wet, level_at, ground)
+        self.assertEqual(record["gates"], 2)
+        self.assertAlmostEqual(record["width_m"], 8.0, delta=0.1)
+        self.assertGreater(record["chamber_m"], 30.0)
+        gates = np.concatenate([t for t, name in pieces if name == "gate"])
+        beams = np.concatenate([t for t, name in pieces if name == "beam"])
+        self.assertEqual(len(gates), 4 * 12)
+        self.assertEqual(len(beams), 4 * 12)
+        # The leaves meet north of their heels: the higher water is north.
+        for head in (gates[gates[:, :, 1].mean(axis=1) > 0], gates[gates[:, :, 1].mean(axis=1) < 0]):
+            points = head.reshape(-1, 3)
+            middle = points[np.abs(points[:, 0]) < 0.3]
+            heels = points[np.abs(points[:, 0]) > 3.7]
+            self.assertGreater(float(middle[:, 1].mean()), float(heels[:, 1].mean()))
+        # The beams reach over the quay, past the walls.
+        self.assertGreater(float(np.abs(beams[:, :, 0]).max()), 8.0)
+        self.assertLess(float(gates[:, :, 2].max()), 2.0)
+
+    def test_a_weir_closes_its_ditch(self):
+        import shapely
+
+        from src.surfaces import WaterBody
+        from src.waterworks import Weir, water_geometry, weir_geometry
+
+        ditch = shapely.box(-2.0, -50.0, 2.0, 50.0)
+        water = [WaterBody(rings=[np.asarray(ditch.exterior.coords)], level_nap=-1.0,
+                           area_m2=400.0, measured=True)]
+        wet = water_geometry(water)
+        weir = Weir((0.5, 10.0), "kantelstuw", 3.0, -0.6, "plaatstaal", 182.0)
+        pieces, record = weir_geometry(weir, wet, lambda xy: -1.0)
+        self.assertEqual(record["crest_nap"], -0.6)
+        self.assertAlmostEqual(record["width_m"], 3.0)
+        plate = pieces[0][0]
+        self.assertAlmostEqual(float(np.ptp(plate[:, :, 0])), 3.0, delta=0.01)
+        self.assertAlmostEqual(float(plate[:, :, 2].max()), -0.6)
+        self.assertEqual(len(pieces), 4, "plate, two uprights, a beam")
+        # A crest the register puts far above the water is not believed.
+        weir.crest_nap = 9.0
+        self.assertAlmostEqual(weir_geometry(weir, wet, lambda xy: -1.0)[1]["crest_nap"], -0.85)
+
+    def test_the_water_board_register_is_read(self):
+        from src.waterworks import parse_bridges, parse_locks, parse_weirs
+
+        def point(x, y, **props):
+            return {"geometry": {"type": "Point", "coordinates": [x, y, 0]},
+                    "properties": {"statusobject": "gerealiseerd", **props}}
+
+        bridges = parse_bridges([
+            point(1, 2, code="B1", hoogteonderzijde=4.22, breedtedoorvaart=14.2,
+                  lengte=7.1, typemateriaal="metselwerk"),
+            point(3, 4, code="B2", typemateriaal="beton", statusobject="gesloopt"),
+        ])
+        self.assertEqual([b.code for b in bridges], ["B1"])
+        self.assertTrue(bridges[0].masonry)
+        self.assertEqual(bridges[0].soffit_nap, 4.22)
+        locks = parse_locks([
+            point(0, 0, naam="WEERDSLUIS", doorvaartbreedte=8, richting=121),
+            point(1, 1, naam="Weerdsluis", richting=120.9),
+        ])
+        self.assertEqual(len(locks), 1, "the same lock from two registers")
+        self.assertEqual(locks[0].width_m, 8.0)
+        weirs = parse_weirs([point(5, 5, typestuw="kantelstuw", kruinbreedte=6.79,
+                                   hoogteconstructie=1.15, typemateriaal="plaatstaal")])
+        self.assertEqual(weirs[0].crest_width_m, 6.79)
+
+    def test_bridges_json_carries_the_clearance(self):
+        from src.structures import StructureSet, write_bridge_list
+
+        structures = StructureSet(bridges=[{
+            "rd": [136814.0, 455479.0], "crown_nap": 4.22, "water_nap": 0.6,
+            "clearance_m": 3.62, "span_m": 14.2, "source": "water board", "arched": True,
+        }])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_bridge_list(
+                structures, GeoContext.from_bbox(BBox(136000, 455000, 137000, 456000)), Path(tmp)
+            )
+            payload = json.loads(path.read_text())
+        bridge = payload["bridges"][0]
+        self.assertEqual(bridge["clearance_m"], 3.62)
+        self.assertEqual(bridge["local"], {"x": 314.0, "z": -21.0})
+
+
+class TestFacadeRegisters(unittest.TestCase):
+    """Churches, monuments and shop boards, from fixtures."""
+
+    @staticmethod
+    def _building(identifier, x0, y0, x1, y1, height=10.0, year=1900, floors=3):
+        from src.buildings import Building
+
+        roof = np.array([
+            [[x0, y0, height], [x1, y0, height], [x1, y1, height]],
+            [[x0, y0, height], [x1, y1, height], [x0, y1, height]],
+        ])
+        return Building(
+            identifier=identifier, wall_tris=np.zeros((0, 3, 3)), roof_tris=roof,
+            ground_z_nap=0.0, roof_max_nap=height, floors=floors, wall_top_nap=height,
+            build_year=year, footprint_m2=(x1 - x0) * (y1 - y0),
+        )
+
+    def test_a_registered_church_gets_the_church_wall(self):
+        import shapely
+
+        from src.buildings import (
+            ARCH_CHURCH, ARCH_HOUSE, ARCH_PARKING, BuildingSet, classify_archetype,
+        )
+        from src.landmarks import Landmarks, Monument, TypedArea, apply_landmarks
+
+        church = self._building("church", 0, 0, 20, 12, height=11.0, year=1890, floors=2)
+        house = self._building("house", 30, 0, 36, 10, height=9.0, year=1900, floors=3)
+        garage = self._building("garage", 50, 0, 90, 30, height=12.0, year=1985, floors=4)
+        monument = self._building("monument", 0, 30, 8, 40, height=12.0, year=None, floors=3)
+        buildings = BuildingSet(buildings=[church, house, garage, monument])
+        self.assertEqual(classify_archetype(church), ARCH_HOUSE, "a low church looks like a house")
+        landmarks = Landmarks(
+            areas=[
+                TypedArea(shapely.box(-1, -1, 21, 13), ("kerk",), "Geertekerk"),
+                # A block with a church somewhere in it: the house is not it.
+                TypedArea(shapely.box(25, -5, 45, 20), ("huizenblok", "kerk"), ""),
+                TypedArea(shapely.box(49, -1, 91, 31), ("parkeerdak, parkeerdek, parkeergarage",), ""),
+            ],
+            monuments=[Monument((4.0, 35.0), 36000, "Woningen en woningbouwcomplexen", "Woonhuis")],
+        )
+        stats = apply_landmarks(buildings, landmarks)
+        self.assertEqual(stats["typed"], 2)
+        self.assertEqual(stats["monuments"], 1)
+        self.assertEqual(stats["from_top10nl"], 2)
+        self.assertEqual(stats["from_monuments"], 0, "a listed house is still a house")
+        self.assertEqual(church.landmark, "kerk")
+        self.assertEqual(church.landmark_name, "Geertekerk")
+        self.assertEqual((church.kind, garage.kind, house.kind), ("church", "parking", ""))
+        self.assertEqual(house.landmark, "")
+        self.assertEqual(classify_archetype(church), ARCH_CHURCH)
+        self.assertEqual(classify_archetype(garage), ARCH_PARKING)
+        self.assertEqual(monument.monument, 36000)
+        self.assertEqual(monument.build_year, 1850, "a monument the BAG gives no year is old")
+
+    def test_a_religious_monument_is_a_church(self):
+        from src.buildings import ARCH_CHURCH, BuildingSet, classify_archetype
+        from src.landmarks import Landmarks, Monument, apply_landmarks
+
+        chapel = self._building("chapel", 0, 0, 10, 8, height=8.0, year=1700, floors=1)
+        apply_landmarks(BuildingSet(buildings=[chapel]), Landmarks(monuments=[
+            Monument((5.0, 4.0), 123, "Religieuze gebouwen", "Kerk en kerkonderdeel")
+        ]))
+        self.assertEqual(chapel.kind, "church")
+        self.assertEqual(classify_archetype(chapel), ARCH_CHURCH)
+
+    def test_the_registers_are_read(self):
+        from src.landmarks import parse_monuments, parse_top10
+
+        areas = parse_top10([
+            {"properties": {"typegebouw": "huizenblok|klokkentoren", "naam": "Domtoren"},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]]}},
+            {"properties": {"typegebouw": "huizenblok"},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]]}},
+        ])
+        self.assertEqual([(a.types, a.name) for a in areas], [(("huizenblok", "klokkentoren"), "Domtoren")])
+        # Every type a kind is read from passes, not only churches and towers.
+        mill = parse_top10([
+            {"properties": {"typegebouw": "windmolen: korenmolen", "naam": "De Windotter"},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 5], [0, 0]]]}},
+        ])
+        self.assertEqual([a.types for a in mill], [("windmolen: korenmolen",)])
+        monuments = parse_monuments([{
+            "geometry": {"type": "Point", "coordinates": [136941, 455423]},
+            "properties": {"rijksmonument_nummer": 36123, "hoofdcategorie": "Religieuze gebouwen",
+                           "subcategorie": "Kerk en kerkonderdeel"},
+        }])
+        self.assertEqual(monuments[0].number, 36123)
+
+    def test_a_registered_windmill_gets_its_sails(self):
+        from src.landmarks import windmill_sails
+
+        mill = self._building("mill", 0, 0, 8, 8, height=20.0, year=1780, floors=1)
+        mill.monument_subcategory = "Industrie- en poldermolen"
+        sails = windmill_sails(mill)
+        self.assertEqual(len(sails), 12 * 9, "an axle, four stocks, four lattices")
+        points = sails.reshape(-1, 3)
+        self.assertGreater(float(points[:, 2].min()), 0.0, "the sails clear the ground")
+        self.assertGreater(float(points[:, 2].max()), 20.0, "and reach above the cap")
+        # Out on the south-west side of the body, into the wind.
+        self.assertLess(float(points[:, 0].mean()), 4.0)
+        self.assertLess(float(points[:, 1].mean()), 4.0)
+        normals = np.cross(sails[:, 1] - sails[:, 0], sails[:, 2] - sails[:, 0])
+        self.assertTrue((np.linalg.norm(normals, axis=1) > 0).all())
+
+    def test_a_turbine_is_as_tall_as_the_register_says(self):
+        from src.landmarks import Turbine, parse_turbines, turbine_mesh
+
+        turbines = parse_turbines([
+            {"geometry": {"type": "Point", "coordinates": [137521.4, 486910.0]},
+             "properties": {"ash": 91, "diam": 117, "wt_type": "Vestas V117"}},
+            {"geometry": {"type": "Point", "coordinates": [1, 1]},
+             "properties": {"ash": None, "diam": 10}},
+        ])
+        self.assertEqual(len(turbines), 1)
+        mesh = turbine_mesh(Turbine((0.0, 0.0), 91.0, 117.0, ""), -4.0)
+        top = float(mesh[:, :, 2].max())
+        self.assertAlmostEqual(top, -4.0 + 91.0 + 58.5, delta=1.5)
+        self.assertAlmostEqual(float(mesh[:, :, 2].min()), -4.0, places=6)
+
+
+
+class TestBuildingKinds(unittest.TestCase):
+    """What a building is, and what that does to its walls: the BAG's units,
+    OpenStreetMap, TOP10NL, and the doors, canopies and terraces that follow."""
+
+    _building = staticmethod(TestFacadeRegisters._building)
+
+    @staticmethod
+    def _box_building(identifier, x0, y0, x1, y1, height):
+        """A closed box with real walls, wound to face out."""
+        from src.buildings import Building
+
+        ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        walls = []
+        for (ax, ay), (bx, by) in zip(ring, ring[1:] + ring[:1]):
+            walls.append([[ax, ay, 0.0], [bx, by, 0.0], [bx, by, height]])
+            walls.append([[ax, ay, 0.0], [bx, by, height], [ax, ay, height]])
+        roof = np.array([
+            [[x0, y0, height], [x1, y0, height], [x1, y1, height]],
+            [[x0, y0, height], [x1, y1, height], [x0, y1, height]],
+        ])
+        return Building(
+            identifier=identifier, wall_tris=np.array(walls, dtype=np.float64), roof_tris=roof,
+            ground_z_nap=0.0, roof_max_nap=height, floors=1, wall_top_nap=height,
+            build_year=1990, footprint_m2=(x1 - x0) * (y1 - y0),
+        )
+
+    def test_the_bag_purposes_are_kept_apart(self):
+        from src.usage import (
+            FUNCTION_EDUCATION, FUNCTION_HOME, FUNCTION_NONE, FUNCTION_PUBLIC,
+            FUNCTION_RETAIL, parse_pand,
+        )
+
+        _, school = parse_pand({"identificatie": "0344100000000001",
+                                "gebruiksdoel": "onderwijsfunctie", "aantal_verblijfsobjecten": 1})
+        self.assertEqual(school.group, FUNCTION_EDUCATION, "a school is no longer a meeting place")
+        _, mixed = parse_pand({"identificatie": "2", "aantal_verblijfsobjecten": "3",
+                               "gebruiksdoel": "woonfunctie,winkelfunctie,bijeenkomstfunctie"})
+        self.assertEqual(mixed.group, FUNCTION_RETAIL)
+        self.assertEqual(mixed.groups, frozenset({FUNCTION_HOME, FUNCTION_RETAIL, FUNCTION_PUBLIC}))
+        _, shed = parse_pand({"identificatie": "3", "gebruiksdoel": None,
+                              "aantal_verblijfsobjecten": 0, "status": "Pand in gebruik"})
+        self.assertEqual((shed.group, shed.units), (FUNCTION_NONE, 0))
+        self.assertIsNone(parse_pand({"gebruiksdoel": "woonfunctie"}))
+
+    def test_the_registers_name_the_kind(self):
+        from src.kinds import (
+            bag_key, ground_kind_from_osm, kind_from_monument, kind_from_osm,
+            kind_from_top10, stronger_ground,
+        )
+
+        self.assertEqual(kind_from_osm({"building": "church"}), "church")
+        self.assertEqual(kind_from_osm(
+            {"building": "yes", "amenity": "place_of_worship", "religion": "muslim"}), "mosque")
+        self.assertEqual(kind_from_osm({"building": "roof", "amenity": "fuel"}), "fuel_canopy")
+        # The shop at a petrol station is not the roof over the pumps.
+        self.assertEqual(kind_from_osm({"building": "retail", "amenity": "fuel"}), "")
+        self.assertEqual(kind_from_osm({"building": "yes", "man_made": "water_tower"}), "water_tower")
+        self.assertEqual(kind_from_osm({"building": "house"}), "", "what the BAG import wrote says nothing")
+        self.assertEqual(kind_from_top10(["huizenblok", "kas, warenhuis"]), "greenhouse")
+        self.assertEqual(kind_from_monument("Molens", "Windmolen"), "windmill")
+        self.assertEqual(kind_from_monument("Molens", "Watermolen"), "")
+        self.assertEqual(kind_from_monument("Boerderijen, molens en bedrijven", "Schuur"), "barn")
+        self.assertEqual(ground_kind_from_osm({"amenity": "cafe"}), "horeca")
+        self.assertEqual(ground_kind_from_osm({"amenity": "bench"}), "")
+        self.assertEqual(stronger_ground("horeca", "hotel"), "hotel", "the lobby, not the bar in it")
+        self.assertEqual(stronger_ground("", "shop"), "shop")
+        self.assertEqual(bag_key("NL.IMBAG.Pand.0344100000000004"), bag_key("344100000000004"))
+
+    def test_openstreetmap_names_buildings_by_their_bag_id(self):
+        from src.buildings import ARCH_MOSQUE, BuildingSet, classify_archetype, kind_label
+        from src.landmarks import apply_landmarks
+        from src.osm_ways import OsmData, OsmNode, OsmWay
+
+        mosque = self._building("NL.IMBAG.Pand.0344100000012345", 0, 0, 20, 20)
+        corner = self._building("NL.IMBAG.Pand.0344100000054321", 30, 0, 40, 10)
+        osm = OsmData(
+            buildings=[OsmWay(1, np.zeros((0, 2)), (), {
+                "building": "yes", "amenity": "place_of_worship", "religion": "muslim",
+                "ref:bag": "344100000012345", "name": "Ulu Camii",
+            })],
+            nodes=[OsmNode(2, (35.0, 5.0), {"amenity": "cafe"}),
+                   OsmNode(3, (36.0, 5.0), {"tourism": "hotel"}),
+                   OsmNode(4, (60.0, 5.0), {"shop": "bakery"})],  # in no building
+        )
+        stats = apply_landmarks(BuildingSet(buildings=[mosque, corner]), None, osm=osm)
+        self.assertEqual(stats["from_osm"], 1)
+        self.assertEqual((mosque.kind, mosque.landmark_name), ("mosque", "Ulu Camii"))
+        self.assertEqual(classify_archetype(mosque), ARCH_MOSQUE)
+        self.assertEqual(kind_label(mosque), "moskee")
+        self.assertEqual(corner.ground_kind, "hotel")
+
+    def test_osm_keeps_the_buildings_that_say_something(self):
+        from src.osm_ways import parse_elements
+
+        elements = [
+            {"type": "node", "id": 1, "lon": 5.1100, "lat": 52.0850},
+            {"type": "node", "id": 2, "lon": 5.1101, "lat": 52.0850},
+            {"type": "node", "id": 3, "lon": 5.1101, "lat": 52.0851},
+            {"type": "way", "id": 10, "nodes": [1, 2, 3, 1],
+             "tags": {"building": "church", "ref:bag": "344100000000001"}},
+            {"type": "way", "id": 11, "nodes": [1, 2, 3, 1],
+             "tags": {"building": "house", "ref:bag": "344100000000002"}},
+            {"type": "way", "id": 12, "nodes": [1, 2, 3, 1], "tags": {"building": "church"}},
+        ]
+        data = parse_elements(elements)
+        self.assertEqual([w.id for w in data.buildings], [10])
+
+    def test_buildings_with_nothing_in_them_are_sheds_garages_and_barns(self):
+        from src.buildings import (
+            ARCH_BARN, ARCH_CHURCH, ARCH_GARAGES, ARCH_HALL, ARCH_HOUSE, ARCH_OUTBUILDING,
+            ARCH_SCHOOL, classify_archetype, kind_label,
+        )
+
+        def unitless(building):
+            building.function, building.units = 11, 0
+            return building
+
+        shed = unitless(self._building("shed", 0, 0, 3, 4, height=2.6, year=1990, floors=1))
+        self.assertEqual(classify_archetype(shed), ARCH_OUTBUILDING)
+        garages = unitless(self._building("garages", 0, 0, 20, 5.5, height=2.8, year=1970, floors=1))
+        self.assertEqual(classify_archetype(garages), ARCH_GARAGES)
+        barn = unitless(self._building("barn", 0, 0, 40, 15, height=9.0, year=1960, floors=1))
+        self.assertEqual(classify_archetype(barn), ARCH_BARN)
+        barn.archetype = ARCH_BARN
+        self.assertEqual(kind_label(barn), "schuur of stal")
+        # The same small building with a home in it is a house.
+        house = self._building("house", 0, 0, 3, 4, height=2.6, year=1990, floors=1)
+        house.function, house.units = 0, 1
+        self.assertEqual(classify_archetype(house), ARCH_HOUSE)
+        school = self._building("school", 0, 0, 40, 20, height=9.0, year=1970, floors=2)
+        school.function = 6
+        self.assertEqual(classify_archetype(school), ARCH_SCHOOL)
+        gym = self._building("gym", 0, 0, 40, 25, height=8.0, year=1980, floors=1)
+        gym.function = 8
+        self.assertEqual(classify_archetype(gym), ARCH_HALL)
+        # What a register says outranks the BAG: a church with no unit in it.
+        chapel = unitless(self._building("chapel", 0, 0, 10, 8, height=8.0, year=1900, floors=1))
+        chapel.kind = "church"
+        self.assertEqual(classify_archetype(chapel), ARCH_CHURCH)
+        # A listed building with nothing in it is a gate or a tower, not a shed.
+        gate = unitless(self._building("gate", 0, 0, 6, 8, height=4.5, year=1600, floors=1))
+        gate.monument = 36000
+        self.assertNotEqual(classify_archetype(gate), ARCH_OUTBUILDING)
+
+    def test_an_old_house_keeps_its_wall_whatever_it_is_used_for(self):
+        """OpenStreetMap tags medieval houses round the Neude building=industrial
+        and the university's old houses on the Drift building=university."""
+        from src.buildings import (
+            ARCH_INDUSTRIAL, ARCH_RETAIL, ARCH_SCHOOL, classify_archetype,
+        )
+
+        house = self._building("house", 0, 0, 8, 12, height=13.0, year=1650, floors=4)
+        house.function, house.kind = 1, "industrial"
+        self.assertEqual(classify_archetype(house), ARCH_RETAIL)
+        college = self._building("college", 0, 0, 8, 12, height=13.0, year=1700, floors=4)
+        college.function, college.kind = 6, "school"
+        self.assertNotEqual(classify_archetype(college), ARCH_SCHOOL)
+        # A listed school of 1956 is listed for the way it looks.
+        listed = self._building("listed", 0, 0, 40, 12, height=12.0, year=1956, floors=3)
+        listed.function, listed.kind, listed.monument = 6, "school", 36151
+        self.assertNotEqual(classify_archetype(listed), ARCH_SCHOOL)
+        # New, they are what they say.
+        shed = self._building("shed", 0, 0, 30, 20, height=8.0, year=1985, floors=1)
+        shed.kind = "industrial"
+        self.assertEqual(classify_archetype(shed), ARCH_INDUSTRIAL)
+        school = self._building("school", 0, 0, 40, 12, height=10.0, year=1975, floors=3)
+        school.kind = "school"
+        self.assertEqual(classify_archetype(school), ARCH_SCHOOL)
+
+    def test_the_ground_floor_follows_what_is_inside(self):
+        from src.buildings import ground_style_for
+        from src.facade import (
+            GROUND_DOORS, GROUND_HOME, GROUND_HORECA, GROUND_LOBBY, GROUND_RETAIL, GROUND_STYLES,
+        )
+
+        building = self._building("b", 0, 0, 10, 10)
+        building.function = 1
+        self.assertEqual(ground_style_for(building), GROUND_RETAIL)
+        building.ground_kind = "horeca"
+        self.assertEqual(ground_style_for(building), GROUND_HORECA)
+        building.ground_kind = "hotel"
+        self.assertEqual(ground_style_for(building), GROUND_LOBBY)
+        building.ground_kind, building.kind = "", "fire_station"
+        self.assertEqual(ground_style_for(building), GROUND_DOORS)
+        building.kind, building.function = "", 0
+        self.assertEqual(ground_style_for(building), GROUND_HOME)
+        self.assertEqual(GROUND_STYLES[GROUND_DOORS].door, "roller")
+
+    def test_a_church_wall_is_laid_out_in_bays_and_a_school_in_storeys(self):
+        from src.buildings import ARCH_CHURCH, ARCH_HOUSE, ARCH_SCHOOL, bay_height_for
+        from src.facade import EXTRA_STYLES
+
+        building = self._building("b", 0, 0, 10, 10)
+        building.archetype = ARCH_CHURCH
+        self.assertEqual(bay_height_for(building, {}), EXTRA_STYLES["church"].tile_height_m)
+        building.archetype = ARCH_SCHOOL
+        self.assertEqual(bay_height_for(building, {}), 0.0)
+        building.archetype = ARCH_HOUSE
+        self.assertEqual(bay_height_for(building, {}), 0.0)
+
+    def test_the_new_walls_are_drawn(self):
+        """Read off the relief, where glass is set back from the wall. Row 0
+        of a tile is the foot of the wall, as for every style."""
+        from src.facade import EXTRA_STYLES, RELIEF_WALL, render_facade_layers
+
+        def openings(name):
+            relief = render_facade_layers(EXTRA_STYLES[name], 128, seed=3)[1]
+            return relief < RELIEF_WALL - 0.05, relief > RELIEF_WALL + 0.05
+
+        glass, raised = openings("closed")
+        self.assertLess(float(glass.mean()) + float(raised.mean()), 0.01, "a closed wall has nothing in it")
+        glass, _ = openings("glasshouse")
+        self.assertGreater(float(glass.mean()), 0.6, "a greenhouse is mostly glass")
+        glass, raised = openings("church")
+        self.assertGreater(float(raised.mean()), 0.05, "no buttresses")
+        rows = np.where(glass.any(axis=1))[0]
+        sill, head = int(rows.min()), int(rows.max())
+        self.assertGreater(head - sill, 64, "a lancet is tall")
+        # Pointed: narrower near its head than half way up.
+        self.assertLess(int(glass[head - 2].sum()), int(glass[(sill + head) // 2].sum()) // 2)
+
+    def test_a_canopy_is_a_roof_on_posts(self):
+        from src.buildings import CANOPY_FASCIA_M, open_canopy
+        from src.facade_uv import fit_wall_u
+
+        canopy = self._box_building("canopy", 0, 0, 20, 12, 5.0)
+        canopy.kind = "fuel_canopy"
+        self.assertTrue(open_canopy(canopy))
+        walls = canopy.wall_tris
+        cut = 5.0 - CANOPY_FASCIA_M
+        low = walls[(walls[:, :, 2] < cut - 1e-6).any(axis=1)]
+        self.assertGreater(len(low), 0, "nothing holds it up")
+        # Below the fascia there are only posts, standing inside the outline.
+        self.assertTrue((low[:, :, 0] > 0.5).all() and (low[:, :, 0] < 19.5).all())
+        self.assertTrue((low[:, :, 1] > 0.5).all() and (low[:, :, 1] < 11.5).all())
+        # The soffit faces down, so it is seen from under the canopy.
+        flat = walls[(np.abs(walls[:, :, 2] - cut) < 1e-6).all(axis=1)]
+        normals = np.cross(flat[:, 1] - flat[:, 0], flat[:, 2] - flat[:, 0])
+        self.assertTrue(len(flat) and (normals[:, 2] < 0).all())
+        u = fit_wall_u(walls, np.zeros(len(walls), dtype=int), np.array([4.0]))
+        self.assertTrue(np.isfinite(u).all())
+
+    def test_a_shed_gets_one_door_facing_the_road(self):
+        from src.buildings import ARCH_OUTBUILDING, BuildingSet
+        from src.doors import LEAF_DEPTH_M, door_meshes
+        from src.osm_ways import OsmData, OsmWay
+
+        shed = self._box_building("shed", 0, 0, 4, 3, 2.5)
+        shed.archetype = ARCH_OUTBUILDING
+        road = OsmWay(1, np.array([[-50.0, -10.0], [50.0, -10.0]]), (1, 2), {"highway": "residential"})
+        meshes = door_meshes(BuildingSet(buildings=[shed]), osm=OsmData(ways=[road]))
+        leaf, frame = meshes["doors"], meshes["door_frames"]
+        self.assertEqual(len(leaf), 10, "one leaf, its back against the wall")
+        self.assertEqual(len(frame), 30)
+        # On the south wall, the one that looks at the road, in its middle.
+        self.assertAlmostEqual(float(leaf[:, :, 1].max()), 0.0, places=9)
+        self.assertAlmostEqual(float(leaf[:, :, 1].min()), -LEAF_DEPTH_M, places=9)
+        self.assertAlmostEqual(float(leaf[:, :, 0].mean()), 2.0, places=6)
+        self.assertAlmostEqual(float(leaf[:, :, 2].max()), 2.0, places=6)
+        normals = np.cross(leaf[:, 1] - leaf[:, 0], leaf[:, 2] - leaf[:, 0])
+        front = (np.abs(leaf[:, :, 1] + LEAF_DEPTH_M) < 1e-9).all(axis=1)
+        self.assertTrue((normals[front, 1] < 0).all(), "the door faces out")
+
+        # A house against the south wall: the door goes on another one.
+        house = self._box_building("house", 0, -8, 4, 0, 8.0)
+        meshes = door_meshes(BuildingSet(buildings=[shed, house]), osm=OsmData(ways=[road]))
+        self.assertGreater(float(meshes["doors"][:, :, 1].min()), 0.0)
+
+    def test_a_barn_door_is_two_leaves_in_a_gable(self):
+        from src.buildings import ARCH_BARN, ARCH_HOUSE, BuildingSet
+        from src.doors import door_meshes
+
+        barn = self._box_building("barn", 0, 0, 30, 12, 4.5)
+        barn.archetype = ARCH_BARN
+        house = self._box_building("house", 50, 0, 60, 10, 6.0)
+        house.archetype = ARCH_HOUSE
+        meshes = door_meshes(BuildingSet(buildings=[barn, house]))
+        leaves = meshes["doors"]
+        self.assertEqual(len(leaves), 20)
+        x = leaves[:, :, 0]
+        self.assertTrue((x <= 1e-9).all() or (x >= 30 - 1e-9).all(), "not in a gable end")
+        self.assertAlmostEqual(float(np.ptp(leaves[:, :, 1])), 3.2, places=6)
+
+    def test_a_cafe_with_seats_outside_gets_a_terrace(self):
+        import shapely
+
+        from src.furniture import KIND_TERRACE, Footprints, terraces
+        from src.osm_ways import OsmData, OsmNode
+
+        footprints = Footprints(polygons=[shapely.box(0, 0, 10, 10)])
+        osm = OsmData(nodes=[
+            OsmNode(1, (5.0, 1.0), {"amenity": "cafe", "outdoor_seating": "yes"}),
+            OsmNode(2, (5.0, 9.0), {"amenity": "restaurant"}),  # seats inside only
+            OsmNode(3, (5.0, 5.0), {"amenity": "bench", "outdoor_seating": "yes"}),
+        ])
+        found = terraces(osm, footprints, BBox(-20, -20, 30, 30))
+        self.assertEqual(len(found), 1)
+        item = found[0]
+        self.assertEqual(item.kind, KIND_TERRACE)
+        self.assertAlmostEqual(item.x, 5.0, places=6)
+        self.assertAlmostEqual(item.y, -2.4, places=6)
+        # The tables run along the front.
+        np.testing.assert_allclose([np.cos(item.spin), np.sin(item.spin)], [1.0, 0.0], atol=1e-9)
 
 
 @unittest.skipUnless(RUN_NETWORK, "network tests disabled with --offline")
