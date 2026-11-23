@@ -291,6 +291,18 @@ DEFAULTS: dict[str, Any] = {
         "detect_eaves_clearance_m": 2.0,
         # No two detected trees closer than this, whatever their crowns say.
         "detect_min_spacing_m": 3.0,
+        # A found peak has to be a crown of its own, measured over the disk
+        # it would be drawn with. Fill: the share of that disk above the
+        # detection floor; a lamp post or catenary mast is one cell of it.
+        # Texture: the share of the crown that is speckled, as lidar falling
+        # into leaves is; a roof the footprints miss -- a station canopy, a
+        # dome -- is a surface. Shoulder: nothing within this many metres
+        # stands more than the rise above the peak, or the peak is the flank
+        # of another crown. 0 turns each one off.
+        "detect_min_crown_fill": 0.15,
+        "detect_min_crown_texture": 0.4,
+        "detect_shoulder_m": 1.5,
+        "detect_shoulder_rise_m": 1.0,
         # Surfaces a found tree is not allowed to stand on. A tall rough thing
         # on a carriageway is a lorry, a bus or scaffolding far more often than
         # a tree: 9.5% of everything found over a square kilometre of
