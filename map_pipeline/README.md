@@ -19,18 +19,21 @@ output/<area_name>/
 ├── model.blend      the model for editing: one collection per layer, one object
 │                    per building, street, junction and tree
 ├── model.fbx        the same model for Unity: terrain, roads, rails, bridges,
-│                    tunnels, water, buildings, trees, furniture, cars, boats
+│                    tunnels, water, buildings, trees, furniture, traffic
+│                    signs, cars, boats
 ├── maptile_tools.py Blender add-on: fit the ground under edited roads, re-export
 ├── aerial.png       aerial ortho of the same area
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
 ├── vehicles.json    car and boat positions and headings, same idea
+├── signs.json       every traffic sign: code, value, plates, facing
 ├── landcover.png    surface class per pixel, registered to the same bbox
 ├── landcover.json   what the class values mean
 ├── facade*.png      generated facade textures, referenced by the FBX
 ├── tree.png         bark and foliage atlas
 ├── water.png        canal water
 ├── furniture.png    metal and wood atlas
+├── signs.png        every sign face and plate the area needs, cut out
 ├── vehicle.png      car paint, hull and timber atlas
 ├── rail.png         ballast with sleepers, and rail steel
 ├── structure.png    concrete for decks, piers, tunnel walls and passages
@@ -493,6 +496,15 @@ Other knobs worth knowing:
 | `surfaces.detail_strength` | `0.22` | Per-class grain mixed into the aerial. 0 disables it. |
 | `surfaces.water_depth_m` | `1.2` | How far each bed is sunk below its own water level. |
 | `furniture.enabled` | `true` | Lampposts, bollards, sign posts and benches. |
+| `signs.enabled` | `true` | Traffic signs from the NDW register. See [Traffic signs](#traffic-signs). |
+| `signs.municipalities` | `[]` | CBS codes (`GM0344`) to read instead of asking PDOK which municipalities the area touches. |
+| `signs.cache_days` | `30` | How long a municipality's register is reused. NDW rebuilds it monthly. |
+| `signs.pole_merge_m` | `0.5` | Records closer than this are one pole. |
+| `signs.size_m` | `0.6` | A round sign's diameter. A triangle is half as wide again. |
+| `signs.clearance_m` | `2.2` | Clear height under the lowest plate on a pole. |
+| `signs.overhead_clearance_m` | `4.6` | Where an overhead sign hangs. A height limit hangs just above its own number. |
+| `signs.commons` | `true` | Fetch the RVV artwork from Wikimedia Commons. Off, every face is drawn. |
+| `signs.unknown` | `true` | Draw the signs NDW has no code for, as a blank plate. |
 | `export.collision` | `false` | Add invisible `Collision_*` shapes for physics. See [Collision shapes](#collision-shapes). |
 | `export.collision_tree_crowns` | `true` | Whether a tree's collider includes its canopy. `false` leaves the trunk alone, at a quarter of the triangles. |
 | `barriers.collision_thickness_m` | `0.30` | The thinnest a collider may be, which is not the thinnest a fence may look: a 6 cm panel is thin enough to tunnel through at 50 Hz. |
@@ -540,6 +552,8 @@ src/surfaces.py    BGT water bodies, land cover and road surfaces
 src/nwb.py         NWB-Wegen road centrelines, names and junctions
 src/roads.py       road ladders: stations, cross-sections, kerbs, objects
 src/furniture.py   BGT lampposts, bollards, signs and benches
+src/signs.py       NDW traffic signs: poles, facing from NWB, stacking, mesh
+src/sign_faces.py  the sign artwork: Commons thumbnails, drawn stand-ins, atlas
 src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
 src/structures.py  bridge decks and piers, and tunnels below ground
@@ -1747,6 +1761,133 @@ and Hindeloopen had bare streets; OpenStreetMap has 20 benches, 8 bins,
 3 terraces and 26 flights of steps in Bourtange, and Mapillary 44 photos and
 10 objects. Hindeloopen has 7 mapped objects and 29 detected ones.
 
+## Traffic signs
+
+The BGT registers a traffic sign as a post and nothing more, and rarely at
+that: over one square kilometre of Utrecht centre it has 16 sign posts. The
+same square has 696 signs on about 570 poles. Those come from the **NDW
+traffic sign register**, the national register of every sign on every Dutch
+road, which NDW (Nationaal Dataportaal Wegverkeer) builds by driving the roads
+with cameras and publishes as open data: the sign's RVV code, the number on
+it, the plates under it, which way it faces and which road section it
+belongs to. `src/signs.py` reads it; `src/sign_faces.py` draws what is on
+each sign.
+
+| | count in the Utrecht square |
+|---|---|
+| BGT `paal` / `verkeersbordpaal` (a bare post) | 16 |
+| BGT `bord` / `verkeersbord` | 3 |
+| NDW signs | 695 |
+| on poles, rebuilt from the records | 564 |
+| overhead | 16 |
+| with plates under them (onderborden) | 310 |
+| distinct RVV codes | 50 |
+| no code (`onbekend`) | 46 |
+
+**The register is read per municipality.** NDW's API has no bbox filter, so
+the run asks PDOK which municipalities the square touches and reads each one
+whole: Utrecht is 31,236 signs and 18 MB. It is kept under `work/_ndw/` for
+`signs.cache_days` (30), shared by every area in that municipality, because NDW
+rebuilds the register monthly. A square on a border reads both, and a sign on
+the boundary that both registers list is drawn once.
+
+**Each sign is turned to its own road, not to the register's bearing.** The
+bearing is rounded to the compass: 94% of Utrecht's are exactly 0, 90, 180 or
+270, so a sign on a street at 30 degrees would stand a third of a right angle
+off its road. What the bearing does say is which way the traffic it addresses
+drives. Measured over the square, 453 of 459 signs with a road section have a
+bearing within 45 degrees of that section's direction, and 69% of them stand
+on the right of it, as Dutch signs do. So the face looks back down the road,
+and the exact angle comes from the NWB section NDW links the sign to: along
+it where NDW says `FORTH`, against it where it says `BACK`. A sign with no
+section takes the nearest road within `signs.road_search_m`, the bearing
+choosing which way along it. Over the square that is 564 signs turned by their
+own section, 128 by the nearest road and 3 left on the rounded bearing.
+`signs.json` says which, per sign.
+
+**Poles are rebuilt from the records.** Two signs on one pole are two records
+a few centimetres to a metre apart, and nothing in the register says they share
+a pole. Records closer than `signs.pole_merge_m` (0.5 m) are joined, chained,
+so five signs strung along a kerb are one pole whatever order they arrive in.
+Over the square that is 564 poles, with up to five signs on one.
+
+**A pole is stacked from the top, and stands clear underneath.** Signs facing
+the same way share a stack, in the order the RVV puts them: priority (B) first,
+then speed (A), prohibitions (C), and so on, each followed directly by its own
+plates. Two stacks facing opposite ways hang back to back at the same heights.
+A stack at an angle to another goes below it, where the two cannot pass through
+each other. The whole column is then lifted until the lowest plate is at
+`signs.clearance_m` (2.2 m), so a cyclist passes under it.
+
+**Sizes are the regulation's series, not measured.** Nothing in the register
+says how big a sign is. A round sign is `signs.size_m` (60 cm) across, a
+triangle half as wide again (90 cm), a square as wide as the disc, and the
+plate under a sign as wide as the sign. Like the barrier heights, these are
+assumptions kept in one place.
+
+**Overhead signs hang where the register cannot say.** `placement: ABOVE`
+means a sign over the carriageway, on a span wire, a gantry or the face of a
+bridge, none of which the register describes. They hang from a short hanger at
+`signs.overhead_clearance_m` (4.6 m). A height limit (C19) hangs just above the
+limit it shows, because that is where the bridge it is fixed to is: a C19 for
+3.5 m at 4.6 m would be inside the deck.
+
+**A pole on a bridge stands on the deck, unless it is under it.** A deck's
+outline covers both the road on the bridge and, for a viaduct, the road under
+it. The nearest BGT road surface settles which: one at
+`relatieve_hoogteligging` above zero is on the bridge.
+
+**The BGT's own post goes where NDW has the pole.** A BGT sign post within 3 m
+of an NDW pole is the same post, and drawn twice it was two poles side by side,
+one with nothing on it. Posts with no NDW pole near them stay, as the plain
+proxy they always were. Over the Utrecht square that is 2 of the 16 dropped.
+The other 14, eight of them traffic-light poles, are 30 to 90 m from any NDW
+sign, along one road in the south-west of the square where the register has
+nothing. It is not complete, and that is where the BGT still helps.
+
+### What is on each sign
+
+**The artwork is the RVV's own, from Wikimedia Commons.** The signs are an
+appendix to a regulation, and a regulation carries no copyright in the
+Netherlands (Auteurswet article 11), so Commons publishes every one as a
+public-domain SVG named `Nederlands verkeersbord C2.svg`. The run fetches
+Commons' own PNG rendering of each from `upload.wikimedia.org`, at an address
+derived from the MD5 of the file name, rather than the SVG: no SVG renderer to
+install, and no API, which is rate limited per address and refuses a shared
+office or cloud address after a request or two. One request a second; a 429
+waits as long as Commons asks; three refusals in a row and the rest of the run
+draws its own. Everything fetched is kept under `work/_signs/` for every later
+area, and a name Commons does not have is remembered so it is not asked for
+again.
+
+**Whatever cannot be fetched is drawn.** Offline, or rate limited, a face is
+drawn from its code: the right shape and colours, the number on a speed or
+weight sign from NDW's black code (`30`, `3,8 m`, `2 t`), STOP on the octagon,
+a P on the parking signs, and no attempt at the pictograms. From across a
+street that reads as the sign. The validation report says how many were drawn
+and warns when none came from Commons. A speed sign's own number is also
+painted onto the Commons art, which has one A1 with a sample number on it.
+
+**Plates carry their text.** NDW records what an onderbord says,
+"uitgezonderd", "ma t/m za 08.00-18.00 uur", "opladen elektrische voertuigen",
+and each distinct text is drawn as a white plate with a black edge. A plate
+NDW recorded as unreadable stays blank. Half of Utrecht's plates say ten
+characters or fewer and one says 258, so a plate takes as many lines as its
+text needs, up to six, and grows taller rather than dropping words. A few texts
+in the register were stored as UTF-8 read as Latin-1, some twice over ("bij
+groen één auto" arrived as a row of accented capitals); they are decoded back
+when read, and a pictogram NDW writes as `[[bus]]` is printed as its name.
+
+**One atlas, cut to each outline.** Every face goes into `signs.png` with
+real transparency round it, on an alpha-clipped material `M_signs`: a round
+sign is a disc, not a square. Its back is the same outline in bare aluminium,
+one cell per distinct outline, so a few backs serve every sign. The whole
+layer is one object, `TrafficSigns`, in one collection, at one draw call.
+
+`signs.json` beside the model lists every sign with its code, the value on it,
+its plates and texts, its facing as a Unity Y rotation and what that facing
+came from, for a simulation that needs to know what the signs say.
+
 ## Bridges and tunnels
 
 The parts of the ground that are not the ground. Until now both were dropped:
@@ -2885,6 +3026,12 @@ notice on reuse. `ATTRIBUTION.txt` is written next to every model.
   (CC BY 4.0)
 - **Road centrelines and street names** — NWB-Wegen (Nationaal Wegenbestand),
   Rijkswaterstaat, via PDOK (CC0)
+- **Traffic signs**: the NDW traffic sign register (Nationaal Dataportaal
+  Wegverkeer), published as open data. NDW names no licence; copies on
+  data.overheid.nl are listed under CC0 and CC BY 4.0, and the credit line
+  covers both.
+- **Traffic sign artwork**: the RVV 1990 signs from Wikimedia Commons, public
+  domain because a regulation carries no copyright (Auteurswet article 11).
 - **Wall surfaces** — [Poly Haven](https://polyhaven.com) (CC0). No attribution
   is required for these; they are credited because it is the decent thing, and
   listed here so you know nothing in the model carries an obligation you did not

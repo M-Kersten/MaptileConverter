@@ -425,6 +425,41 @@ DEFAULTS: dict[str, Any] = {
         # covers. Needs the Mapillary source on (photos.mapillary).
         "mapillary_objects": True,
     },
+    "signs": {
+        # Traffic signs from NDW's national register: which sign, which way it
+        # faces, what the plates under it say. 696 signs on about 570 poles
+        # over one square kilometre of Utrecht, where the BGT has 16 bare posts.
+        "enabled": True,
+        "api_url": "https://data.ndw.nu/api/rest/static-road-data/traffic-signs/v5/current-state",
+        "timeout_s": 300,
+        "max_retries": 3,
+        # The register is served per municipality and rebuilt monthly, so one
+        # download serves every area in it for a month.
+        "cache_days": 30,
+        # CBS codes ("GM0344") to read instead of asking PDOK which
+        # municipalities the area touches.
+        "municipalities": [],
+        # Records this close together are one pole.
+        "pole_merge_m": 0.5,
+        # How far to look for a road to turn a sign with no road section to.
+        "road_search_m": 25.0,
+        # The regulation's sizes: a round sign's diameter (a triangle is half
+        # as wide again), the clear height under the lowest plate, and the
+        # space between plates.
+        "size_m": 0.6,
+        "clearance_m": 2.2,
+        "gap_m": 0.05,
+        "pole_diameter_m": 0.06,
+        # Signs hung over the road, from a span wire or a gantry the register
+        # does not describe. A height limit hangs just above its own number.
+        "overhead_clearance_m": 4.6,
+        # Draw the signs NDW could not read the code of, as a blank plate.
+        "unknown": True,
+        # The RVV artwork from Wikimedia Commons, one request a second. Off,
+        # or offline, every face is drawn here instead.
+        "commons": True,
+        "commons_pause_s": 1.0,
+    },
     "barriers": {
         # Walls, fences, hedges and the small structures bolted onto buildings.
         # The largest thing the BGT publishes that the model used to ignore:
@@ -773,6 +808,7 @@ class PipelineConfig:
     trees: dict[str, Any]
     surfaces: dict[str, Any]
     furniture: dict[str, Any]
+    signs: dict[str, Any]
     barriers: dict[str, Any]
     vehicles: dict[str, Any]
     rails: dict[str, Any]
@@ -805,6 +841,7 @@ class PipelineConfig:
             "trees": self.trees,
             "surfaces": self.surfaces,
             "furniture": self.furniture,
+            "signs": self.signs,
             "barriers": self.barriers,
             "vehicles": self.vehicles,
             "rails": self.rails,
@@ -1037,6 +1074,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         trees=merged["trees"],
         surfaces=merged["surfaces"],
         furniture=merged["furniture"],
+        signs=merged["signs"],
         barriers=merged["barriers"],
         vehicles=merged["vehicles"],
         rails=merged["rails"],

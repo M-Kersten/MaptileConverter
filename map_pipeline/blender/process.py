@@ -2884,6 +2884,44 @@ def build_furniture(scene: dict, work_dir: Path, material):
 
 
 
+def build_signs(scene: dict, work_dir: Path, material):
+    """Traffic signs: poles, faces and backs, built on the Python side.
+
+    One object and one material: every face is a cell of one atlas, cut to its
+    outline by the alpha, so five hundred poles are one draw. The geometry
+    arrives finished -- poles as octagonal tubes, each sign a quad for its
+    face and one behind it for the bare aluminium back -- because the stacking
+    and the turning to the road are the part worth testing, and tests cannot
+    run Blender.
+    """
+    signs_file = scene.get("signs", {}).get("file")
+    if not signs_file or not (work_dir / signs_file).is_file():
+        return None
+    data = np.load(work_dir / signs_file)
+    sizes = data["sizes"]
+    if len(sizes) == 0:
+        return None
+    origin_x, origin_y = scene["origin_rd"]
+    z_offset = float(scene["ground_z_offset_nap"])
+    vertices = data["vertices"] - np.array([origin_x, origin_y, z_offset])
+    loops = data["loops"]
+    obj = build_mesh_object(
+        "TrafficSigns",
+        vertices,
+        loops,
+        np.concatenate([[0], np.cumsum(sizes)[:-1]]),
+        sizes,
+        data["uv"][loops],
+        np.zeros(len(sizes)),
+        [material],
+        shade_smooth=False,
+    )
+    log(
+        f"traffic signs: {len(data['pole_xy'])} poles, {len(sizes)} faces"
+    )
+    return obj
+
+
 def _hull(cx, cy, cz, length, beam, depth, freeboard, spin):
     """A boat hull: a box with the bow drawn to a point, as (verts, faces).
 
@@ -3658,6 +3696,7 @@ def copy_textures(
         ("tree", "trees"),
         ("water", "surfaces"),
         ("furniture", "furniture"),
+        ("sign", "signs"),
         ("fence", "barriers"),
         ("vehicle", "vehicles"),
         ("rail", "rails"),
@@ -3849,6 +3888,16 @@ def main() -> int:
                 make_cutout_material("M_fence", extra_textures["fence"], roughness=0.6)
                 if "fence" in extra_textures
                 else None,
+            )
+
+    if "sign" in extra_textures:
+        # Sign faces are retroreflective sheeting: smoother than the street
+        # furniture, though nothing like glass.
+        with _Layer("Traffic signs"):
+            build_signs(
+                scene,
+                work_dir,
+                make_cutout_material("M_signs", extra_textures["sign"], roughness=0.4),
             )
 
     if "vehicle" in extra_textures:

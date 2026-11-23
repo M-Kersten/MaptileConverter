@@ -6066,6 +6066,18 @@ def _blender_mesh_calls():
              heading=rng.uniform(0, 6, n), length=np.full(n, 4.2),
              width=np.full(n, 1.8), kind=np.zeros(n, np.int32),
              colour=rng.integers(0, 4, n))
+    # Traffic signs as the Python side builds them: a pole and two plates.
+    from src.signs import _Mesh
+    sign_mesh = _Mesh()
+    sign_mesh.prism(5.0, 5.0, -0.15, 3.0, 0.03, (0.01, 0.99))
+    sign_mesh.plate(5.0, 5.0, 0.4, 2.2, 0.6, 0.6, (0.1, 0.1, 0.2, 0.2),
+                    (0.3, 0.3, 0.4, 0.4), 0.05, 0.012)
+    sign_mesh.plate(5.0, 5.0, 3.5, 2.2, 0.6, 0.2, (0.5, 0.5, 0.6, 0.6),
+                    (0.01, 0.99, 0.01, 0.99), 0.05, 0.012)
+    sign_vertices, sign_loops, sign_sizes, sign_uv = sign_mesh.arrays()
+    np.savez(folder / "signs.npz", vertices=sign_vertices, loops=sign_loops,
+             sizes=sign_sizes, uv=sign_uv, pole_xy=np.array([[5.0, 5.0]]),
+             pole_ground=np.zeros(1), pole_top=np.array([2.8]))
     # A real road network, from the real mesher: a T-junction.
     _, street = _build_street()
     np.savez(folder / "roads.npz", **street.to_npz_fields(), road_lift_m=0.03)
@@ -6085,6 +6097,7 @@ def _blender_mesh_calls():
         "trees": {"file": "trees.npz", "texture": "t.png"},
         "furniture": {"file": "furniture.npz", "texture": "f.png",
                       "atlas_uv": {}},
+        "signs": {"file": "signs.npz", "texture": "s.png"},
         "barriers": {"file": "barriers.npz", "texture": "f.png"},
         "structures": {"file": "structures.npz", "kind_names": {"0": "bridge"}},
         "rails": {"file": "rails.npz", "kind_names": {"0": "track"}},
@@ -6101,6 +6114,7 @@ def _blender_mesh_calls():
         ("build_buildings", (scene, folder, ["M"], "M", ["M"], "M")),
         ("build_trees", (scene, folder, "M")),
         ("build_furniture", (scene, folder, "M")),
+        ("build_signs", (scene, folder, "M")),
         ("build_barriers", (scene, folder, "M")),
         ("build_structures", (scene, folder, "M")),
         ("build_rails", (scene, folder, "M")),
@@ -6449,7 +6463,9 @@ class TestSourceRegistry(unittest.TestCase):
         self.assertEqual(
             set(bgt[0].split(",")),
             {"trees", "water", "land_cover", "furniture", "barriers",
-             "vehicles", "rails", "structures"},
+             "vehicles", "rails", "structures",
+             # NDW's fallback is the BGT's own sign posts.
+             "signs"},
         )
 
     def test_disabled_sources_are_not_checked(self):
@@ -13156,6 +13172,440 @@ class TestLiveServices(unittest.TestCase):
             "pages shared a transform; merging raw pages would be safe, but the "
             "pipeline no longer assumes that",
         )
+
+
+class TestTrafficSigns(unittest.TestCase):
+    """Traffic signs from NDW's register: turned, stacked and drawn.
+
+    The register gives a sign's position, its code and a bearing rounded to
+    the compass. Everything the eye checks first in a street -- that a sign
+    faces its road, that two signs on one pole are one pole, that the plates
+    under a sign hang under that sign -- is worked out here, which is why it is
+    tested here.
+    """
+
+    @staticmethod
+    def _section(points, section_id=1):
+        from src.nwb import Centreline, Network
+
+        line = Centreline(
+            points=np.asarray(points, dtype=float), section_id=section_id,
+            start_junction=1, end_junction=2, name="Teststraat", kind="RB",
+        )
+        return Network(lines=[line])
+
+    @staticmethod
+    def _sign(x, y, code="C2", bearing=None, direction="", section=None, **kw):
+        from src.signs import Sign
+
+        return Sign(x=x, y=y, code=code, bearing=bearing, direction=direction,
+                    road_section=section, **kw)
+
+    def test_a_sign_faces_the_traffic_it_addresses_at_its_roads_angle(self):
+        """NDW's bearing is the way the addressed traffic drives, rounded to a
+        quadrant: on a street at 30 degrees it says 90. The face looks back
+        down the road, at the street's own angle, not at the quadrant's."""
+        import math
+
+        from src.signs import set_facing
+
+        angle = math.radians(30.0)
+        road = self._section([[0, 0], [100 * math.cos(angle), 100 * math.sin(angle)]])
+        forth = self._sign(40, 26, bearing=90, direction="FORTH", section=1)
+        back = self._sign(40, 20, bearing=270, direction="BACK", section=1)
+        counts = set_facing([forth, back], road)
+
+        self.assertEqual(counts["section"], 2)
+        self.assertAlmostEqual(math.degrees(forth.facing) % 360, 210.0, places=6)
+        self.assertAlmostEqual(math.degrees(back.facing) % 360, 30.0, places=6)
+
+    def test_with_no_direction_the_bearing_picks_which_way_along_the_road(self):
+        import math
+
+        from src.signs import set_facing
+
+        road = self._section([[0, 0], [100, 10]])
+        # Not its section: the nearest road, and the bearing (west) decides.
+        sign = self._sign(50, 8, bearing=270, direction="FORTH", section=999)
+        counts = set_facing([sign], road)
+        self.assertEqual(counts["nearest road"], 1)
+        travel = np.array([-100.0, -10.0]) / math.hypot(100, 10)
+        self.assertAlmostEqual(sign.facing, math.atan2(-travel[1], -travel[0]), places=6)
+
+    def test_with_no_road_in_reach_the_rounded_bearing_is_all_there_is(self):
+        import math
+
+        from src.signs import set_facing
+
+        far = self._sign(5000, 5000, bearing=180)
+        counts = set_facing([far], self._section([[0, 0], [10, 0]]), search_m=25.0)
+        self.assertEqual(counts["bearing"], 1)
+        # Traffic driving south reads a sign that faces north.
+        self.assertAlmostEqual(math.degrees(far.facing) % 360, 90.0, places=6)
+
+    def test_compass_bearing_to_angle(self):
+        import math
+
+        from src.signs import compass_to_angle
+
+        for compass, maths in ((0, 90), (90, 0), (180, -90), (270, -180)):
+            self.assertAlmostEqual(
+                math.cos(compass_to_angle(compass)), math.cos(math.radians(maths)), places=9
+            )
+            self.assertAlmostEqual(
+                math.sin(compass_to_angle(compass)), math.sin(math.radians(maths)), places=9
+            )
+
+    def test_records_close_together_are_one_pole(self):
+        """Four records strung along a kerb a third of a metre apart are one
+        pole, whatever order they come in; one three metres on is another."""
+        from src.signs import group_poles
+
+        signs = [self._sign(0.9, 0), self._sign(0, 0), self._sign(0.3, 0),
+                 self._sign(0.6, 0), self._sign(3.6, 0)]
+        centres = group_poles(signs, 0.5)
+        self.assertEqual(len(centres), 2)
+        self.assertEqual(len({s.pole for s in signs[:4]}), 1)
+        self.assertNotEqual(signs[4].pole, signs[0].pole)
+        self.assertAlmostEqual(float(centres[signs[0].pole][0]), 0.45)
+
+    def test_an_overhead_sign_gets_no_pole(self):
+        from src.signs import group_poles
+
+        signs = [self._sign(0, 0, overhead=True), self._sign(0.1, 0)]
+        centres = group_poles(signs, 0.5)
+        self.assertEqual(len(centres), 1)
+        self.assertEqual(signs[0].pole, -1)
+
+    def test_a_pole_stacks_down_from_the_top_and_stands_clear_underneath(self):
+        """Signs facing one way share a stack, each followed by its own
+        onderbord; the lowest plate is at the clearance so a cyclist passes
+        under it. Back to back shares heights; at right angles goes below."""
+        import math
+
+        from src.signs import Plate, layout_pole
+
+        north = math.pi / 2
+        b6 = [Plate(0, ("sign", "B6", ""), 0.9, 0.78, north)]
+        c2 = [Plate(1, ("sign", "C2", ""), 0.6, 0.6, north),
+              Plate(1, ("plate", "OTHER", "uitgezonderd"), 0.6, 0.2, north)]
+        behind = [Plate(2, ("sign", "D2", ""), 0.6, 0.6, -north)]
+        across = [Plate(3, ("sign", "E1", ""), 0.6, 0.6, 0.0)]
+        top = layout_pole([b6, c2, behind, across], gap_m=0.05, clearance_m=2.2)
+
+        plates = b6 + c2 + behind + across
+        self.assertAlmostEqual(min(p.bottom for p in plates), 2.2, places=9)
+        self.assertAlmostEqual(top, max(p.bottom + p.height for p in plates), places=9)
+        # Down the stack in order, the onderbord right under its own sign.
+        self.assertGreater(b6[0].bottom, c2[0].bottom + c2[0].height)
+        self.assertAlmostEqual(c2[1].bottom + c2[1].height, c2[0].bottom - 0.05, places=9)
+        # Back to back: the same top.
+        self.assertAlmostEqual(behind[0].bottom + 0.6, b6[0].bottom + 0.78, places=9)
+        # At right angles: wholly below everything above it.
+        self.assertLess(across[0].bottom + 0.6, c2[1].bottom)
+
+    def test_a_round_sign_is_smaller_than_a_triangle_of_the_same_series(self):
+        from src.sign_faces import shape_of
+        from src.signs import plate_size
+
+        class Face:
+            aspect = 1.0
+
+        class Wide:
+            aspect = 1.15
+
+        round_w, round_h = plate_size(Face, shape_of("C2"), 0.6)
+        tri_w, tri_h = plate_size(Wide, shape_of("J29"), 0.6)
+        self.assertAlmostEqual(round_w, 0.6)
+        self.assertAlmostEqual(tri_w, 0.9)
+        self.assertAlmostEqual(tri_h, 0.9 / 1.15)
+
+    def test_shapes_and_printed_values(self):
+        from src.sign_faces import black_text, shape_of
+
+        for code, shape in (("B6", "triangle_down"), ("B7", "octagon"),
+                            ("B1", "diamond"), ("G7", "round"), ("G11", "round"),
+                            ("G5", "rect"), ("E1", "round"), ("E4", "square"),
+                            ("A1", "round"), ("A4", "square"), ("J37", "triangle"),
+                            ("E8-vracht", "square"), ("onbekend", "rect")):
+            self.assertEqual(shape_of(code), shape, code)
+        self.assertEqual(black_text("A1", "30"), "30")
+        self.assertEqual(black_text("C19", "3.8"), "3,8 m")
+        self.assertEqual(black_text("C17", "9.0"), "9 m")
+        self.assertEqual(black_text("C20", "2.0"), "2 t")
+        self.assertEqual(black_text("D2", "RO"), "")
+        self.assertEqual(black_text("H1", "Utrecht"), "Utrecht")
+
+    def test_plate_text_is_repaired_and_never_cut_short(self):
+        """NDW stores some plate texts as UTF-8 read as Latin-1, once or twice
+        over, and writes pictograms as [[names]]. A long text gets more lines,
+        never fewer words."""
+        from src.sign_faces import MAX_PLATE_LINES, clean_text, plate_lines
+
+        for original in ("bij groen \u00e9\u00e9n auto", "opladen elektrische auto\u2019s",
+                         "wielklemregeling van kracht \u20ac159,-"):
+            once = original.encode("utf-8").decode("cp1252")
+            twice = once.encode("utf-8").decode("latin-1")
+            self.assertEqual(clean_text(once), original)
+            self.assertEqual(clean_text(twice), original)
+        self.assertEqual(clean_text("[[bus]] [[route-links]]"), "bus \u2190")
+        self.assertEqual(plate_lines("onleesbaar"), [])
+        text = " ".join(f"woord{i}" for i in range(45))
+        lines = plate_lines(text)
+        self.assertLessEqual(len(lines), MAX_PLATE_LINES)
+        self.assertEqual(" ".join(lines), text)
+
+    def test_commons_file_addresses(self):
+        """Commons keeps a file under the first one and two hex digits of the
+        MD5 of its name, spaces as underscores."""
+        import hashlib
+
+        from src.sign_faces import commons_names, thumb_url
+
+        name = "Nederlands verkeersbord C2.svg"
+        digest = hashlib.md5(b"Nederlands_verkeersbord_C2.svg").hexdigest()
+        self.assertEqual(
+            thumb_url(name, 250),
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/"
+            f"{digest[0]}/{digest[:2]}/Nederlands_verkeersbord_C2.svg/"
+            "250px-Nederlands_verkeersbord_C2.svg.png",
+        )
+        self.assertEqual(
+            commons_names("A1", "30"),
+            ["Nederlands verkeersbord A1-30.svg", "Nederlands verkeersbord A1.svg"],
+        )
+        self.assertEqual(commons_names("E8-vracht")[-1], "Nederlands verkeersbord E8.svg")
+        self.assertEqual(commons_names("onbekend"), [])
+
+    def test_commons_is_asked_once_per_name_and_given_up_on_politely(self):
+        """A name Commons has not got is remembered, so the next area does not
+        ask again; a refusal is not, and enough of them in a row stops the
+        asking for the rest of the run."""
+        import io
+
+        from PIL import Image
+
+        from src.sign_faces import CommonsClient
+
+        buffer = io.BytesIO()
+        Image.new("RGBA", (8, 8), (255, 0, 0, 255)).save(buffer, "PNG")
+        png = buffer.getvalue()
+
+        class Response:
+            def __init__(self, status, content=b"", headers=None):
+                self.status_code, self.content, self.headers = status, content, headers or {}
+
+        class Session:
+            def __init__(self, answer):
+                self.answer, self.urls = answer, []
+
+            def get(self, url, **kw):
+                self.urls.append(url)
+                return self.answer(url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            session = Session(lambda url: Response(200, png) if "B6" in url else Response(404))
+            client = CommonsClient(cache, pause_s=0.0, session=session)
+            self.assertIsNone(client.get(["Nederlands verkeersbord X9.svg"]))
+            self.assertIsNotNone(client.get(["Nederlands verkeersbord B6.svg"]))
+            asked = len(session.urls)
+
+            again = CommonsClient(cache, pause_s=0.0, session=session)
+            self.assertIsNone(again.get(["Nederlands verkeersbord X9.svg"]))
+            self.assertIsNotNone(again.get(["Nederlands verkeersbord B6.svg"]))
+            self.assertEqual(len(session.urls), asked, "asked Commons again")
+            self.assertEqual(again.from_cache, 1)
+
+            refusing = Session(lambda url: Response(429, headers={"Retry-After": "0"}))
+            limited = CommonsClient(cache, pause_s=0.0, max_wait_s=0.0,
+                                    give_up_after=3, session=refusing)
+            self.assertIsNone(limited.get(["Nederlands verkeersbord C3.svg"]))
+            self.assertTrue(limited.given_up)
+            self.assertIsNone(limited.get(["Nederlands verkeersbord C4.svg"]))
+            self.assertEqual(len(refusing.urls), 3)
+            self.assertNotIn(
+                "Nederlands verkeersbord C3.svg",
+                json.loads((cache / "missing.json").read_text()),
+                "a refusal was recorded as a missing file",
+            )
+
+    def test_the_atlas_cuts_each_face_to_its_outline(self):
+        """A round sign is a disc on a clear square, its back the same disc in
+        aluminium, and every UV lands inside its own cell."""
+        from PIL import Image
+
+        from src.sign_faces import METAL, build_atlas
+
+        with tempfile.TemporaryDirectory() as tmp:
+            atlas = build_atlas([("C2", ""), ("E4", ""), ("A1", "30")],
+                                [("OTHER", "uitgezonderd")], Path(tmp) / "signs.png")
+            image = np.asarray(Image.open(atlas.path).convert("RGBA"))
+        h, w = image.shape[:2]
+
+        def pixel(u, v):
+            return image[min(h - 1, int((1 - v) * h)), min(w - 1, int(u * w))]
+
+        c2 = atlas.faces[("sign", "C2", "")]
+        u0, v0, u1, v1 = c2.uv
+        self.assertTrue(0 <= u0 < u1 <= 1 and 0 <= v0 < v1 <= 1)
+        self.assertEqual(int(pixel((u0 + u1) / 2, (v0 + v1) / 2)[3]), 255)
+        self.assertLess(int(pixel(u0 + 0.002, v1 - 0.002)[3]), 64, "a disc has clear corners")
+        self.assertIsNotNone(c2.back, "a round sign needs a round back")
+        back = atlas.faces[c2.back]
+        bu0, bv0, bu1, bv1 = back.uv
+        centre = pixel((bu0 + bu1) / 2, (bv0 + bv1) / 2)
+        self.assertEqual(tuple(int(c) for c in centre[:3]), METAL)
+        self.assertLess(int(pixel(bu0 + 0.002, bv1 - 0.002)[3]), 64)
+        # A plate is a rectangle: its back is the plain metal patch.
+        self.assertIsNone(atlas.faces[("plate", "OTHER", "uitgezonderd")].back)
+        self.assertEqual(tuple(int(c) for c in pixel(*atlas.metal_uv)[:3]), METAL)
+        self.assertEqual(atlas.counts().get("drawn"), 3)
+
+    def test_a_face_looks_where_the_sign_faces_and_its_back_the_other_way(self):
+        import math
+
+        from src.signs import _Mesh
+
+        mesh = _Mesh()
+        facing = math.radians(35.0)
+        mesh.plate(10.0, 20.0, facing, 2.2, 0.6, 0.6, (0.1, 0.2, 0.3, 0.4),
+                   (0.5, 0.6, 0.7, 0.8), 0.05, 0.012)
+        vertices, loops, sizes, uv = mesh.arrays()
+        self.assertEqual(list(sizes), [4, 4])
+        want = np.array([math.cos(facing), math.sin(facing), 0.0])
+        for k, sign in ((0, 1.0), (1, -1.0)):
+            quad = vertices[loops[4 * k : 4 * k + 4]]
+            normal = np.cross(quad[1] - quad[0], quad[3] - quad[0])
+            normal /= np.linalg.norm(normal)
+            np.testing.assert_allclose(normal, sign * want, atol=1e-9)
+        # The front's lower left, as seen by the reader, is the cell's lower left.
+        np.testing.assert_allclose(uv[loops[0]], (0.1, 0.2))
+        np.testing.assert_allclose(uv[loops[2]], (0.3, 0.4))
+        self.assertAlmostEqual(float(vertices[:, 2].min()), 2.2)
+
+    def test_a_bgt_post_under_an_ndw_pole_is_dropped(self):
+        from src.furniture import KIND_LAMP, KIND_SIGN, FurnitureSet
+        from src.signs import SignSet, drop_covered_posts
+
+        furniture = FurnitureSet(
+            xy=np.array([[0.0, 0.0], [10.0, 0.0], [0.5, 0.0]]),
+            ground_z_nap=np.zeros(3),
+            kind=np.array([KIND_SIGN, KIND_SIGN, KIND_LAMP], dtype=np.int32),
+        )
+        signs = SignSet(pole_xy=np.array([[1.0, 1.0]]))
+        self.assertEqual(drop_covered_posts(furniture, signs, sign_kind=KIND_SIGN), 1)
+        self.assertEqual(furniture.kind.tolist(), [KIND_SIGN, KIND_LAMP])
+        np.testing.assert_allclose(furniture.xy, [[10.0, 0.0], [0.5, 0.0]])
+
+    def test_a_pole_on_a_bridge_stands_on_the_deck_only_beside_a_raised_road(self):
+        """Inside a deck's outline is the road on the bridge or the road under
+        it; the nearest BGT road's level says which."""
+        from src.signs import _on_deck
+        from src.surfaces import RoadPart
+
+        square = [np.array([[0, 0], [20, 0], [20, 10], [0, 10], [0, 0]], float)]
+        poles = np.array([[5.0, 5.0], [50.0, 50.0]])
+        deck = lambda x, y: np.where(np.asarray(x) < 30, 6.0, np.nan)  # noqa: E731
+        ground = np.zeros(2)
+        on_bridge = _on_deck(poles, deck, [RoadPart(rings=square, surface_class=1, level=1)], ground)
+        under = _on_deck(poles, deck, [RoadPart(rings=square, surface_class=1, level=0)], ground)
+        self.assertEqual(float(on_bridge[0]), 6.0)
+        self.assertTrue(np.isnan(on_bridge[1]))
+        self.assertTrue(np.isnan(under[0]))
+
+    def test_the_register_is_clipped_and_read_once_per_sign(self):
+        from src.signs import parse_signs
+
+        def feature(ident, lon, lat, **props):
+            return {"type": "Feature", "id": ident,
+                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                    "properties": {"rvvCode": "C2", "bearing": 90, **props}}
+
+        features = [
+            # Utrecht centre, twice: once from each of two municipalities.
+            feature("a", 5.1214, 52.0907, supplementarySigns=[
+                {"signCode": "OTHER", "index": 1, "text": "tweede"},
+                {"signCode": "OB54", "index": 0, "text": ""}]),
+            feature("a", 5.1214, 52.0907),
+            feature("b", 4.9, 52.37),  # Amsterdam
+            feature("c", 5.1215, 52.0908, placement="ABOVE", roadSectionId=600123,
+                    drivingDirection="BACK", blackCode="3.8", rvvCode="C19"),
+        ]
+        signs = parse_signs(features, BBox(136000, 455000, 137000, 456000))
+        self.assertEqual([s.ndw_id for s in signs], ["a", "c"])
+        self.assertEqual(signs[0].plates, [("OB54", ""), ("OTHER", "tweede")])
+        self.assertTrue(signs[1].overhead)
+        self.assertEqual((signs[1].road_section, signs[1].direction), (600123, "BACK"))
+        self.assertEqual(signs[1].black, "3.8")
+
+    def test_a_whole_area_offline(self):
+        """The register from the cache, the faces drawn: a pole per group, the
+        lowest plate at the clearance, and a sign list that reads back."""
+        import gzip
+        import math
+
+        from src.geo import GeoContext
+        from src.signs import build_signs, save_signs, write_sign_list
+
+        bbox = BBox(136000, 455000, 136200, 455200)
+        geo = GeoContext.from_bbox(bbox)
+        lon, lat = geo.to_wgs84(136100.0, 455100.0)
+        features = [
+            {"type": "Feature", "id": f"s{i}",
+             "geometry": {"type": "Point", "coordinates": [lon + 1e-6 * i, lat]},
+             "properties": {"rvvCode": code, "bearing": 90, "drivingDirection": "FORTH",
+                            "roadSectionId": 7, "placement": "ALONG",
+                            "supplementarySigns": plates}}
+            for i, (code, plates) in enumerate((
+                ("C2", [{"signCode": "OTHER", "index": 0, "text": "uitgezonderd"}]),
+                ("B6", []),
+            ))
+        ] + [
+            {"type": "Feature", "id": "over",
+             "geometry": {"type": "Point", "coordinates": [lon, lat + 2e-4]},
+             "properties": {"rvvCode": "C19", "blackCode": "3.5", "bearing": 90,
+                            "placement": "ABOVE", "supplementarySigns": []}},
+        ]
+        road = self._section([[136000, 455090], [136200, 455110]], section_id=7)
+
+        class Ground:
+            def surface(self, x, y):
+                return np.full(np.shape(np.atleast_1d(x)), 1.5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work" / "area"
+            (work.parent / "_ndw").mkdir(parents=True)
+            with gzip.open(work.parent / "_ndw" / "GM0344.json.gz", "wt") as handle:
+                json.dump(features, handle)
+            result = build_signs(
+                bbox, work, terrain=Ground(), network=road,
+                signs_cfg={"municipalities": ["GM0344"], "commons": False},
+            )
+            path = save_signs(result, work / "signs.npz")
+            listed = json.loads(write_sign_list(result, geo, Path(tmp) / "out").read_text())
+            saved = np.load(path)
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result.counts["poles"], 1)
+        self.assertEqual(result.counts["overhead"], 1)
+        self.assertEqual(result.counts["faced_by_road_section"], 2)
+        self.assertEqual(int(saved["sizes"].sum()), len(saved["loops"]))
+        self.assertTrue(np.isfinite(saved["vertices"]).all())
+        # The lowest plate on the pole at 2.2 m over the 1.5 m ground.
+        pole_plates = saved["vertices"][saved["vertices"][:, 2] > 1.5 + 0.5]
+        self.assertGreater(len(pole_plates), 0)
+        on_pole = [s for s in result.signs if not s.overhead]
+        self.assertTrue(all(s.centre_z > 2.2 for s in on_pole))
+        # The C19 hangs just above its own 3.5 m.
+        over = next(s for s in result.signs if s.overhead)
+        self.assertGreater(over.centre_z, 3.6)
+        self.assertLess(over.centre_z, 4.4)
+        # Traffic drives east along the section, so the face looks west.
+        record = next(r for r in listed["signs"] if r["code"] == "C2")
+        heading = math.degrees(math.atan2(20, 200))
+        self.assertAlmostEqual(record["facing_deg"], (90 - (180 + heading)) % 360, places=0)
+        self.assertEqual(record["onderborden"], [{"code": "OTHER", "text": "uitgezonderd"}])
 
 
 if __name__ == "__main__":
