@@ -4773,10 +4773,10 @@ class TestPassagesUnderBuildings(unittest.TestCase):
         _, _, buildings = _building_over([(shapely.box(8, -5, 14, 15), "road")])
         with tempfile.TemporaryDirectory() as tmp:
             path = save_buildings(buildings, Path(tmp) / "buildings.npz")
-            data = np.load(path)
-            self.assertEqual(len(data["passage_tris"]), len(data["passage_building"]))
-            self.assertGreater(len(data["passage_tris"]), 0)
-            self.assertTrue((data["passage_building"] == 0).all())
+            with np.load(path) as data:
+                self.assertEqual(len(data["passage_tris"]), len(data["passage_building"]))
+                self.assertGreater(len(data["passage_tris"]), 0)
+                self.assertTrue((data["passage_building"] == 0).all())
 
 class TestTunnels(unittest.TestCase):
     """A tunnel's mouths are measured; between them its floor is drawn.

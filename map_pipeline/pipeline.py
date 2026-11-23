@@ -671,7 +671,7 @@ def street_details(config, work_dir, furniture, *, buildings, surfaces, terrain,
 
 
 def layered_scene(
-    config: PipelineConfig, ground, harbour=None, paving=None, werf_files=None, guardrails=None,
+    config: PipelineConfig, ground, harbour=None, guardrails=None, paving=None, werf_files=None,
 ) -> dict:
     """What the Blender stage needs to build the modellers' ground."""
     settings = config.layered
