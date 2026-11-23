@@ -9752,6 +9752,429 @@ class TestHarbour(unittest.TestCase):
         self.assertTrue(all(v.passed for v in verdicts.values()))
 
 
+class TestHarbourFittings(unittest.TestCase):
+    """What a pier stands on and what a harbour quay carries."""
+
+    def _build(self, **switches):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import shapely
+
+        import src.harbour as harbour
+        from src.geo import BBox
+        from src.surfaces import WaterBody
+
+        bbox = BBox(0.0, 0.0, 200.0, 200.0)
+        # A basin 100 m across under a quay at +3 m, and a canal 10 m wide.
+        basin = WaterBody(rings=[np.array([[0, 0], [200, 0], [200, 100], [0, 100], [0, 0]], float)],
+                          level_nap=0.5, area_m2=20000.0, measured=True)
+        canal = WaterBody(rings=[np.array([[0, 150], [200, 150], [200, 160], [0, 160], [0, 150]], float)],
+                          level_nap=0.5, area_m2=2000.0, measured=True)
+        quays = [shapely.LineString([(20, 100), (180, 100)]), shapely.LineString([(20, 150), (180, 150)])]
+        jetty = {"type": "Polygon", "coordinates": [[[40, 60], [44, 60], [44, 99], [40, 99], [40, 60]]]}
+        pontoon = {"type": "Polygon", "coordinates": [[[100, 40], [112, 40], [112, 43], [100, 43], [100, 40]]]}
+        features = {"kunstwerkdeel_vlak": [
+            {"geometry": jetty, "properties": {"type": "steiger"}},
+            {"geometry": pontoon, "properties": {"type": "niet-bgt", "plus_type": "ponton"}},
+        ]}
+
+        def fetch(collection, _bbox, **_kwargs):
+            return features.get(collection, []), SimpleNamespace()
+
+        def ground(x, y):
+            y = np.asarray(y, dtype=float)
+            return np.where((y > 100) & (y < 150) | (y > 160), 3.0, -0.5) + 0.0 * np.asarray(x)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(harbour, "fetch_current", fetch):
+            built = harbour.build_harbour(
+                bbox, Path(tmp), water=[basin, canal], quays=quays, surface_at=ground, **switches,
+            )
+            saved = dict(np.load(Path(tmp) / "harbour.npz"))
+        return built, saved
+
+    def test_a_jetty_stands_on_piles_down_into_the_water(self):
+        from src.harbour import BELOW_WATER_M, DECK_ABOVE_M, JETTY, PILE, PILE_EVERY_M
+
+        built, _ = self._build()
+        piles = built.tris[built.tri_kind == PILE].reshape(-1, 3)
+        on_jetty = piles[(piles[:, 0] > 39) & (piles[:, 0] < 45)]
+        # Two to a row, a row at least every four metres of its 39.
+        self.assertGreaterEqual(len(np.unique(on_jetty[:, 1].round(0))), 39 / PILE_EVERY_M)
+        self.assertAlmostEqual(on_jetty[:, 2].min(), 0.5 - BELOW_WATER_M, places=6)
+        # Up to the underside of the deck and no further.
+        self.assertLess(on_jetty[:, 2].max(), 0.5 + DECK_ABOVE_M[JETTY])
+        self.assertGreater(on_jetty[:, 2].max(), 0.5)
+
+    def test_a_wide_jetty_has_a_kerb_round_its_deck(self):
+        from src.harbour import DECK_ABOVE_M, JETTY
+
+        built, _ = self._build()
+        deck = built.tris[built.tri_kind == JETTY].reshape(-1, 3)
+        top = 0.5 + DECK_ABOVE_M[JETTY]
+        kerb = deck[deck[:, 2] > top + 1e-6]
+        self.assertGreater(len(kerb), 0)
+        self.assertLess(kerb[:, 2].max(), top + 0.2)
+        # Round the edge, not across the middle of the 4 m deck.
+        self.assertTrue((np.abs(kerb[:, 0] - 42.0) > 1.8).all())
+
+    def test_a_pontoon_lies_between_guide_piles(self):
+        from src.harbour import PILE, POST_ABOVE_M
+
+        built, _ = self._build()
+        piles = built.tris[built.tri_kind == PILE].reshape(-1, 3)
+        guides = piles[piles[:, 0] > 90]
+        self.assertGreater(len(guides), 0)
+        self.assertAlmostEqual(guides[:, 2].max(), 0.5 + POST_ABOVE_M, places=6)
+        # Beside the deck, not through it.
+        self.assertTrue((guides[:, 1] > 43.0).all())
+
+    def test_a_harbour_quay_has_bollards_and_a_canal_quay_has_none(self):
+        from src.harbour import BOLLARD, BOLLARD_EVERY_M
+        from src.harbour_kit import BOLLARD_HEIGHT_M
+
+        built, _ = self._build()
+        bollards = built.tris[built.tri_kind == BOLLARD].reshape(-1, 3)
+        self.assertAlmostEqual(built.counts["bollard"], 160.0 / BOLLARD_EVERY_M, delta=1.5)
+        # On the quay, behind its edge, and none along the canal at y = 150.
+        self.assertTrue((bollards[:, 1] > 100.0).all())
+        self.assertTrue((bollards[:, 1] < 102.0).all())
+        self.assertAlmostEqual(bollards[:, 2].min(), 3.0, places=6)
+        self.assertAlmostEqual(bollards[:, 2].max(), 3.0 + BOLLARD_HEIGHT_M, places=6)
+
+    def test_ladders_hang_down_the_quay_face_into_the_water(self):
+        from src.harbour import COPING_M, LADDER
+
+        built, _ = self._build()
+        self.assertGreaterEqual(built.counts["ladder"], 2)
+        ladders = built.tris[built.tri_kind == LADDER].reshape(-1, 3)
+        self.assertLess(ladders[:, 2].min(), 0.5)
+        self.assertGreater(ladders[:, 2].max(), 3.0)
+        # Out in front of the coping.
+        self.assertTrue((ladders[:, 1] < 100.0 - COPING_M + 0.1).all())
+
+    def test_the_fittings_can_be_left_out(self):
+        built, saved = self._build(fittings=False)
+        for name in ("pile", "bollard", "ladder"):
+            self.assertNotIn(name, built.counts)
+        self.assertTrue((saved["tri_paint"] == -1).all())
+
+
+class TestTerminal(unittest.TestCase):
+    """Crane rails from the BGT; cranes and containers as the survey saw them."""
+
+    @staticmethod
+    def _field(paint, size=300.0, cell=0.5):
+        """A height field over [0, size]^2, `paint(x, y, h)` filling it in."""
+        from rasterio.transform import from_origin
+
+        from src.terminal import HeightField
+
+        n = int(size / cell)
+        h = np.zeros((n, n))
+        transform = from_origin(0.0, size, cell, cell)
+        cols, rows = np.meshgrid(np.arange(n), np.arange(n))
+        x = (cols + 0.5) * cell
+        y = size - (rows + 0.5) * cell
+        paint(x, y, h)
+        return HeightField(h, transform)
+
+    @staticmethod
+    def _track(gauge=20.0, y=100.0, length=200.0):
+        from src.terminal import Track
+
+        return Track(start=np.array([50.0, y]), along=np.array([1.0, 0.0]), length=length, gauge=gauge)
+
+    def test_the_rails_of_a_stacking_yard_pair_across_the_lanes_not_the_gaps(self):
+        """Rail, lane, rail, gap, rail, lane, rail: the nearest two rails are
+        either side of a gap, and a yard cut off by the area's edge has an
+        odd rail left over."""
+        import shapely
+
+        from src.terminal import pair_tracks
+
+        offsets = [0.0, 20.0, 25.0, 45.0, 50.0]
+        rails = [shapely.LineString([(10.0, y), (310.0, y)]) for y in offsets]
+        rails.append(shapely.LineString([(10.0, 400.0), (310.0, 400.0)]))  # alone
+        rails.append(shapely.LineString([(500.0, 0.0), (500.0, 300.0)]))  # across
+        tracks = pair_tracks(rails)
+        self.assertEqual(len(tracks), 2)
+        for track in tracks:
+            self.assertAlmostEqual(track.gauge, 20.0, places=6)
+            self.assertAlmostEqual(track.length, 300.0, places=6)
+        self.assertEqual(sorted(round(float(t.start[1])) for t in tracks), [10, 35])
+
+    def test_a_bar_across_the_rails_is_a_portal_crane(self):
+        from src.terminal import find_cranes
+
+        def paint(x, y, h):
+            h[(np.abs(x - 120.0) < 4.0) & (np.abs(y - 100.0) < 12.0)] = 26.0
+            # Containers between the rails, five high, are not a crane.
+            h[(x > 150.0) & (x < 220.0) & (np.abs(y - 100.0) < 8.0)] = 12.95
+
+        cranes = find_cranes([self._track()], self._field(paint))
+        self.assertEqual([c.kind for c in cranes], ["gantry"])
+        self.assertAlmostEqual(float(cranes[0].centre[0]), 120.0, delta=1.0)
+        self.assertAlmostEqual(float(cranes[0].centre[1]), 100.0, delta=1e-6)
+        self.assertAlmostEqual(cranes[0].height_m, 26.0, places=6)
+
+    def test_a_tower_with_an_arm_out_past_the_rails_is_a_slewing_crane(self):
+        from src.terminal import find_cranes
+
+        def paint(x, y, h):
+            h[(np.abs(x - 120.0) < 3.0) & (np.abs(y - 100.0) < 3.0)] = 22.0
+            # The jib, out over the water to the south, rising to its head.
+            arm = (np.abs(x - 120.0) < 1.0) & (y < 100.0) & (y > 70.0)
+            h[arm] = 22.0 + (100.0 - y[arm]) * 0.4
+
+        cranes = find_cranes([self._track(gauge=8.0)], self._field(paint))
+        self.assertEqual([c.kind for c in cranes], ["jib"])
+        crane = cranes[0]
+        self.assertAlmostEqual(float(crane.centre[0]), 120.0, delta=3.0)
+        self.assertAlmostEqual(float(crane.tip[0]), 120.0, delta=1.0)
+        self.assertAlmostEqual(float(crane.tip[1]), 71.0, delta=2.0)
+        self.assertAlmostEqual(crane.tip_m, 33.5, delta=1.5)
+
+    def test_a_shed_over_the_rails_is_no_crane(self):
+        from src.terminal import find_cranes
+
+        def paint(x, y, h):
+            h[(x > 60.0) & (x < 200.0) & (np.abs(y - 100.0) < 12.0)] = 14.0
+
+        self.assertEqual(find_cranes([self._track()], self._field(paint)), [])
+
+    def _quay(self, boom_down):
+        import shapely
+
+        from src.terminal import find_cranes
+
+        def paint(x, y, h):
+            frame = (np.abs(x - 150.0) < 13.0) & (np.abs(y - 100.0) < 17.5)
+            h[frame] = 50.0
+            h[frame & (y > 105.0)] = 56.0  # the machinery house
+            h[(np.abs(x - 150.0) < 2.0) & (y < 86.0) & (y > 78.0)] = 80.0  # the A-frame
+            if boom_down:
+                h[(np.abs(x - 150.0) < 2.0) & (y <= 78.0) & (y > 25.0)] = 50.0
+            else:
+                up = (np.abs(x - 150.0) < 2.0) & (y <= 82.0) & (y > 70.0)
+                h[up] = 50.0 + (82.0 - y[up]) * 5.0
+            # A ship at the quay: lower than the boom, and no part of the crane.
+            h[(x > 60.0) & (x < 240.0) & (y < 70.0) & (y > 30.0) & (h < 1.0)] = 30.0
+
+        water = shapely.box(0.0, 0.0, 300.0, 76.0)
+        cranes = find_cranes([self._track(gauge=35.0)], self._field(paint), wet=water)
+        self.assertEqual([c.kind for c in cranes], ["quay"])
+        return cranes[0]
+
+    def test_a_quay_crane_with_its_boom_down_reaches_out_over_the_ship(self):
+        crane = self._quay(boom_down=True)
+        self.assertFalse(crane.boom_up)
+        # Towards the water, to the south.
+        np.testing.assert_allclose(crane.water, [0.0, -1.0], atol=1e-9)
+        self.assertAlmostEqual(crane.boom_m, 50.0, delta=1.0)
+        self.assertAlmostEqual(crane.outreach_m, 82.5 - 25.0, delta=4.0)
+        self.assertAlmostEqual(crane.height_m, 80.0, delta=1.0)
+
+    def test_a_quay_crane_with_its_boom_up_keeps_its_girder_height(self):
+        crane = self._quay(boom_down=False)
+        self.assertTrue(crane.boom_up)
+        self.assertAlmostEqual(crane.boom_m, 50.0, delta=1.5)
+        # Its top is the boom's head, far above the girder.
+        self.assertGreater(crane.height_m, 100.0)
+
+    def _yard(self, paint):
+        from src.terminal import find_containers
+
+        field = self._field(paint, size=120.0)
+        return find_containers(field, yard=np.ones(field.height.shape, dtype=bool))
+
+    def test_flat_tops_at_container_heights_are_stacks(self):
+        from src.harbour_kit import CONTAINER_HEIGHT_M
+
+        def paint(x, y, h):
+            # Four wide and two forty-footers long, three high ...
+            h[(x >= 20.0) & (x < 44.4) & (y >= 20.0) & (y < 29.8)] = 3 * CONTAINER_HEIGHT_M
+            # ... and beside them one twenty-footer, high cube, on its own.
+            h[(x >= 60.0) & (x < 62.5) & (y >= 60.0) & (y < 66.0)] = 2.9
+            # A lorry: as long as a container and not as high as two.
+            h[(x >= 80.0) & (x < 82.5) & (y >= 20.0) & (y < 33.0)] = 4.0
+            # A tree.
+            bumpy = (x - 100.0) ** 2 + (y - 100.0) ** 2 < 36.0
+            h[bumpy] = 5.0 + np.sin(x[bumpy] * 9.0) * np.cos(y[bumpy] * 7.0)
+
+        stacks = self._yard(paint)
+        self.assertEqual(sum(s.tiers for s in stacks), 4 * 2 * 3 + 1)
+        tall = [s for s in stacks if s.tiers == 3]
+        self.assertEqual(len(tall), 8)
+        for stack in tall:
+            self.assertAlmostEqual(stack.length, 12.19, delta=0.1)
+            self.assertAlmostEqual(abs(float(stack.along[0])), 1.0, places=6)
+        lone = [s for s in stacks if s.tiers == 1]
+        self.assertEqual(len(lone), 1)
+        self.assertAlmostEqual(lone[0].length, 6.06, delta=0.01)
+        np.testing.assert_allclose(lone[0].centre, [61.25, 63.0], atol=0.6)
+
+    def test_a_bus_and_two_site_huts_are_not_a_container_yard(self):
+        def paint(x, y, h):
+            h[(x >= 20.0) & (x < 22.5) & (y >= 20.0) & (y < 32.0)] = 3.0
+            h[(x >= 60.0) & (x < 62.5) & (y >= 60.0) & (y < 66.0)] = 2.6
+
+        self.assertEqual(self._yard(paint), [])
+
+    def _terminal(self, **switches):
+        """A quay with a crane track, a yard crane on it and a block of stacks."""
+        from types import SimpleNamespace
+        from unittest import mock
+
+        import rasterio
+        import shapely
+        from rasterio.transform import from_origin
+
+        import src.harbour as harbour
+        from src.geo import BBox
+        from src.surfaces import WaterBody
+
+        bbox = BBox(0.0, 0.0, 200.0, 200.0)
+        basin = WaterBody(rings=[np.array([[0, 0], [200, 0], [200, 50], [0, 50], [0, 0]], float)],
+                          level_nap=0.5, area_m2=10000.0, measured=True)
+
+        def line(y):
+            return {"geometry": {"type": "LineString", "coordinates": [[10, y], [190, y]]},
+                    "properties": {"functie": "niet-bgt", "plus_functie": "(haven)kraan",
+                                   "relatieve_hoogteligging": 0}}
+
+        square = [[0, 50], [200, 50], [200, 200], [0, 200], [0, 50]]
+        features = {
+            "spoor": [line(60), line(80), {"geometry": {"type": "LineString", "coordinates": [[10, 190], [190, 190]]},
+                                           "properties": {"functie": "trein"}}],
+            "onbegroeidterreindeel": [{"geometry": {"type": "Polygon", "coordinates": [square]},
+                                       "properties": {"fysiek_voorkomen": "erf"}}],
+            "pand": [{"geometry": {"type": "Polygon", "coordinates": [
+                [[150, 150], [190, 150], [190, 180], [150, 180], [150, 150]]]}, "properties": {}}],
+        }
+
+        def fetch(collection, _bbox, **_kwargs):
+            return features.get(collection, []), SimpleNamespace()
+
+        def ground(x, y):
+            return np.where(np.asarray(y, dtype=float) > 50, 3.0, -0.5) + 0.0 * np.asarray(x)
+
+        n = 400
+        cols, rows = np.meshgrid(np.arange(n), np.arange(n))
+        x, y = (cols + 0.5) * 0.5, 200.0 - (rows + 0.5) * 0.5
+        dsm = np.where(y > 50, 3.0, np.nan)
+        dsm[(np.abs(x - 100.0) < 4.0) & (np.abs(y - 70.0) < 12.0)] = 3.0 + 25.0  # the crane
+        dsm[(x >= 20.0) & (x < 44.4) & (y >= 100.0) & (y < 109.8)] = 3.0 + 2 * 2.59  # the stacks
+        dsm[(x >= 150.0) & (x < 190.0) & (y >= 150.0) & (y < 180.0)] = 3.0 + 5.2  # a shed, flat roofed
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(harbour, "fetch_current", fetch):
+            path = Path(tmp) / "dsm.tif"
+            with rasterio.open(path, "w", driver="GTiff", height=n, width=n, count=1,
+                               dtype="float32", transform=from_origin(0.0, 200.0, 0.5, 0.5)) as out:
+                out.write(dsm.astype(np.float32), 1)
+            built = harbour.build_harbour(
+                bbox, Path(tmp), water=[basin], quays=[shapely.LineString([(0, 50), (200, 50)])],
+                surface_at=ground, dsm_path=path, **switches,
+            )
+            saved = dict(np.load(Path(tmp) / "harbour.npz"))
+        return built, saved
+
+    def test_the_pipeline_keeps_the_trees_off_the_cranes(self):
+        source = (Path(__file__).resolve().parents[1] / "pipeline.py").read_text()
+        start = source.index("trees = build_trees(")
+        self.assertIn("keep_off=harbour.no_trees", source[start:start + 1100])
+
+    def test_crane_rails_lie_in_the_paving_and_train_rails_are_left_alone(self):
+        from src.harbour import CRANE_RAIL
+
+        built, _ = self._terminal()
+        self.assertAlmostEqual(built.counts["crane_rail_m"], 360.0, delta=0.5)
+        rails = built.tris[built.tri_kind == CRANE_RAIL].reshape(-1, 3)
+        self.assertEqual(sorted(set(rails[:, 1].round(0))), [60.0, 80.0])
+        self.assertLess(rails[:, 2].max() - 3.0, 0.1)
+        self.assertGreater(rails[:, 2].max(), 3.0)
+
+    def test_the_crane_the_survey_saw_stands_on_its_rails_as_high_as_it_was_seen(self):
+        from src.harbour import CRANE
+
+        built, _ = self._terminal()
+        self.assertEqual(built.counts.get("gantry_crane"), 1)
+        crane = built.tris[built.tri_kind == CRANE].reshape(-1, 3)
+        self.assertAlmostEqual(crane[:, 2].max(), 3.0 + 25.0, delta=0.1)
+        self.assertAlmostEqual(crane[:, 2].min(), 3.0, delta=0.2)
+        # Its feet on the two rails, y = 60 and y = 80.
+        feet = crane[crane[:, 2] < 3.5]
+        self.assertTrue((np.minimum(np.abs(feet[:, 1] - 60.0), np.abs(feet[:, 1] - 80.0)) < 0.5).all())
+        np.testing.assert_allclose(built.crane_height, [25.0], atol=0.1)
+
+    def test_a_crane_keeps_the_tree_detector_off_its_footprint(self):
+        """The canopy model reads a crane as a clump of tall trees."""
+        import shapely
+
+        built, _ = self._terminal()
+        self.assertEqual(len(built.crane_footprints), 1)
+        outline = built.crane_footprints[0]
+        self.assertTrue(outline.contains(shapely.Point(100.0, 70.0)))
+        self.assertTrue(outline.contains(shapely.Point(100.0, 59.0)))
+        self.assertFalse(outline.contains(shapely.Point(135.0, 70.0)))
+        # And each of the eight stacks its own, the crane's among them all.
+        self.assertEqual(len(built.stack_footprints), 8)
+        self.assertEqual(len(built.no_trees), 9)
+        stacks = shapely.union_all(built.stack_footprints)
+        self.assertTrue(stacks.contains(shapely.Point(30.0, 105.0)))
+        self.assertFalse(stacks.contains(shapely.Point(60.0, 105.0)))
+
+    def test_containers_are_built_where_they_stood_and_a_shed_is_not_one(self):
+        from src.harbour import CONTAINER
+        from src.harbour_kit import CONTAINER_HEIGHT_M
+
+        built, _ = self._terminal()
+        self.assertEqual(built.counts.get("container"), 4 * 2 * 2)
+        self.assertEqual(built.counts.get("container_stack"), 8)
+        boxes = built.tris[built.tri_kind == CONTAINER].reshape(-1, 3)
+        self.assertGreaterEqual(boxes[:, 0].min(), 19.5)
+        self.assertLessEqual(boxes[:, 0].max(), 45.0)
+        self.assertGreaterEqual(boxes[:, 1].min(), 99.5)
+        self.assertLessEqual(boxes[:, 1].max(), 110.5)
+        self.assertAlmostEqual(boxes[:, 2].min(), 3.0, places=6)
+        self.assertAlmostEqual(boxes[:, 2].max(), 3.0 + 2 * CONTAINER_HEIGHT_M, delta=0.05)
+
+    def test_every_crane_and_container_carries_a_paint(self):
+        from src.harbour import CONTAINER, CRANE
+
+        built, saved = self._terminal()
+        painted = np.isin(built.tri_kind, (CRANE, CONTAINER))
+        self.assertTrue((built.tri_paint[painted] >= 0).all())
+        self.assertTrue((built.tri_paint[~painted] == -1).all())
+        names = [str(n) for n in saved["paint_names"]]
+        self.assertEqual(saved["paint_rgb"].shape, (len(names), 3))
+        used = {names[i] for i in np.unique(built.tri_paint[built.tri_kind == CONTAINER])}
+        self.assertTrue(all(name.startswith("Container_") for name in used))
+        # More than one colour in sixteen containers.
+        self.assertGreater(len(used), 1)
+
+    def test_the_same_run_paints_the_same_colours(self):
+        first, _ = self._terminal()
+        second, _ = self._terminal()
+        np.testing.assert_array_equal(first.tri_paint, second.tri_paint)
+
+    def test_cranes_and_containers_can_be_left_out(self):
+        built, _ = self._terminal(cranes=False, containers=False)
+        for name in ("crane_rail_m", "gantry_crane", "container"):
+            self.assertNotIn(name, built.counts)
+
+    def test_the_checks_read_the_terminal(self):
+        from src.validate import CheckReport, check_harbour
+
+        built, _ = self._terminal()
+        report = CheckReport()
+        check_harbour(report, built)
+        verdicts = {c.name: c for c in report.checks}
+        self.assertIn("cranes_as_high_as_cranes", verdicts)
+        self.assertIn("containers_stacked_no_higher_than_six", verdicts)
+        self.assertTrue(all(v.passed for v in verdicts.values()))
+
+
 class TestPathsOverWater(unittest.TestCase):
     """Lidar does not reflect off water, so the bare-earth grid has a hole over
     every body and the filler interpolates across it. The result dips: measured

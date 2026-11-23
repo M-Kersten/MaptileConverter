@@ -141,9 +141,9 @@ used.
 
 The style is *Layered* (as the modellers build it) or *Survey* (the ground as
 measured). In the layered style water is cut into the ground and covered by a
-flat water object, harbours get quay faces, jetties and mooring posts, and cars
-and boats start unticked, as the modellers' files
-have none; tick them to add them.
+flat water object, harbours get quay faces, jetties, cranes and containers,
+and cars and boats start unticked, as the modellers' files have none; tick
+them to add them.
 
 The page is written for someone who has never opened a GIS or a 3D package.
 **Detail is one choice, not a panel of sliders**: Draft, Standard or High (see
@@ -1001,11 +1001,55 @@ How it is built (`src/layered.py`):
   More than 2 m out from the waterline on average, a line is a 2 m catwalk on
   posts every 6 m, `<Prefix>_Loopbruggen`, at the surface model's height or
   2.5 m above the water; closer in, a 30 cm fender from under the water to the
-  quay top, `<Prefix>_Remmingswerk`. Ships and cranes are not in the open data
-  as 3D objects and are left to the modellers. Over Rotterdam
+  quay top, `<Prefix>_Remmingswerk`. Over Rotterdam
   Rijnhaven–Maashaven: 2.78 km of quay, 12 jetties, 17 pontoons and 43 mooring
   posts; at the Hoek van Holland ferry terminal 82 m of catwalk and 175 m of
-  fender.
+  fender. Ships are not in the open data and are left to the modellers.
+* **Piers and quays, fitted out** (`layered.harbour_fittings`). A jetty stands
+  on piles, `<Prefix>_Steigerpalen`: a row across the deck every 4 m, from
+  1.5 m under the water to a headstock under the deck, and only where the
+  deck is over water. A deck 2.5 m wide or more has a kerb round it. A
+  pontoon of 6 m or longer lies between two guide piles. Along a quay on open
+  water (more than 40 m across: a harbour, not a canal) and at least 1 m over
+  it, a bollard stands every 20 m, 0.8 m back from the edge
+  (`<Prefix>_Bolders`), and a ladder hangs down the face every 60 m to 1 m
+  under the water (`<Prefix>_Kadetrappen`).
+* **Cranes** (`src/terminal.py`, `layered.harbour_cranes`). The BGT draws
+  crane rails (`spoor`, plus-function `(haven)kraan`), one line a rail; they
+  lie in the paving as `<Prefix>_Kraanbanen`. Two parallel rails side by side
+  are a track with a gauge, paired across the lanes of a stacking yard and
+  not across the 5 m gaps between them. The cranes themselves are in no
+  dataset, but the surface model was flown over them: returns more than 18 m
+  above the paving between the rails of a track (10 m where no containers
+  stand between them) are a crane, one per cluster along the track.
+  What it is follows from its footprint. Across its rails and little
+  further: a portal crane, the yard crane over a stack. On a track of 15 m or
+  wider with its top over 40 m: a ship-to-shore crane, its girder at the
+  height most of the returns between the rails are at, its boom down where
+  the survey saw a level line out over the water at that height and up
+  where it did not. Anything else: a slewing crane, its foot where the most
+  of it is and its jib's head where the survey saw the high part furthest
+  from there. All are a few dozen boxes and beams at the measured height,
+  in one of five paints, in `<Prefix>_Kranen`: the right crane in the right
+  place for a skyline, and a stand-in close up. The canopy model reads a
+  crane as a clump of tall trees, so the tree detector keeps 8 m off every
+  crane, and off every container stack.
+* **Containers** (`layered.harbour_containers`). On BGT yard ground
+  (`onbegroeidterreindeel`), off the buildings, a flat top in the surface
+  model at one to six container heights (2.59 m, or a high cube's 2.90 m) is
+  a stack that many high. Each flat top is filled with containers 2.44 m
+  wide, forty-footers where two twenty-foot lengths lie in a row, along the
+  crane track it lies in or else along its own long side, each in one of
+  eight paints that depend only on where it stands. Fewer than ten in an
+  area are a bus and two site huts and are left out. They are
+  `<Prefix>_Containers`: the stacks of the day the survey was flown. Over a
+  square kilometre of the ECT Delta terminal on the Maasvlakte: 28.7 km of
+  crane rail, 10 ship-to-shore cranes (two with the boom down over a ship),
+  38 yard cranes and 10,502 containers in 3,925 stacks, 92,000 triangles of
+  container and 8,000 of crane. Over the Eemhaven: 8 slewing cranes on
+  0.9 km of rail, 1,182 containers, 1,507 piles under 26 jetties, 88
+  bollards and 25 ladders. Needs the surface model, which is read whenever
+  water or road geometry is on.
 * **Railings** (`src/railings.py`). Along every side of a bridge deck that is
   over water, and down both sides of every catwalk, unless a BGT wall, fence
   or parapet already stands within 0.6 m of the edge: posts every 1.5 m, a
@@ -1089,6 +1133,9 @@ The layered style's settings, all optional:
 | `layered.water_surface` | true | the flat water object over every BGT water |
 | `layered.water_level_offset_m` | 0 | added to every water level: a tide (the survey's is whatever the tide was when it was flown) |
 | `layered.harbour` | true | quay faces, jetties, pontoons, mooring posts, catwalks and fenders |
+| `layered.harbour_fittings` | true | piles under jetties, kerbs, guide piles, and bollards and ladders on harbour quays |
+| `layered.harbour_cranes` | true | the BGT's crane rails, and the cranes the surface model saw on them |
+| `layered.harbour_containers` | true | the container stacks the surface model saw |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.flush_walkways` | true | a walkway the survey shows level with the road beside it is laid as road, without a kerb |

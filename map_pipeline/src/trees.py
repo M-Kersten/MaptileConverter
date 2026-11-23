@@ -778,11 +778,15 @@ def build_trees(
     buildings=None,
     surfaces=None,
     deck_at=None,
+    keep_off=None,
 ) -> TreeSet:
     """Fetch BGT trees over `bbox` and give each one a height from AHN.
 
     `deck_at(x, y)` is the top of a bridge deck there, NaN off one. A tree in
-    a planter on a deck stands on the deck: see `_on_decks`.
+    a planter on a deck stands on the deck: see `_on_decks`. `keep_off` is a
+    list of shapely outlines no tree is found in: a harbour crane is thirty
+    metres of rough returns, which is what the detector takes a tree for,
+    and so is the ragged edge of a container stack.
     """
     result = TreeSet()
 
@@ -937,6 +941,16 @@ def build_trees(
             shoulder_m=float(trees_cfg.get("detect_shoulder_m", 1.5)),
             shoulder_rise_m=float(trees_cfg.get("detect_shoulder_rise_m", 1.0)),
         )
+        if len(found) and keep_off:
+            import shapely
+
+            taken = shapely.contains_xy(
+                shapely.union_all(np.array(list(keep_off), dtype=object)),
+                found[:, 0], found[:, 1],
+            )
+            if taken.any():
+                LOG.info("dropped %d canopy peaks on harbour cranes and containers", int(taken.sum()))
+                found, heights = found[~taken], np.asarray(heights)[~taken]
         if len(found):
             ground = np.asarray(
                 terrain.surface(found[:, 0], found[:, 1]), dtype=np.float64

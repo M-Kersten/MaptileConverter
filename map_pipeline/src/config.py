@@ -63,6 +63,12 @@ DEFAULTS: dict[str, Any] = {
         # Quay faces along the BGT quay walls, jetties and pontoons as decks,
         # mooring posts as posts (src/harbour.py).
         "harbour": True,
+        # On top of that: piles under the jetties, kerbs, bollards and quay
+        # ladders; the BGT's crane rails with the cranes the surface model
+        # saw on them; and the container stacks it saw (src/terminal.py).
+        "harbour_fittings": True,
+        "harbour_cranes": True,
+        "harbour_containers": True,
         # The curb generator on every walkway and traffic island. Needs
         # Blender 5; with an older one the walkways stay flat.
         "kerbs": True,
@@ -982,6 +988,8 @@ def load_config(path: str | Path) -> PipelineConfig:
     layered["paving"] = bool(layered.get("paving", True))
     layered["werven"] = bool(layered.get("werven", True))
     layered["harbour"] = bool(layered.get("harbour", True))
+    for key in ("harbour_fittings", "harbour_cranes", "harbour_containers"):
+        layered[key] = bool(layered.get(key, True))
     layered["water_level_offset_m"] = float(layered.get("water_level_offset_m", 0.0))
     for key in ("outline_m", "ditch_depth_m"):
         value = float(layered[key])
