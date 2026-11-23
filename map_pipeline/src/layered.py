@@ -588,6 +588,9 @@ def build_layered_ground(
                 | {_code(ROAD, material) for material in ROAD_SURFACES},
                 narrow_codes={_code(WALKWAY, material) for material in WALKWAY_SURFACES}
                 | {_code(ROAD, m) for m in ("Beton_Geel", "Verharding", "Grind")},
+                # What the curb generator kerbs: no thin strip of anything
+                # else goes into it while it has another neighbour.
+                kerbed_codes={k for _, k in pieces if k // 16 == WALKWAY},
                 quays=quays,
                 **({"near_m": float(square_m)} if square_m else {}),
             )

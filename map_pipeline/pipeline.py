@@ -39,8 +39,11 @@ if __name__ == "__main__":
         raise SystemExit(2)
 
 from src.bgt import fetch_current as bgt_fetch  # noqa: E402
+from src.bgt import fetch_current  # noqa: E402
 from src.bgt import use_cache as bgt_cache  # noqa: E402
+from src.guardrails import GuardrailSet, build_guardrails  # noqa: E402
 from src.harbour import HarbourSet, build_harbour  # noqa: E402
+from src.railings import guarded_area  # noqa: E402
 from src.buildings import build_buildings  # noqa: E402
 from src.config import PipelineConfig, load_config  # noqa: E402
 from src.elevation import (  # noqa: E402
@@ -53,6 +56,7 @@ from src.elevation import (  # noqa: E402
 from src.terrain_mesh import build_terrain_mesh  # noqa: E402
 from src.passages import fetch_passage_areas  # noqa: E402
 from src.layered import build_layered_ground  # noqa: E402
+from src.layered import MOTORWAY, build_layered_ground  # noqa: E402
 from src.nwb import NWB_URL, fetch_centrelines  # noqa: E402
 from src.roads import (  # noqa: E402
     TERRAIN_CLEARANCE_M,
@@ -110,9 +114,11 @@ from src.surfaces import (  # noqa: E402
     SurfaceSet,
     blend_surface_detail,
     build_surfaces,
+    save_surfaces,
     write_land_cover,
 )
 from src.relight import remove_cast_shadows  # noqa: E402
+from src.roofs import RoofAtlas, build_roof_atlas, roof_settings  # noqa: E402
 from src.trees import (  # noqa: E402
     TreeSet,
     bake_canopy_shade,
@@ -142,10 +148,12 @@ from src.validate import (  # noqa: E402
     check_layered,
     check_furniture,
     check_passages,
+    check_roof_atlas,
     check_rails,
     check_signs,
     check_structures,
     check_vehicles,
+    check_guardrails,
     check_harbour,
     check_surfaces,
     check_terrain,
@@ -492,6 +500,51 @@ def run_blender_stage(
     )
 
 
+def _open_tunnel_mouths(structures, config, terrain, ground_layers, surfaces, work_dir) -> dict:
+    """Open the ground at every tunnel mouth, and save the ground again."""
+    import shapely
+
+    from src.tunnels import mouths, open_mouths
+
+    openings = mouths(structures.tunnels, area=shapely.box(*config.bbox.as_list()))
+    if not openings:
+        return {"mouths_opened": 0}
+    counts = {"mouths_opened": len(openings), "ground_faces_cut": 0}
+    if ground_layers is not None:
+        cut = open_mouths(
+            ground_layers.mesh, openings,
+            face_arrays=("face_kind", "face_part", (ground_layers, "face_material"),
+                         (ground_layers, "face_object")),
+        )
+        counts["ground_faces_cut"] += cut["faces_cut"]
+        ground_layers.save(work_dir)
+        terrain.save(work_dir)
+    elif getattr(terrain, "mesh", None) is not None:
+        cut = open_mouths(terrain.mesh, openings, face_arrays=("face_kind", "face_part"))
+        counts["ground_faces_cut"] += cut["faces_cut"]
+        terrain.save(work_dir)
+    roads = getattr(surfaces, "road_mesh", None)
+    if roads is not None and len(roads):
+        cut = open_mouths(
+            roads, openings,
+            face_arrays=("face_class", "face_level", "face_object", "face_kind"),
+            loop_arrays=("loop_uv",),
+        )
+        counts["road_faces_cut"] = cut["faces_cut"]
+        if cut["faces_cut"] or cut["vertices_moved"]:
+            # The checks read the roads as triangles; as they are now.
+            tris, owner = roads.triangles()
+            surfaces.road_tris = tris
+            surfaces.road_tri_class = roads.face_class[owner].astype("int32")
+            surfaces.road_tri_level = roads.face_level[owner].astype("int32")
+            save_surfaces(surfaces, config.bbox, work_dir)
+    LOG.info(
+        "tunnel mouths: %d opened, %d ground faces cut",
+        counts["mouths_opened"], counts["ground_faces_cut"],
+    )
+    return counts
+
+
 def _collision_metadata(work_dir: Path) -> dict:
     """The collision block for metadata.json, read back from Blender's summary.
 
@@ -617,7 +670,9 @@ def street_details(config, work_dir, furniture, *, buildings, surfaces, terrain,
     return osm, found
 
 
-def layered_scene(config: PipelineConfig, ground, harbour=None, paving=None, werf_files=None) -> dict:
+def layered_scene(
+    config: PipelineConfig, ground, harbour=None, paving=None, werf_files=None, guardrails=None,
+) -> dict:
     """What the Blender stage needs to build the modellers' ground."""
     settings = config.layered
     curb = settings["curb"]
@@ -640,6 +695,7 @@ def layered_scene(config: PipelineConfig, ground, harbour=None, paving=None, wer
         },
         "water_surface": bool(settings.get("water_surface", True)),
         "harbour": "harbour.npz" if harbour is not None and len(harbour) else "",
+        "guardrails": "guardrails.npz" if guardrails is not None and len(guardrails) else "",
         "water_level_offset_m": float(settings.get("water_level_offset_m", 0.0)),
         "walkway_material": str(curb.get("walkway_material") or ""),
         "curb_material": str(curb.get("curb_material") or "Beton"),
@@ -865,13 +921,16 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     want_photos = bool(
         config.photos.get("mapillary") or config.photos.get("folder")
     )
+    # The roofs' own photo, finer than the ground's; off puts them on the
+    # aerial as before.
+    want_roofs = roof_settings(config.buildings)["metres_per_px"] > 0
 
     # Five fixed stages, plus aerial relighting and the terrain mesh, plus
     # the optional sources, plus Blender.
     total = 7 + sum(
         (
             want_trees, want_surfaces, want_furniture, want_signs, want_barriers,
-            want_usage,
+            want_usage, want_roofs,
             want_vehicles, want_rails, want_structures, want_photos,
         )
     ) + (0 if args.skip_blender else 1)
@@ -990,10 +1049,26 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             passage_areas=passage_areas,
         )
 
+    roof_atlas = RoofAtlas(None, note="switched off (buildings.roof_cm is 0)")
+    if want_roofs:
+        with Stage("roof textures (PDOK aerial)", next_step(), total):
+            # Only where the roofs are, finer than the ground. The sun comes
+            # out of it with the ground's, in the relighting stage.
+            roof_atlas = build_roof_atlas(
+                config.bbox,
+                work_dir,
+                roofs=[b.roof_tris for b in buildings.buildings],
+                buildings_cfg=config.buildings,
+                aerial_cfg=config.aerial,
+                ground_m_per_px=aerial.resolution_m,
+                layer_name=aerial.layer_name,
+            )
+
     ground_layers = None
     harbour = HarbourSet()
     werf = None
     werf_files = None
+    guardrails = GuardrailSet()
     if layered:
         with Stage("terrain and ground layers", next_step(), total):
             # The modellers' ground: a coarse terrain within tolerance of the
@@ -1055,6 +1130,12 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     error["p99_m"],
                 )
             terrain.save(work_dir)
+            bgt_kwargs = {
+                "page_limit": int(config.surfaces["page_limit"]),
+                "timeout": float(config.surfaces["timeout_s"]),
+                "max_retries": int(config.surfaces["max_retries"]),
+                "max_pages": int(config.surfaces["max_pages"]),
+            }
             if surfaces.walls and settings.get("werven", True):
                 # A brick wall on each, from the wharf to the street, with
                 # the cellars' doors in it.
@@ -1080,12 +1161,24 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                     fittings=bool(settings.get("harbour_fittings", True)),
                     cranes=bool(settings.get("harbour_cranes", True)),
                     containers=bool(settings.get("harbour_containers", True)),
-                    fetch_kwargs={
-                        "page_limit": int(config.surfaces["page_limit"]),
-                        "timeout": float(config.surfaces["timeout_s"]),
-                        "max_retries": int(config.surfaces["max_retries"]),
-                        "max_pages": int(config.surfaces["max_pages"]),
-                    },
+                    fetch_kwargs=bgt_kwargs,
+                )
+            if bool(settings.get("guardrails", True)) and (
+                ground_layers.mesh.face_kind == MOTORWAY
+            ).any():
+                # Steel guardrails along the motorway, standing on the ground
+                # just built, and not where the BGT has a wall or fence.
+                guardrails = build_guardrails(
+                    ground_layers,
+                    surfaces.areas,
+                    bbox=config.bbox,
+                    guarded=guarded_area(config.bbox, fetch_current, bgt_kwargs),
+                    collision_thickness_m=(
+                        float(config.barriers.get("collision_thickness_m", 0.30))
+                        if config.export.get("collision", False)
+                        else None
+                    ),
+                    work_dir=work_dir,
                 )
 
     else:
@@ -1185,6 +1278,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
     #      itself amplified where a shadow used to be.
     #   3. The canopy occlusion goes on last. It is the one shading term that
     #      belongs in a ground texture, because it is true at any hour.
+    #
+    # The roof atlas takes only the first: the same sun, shadow and gains,
+    # read at each roof pixel's own position. The grain is for ground classes
+    # and a roof has none; the canopy occlusion is the ground's, under trees
+    # that mostly stand lower than the roofs beside them.
     with Stage("aerial relighting", next_step(), total):
         shadow_info = remove_cast_shadows(
             aerial.path,
@@ -1194,6 +1292,7 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             trees=trees if len(trees) else None,
             class_grid=surfaces.class_grid,
             strength=float(config.aerial.get("deshadow", 1.0)),
+            roofs=roof_atlas if roof_atlas.ok else None,
         )
         if surfaces.class_grid is not None:
             blend_surface_detail(
@@ -1373,17 +1472,6 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 write_spawn_list(vehicles, config.geo, out_dir)
                 vehicle_texture = generate_vehicle_texture(work_dir)
 
-    rails = RailSet()
-    rail_texture = None
-    if want_rails:
-        with Stage("railways (BGT)", next_step(), total):
-            rails = build_rails(
-                config.bbox, work_dir, rails_cfg=config.rails, terrain=terrain
-            )
-            if len(rails.ballast_tris) or len(rails.rail_tris):
-                save_rails(rails, work_dir / "rails.npz")
-                rail_texture = generate_rail_texture(work_dir)
-
     structures = StructureSet()
     structure_texture = None
     structure_brick = None
@@ -1421,6 +1509,29 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
 
                     structure_brick = generate_brick_texture(work_dir)
                 deck_paving = _deck_paving(surfaces)
+
+            if len(structures.tunnels):
+                # A height field cannot have a hole in its side: the ground
+                # climbs from the cutting floor onto the roof across every
+                # mouth. Opened here, so the road can drive in.
+                structures.counts.update(
+                    _open_tunnel_mouths(structures, config, terrain, ground_layers, surfaces, work_dir)
+                )
+
+    rails = RailSet()
+    rail_texture = None
+    if want_rails:
+        with Stage("railways (BGT)", next_step(), total):
+            rails = build_rails(
+                config.bbox, work_dir, rails_cfg=config.rails, terrain=terrain,
+                # Track below ground runs on its tunnel's floor.
+                tunnel_floor=(
+                    structures.tunnels.floor_at if len(structures.tunnels) else None
+                ),
+            )
+            if len(rails.ballast_tris) or len(rails.rail_tris):
+                save_rails(rails, work_dir / "rails.npz")
+                rail_texture = generate_rail_texture(work_dir)
 
     if photo_textures is None:
         # No street photos: the walls are still drawn, from the registers.
@@ -1502,10 +1613,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             photo_textures=photo_textures.pages if photo_textures is not None else None,
             photo_normals=photo_textures.normal_pages if photo_textures is not None else None,
             layered=(
-                layered_scene(config, ground_layers, harbour, paving=paving_entry, werf_files=werf_files)
+                layered_scene(
+                    config, ground_layers, harbour, guardrails=guardrails,
+                    paving=paving_entry, werf_files=werf_files,
+                )
                 if ground_layers is not None
                 else None
             ),
+            roof_atlas=roof_atlas if roof_atlas.ok else None,
         )
 
     if not args.skip_blender:
@@ -1525,20 +1640,26 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             lod=str(config.buildings["lod"]),
             ahn_model=str(config.terrain["ahn_model"]),
             trees=trees,
+            roof_files=roof_atlas.files if roof_atlas.ok else None,
             extra={
                 "surfaces": surfaces.stats(),
                 "street_furniture": furniture.stats(),
                 "traffic_signs": signs.stats(),
                 "barriers": barriers.stats(),
+                **({"guardrails": guardrails.stats()} if len(guardrails) else {}),
                 "vehicles": vehicles.stats(),
                 "railways": rails.stats(),
                 "structures": {
                     **structures.stats(),
                     "deck_heights_from": "AHN DSM, median over each deck",
+                    "deck_thickness": "chosen (structures.deck_thickness_m), not measured",
                     "tunnel_depth": (
-                        "constructed, not surveyed: no open dataset carries "
-                        "Dutch tunnel depths"
+                        "measured at the mouths, from the AHN DTM over the cutting "
+                        "in front of each; drawn between them, under the ground or "
+                        "water over the tunnel: no open dataset carries Dutch "
+                        "tunnel depths"
                     ),
+                    "tunnels": structures.tunnels.stats() if len(structures.tunnels) else [],
                 },
                 "building_function": usage.stats(),
                 **(
@@ -1558,6 +1679,13 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
                 # longer carrying its own sun -- and, when it still is, at
                 # what angle, so they can match it.
                 **({"aerial_relighting": shadow_info} if shadow_info else {}),
+                # The roofs' own photo: what was asked, what the budget
+                # allowed, and what fetching it cost. Absent when off.
+                **(
+                    {"roof_atlas": roof_atlas.to_dict()}
+                    if want_roofs and roof_atlas.to_dict()
+                    else {}
+                ),
                 # What to collide with, which is a question about the FBX and
                 # so belongs next to it rather than in work/. Read back from
                 # the Blender stage's own summary: this says what was drawn,
@@ -1617,6 +1745,11 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_trees(report, trees if want_trees else None, config.bbox)
         check_surfaces(report, surfaces if want_surfaces else None, terrain)
         check_harbour(report, harbour)
+        if ground_layers is not None and bool(config.layered.get("guardrails", True)):
+            check_guardrails(
+                report, guardrails, ground_layers,
+                work_dir=None if args.skip_blender else work_dir,
+            )
         check_furniture(report, furniture if want_furniture else None, config.bbox)
         check_signs(report, signs if want_signs else None, config.bbox)
         # Against what they were placed on: the model's own surface, which
@@ -1624,6 +1757,9 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
         check_barriers(
             report, barriers if want_barriers else None, terrain.surface,
             deck_at=deck_at,
+            # The ground at a tunnel mouth was reshaped after the barriers
+            # were stood on it; what stands there says nothing about them.
+            mouths=getattr(getattr(terrain, "mesh", None), "mouths", None),
         )
         check_vehicles(
             report, vehicles if want_vehicles else None, config.bbox, surfaces
@@ -1637,6 +1773,14 @@ def run(config: PipelineConfig, args: argparse.Namespace) -> int:
             check_street_photos(report, street_photos)
             if not args.skip_blender:
                 check_photo_textures(report, photo_textures, out_dir, work_dir)
+        if want_roofs:
+            check_roof_atlas(
+                report,
+                roof_atlas,
+                out_dir=None if args.skip_blender else out_dir,
+                work_dir=work_dir,
+                page_cap=int(config.buildings["roof_atlas_px"]),
+            )
 
         if not args.skip_blender:
             check_export(

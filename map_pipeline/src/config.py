@@ -69,6 +69,10 @@ DEFAULTS: dict[str, Any] = {
         "harbour_fittings": True,
         "harbour_cranes": True,
         "harbour_containers": True,
+
+        # Steel guardrails along the motorway's verges and down its central
+        # reservation, as one object (<prefix>_Geleiderail; src/guardrails.py).
+        "guardrails": True,
         # The curb generator on every walkway and traffic island. Needs
         # Blender 5; with an older one the walkways stay flat.
         "kerbs": True,
@@ -204,6 +208,23 @@ DEFAULTS: dict[str, Any] = {
             # The ceiling stays this far below the lowest roof over it.
             "slab_m": 0.5,
         },
+
+        # Roofs get their own photo, finer than the ground's, fetched only
+        # where the roofs are and packed into roofs_00.png and up (see
+        # src/roofs.py). Set by `detail`. 0 puts the roofs back on the aerial,
+        # as they were before. The ortho is 8 cm, so finer is clamped to that.
+        "roof_cm": 10,
+        # The most pixels all roof pages together may hold. When the roofs of
+        # an area need more at roof_cm, they are fetched coarser and the run
+        # says so. Over Utrecht centre, roofs at 10 cm come to 29 Mpx per
+        # quarter square kilometre.
+        "roof_max_mpx": 48,
+        # The largest a page may be. WebGL and many GPUs stop at 8192; Unity
+        # imports up to 16384.
+        "roof_atlas_px": 8192,
+        # Photo kept around each roof inside its rectangle, so a mipmap does
+        # not blend the roof with whatever was packed beside it.
+        "roof_padding_px": 4,
     },
     "facade": {
         # One storey per texture tile vertically, so windows line up per floor
@@ -519,18 +540,22 @@ DEFAULTS: dict[str, Any] = {
         # A deck floats this far over its measured height, so it does not fight
         # the road riding on it for the same depth.
         "deck_lift_m": 0.05,
+        # From a deck's top to its underside, edge beam included: what shows
+        # from the water, the quay and the road under a viaduct. The surface
+        # model sees only the top, so this is chosen; 0 is the old flat sheet.
+        "deck_thickness_m": 0.8,
         # Used only when the surface model has no reading over a deck, which is
         # rare. A Dutch road bridge clears what it crosses by about this much.
         "fallback_clearance_m": 5.0,
-        # Nothing measures how deep a tunnel runs, and no open dataset carries
-        # it, so this profile is drawn rather than surveyed: portals at ground
-        # level, ramping down to this depth in between. The Maastunnel road
-        # deck sits about 20 m under the Maas.
-        "tunnel_depth_m": 18.0,
-        "tunnel_ramp_m": 350.0,
-        # Side walls up to ground level, so a tunnel reads as a cutting rather
-        # than as a road floating underground. No ceiling, deliberately: a
-        # roofed tunnel is invisible in the model it was added to.
+        # A tunnel's mouths are measured: the AHN sees the cutting in front of
+        # each down to the tunnel's edge. Between them the floor is drawn, a
+        # roof and a clearance under what is over the tunnel. Under water that
+        # is the bed, which nothing here measures: it deepens from the bank to
+        # at most this. The Maas at the Maastunnel is dredged to about 12 m.
+        "tunnel_water_depth_m": 12.0,
+        # The tube: walls and a ceiling looking inward, and at each mouth a
+        # headwall, a cap and wing walls over where the ground is opened.
+        # False leaves the floor alone, for a road to drive on.
         "tunnel_walls": True,
         "page_limit": 1000,
         "timeout_s": 180,
@@ -667,13 +692,20 @@ DEFAULTS: dict[str, Any] = {
 # config file names one with a top-level "detail"; anything it also sets
 # explicitly wins. The UI shows the same table (ui/index.html, DETAIL), and a
 # test keeps the two equal.
+#
+# Roofs have a resolution of their own (roof_cm, 0 is the aerial) and a
+# budget in megapixels for all roof pages together (roof_mpx). Draft keeps
+# the roofs on the aerial, because Draft is about waiting less.
 DETAIL_PRESETS: dict[str, dict] = {
     "draft": {"aerial_cm": 50, "grid_m": 4.0, "facade_px": 256,
-              "buildings_per_look": 160, "normal_map": False},
+              "buildings_per_look": 160, "normal_map": False,
+              "roof_cm": 0, "roof_mpx": 16},
     "standard": {"aerial_cm": 25, "grid_m": 2.0, "facade_px": 512,
-                 "buildings_per_look": 80, "normal_map": True},
+                 "buildings_per_look": 80, "normal_map": True,
+                 "roof_cm": 10, "roof_mpx": 48},
     "high": {"aerial_cm": 12, "grid_m": 1.0, "facade_px": 1024,
-             "buildings_per_look": 40, "normal_map": True},
+             "buildings_per_look": 40, "normal_map": True,
+             "roof_cm": 8, "roof_mpx": 128},
 }
 
 
@@ -729,6 +761,13 @@ RETIRED: dict[str, str] = {
     "layered.grass_lift_m": (
         "the roads, walkways and grass are the ground itself, not lifted onto a terrain"
     ),
+    "structures.tunnel_depth_m": (
+        "a tunnel's mouths are read from the survey and its floor drawn under what is "
+        "over it; set structures.tunnel_water_depth_m for the bed of the water it crosses"
+    ),
+    "structures.tunnel_ramp_m": (
+        "a tunnel descends from each measured mouth at the grade a tunnel is built to"
+    ),
 }
 
 
@@ -764,6 +803,10 @@ def detail_settings(detail: str, side_m: float) -> dict:
             # 25 standard, 40 high (more fills pages faster than it shows).
             "drawn_px_per_m": min(40.0, 25.0 * int(preset["facade_px"]) / 512.0),
         },
+        "buildings": {
+            "roof_cm": float(preset["roof_cm"]),
+            "roof_max_mpx": float(preset["roof_mpx"]),
+        },
     }
 
 
@@ -779,6 +822,59 @@ def default_prefix(name: str) -> str:
     # Blender and Unity both take anything, but a file system path does not.
     cleaned = re.sub(r"[^A-Za-z0-9_]", "", cleaned)
     return cleaned or "Area"
+
+
+def _check_roof_settings(buildings: dict, aerial: dict, bbox: BBox) -> None:
+    """Normalise the roof atlas settings in place, saying what was changed.
+
+    `roof_cm` 0 (or false, or null) is the way back to the roofs on the
+    aerial. Finer than the 8 cm ortho is clamped, because the extra pixels
+    would be an upsampled JPEG spending the budget. No finer than the
+    ground's own photo is the same as off, and is said so.
+    """
+    raw = buildings.get("roof_cm")
+    cm = 0.0 if raw in (None, False) else float(raw)
+    if cm < 0:
+        raise ValueError(f"buildings.roof_cm must be 0 (off) or positive, got {cm}")
+    source_cm = AERIAL_SOURCE_M_PER_PX * 100
+    if 0 < cm < source_cm:
+        LOG.warning(
+            "buildings.roof_cm is %.1f, finer than the %.0f cm source; using %.0f",
+            cm, source_cm, source_cm,
+        )
+        cm = source_cm
+    ground_cm = 100.0 * bbox.width / max(int(aerial["size_px"]), 1)
+    if cm > 0 and cm >= ground_cm:
+        LOG.info(
+            "buildings.roof_cm %.1f is no finer than the aerial's %.1f cm; the "
+            "roofs stay on the aerial",
+            cm, ground_cm,
+        )
+        cm = 0.0
+    buildings["roof_cm"] = cm
+
+    budget = float(buildings.get("roof_max_mpx", 48))
+    if not budget > 0:
+        raise ValueError(f"buildings.roof_max_mpx must be positive, got {budget}")
+    buildings["roof_max_mpx"] = budget
+
+    page = int(buildings.get("roof_atlas_px", 8192))
+    if not 256 <= page <= 16384:
+        raise ValueError(
+            f"buildings.roof_atlas_px must be between 256 and 16384, got {page}"
+        )
+    if page > 8192:
+        LOG.warning(
+            "buildings.roof_atlas_px is %d: Unity imports that, but WebGL and "
+            "many GPUs stop at 8192, so the browser's 3D view scales it down",
+            page,
+        )
+    buildings["roof_atlas_px"] = page - page % 4
+
+    padding = int(buildings.get("roof_padding_px", 4))
+    if padding < 0:
+        raise ValueError(f"buildings.roof_padding_px must not be negative, got {padding}")
+    buildings["roof_padding_px"] = padding
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -905,6 +1001,11 @@ def load_config(path: str | Path) -> PipelineConfig:
     name = str(merged["name"]).strip()
     if not name:
         raise ValueError("config 'name' must not be empty")
+    # The name is a folder in work/ and in output/: one folder, inside them.
+    if set(name) <= {"."} or any(sep in name for sep in ("/", "\\")):
+        raise ValueError(
+            f"config 'name' {name!r} must be a plain folder name: no slashes, not only dots"
+        )
 
     ahn_model = str(merged["terrain"]["ahn_model"]).strip().upper()
     if ahn_model not in ("DTM", "DSM"):
@@ -1007,6 +1108,7 @@ def load_config(path: str | Path) -> PipelineConfig:
             f"buildings.clip_mode must be 'centroid' or 'intersect', got {clip_mode!r}"
         )
     merged["buildings"]["clip_mode"] = clip_mode
+    _check_roof_settings(merged["buildings"], merged["aerial"], bbox)
 
     layered = merged["layered"]
     for key in ("tolerance_m", "square_m"):
@@ -1027,6 +1129,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     layered["harbour"] = bool(layered.get("harbour", True))
     for key in ("harbour_fittings", "harbour_cranes", "harbour_containers"):
         layered[key] = bool(layered.get(key, True))
+    layered["guardrails"] = bool(layered.get("guardrails", True))
     layered["water_level_offset_m"] = float(layered.get("water_level_offset_m", 0.0))
     for key in ("outline_m", "ditch_depth_m"):
         value = float(layered[key])

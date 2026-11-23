@@ -656,6 +656,9 @@ def build_surfaces(
             water_clearance_m=float(surfaces_cfg.get("road_water_clearance_m", 0.25)),
             deck_sampler=deck_sampler,
             uv_origin=bbox.center,
+            # The grid `terrain.sample` reads, which a face crossing a quay
+            # wall is cut along so it follows the step.
+            ground_grid=_grid_of(terrain),
         )
         result.road_mesh = mesh
         tris, owner = mesh.triangles()
@@ -701,6 +704,15 @@ def build_surfaces(
 
     save_surfaces(result, bbox, work_dir)
     return result
+
+
+def _grid_of(terrain) -> tuple[float, float, float] | None:
+    """One node of the terrain grid and its spacing, when there is a grid."""
+    xs = getattr(terrain, "xs", None)
+    ys = getattr(terrain, "ys", None)
+    if xs is None or ys is None or len(xs) < 2 or len(ys) < 1:
+        return None
+    return float(xs[0]), float(ys[0]), float(xs[1] - xs[0])
 
 
 def _quay_walls(bbox: BBox, fetch_kwargs: dict) -> list:

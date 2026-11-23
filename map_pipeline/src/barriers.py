@@ -1202,9 +1202,15 @@ def build_barriers(
             geometry = feature.get("geometry") or {}
             geometry_type = str(geometry.get("type") or "")
             try:
-                raised = int(properties.get("relatieve_hoogteligging") or 0) > 0
+                level = int(properties.get("relatieve_hoogteligging") or 0)
             except (TypeError, ValueError):
-                raised = False
+                level = 0
+            if level < 0:
+                # In a tunnel: the Maastunnel's dividing wall, stood on the
+                # ground, ran up over the headwall and across the park on top.
+                counts["below_ground_left_out"] = counts.get("below_ground_left_out", 0) + 1
+                continue
+            raised = level > 0
             ground = on_deck if raised and deck_at is not None else terrain.surface
 
             if geometry_type in ("LineString", "MultiLineString"):

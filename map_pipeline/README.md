@@ -23,6 +23,8 @@ output/<area_name>/
 │                    signs, cars, boats
 ├── maptile_tools.py Blender add-on: fit the ground under edited roads, re-export
 ├── aerial.png       aerial ortho of the same area
+├── roofs_00.png …   the roofs from the same ortho at a finer resolution, packed
+│                    per building into one or a few pages (see Roofs below)
 ├── metadata.json    bbox, origin offset, CRS, source versions
 ├── trees.json       tree positions and heights, for spawning Unity prefabs
 ├── vehicles.json    car and boat positions and headings, same idea
@@ -40,9 +42,10 @@ output/<area_name>/
 └── ATTRIBUTION.txt  source credits
 ```
 
-The pipeline stops there: no Unity layer and no WebGL build. To look round a
-model without opening Blender or Unity, the UI opens it in 3D in the browser;
-see [The 3D view](#the-3d-view).
+The pipeline stops there: no Unity scene and no WebGL build. A Unity package
+in `unity/` sets up the import; see [Importing into Unity](#importing-into-unity).
+To look round a model without opening Blender or Unity, the UI opens it in 3D
+in the browser; see [The 3D view](#the-3d-view).
 
 **Two styles of ground.** By default the ground is built the way our 3D
 modellers build an area by hand — the *layered* style: a terrain of quads
@@ -129,14 +132,28 @@ Open <http://127.0.0.1:8765>. The page is in Dutch and has three views.
   [The 3D view](#the-3d-view)); **Bekijken** opens
   the renders, the check results and the download links; **Opnieuw bouwen**
   opens the map with that area's square, name, style, detail and collision
-  setting filled in. A build that is running shows on top as a card with a
-  progress bar, the log and a stop button — also after a page reload, as the
-  page asks the server which runs are going (`/api/jobs`).
+  setting filled in, and **Verwijderen** deletes the model, its renders and its
+  intermediates after asking. **Alles downloaden als zip** in the dialog packs
+  `output/<area>/` into one file. A build that is running shows on top as a
+  card with a progress bar, the log and a stop button, also after a page
+  reload, as the page asks the server which runs are going (`/api/jobs`).
 - **Nieuw gebied** opens the map full screen: a search field top left, the
   layers drawer on the right, and a build bar along the bottom with name,
   width, style, detail, the time estimate and **Model bouwen**. Click the map to
   move the square, drag to pan, scroll to zoom. The defaults are the ones to
   use. Building takes you back to Modellen, where the run card follows it.
+
+**Builds queue.** One model is built at a time, as two Blender runs side by side
+only slow each other down. While one runs, the button reads **In de wachtrij
+zetten** and the next area waits under **Wachtrij** on Modellen, where **Uit de
+wachtrij** takes it off again. The queue lives on disk: every run keeps its
+settings and log in `work/<area>/run.json` and `run.log`, so a server that is
+stopped and started again picks the waiting runs back up. Stopping the server,
+with Ctrl+C or a plain `kill`, stops the run that is building, Blender
+included, and the next server shows it as *onderbroken*, with **Opnieuw
+starten** to build it again from its own settings. The stop button on a run
+card stops Blender too, so the next run in the queue has the machine to
+itself.
 
 The page uses the Virtuele Brigade colours. It names Rijksoverheid Sans in its
 font stack but does not ship the font; without it the browser's sans-serif is
@@ -158,7 +175,8 @@ straightening, contour spacing, road face size and more — and every one of the
 was a way to make the model worse that a newcomer had to learn to leave alone.
 They are gone; a config file that still sets one loads and says what replaced
 it. The **?** button opens *Wat je krijgt, en hoe je het opent*, which names the
-output files and gives the steps for Blender and Unity.
+output files, gives the steps for Blender and Unity and has the Unity importer
+package to download (see [Importing into Unity](#importing-into-unity)).
 
 The layers drawer lists every optional dataset with a switch and a live status
 light, so you pick what goes in and see what is answering right now. Terrain,
@@ -249,34 +267,76 @@ Blender or Unity, and for showing it to someone who has neither.
 | Right-drag, or Shift + drag | turn and tilt |
 | Scroll | zoom towards the cursor |
 | Double-click | fly to that point |
-| Click | what it is and where: name, layer, properties, RD and NAP |
+| Click | what it is and where: name, layer, properties, faces, RD and NAP |
+| Z, or **Wireframe** | the wireframe on and off; **Quads** or **Triangles** beside it |
+| Shift + Z | the wireframe as triangles, the way the FBX and the graphics card see it |
+| M, or **Meten** | measure: click two points for the distance, the level distance and the height difference |
+| Search field | find an object by name or by a property, a BAG id say, and fly to it |
+| **Link** | copy the address of this view, camera included |
+| Esc | stop measuring, close the search |
 | Touch | one finger moves, two fingers zoom, turn and tilt |
 | Keys | arrows move, Shift + arrows turn and tilt, + and − zoom, Home shows the whole area |
 
 **Overzicht** and **Boven** frame the whole area, at an angle or straight from
 above with north up, and the compass turns the view back to north. **Lagen**
 lists every collection of the `.blend` with a switch: the trees off to see the
-street, the buildings off to see the ground. A click on a building gives its
+street, the buildings off to see the ground. The collision shapes are a layer
+too, off at first; switched on they lie over the model in translucent magenta,
+so a wall proxy that misses its wall or a barrier without one shows at a
+glance. A click on a building gives its
 BAG id, construction year and height from 3DBAG; on a tree its height and
 whether it came from the BGT register or was found in the height model. Under
 the cursor the page reads out RD and NAP all the time, so the view also measures
 a model against the map.
 
-The address carries the model: `http://<your-machine>:8765/#3d/utrecht_dom`
-opens it straight away, and the browser's back button leaves it.
+**The wireframe is the mesh as Blender shows it.** **Wireframe** draws the
+edges of every face over the model, with the textures off and the faces plain grey: quads as quads, n-gons whole, without the
+diagonals the export triangulation adds, so the 4 m squares, the rungs across a
+road and the rows along a verge can be checked in the browser as in Blender's
+edit mode. The lines are dark on the grey faces; the clicked object's are
+orange. Far off, where an edge of a few metres shrinks to
+a pixel or two, the lines fade, or the whole model would turn black: zoom in
+to read them. Switch layers off to look at one alone: the
+ground with the buildings and trees off is the layout the modellers asked for.
+A click also counts the object's faces and vertices as Blender does, with its
+modifiers and before the triangulation: the kerbed walkways of Utrecht centre
+are 44,166 quads, 2,504 triangles and 6 n-gons. **Triangles** beside the
+switch, or Shift + Z, draws the same mesh as the FBX carries it, every quad cut
+in two: the diagonals Unity will see.
+
+**Meten** turns a click into a point: the first click sets one end, the second
+the other, and the card gives the straight distance, the distance over the
+ground plan and the height difference, in metres to the centimetre, with RD and
+NAP of both ends. A third click starts again. The search field top left finds
+objects by name or by a text property, so a BAG id taken from the BAG viewer
+finds its building, and a click on a result flies there and selects it.
+
+The address carries the model and the camera:
+`http://<your-machine>:8765/#3d/utrecht_dom/c=12.4,3.1,-40.2,180.0,0.785,0.611`
+opens that model from that spot (the point looked at in the model's own metres,
+the distance to it, then turn and tilt in radians), as the page keeps the
+address up to date while you look round. **Link** copies it, so a colleague sees the same corner. The
+browser's back button leaves the 3D view.
 
 **What it reads.** The Blender stage writes the view as its last step, to
 `work/<area>/viewer.glb`: a binary glTF of the scene with every modifier as the
 render has it, so the kerbs and the export triangulation are in, as in the FBX.
-The objects of a layer are merged per material, so a thousand buildings are a
-few dozen draws. The trees, ten thousand objects sharing a dozen meshes, stay
+The objects of a layer are merged per material and per tile, a grid of six by
+six over the area, so a thousand buildings are a few hundred draws and the page
+skips the tiles outside the view. Street furniture, barriers and vehicles are
+also left out beyond 450 m, where they would be a pixel each. The trees, ten thousand objects sharing a dozen meshes, stay
 instances (`EXT_mesh_gpu_instancing`), and normals are bytes
 (`KHR_mesh_quantization`). Every vertex carries the number of its object and
-the file lists the objects with their custom properties, which is what a click
-reads back. The textures are not in it: it names them, and the page loads them
-from `output/<area>/`, so the aerial is not stored twice. Over a 500 m square
-of Utrecht centre the file is 17.5 MB for 399,219 triangles and 1,927 objects,
-written in under two seconds, and the browser has it on screen in under one.
+the file lists the objects with their custom properties, face counts and
+bounds, which is what a click reads back and the search flies to. The wireframe costs a byte per triangle: which of
+its three sides are edges of the mesh. The triangulation is render-only and
+keeps every vertex and its number, so the edges are read from the scene as the
+viewport has it and looked up among the triangles' sides; the page makes the
+lines from that the first time it is switched on. The textures are not in the
+file: it names them, and the page loads them from `output/<area>/`, so the
+aerial is not stored twice. Over a 500 m square of Utrecht centre the file is
+17.9 MB for 399,219 triangles and 1,927 objects, written in under three
+seconds, and the browser has it on screen in under one.
 
 It lives in `work/` because it is a cache for the page and no part of the
 model: `output/<area>/` stays what goes into Unity, and deleting the view
@@ -284,9 +344,11 @@ loses nothing.
 
 **When there is none, or it is out of date, the server writes it.** A
 `viewer.json` beside the view stamps it with the size and time of the
-`model.blend` it shows. A model built before there was a 3D view, one whose
-`work/` folder was cleared, and one edited in Blender and saved since all miss
-that stamp, and opening them runs `blender/web_export.py` on the `.blend`
+`model.blend` it shows, and with the layout of the file, which the page and the
+server agree on. A model built before there was a 3D view, one whose `work/`
+folder was cleared, one edited in Blender and saved since, and one whose view
+is of an older layout (from before the wireframe, say) all miss that stamp,
+and opening them runs `blender/web_export.py` on the `.blend`
 through the same Blender the pipeline uses, one model at a time; the page says
 *3D-weergave voorbereiden* meanwhile, about three seconds over that square. So
 the next time it opens, the 3D view shows what was saved in Blender. A `.blend`
@@ -400,11 +462,11 @@ One choice, three levels. Detail is set as ground resolution rather than pixel
 count, so a level means the same thing whatever the area size, and the pixel
 counts are derived from the box.
 
-| Detail | Aerial | Ground grid | Facade | Normal map | Buildings per wall look |
-| --- | --- | --- | --- | --- | --- |
-| Draft | 50 cm/px | 4 m | 256 px | off | 160 |
-| Standard | 25 cm/px | 2 m | 512 px | on | 80 |
-| High | 12 cm/px | 1 m | 1024 px | on | 40 |
+| Detail | Aerial | Roofs | Ground grid | Facade | Normal map | Buildings per wall look |
+| --- | --- | --- | --- | --- | --- | --- |
+| Draft | 50 cm/px | on the aerial | 4 m | 256 px | off | 160 |
+| Standard | 25 cm/px | 10 cm/px, up to 48 Mpx | 2 m | 512 px | on | 80 |
+| High | 12 cm/px | 8 cm/px, up to 128 Mpx | 1 m | 1024 px | on | 40 |
 
 **Both dials hit a source-data ceiling**, and going past it costs time without
 adding information. The aerial layer is an 8 cm ortho, so a 1 km area is fully
@@ -415,7 +477,9 @@ past what the data holds.
 **The aerial jump from 25 to 12 cm/px is large; from 12 cm to native 8 cm it is
 small.** At 25 cm/px cars are blobs. At 12 cm/px you can see individual cars,
 kerb lines and bare branches. Native 8 cm adds little over that for double the
-file (92 MB against 174 MB for 1 km²).
+file (92 MB against 174 MB for 1 km²). The roofs are the exception to the
+column: at Standard and High they have a photo of their own, finer than the
+ground's (see [Roofs](#roofs)).
 
 **The ground grid is a trade between faithful and editable.** How far the
 drawn ground strays from every surveyed AHN pixel under it, measured over the
@@ -436,7 +500,7 @@ close-up work. The run reports these figures for its own area as
 **Unity has its own limits.** Textures over 16384 px cannot be imported at full
 size, which a 2 km area at native resolution would exceed. Imported textures
 are also capped at 2048 by default, so raise *Max Size* on `aerial.png` or none
-of this is visible. A terrain over 65k vertices needs a 32-bit index buffer,
+of this is visible; the Unity package does that by itself. A terrain over 65k vertices needs a 32-bit index buffer,
 which Unity sets automatically.
 
 **The services cap a single response, so large areas are fetched in pieces.**
@@ -461,8 +525,9 @@ the join on a 3 km area, the height difference between neighbouring cells is
 The facade normal map is the one quality lever that is not about resolution: it
 gives window reveals, sills and storey bands real relief under a moving light.
 It costs one small extra texture and survives FBX as the material's bump slot.
-It is written as `*_normal.png` because Unity keys off that suffix to set the
-texture type automatically.
+It is written as `*_normal.png`, the suffix the Unity package keys off to
+import it as a normal map; without the package, set its Texture Type to
+*Normal map* by hand.
 
 Other knobs worth knowing:
 
@@ -515,10 +580,10 @@ Other knobs worth knowing:
 | `rails.enabled` | `true` | Railway, tram and metro track from BGT `spoor`. |
 | `rails.step_m` | `4.0` | How far apart points along a track may get before the ground under it stops being followed. |
 | `structures.bridges` | `true` | Bridge decks and piers from BGT `overbruggingsdeel`, heights read off the AHN surface model. |
-| `structures.tunnels` | `true` | Tunnels from BGT `tunneldeel`, on a constructed depth profile. |
-| `structures.tunnel_depth_m` | `18.0` | How deep the drawn profile goes. Nothing measures this; see below. |
-| `structures.tunnel_ramp_m` | `350.0` | How long the descent from each portal is. |
-| `structures.tunnel_walls` | `true` | Side walls up to ground level, so a tunnel reads as a cutting. No ceiling: a roofed tunnel is invisible. |
+| `structures.deck_thickness_m` | `0.8` | From a deck's top to its underside, edge beam included. The surface model sees only the top, so this is chosen. `0` is the old flat sheet. |
+| `structures.tunnels` | `true` | Tunnels from BGT `tunneldeel`: mouths read from the survey, the floor drawn between them. |
+| `structures.tunnel_water_depth_m` | `12.0` | The deepest the bed of the water over a tunnel is drawn. Nothing measures it; see below. |
+| `structures.tunnel_walls` | `true` | The tube: walls and a ceiling looking inward, and a headwall, cap and wing walls at each mouth. `false` leaves the floor alone. |
 | `usage.enabled` | `true` | BAG building function, deciding the ground storey. |
 | `facade.floor_height_m` | `3.0` | Nominal storey height for the window grid. |
 | `facade.texture_px` | `512` | Pixels per storey tile. 512 over a 4 m tile is 128 px/m. |
@@ -529,10 +594,90 @@ Other knobs worth knowing:
 | `buildings.tiles_version` | `v20250903` | Which dated 3DBAG release the static tiles come from. Bumped by hand; releases are listed at 3dbag.nl/en/download. |
 | `buildings.probe_timeout_s` | `8.0` | How long to knock on the API before giving up and using the tiles. |
 | `buildings.passages.enabled` | `true` | A tunnel through the base of every building standing over a road or water at ground level. See [Under a building](#under-a-building). |
+| `buildings.roof_cm` | `10` | Resolution of the roofs' own photo, set by `detail`. `0` puts the roofs on the aerial as before. Finer than the 8 cm source is clamped to 8; no finer than the aerial is the same as `0`. See [Roofs](#roofs). |
+| `buildings.roof_max_mpx` | `48` | The most pixels all roof pages may hold together, set by `detail`. Where the roofs need more at `roof_cm`, they are fetched coarser, the log warns and `roof_resolution_as_asked` says by how much. |
+| `buildings.roof_atlas_px` | `8192` | The largest side of a page. WebGL and many GPUs stop at 8192; Unity imports up to 16384, and anything above 8192 is warned about. |
+| `buildings.roof_padding_px` | `4` | Photo kept round each roof inside its rectangle, so the first mipmaps do not blend it with the rectangle packed next to it. |
 | `terrain.grid_m` | `2.0` | Ground grid spacing; set by `detail`. See [Terrain](#terrain). |
 | `terrain.feature_edges` | `["water", "roads", "buildings"]` | Which outlines the terrain's edges follow, each with a row of quads alongside. `[]` gives the plain grid. |
 | `aerial.deshadow` | `1.0` | How much of the flown sun to take back out of the photo, 0 to 1. See [The flown sun](#the-flown-sun-and-taking-it-back-out). `0` leaves it as flown. |
 | `aerial.max_request_px` | `2000` | Tile size for the WMS mosaic; the service caps requests at 2500. |
+
+### Roofs
+
+A roof is most of what a drone sees, and at Standard's 25 cm a pixel is a
+quarter of a metre of tiles: a dormer is a few pixels and a skylight is none.
+The ortho is 8 cm. Fetching the whole area at that is nearly what High does,
+and it spends most of the pixels on ground that is not the problem. So the
+roofs get a photo of their own, fetched only where they are (`src/roofs.py`):
+
+* **Rectangles on one grid.** Each building's roof extent, plus
+  `roof_padding_px` (4) of photo round it, becomes a rectangle of pixels on
+  one grid anchored at the area's north-west corner. Where two overlap and one
+  rectangle round both holds no more pixels than the two apart, they become
+  one: a terrace is one strip rather than a row of slivers each carrying its
+  neighbours' party walls.
+* **Packed into pages.** Tallest first, bottom-left along a skyline, into pages
+  of at most `roof_atlas_px` (8192) a side. A page is sized to what it holds,
+  in multiples of 4 for block compression, and there is one page when one will
+  do.
+* **A budget.** When the pages would hold more than `roof_max_mpx`, the
+  resolution is coarsened in whole millimetres until they fit; the log warns
+  and `roof_resolution_as_asked` says by how much. If not even the ground's
+  own resolution would fit, the roofs stay on the aerial.
+* **Few requests.** The grid is cut into tiles of `aerial.max_request_px`
+  (2000 px), and each tile a rectangle reaches is one GetMap for the part of it
+  the rectangles need, four at a time. Every pixel lands on the same grid, so a
+  rectangle split between two requests joins without a seam and nothing is
+  resampled. A window the WMS refuses is mosaicked from WMTS tiles; if neither
+  answers, the roofs stay on the aerial and the run warns.
+* **Mapped and relit.** Each roof triangle's UV points into its rectangle
+  (`work/<area>/roofs.npz`, read by the Blender stage), and the relighting
+  stage takes the flown sun out of the pages exactly as it does out of the
+  ground (see [The flown sun](#the-flown-sun-and-taking-it-back-out)).
+
+Measured over a 500 m square of Utrecht centre round the Dom, at Standard, the
+same area built with `roof_cm: 0` against the default:
+
+| | `roof_cm: 0` | `roof_cm: 10` |
+| --- | --- | --- |
+| roofs | on the 2000 px aerial, 25 cm/px | one 5504 x 5204 page, 10 cm/px |
+| fetched for the roofs | nothing | 27.2 Mpx in 16 requests, 3.6 s |
+| run time | 137 s | 18 s more: 5.9 s roof stage, 10 s relighting, 2 s checks |
+| output folder | 51 MB | 89 MB, of which `roofs_00.png` 38 MB |
+| detail on the roofs | 4.1 | 12.2 |
+
+The last row is the mean absolute Laplacian of luminance over the roof pixels,
+both read at 10 cm: the finest detail in the picture, three times what the
+upsampled aerial has. Most of the time is writing PNG, not the network: a
+29 Mpx page takes 7.8 s to compress and arrives in under 4.
+
+The centre of Utrecht is the hard case for this. Roofs cover 53% of the square
+there, and with streets running every way their rectangles, merged, add up to
+more than the square itself: 241,000 m² against 133,000 m² of roof. So the page
+holds about as many pixels as the whole square would at 10 cm. Where roofs
+cover less of the ground the page shrinks with them, while the ground's photo
+does not.
+
+**At a square kilometre the budget decides.** The square kilometre of the
+default `config.json`, which overlaps most of the 500 m square above, holds
+2,557 roofs: at 10 cm they would need more than the 48 Mpx Standard allows. They come out at 13.6 cm/px instead, on
+one 7164 x 6700 page: 54 Mpx fetched in 23 requests in 8.4 s, 30 s added to the
+fetch and relighting stages of a 400 s run, and a 71 MB page beside a 30 MB
+aerial. The log and `roof_resolution_as_asked` both say so. That is still
+nearly twice as sharp as the ground in each direction; for 10 cm over a square
+kilometre of city centre, raise `roof_max_mpx` and expect a second page.
+
+Two things were weighed and left out. Rectangles turned to each building would
+pack tighter where the streets run every way, but every roof pixel would then
+be resampled off the service's grid, which costs some of the sharpness this is
+for. And the pages are PNG like every other texture here: the photo has been
+relit, so a JPEG would be a second lossy generation. As JPEG at quality 92 the
+page above would be 7.6 MB rather than 38; on the graphics card the two are the
+same size.
+
+`roof_cm: 0`, and Draft, give the previous model: no stage, no page, and the
+roofs on `M_aerial` with the aerial's planar UV.
 
 ## How it fits together
 
@@ -542,6 +687,7 @@ src/elevation.py   AHN WCS -> GeoTIFF -> regular height grid; the fit under road
 src/terrain_mesh.py the terrain mesh: outlines as edges, rows, grid, fill
 src/buildings.py   3DBAG API -> CityJSON -> semantic mesh data
 src/imagery.py     PDOK WMS/WMTS -> aerial.png + georeference
+src/roofs.py       the roofs at a finer resolution: rectangles, packing, roofs_00.png
 src/facade.py      generated facade, tree, water and furniture textures
 src/facade_uv.py   fitting whole window bays across each wall face
 src/textures.py    photographed CC0 wall surfaces, fetched once and cached
@@ -558,6 +704,7 @@ src/vehicles.py    cars in the parking bays, boats between the mooring posts
 src/rails.py       railway, tram and metro track from BGT spoor
 src/structures.py  bridge decks and piers, and tunnels below ground
 src/passages.py    tunnels through buildings standing over a road or water
+src/tunnels.py     tunnel mouths read from the survey, the floor between them, the ground opened at each mouth
 src/usage.py       BAG building function, joined to 3DBAG on the building id
 src/export.py      metadata.json and the Blender scene description
 src/validate.py    the headless checks
@@ -568,6 +715,8 @@ blender/web_export.py  the scene as one binary glTF, for the 3D view
 ui/server.py       local web UI, standard library only
 ui/index.html      the page: models gallery, full-screen RD map with build bar, live log, results
 ui/viewer.js       the 3D view: WebGL2, reads what web_export.py writes
+unity/com.terreinlab.importer/  Unity package: imports every model with the
+                   right settings, its properties and RD/NAP on components
 ```
 
 The heavy CityJSON and raster work all happens on the Python side.
@@ -636,7 +785,7 @@ outliner and an empty that everything in it hangs from:
 | `Buildings` | one object per building, `Pand_<BAG id>`, with `bag_id`, `build_year` and `height_m` as custom properties |
 | `Water` | water surfaces and beds |
 | `Trees` | `Trees_registered` and `Trees_detected`, one object per tree |
-| `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named |
+| `Street furniture`, `Barriers`, `Vehicles`, `Rail`, `Structures` | as named; in the layered style `Barriers` also holds the motorway's guardrails, `<Prefix>_Geleiderail` |
 | `Collision` | the physics proxies, hidden; see [Collision shapes](#collision-shapes) |
 
 **Trees are instances.** Ten thousand trees share twelve meshes: three kinds,
@@ -726,8 +875,79 @@ after editing.
 
 ## Importing into Unity
 
-Copy the whole output folder into `Assets/` — the FBX finds its textures by
-name beside it. Then select `model.fbx`, and in the Inspector:
+**Install the TerreinLab Importer package once per Unity project**, and every
+model imports with the right settings by itself. It needs Unity 2021.3 or
+later. In *Window → Package Manager*, click **+** at the top left, choose *Add
+package from disk…* and pick `unity/com.terreinlab.importer/package.json` from
+this folder. Unity uses the package where it lies rather than copying it, so
+put the folder somewhere it will stay before you add it. On a machine without
+this folder, the **?** dialog of the UI offers the package as a zip: unpack it
+and pick its `package.json` the same way.
+
+Then copy the output folder into `Assets/`, all but `model.blend`. The FBX
+finds its textures by name beside it. Unity imports a `.blend` itself when
+Blender is installed on the machine, and the model would come in twice.
+
+The package treats an `.fbx` as a TerreinLab model when the same folder holds
+`metadata.json` and `ATTRIBUTION.txt` and the metadata gives the RD origin
+(`crs`, `origin_rd` and `ground_z_offset_nap`). It leaves every other asset in
+the project alone. For a TerreinLab model it:
+
+- **sets the model up as the list below says**: Scale Factor 1 with Convert
+  Units on, Bake Axis Conversion on, Generate Lightmap UVs off, Index Format
+  Auto, the materials kept inside the model and pointing at the textures beside
+  it, and no rig or animation, since the model has none;
+- **sets up the textures beside it**: `aerial.png` at Max Size 8192, or 16384
+  when the aerial is larger than 8192 px (Android, iOS, tvOS and WebGL stay at
+  8192); every `roofs_*.png` the same way, and kept at its own size rather than
+  scaled to a power of two; every `*_normal.png` as a normal map; `landcover.png` as data, which
+  means no filtering, mipmaps or compression, and readable from scripts; and
+  the rest with mipmaps and repeat wrapping. `fence.png` keeps its alpha
+  coverage in every mipmap, so fences do not thin out with distance;
+- **turns on GPU instancing** in every material of the model. `M_tree` is the
+  one that matters: ten thousand trees share twelve meshes and that material,
+  and with instancing each shape is drawn in one batch. Marking the
+  `Buildings` and `Roads` hierarchies *Static* is still yours to do;
+- **keeps the custom properties** of each object on a `TerreinLabProperties`
+  component: `bag_id`, `build_year` and `height_m` on a building, `kind` on a
+  road, `height_m` and `detected` on a tree, `maptile_role` on the pieces of
+  ground. The Inspector lists them, and scripts read them as `BagId`,
+  `BuildYear`, `HeightM`, `Kind`, `Detected` and `MaptileRole`;
+- **puts a `TerreinLabModel` component on the model's root**, holding the area
+  name, `origin_rd` and `ground_z_offset_nap` from `metadata.json`, with
+  methods that turn a Unity position into RD and NAP and back (see
+  [Coordinates](#coordinates)). They go through the root's transform, so they
+  still hold after you move, turn or scale the model:
+
+  ```csharp
+  using TerreinLab;
+
+  var model = GetComponentInParent<TerreinLabModel>();
+  RdNapPosition here = model.WorldToRdNap(transform.position);  // here.RdX, here.RdY, here.Nap
+  Vector3 there = model.RdNapToWorld(136900.0, 455850.0, 5.2);
+  ```
+
+  A script in an assembly definition of its own needs a reference to
+  `TerreinLab.Importer` to see these.
+
+The package applies these settings on every import, so a model cannot arrive
+half set up, and changing one of them in the Inspector has no effect while it
+is installed. To import a model differently, to bake lightmaps for example, use
+a copy of `model.fbx` in a folder without `metadata.json`: to the package that
+is an ordinary FBX.
+
+**Models already in the project** before the package was installed, or before
+it was updated, keep their old import until you choose *Tools → TerreinLab →
+Reimport models*. It reimports every TerreinLab model in the project and the
+textures beside it, writes the settings into their import settings so the
+Inspector shows them, and turns on GPU instancing in any material you have
+extracted from a model, which an import cannot reach. If you copy a model in
+while Unity is open and its `metadata.json` or `ATTRIBUTION.txt` arrives after
+the FBX, the package reimports the FBX and the textures by itself.
+
+**Without the package**, select `model.fbx` and set these in the Inspector.
+They are also what to look at when a model imported with the package looks
+wrong.
 
 1. **Model → Scale Factor: 1, Convert Units: on.** The model is in metres.
 2. **Model → Bake Axis Conversion: on.** Without it the root object arrives
@@ -741,14 +961,18 @@ name beside it. Then select `model.fbx`, and in the Inspector:
 4. **Model → Index Format: Auto.** The ground has more than 65k vertices and
    needs 32-bit indices; Auto handles it.
 5. **`aerial.png` → Max Size: 8192** (or 16384). Unity caps imported textures at
-   2048 by default, and the whole aerial is shrunk to that otherwise.
+   2048 by default, and the whole aerial is shrunk to that otherwise. The same
+   for each `roofs_*.png`, and set its **Non-Power of 2** to *None*: a page is
+   sized to what it holds (5504 x 5204 over Utrecht centre), and the default
+   *To nearest* would scale that down to 4096 x 4096.
 6. **Tree materials → Enable GPU Instancing.** Ten thousand trees share twelve
    meshes; instancing draws each shape in one batch. Marking the `Buildings` and
    `Roads` hierarchies *Static* lets Unity batch those too.
 
 Custom properties (`kind` on roads, `bag_id` and `build_year` on buildings)
-arrive as FBX user properties, which an `AssetPostprocessor` reads in
-`OnPostprocessGameObjectWithUserProperties`.
+arrive as FBX user properties either way. Without the package, an
+`AssetPostprocessor` of your own reads them in
+`OnPostprocessGameObjectWithUserProperties`, which is what the package does.
 
 ## When 3DBAG is down
 
@@ -1072,6 +1296,57 @@ How it is built (`src/layered.py`):
   are `Structures_railing`, catwalk railings `<Prefix>_Leuningen`; a stand-in
   for the railing of the place. `structures.railings` turns the bridge ones
   off.
+* **Guardrails** (`src/guardrails.py`). The BGT draws a motorway's
+  carriageways and verges and nothing standing between them, so a steel
+  guardrail is laid wherever a motorway carriageway meets grass, open ground,
+  water or a hard verge in the ground as built: along every verge and down
+  both sides of the central reservation. Not where the carriageway meets
+  another road part, a junction mouth or the lane into a service area: the
+  rail stops 0.3 m short of that road rather than turning the corner into it.
+  Not at a merge, where two motorway parts share an edge and there is none to
+  follow. Not across the end of a carriageway that runs onto a bridge or into
+  a tunnel, whose deck the structures stage builds: an edge with both ends
+  within a metre of a part on a bridge (`relatieve_hoogteligging` not 0) and
+  the carriageway beside it clear of that part is such an end. The metre has
+  room to spare: in the ground as built the ends of the ramps at Princeville
+  (below) stand up to 0.33 m off their bridge parts, and a test 10 cm out
+  missed 11 of their 37 edges and ran a rail across them. A verge passing
+  under a bridge keeps its rail. Not on a green gore the
+  layered style kerbs as an island: its kerb is its edge. And not within
+  0.6 m of a BGT wall, fence or noise barrier, which guards the edge already.
+  The rail's face stands 0.5 m onto the verge and no closer than that to any
+  carriageway, so in a gore the rails of its two sides stop where it narrows;
+  where two would stand back to back closer than 0.4 m, at a gore's tip or in
+  a reservation too narrow for two, the shorter one stops, and a strip under a
+  metre wide has room for none. Nothing shorter than 10 m is kept, and a rail
+  stops 0.23 m inside the edge of the area, so its posts are over the ground.
+  The rail is Rijkswaterstaat's steel guardrail in broad terms: a W-profile
+  beam 0.31 m tall and 8 cm deep, its top 0.75 m above the ground at its face,
+  on 10 cm square posts. The posts stand every 2 m, a common spacing for Dutch
+  steel guardrail (a stiffer stretch has them closer, a softer one further
+  apart), which is also twice to every 4 m square of the ground, so the rail
+  follows the verge as built. Each post goes 10 cm into the ground under the
+  lowest of its corners: on a steep bank a post set by its middle had one
+  corner in the air. The beam is folded once down its middle, which catches
+  the light the way the W does: about 10 triangles a metre, against the
+  railings' 17. Every height is read off the ground the layers are, so a post
+  stands on the verge the model has, not on the survey under it. It is one
+  object, `<Prefix>_Geleiderail`, in the railings' `Staal`, kept with the
+  walls and fences in `Barriers` (the 3D view names that layer already); with
+  collision shapes on, `Collision_Guardrails` is its proxy (see
+  [Collision shapes](#collision-shapes)). `layered.guardrails` turns it off.
+  Over 500 m of the A16 at Tankstation Hazeldonk (RD 109,980 to 110,480 by
+  390,170 to 390,670), with 3.4 km of motorway outline, that is 3,229 m of
+  rail in 10 runs, 2,144 m of it between two carriageways, on 1,630 posts:
+  32,560 triangles, laid out in 0.2 s. Read back from Blender, every corner of
+  every post foot is 0.10 to 0.14 m into the ground as built and the top of
+  the rail's face 0.750 m above it; every post stands on grass. Over the
+  A16/A58 interchange at Princeville (RD 110,200 to 110,700 by 393,050 to
+  393,550), where the A58's ramps cross the A16 and the railway on five
+  bridge parts, it is 5,125 m in 21 runs on 2,593 posts, none across a ramp's
+  end; the A16's verges keep their rails under the ramps. There 274 m of
+  motorway edge borders green gores kerbed as islands and has none, and on
+  the banks up to the bridges a post goes in up to 0.43 m at its uphill corner.
 * **Thin strips.** A ground polygon thinner than 0.5 m (twice its area over
   its perimeter) is folded into the neighbour it shares most outline with
   before meshing, land into land where it can. Three BGT borders 35–40 cm
@@ -1150,6 +1425,7 @@ The layered style's settings, all optional:
 | `layered.harbour_fittings` | true | piles under jetties, kerbs, guide piles, and bollards and ladders on harbour quays |
 | `layered.harbour_cranes` | true | the BGT's crane rails, and the cranes the surface model saw on them |
 | `layered.harbour_containers` | true | the container stacks the surface model saw |
+| `layered.guardrails` | true | steel guardrails along the motorway's verges and central reservation, `<Prefix>_Geleiderail` |
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.flush_walkways` | true | a walkway the survey shows level with the road beside it is laid as road, without a kerb |
@@ -1182,8 +1458,8 @@ vertices and 10 cm each. And where two footpaths touch at a single point on
 the edge of the area, the kerb on the cut edge stands its own width outside
 it, which the check also allows: a runaway kerb goes metres.
 
-Not in it yet: the motorway's guardrails, and the modellers' hand-made
-buildings — the buildings are 3DBAG's, as in the survey style.
+Not in it yet: the modellers' hand-made buildings. The buildings are
+3DBAG's, as in the survey style.
 
 ## Terrain
 
@@ -1332,6 +1608,15 @@ across and would otherwise be one face tens of metres wide, flat between its
 corners while the ground under it is not. Any road face over 150 m² is cut into
 a 4 m grid of its own, so it follows the ground in rows and columns instead of
 forcing the terrain metres down to get under it.
+
+A small face can have the same trouble when its corners straddle a height step:
+a ramp down to a canal wharf, or the wharf path along a quay wall. Flat between
+its corners, it hangs metres below the top of the wall or rises over the wharf.
+Any face at grade that the ground strays more than 50 cm from is cut along the
+terrain's own grid lines, so each piece lies within one cell of the height model
+and follows it as closely as anything flat can. Over Utrecht's Vismarkt that is
+91 faces at standard detail; before, 32 road triangles there were up to 2.1 m
+off the ground and `road_surface_follows_terrain` failed.
 
 The checks `terrain_stays_under_roads` and `road_surface_follows_terrain` hold
 both ends of this: no ground through any road, and no road far off the survey.
@@ -1483,7 +1768,9 @@ outlines are surveyed to the centimetre and wobble by a few centimetres between
 rungs, and every wobble kept is one more corner on a face, so each kerb run is
 straightened between the rungs it meets — within 10 cm, and once per kerb, so
 the two surfaces sharing it stay welded. A face over 150 m² with no street to cut
-it (a car park, a square) is cut into a 4 m grid. On Bronbeek:
+it (a car park, a square) is cut into a 4 m grid, and a face whose corners
+straddle a step in the ground (a quay wall) is cut along the terrain grid. On
+Bronbeek:
 
 | | |
 | --- | --- |
@@ -1892,8 +2179,7 @@ came from, for a simulation that needs to know what the signs say.
 
 The parts of the ground that are not the ground. Until now both were dropped:
 tunnels skipped outright, bridges draped onto the surface, which sank the
-Erasmusbrug into the Maas. They need opposite treatment, because the data for
-them is not symmetrical.
+Erasmusbrug into the Maas.
 
 **A bridge can be measured.** BGT `overbruggingsdeel` comes split into `dek` and
 `pijler` — the deck and the piers holding it up, as separate polygons — and a
@@ -1903,6 +2189,16 @@ the Maas the DSM returns a reading on all seventeen decks. The height is a
 median over each deck rather than a point sample, because the DSM also caught
 the railings, the gantries and whatever was driving across when it was flown.
 Piers are extruded from the deck down to whatever they stand on.
+
+**A deck is a slab.** It was its top alone, a sheet laid over the canal. From
+the water, from the quay and from a car under a viaduct a bridge is mostly its
+edge and its underside. Each deck now has an underside `deck_thickness_m`
+(0.8 m) below its top, and sides round its outline between the two. The BGT
+splits a bridge into parts, one per carriageway or span; where two parts meet
+level no wall stands between them, and where one is higher the step is drawn.
+The surface model sees only the top, so the depth is chosen: an Amsterdam canal
+bridge is about 0.6 m at its fascia, a concrete viaduct 1 to 1.5 m. Piers stop
+under the slab.
 
 **The road on a bridge rides its deck.** Draping it on the terrain left the deck
 at its real height with its own carriageway lying on the water. Elevated road
@@ -1950,17 +2246,71 @@ bridge stands on its deck as well: placed on the survey, the camera stood on
 the wharf four metres down, inside the bridge, and was matched against walls
 it could not see.
 
-**A tunnel cannot be measured.** Nothing looks down and sees the Maastunnel. The
-BGT gives its footprint and the carriageway inside it, and an ordinal level of
--1, but no depth in metres exists in any open dataset. So the profile here is
-**constructed**: portals at ground level, ramping down over `tunnel_ramp_m` to
-`tunnel_depth_m`, along the tunnel's own long axis — which is the only part of
-it that comes from the data. Over the Maastunnel that puts the road at −22 m NAP
-mid-river against a real figure of about −20. It is the one piece of geometry in
-this pipeline that is drawn rather than measured, and `metadata.json` says so.
+**A tunnel is measured at its mouths.** The BGT draws a tunnel (`tunneldeel`) as
+the part that is covered. Its open approaches are ordinary roads at level 0 in a
+cutting, and the AHN terrain model sees them all the way to the tunnel's edge:
+at the Maastunnel −3.6 m NAP at the south mouth and −5.8 m at the north one,
+with the ground on the tunnel at +4 to +5 m. The first version of this started
+every tunnel at ground level, so the measured ramp ran into an eight metre wall.
+It also drew one depth profile along one axis through every tunnel in the area,
+and a square kilometre of Rotterdam holds thirteen tunnel parts: the car tunnel,
+the cycle tube with its escalator shafts, four underpasses by the Parkhaven, two
+metro sections. An underpass further north became the end of "the tunnel", and
+the Maastunnel's north mouth went 18 m down.
 
-Tunnels get side walls but no ceiling, deliberately: a roofed tunnel is
-invisible in the model it was just added to.
+Now (`src/tunnels.py`):
+
+- Touching parts are one tunnel, and each tunnel is planned on its own, on its
+  whole outline as the BGT has it. Where the area cuts a tunnel is not a mouth:
+  the road carries on underground there.
+- A stretch of a tunnel's edge is a mouth where the survey just outside reads at
+  least 2.7 m below the ground just inside, on a road, path or track bed at
+  ground level. The floor at the mouth is the height read in front of it. A
+  street beside a tunnel can read like that too; beside the Maastunnel's south
+  mouth it lay seven metres higher, three metres along, which no tunnel floor
+  climbs. Of two mouths no floor can join, the higher goes, and a mouth's floor
+  is level across it, so it is never joined round a corner to the street.
+- Between the mouths the floor is drawn. It stays a roof and a clearance under
+  what is over the tunnel: 4.7 m for a road, 6.2 m for a train, 4.6 m for a
+  metro, 2.8 m for a cycle path, and less where the mouths show less room. It
+  runs no steeper than a tunnel is built, 4.5% for a road and 2.5% for a train,
+  and down from each mouth without climbing before the deepest point.
+- Under water, what is over the tunnel is the bed, which nothing here measures.
+  It deepens a quarter metre per metre out from the bank, to
+  `tunnel_water_depth_m`. The Maastunnel comes out at −17.4 m NAP under the
+  Maas, where the real one is at about −20 m. Where a short tunnel cannot reach
+  a guessed bed at its grade, the measured mouths win.
+- Where the terrain model sees nothing over a tunnel, something is built there:
+  the roof of an underpass, or one of the Maastunnel's ventilation buildings.
+  The gridded terrain fills such a hole from the cutting floors either side, four
+  metres too low, and the surface model reads the building's roof 19 m up. The
+  highest ground the survey saw within 20 m stands in for it.
+
+Over the Maastunnel and the eight underpasses near it every mouth is read
+whole, and the floor meets each one within a centimetre
+(`tunnel_floor_meets_its_mouths`).
+
+**A tunnel is a tube.** An asphalt floor along the drawn profile; walls and a
+ceiling that look inward, because from inside the back of the terrain is no
+ceiling (an engine culls it and shows the sky); and at each mouth a concrete
+headwall over the opening, a cap over the roof's edge, an apron on the cutting
+floor and wing walls down both sides of it. `tunnel_walls: false` leaves the
+floor alone.
+
+**The ground opens at each mouth.** A height field cannot have a hole in its
+side. Wherever a cutting meets a tunnel, the ground climbs from the cutting
+floor straight onto the roof, across the opening. So in front of a mouth the
+ground is held down under the apron, behind it the ground is held up over the
+ceiling, and the one row of faces spanning the mouth goes. The hole that leaves
+lies under the headwall and the cap. Both ground styles are opened this way, and
+the survey style's road mesh with them; the terrain check counts the edges round
+a mouth as an opening rather than a crack.
+
+**Track in a tunnel runs on its floor.** Railway, metro and tram track below
+ground used to be left out. It now follows the floor of the tunnel it is in,
+and is left out only where it runs below ground in no tunnel the BGT draws. A
+wall the BGT puts below ground is left out: the Maastunnel's dividing wall,
+stood on the ground, ran up over the headwall and across the park on top.
 
 ### Under a building
 
@@ -2527,6 +2877,26 @@ Measured over Bronbeek with buildings and trees, 41.6 s:
 It is a mitigation, not a cure, and the limit is information rather than
 effort. `aerial.deshadow: 0` leaves the photo as flown.
 
+**The roofs get the ground's correction, not a fit of their own.** The roof
+atlas (see [Roofs](#roofs)) is the same flight cut into rectangles, with no
+ground round its roofs to measure a shadow against. So nothing is fitted on it:
+the sun, the cast shadow and the gains per class and channel are the ones
+fitted on the ground, read at each roof pixel's own RD position, with the same
+veto from the photo. The shadow is feathered at its own 0.5 m scale and read
+bilinearly, which comes to the same metre or so of ramp the ground gets. Over
+Utrecht centre a roof's mean luminance in the atlas and the same roof's in the
+aerial differ by 0.3 levels at the median and 2.1 at the 90th percentile, over
+338 roofs and terraces. Fetching the whole area at the roofs' resolution and
+relighting that instead would have cost the ground the same pixels again,
+which is what the atlas is there to avoid.
+
+The atlas does not get the ground's other two passes. The grain is per ground
+surface, and a roof has none. The canopy occlusion is drawn under trees, which
+in a street mostly stand lower than the roof next to them, so on a roof it
+would darken the wrong side of the crown. One limit carries over: the shadow is
+known at 0.5 m, so at 10 cm a thin dark rim can stay along a hard shadow edge
+on a roof, as it can at 25 cm on the ground.
+
 ### The leaf-off photo, under the leafy trees
 
 That same decision leaves the model disagreeing with itself. The ground under a
@@ -2715,11 +3085,18 @@ Set `trees.enabled` to `false` to skip them entirely.
 
 ## Materials
 
-Two materials, by default.
+Three materials, by default.
 
 **`M_aerial`** carries `aerial.png` with a top-down planar UV taken from world XY
-normalised to the aerial bbox. It goes on the terrain *and* on the roof surfaces,
-so roofs pick up real photo texture for free and buildings blend into the ground.
+normalised to the aerial bbox. It goes on the terrain.
+
+**`M_roof`** carries `roofs_00.png`, the same flight over the roofs only, at a
+finer resolution (see [Roofs](#roofs)). Each roof triangle's UV is top-down too,
+into its building's rectangle on the page, so a roof still lines up with the
+ground beside it. With more than one page the materials are `M_roof_00`,
+`M_roof_01` and so on, one per page, and a building's roof is always on one
+page. `buildings.roof_cm: 0`, and the Draft level, put the roofs back on
+`M_aerial` as before, with the planar UV the terrain has.
 
 **`M_facade`** carries a generated facade. V counts storeys from the base of the
 wall, at a storey height of `wall_height / storeys`, so the top row of windows
@@ -2857,12 +3234,14 @@ Off by default (`export.collision`, or "Add simplified shapes for physics" in
 the UI). This is for driving or flying something through the model rather than
 looking at it, and it costs FBX size that most imports do not want.
 
-Two extra objects appear, and **only** two, because only two earn their place:
+Two extra objects appear, and a third in the layered style where the motorway
+has guardrails; only these earn their place:
 
 | Object | What it is | Against the drawn mesh |
 |---|---|---|
 | `Collision_Trees` | a trunk prism and a box round the canopy, per tree | 28 triangles against 52–84, so **2.3×** cheaper over a real height mix — or 16 with `export.collision_tree_crowns` off, **4×** |
 | `Collision_Barriers` | the same walls and fences, fattened | one extra prism per thin run |
+| `Collision_Guardrails` | a block along each guardrail, from the rail's face back over its posts and from below the ground to the rail's top, fattened as a fence is | 8 triangles per post against the drawn 20; 13,000 over the Hazeldonk A16 square |
 
 Everything else in the scene is already the right shape to collide with, and
 `metadata.json` names which object to use for each layer instead of shipping a
@@ -2887,6 +3266,9 @@ generated. `barriers.collision_thickness_m` defaults to 0.30 m, which covers
 15 m/s and is invisible because the drawn fence stays 6 cm. Above that, set the
 moving body's Collision Detection to **Continuous Dynamic** as well — that
 cannot tunnel at any speed, and thickening is a mitigation rather than the cure.
+A guardrail's beam is 8 cm deep, rail and post 18 cm together, so its block is
+fattened to the same 0.30 m, onto the verge behind the rail and never into the
+carriageway in front of it, where a car would meet a wall it cannot see.
 
 Which dimension gets fattened depends on how the barrier was surveyed. A line
 barrier is a swept prism, so its `thickness_m` is the thin direction. An area
@@ -3006,6 +3388,26 @@ kerb), `walkways_have_kerbs` (the curb generator ran),
 holds the coarse terrain to its own tolerance rather than to the survey
 style's 25 cm. In both styles `terrain_exported_as_triangles` checks the FBX
 holds the terrain cut as the pipeline cut it.
+
+When the roofs have their own photo, four checks read it back:
+`roof_atlas_written` (every page on disk at its planned size, with content in
+it), `roof_atlas_within_size_cap` (no page over `roof_atlas_px`, and all of them
+within `roof_max_mpx`), `roof_uvs_inside_their_rectangles` (every corner of
+every roof triangle inside its own building's rectangle, at least the padding
+from its edge) and `roofs_use_the_atlas` (Blender put as many roof triangles on
+`M_roof` as were planned). `roof_resolution_as_asked` warns when the budget
+made the roofs coarser than `roof_cm`. An atlas that could not be fetched is a
+warning too: the roofs are then on the aerial, as they were before.
+
+The guardrails have three: `guardrails_present` (how many metres, posts and
+triangles, and a warning where a motorway with verges has none),
+`guardrails_on_the_verge` (every post and every point of the rail's face on a
+face of grass, open ground or a hard verge, read off the ground's own faces
+rather than the distances the rails were laid out by) and
+`guardrails_stand_on_the_ground` (read back from Blender: the object has every
+post foot and rail top the layout placed, no corner of any foot is less than
+8 cm into the ground as built, so none is in the air, and the top of the
+rail's face is within 2 cm of 0.75 m above that ground at every post).
 
 `web_view_written` says whether the 3D view was written. It only ever warns:
 the model is whole without it, and the page writes the view from the `.blend`

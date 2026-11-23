@@ -70,6 +70,11 @@ ATTRIBUTION = {
 }
 
 
+def roof_material_name(page: int, pages: int) -> str:
+    """`M_roof` for one page, `M_roof_00` and up for several, as the facades."""
+    return "M_roof" if pages == 1 else f"M_roof_{page:02d}"
+
+
 def build_metadata(
     *,
     name: str,
@@ -82,8 +87,13 @@ def build_metadata(
     ahn_model: str,
     trees=None,
     extra: dict[str, Any] | None = None,
+    roof_files: list[str] | None = None,
 ) -> dict:
-    """Assemble the metadata document."""
+    """Assemble the metadata document.
+
+    `roof_files` names the roof atlas pages when the roofs have their own
+    photo, which changes what the materials are for.
+    """
     bbox = geo.bbox
     wgs = rd_bbox_to_wgs84(bbox)
     center_lon, center_lat = geo.to_wgs84(*bbox.center)
@@ -128,7 +138,21 @@ def build_metadata(
         ),
         "materials": {
             "M_aerial": (
-                "aerial ortho, top-down planar UV; used on terrain and roofs"
+                "aerial ortho, top-down planar UV; used on the terrain"
+                if roof_files
+                else "aerial ortho, top-down planar UV; used on terrain and roofs"
+            ),
+            **(
+                {
+                    roof_material_name(i, len(roof_files)): (
+                        f"roof atlas {name}: the ortho over each roof at a finer "
+                        "resolution than the ground, one rectangle per building "
+                        "or terrace, top-down UV into it"
+                    )
+                    for i, name in enumerate(roof_files)
+                }
+                if roof_files
+                else {}
             ),
             "M_facade": (
                 "generated facade, UV in metres: "
@@ -213,6 +237,7 @@ def write_scene_description(
     photo_textures: list[Path] | None = None,
     photo_normals: list | None = None,
     layered: dict | None = None,
+    roof_atlas=None,
 ) -> Path:
     """Write scene.json: everything the Blender stage needs, and nothing else.
 
@@ -237,6 +262,20 @@ def write_scene_description(
             # Concrete for the lining of the passages cut under buildings.
             **({"passage_texture": passage_texture.name} if passage_texture is not None else {}),
         },
+        # The roofs' own photo: the pages, and the UVs per roof triangle in
+        # buildings.npz order. Empty when the roofs are on the aerial.
+        "roofs": (
+            {
+                "file": "roofs.npz",
+                "textures": list(roof_atlas.files),
+                "materials": [
+                    roof_material_name(i, len(roof_atlas.files))
+                    for i in range(len(roof_atlas.files))
+                ],
+            }
+            if roof_atlas is not None and roof_atlas.ok
+            else {}
+        ),
         "aerial": {
             "file": aerial.path.name,
             "bbox_rd": aerial.bbox.as_list(),
@@ -447,6 +486,7 @@ def write_attribution(
 __all__ = [
     "ATTRIBUTION",
     "build_metadata",
+    "roof_material_name",
     "write_attribution",
     "write_metadata",
     "write_scene_description",

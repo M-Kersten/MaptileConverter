@@ -197,6 +197,14 @@
   .card h3 { font-size: 20px; line-height: 26px; overflow-wrap: anywhere; }
   .card .checks { display: flex; align-items: center; gap: 6px; font-size: 14px; line-height: 20px; }
   .card .buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 8px; }
+  .queue { display: flex; flex-direction: column; gap: 8px; padding: 16px 24px; background: var(--bg-300);
+           border: 1px solid var(--line); border-radius: var(--radius-lg); }
+  .queue ol { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+  .queue li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0;
+              border-top: 1px solid var(--line); font-size: 15px; line-height: 20px; }
+  .queue li .muted { font-size: 13px; }
+  .btn.danger { color: var(--danger); }
+  .btn.danger:hover:not(:disabled) { background: rgba(242, 109, 109, .14); }
   .empty { padding: 48px 24px; text-align: center; border: 1px dashed var(--line-control); border-radius: var(--radius-lg);
            display: flex; flex-direction: column; align-items: center; gap: 16px; color: var(--text-muted); }
 
@@ -319,6 +327,23 @@
   #viewerTools { top: 16px; right: 16px; padding: 8px; display: flex; align-items: center; gap: 4px; }
   #viewerTools .help { margin: 0 8px; }
   #viewNorth svg { width: 26px; height: 26px; }
+  #viewWire[aria-pressed="true"], #viewMeasure[aria-pressed="true"] { background: var(--bg-200); color: var(--signal-bright); }
+  .vsearch { position: relative; margin-bottom: 8px; }
+  #viewerResults { display: flex; flex-direction: column; margin-top: 4px; }
+  #viewerResults:empty { display: none; }
+  #viewerResults button { display: flex; flex-direction: column; align-items: flex-start; gap: 0; width: 100%;
+                          padding: 6px 8px; border: 0; border-radius: var(--radius-sm); background: none; color: var(--text-primary);
+                          text-align: left; cursor: pointer; font-size: 14px; line-height: 18px; overflow-wrap: anywhere; }
+  #viewerResults button:hover, #viewerResults button:focus-visible { background: var(--bg-200); }
+  #viewerResults .who { font-size: 12px; line-height: 16px; color: var(--text-muted); }
+  .wiremode { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+  #measureLayer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+  #measureLine { stroke: var(--signal-bright); stroke-width: 2.5; stroke-dasharray: 8 5; }
+  #measureLayer circle { fill: var(--signal-bright); stroke: var(--bg-000); stroke-width: 2; }
+  #measureCard { left: 50%; bottom: 52px; transform: translateX(-50%); width: 420px; max-width: calc(100% - 32px);
+                 padding: 12px 16px; display: flex; flex-direction: column; gap: 6px; }
+  #measureCard .ihead { display: flex; align-items: center; justify-content: space-between; }
+  #measureCard .kv { white-space: pre-wrap; margin: 0; }
   #viewerLayers { top: 88px; right: 16px; width: 320px; max-width: calc(100% - 32px); max-height: calc(100% - 180px);
                   overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 4px; }
   .lrow { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); cursor: pointer; }
@@ -362,8 +387,18 @@
     #viewerCoords { left: 12px; bottom: 80px; }
     #viewerHint { display: none; }
   }
+  @media (max-width: 1100px) {
+    #viewerTools .label { display: none; }
+    #viewOverview, #viewTop, #viewWire, #viewMeasure { width: 40px; padding: 0; }
+  }
   @media (max-width: 640px) {
     #viewerMeta { display: none; }
+    #viewerTools { padding: 6px; gap: 0; }
+    #viewerTools .btn { padding: 0 8px; }
+    #viewerTools .btn.icon, #viewOverview, #viewTop, #viewWire, #viewMeasure { width: 38px; padding: 0; }
+    #viewerTools .help { margin: 0 6px; }
+    #measureCard { bottom: 80px; }
+    #measureCard .kv { font-size: 11px; }
     #viewerLayers { left: 12px; width: auto; }
   }
 
@@ -453,12 +488,18 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
           Stoppen
         </button>
+        <button class="btn" id="rerunJob" hidden>Opnieuw starten</button>
         <button class="btn" id="open3dResult" hidden>In 3D</button>
         <button class="btn ghost" id="openResult" hidden>Bekijken</button>
         <button class="btn ghost icon" id="dismissRun" aria-label="Melding sluiten" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
       </div>
+    </section>
+
+    <section class="queue" id="queueCard" aria-label="Wachtrij" hidden>
+      <span class="overline">Wachtrij</span>
+      <ol id="queueList"></ol>
     </section>
 
     <div class="bar">
@@ -557,8 +598,8 @@
     </div>
     <div class="optrow">
       <input type="checkbox" class="switch" id="collision">
-      <label for="collision">Botsvormen voor fysica</label>
-      <span class="help" tabindex="0" role="button" aria-label="Over botsvormen"
+      <label for="collision">Collision shapes voor fysica</label>
+      <span class="help" tabindex="0" role="button" aria-label="Over collision shapes"
         data-tip="Om er iets doorheen te laten rijden of vliegen in plaats van ernaar te kijken. Voegt onzichtbare <b>Collision_</b>-objecten toe: eenvoudige blokken om de bomen, en hekken dikker gemaakt zodat een snel object niet door een paneel van 6 cm schiet. In Unity: Mesh Collider erop, Mesh Renderer uit. Laat uit als je alleen een beeld wilt; het maakt het bestand groter.">?</span>
     </div>
 
@@ -629,7 +670,7 @@
         </div>
         <button class="btn primary" id="run">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7 12 12l8.7-5M12 22V12"/></svg>
-          Model bouwen
+          <span id="runLabel">Model bouwen</span>
         </button>
       </div>
     </div>
@@ -660,17 +701,42 @@
   </div>
 
   <nav class="float" id="viewerTools" aria-label="Weergave">
-    <button class="btn ghost" id="viewOverview" title="Het hele gebied, schuin van boven (Home)">Overzicht</button>
-    <button class="btn ghost" id="viewTop" title="Recht van boven, met het noorden boven">Boven</button>
+    <button class="btn ghost" id="viewOverview" title="Het hele gebied, schuin van boven (Home)" aria-label="Overzicht">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10.5 12 4l9 6.5V20H3z"/><path d="M9 20v-6h6v6"/></svg>
+      <span class="label">Overzicht</span>
+    </button>
+    <button class="btn ghost" id="viewTop" title="Recht van boven, met het noorden boven" aria-label="Boven">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="12" cy="12" r="2.5"/></svg>
+      <span class="label">Boven</span>
+    </button>
+    <button class="btn ghost" id="viewWire" aria-pressed="false" aria-label="Wireframe"
+      title="Wireframe: de edges zoals Blender ze toont, quads als quads, zonder textures (Z)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16v16H4zM4 12h16M12 4v16"/></svg>
+      <span class="label">Wireframe</span>
+    </button>
+    <button class="btn ghost" id="viewMeasure" aria-pressed="false" aria-label="Meten"
+      title="Klik twee punten: afstand, horizontaal en hoogteverschil (M)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17 17 3l4 4L7 21z"/><path d="m7 13 2 2M10 10l2 2M13 7l2 2"/></svg>
+      <span class="label">Meten</span>
+    </button>
+    <button class="btn ghost icon" id="viewShare" aria-label="Link naar deze weergave kopiëren"
+      title="Link naar dit model, met deze camera, kopiëren">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg>
+    </button>
     <button class="btn ghost icon" id="viewNorth" aria-label="Draai met het noorden boven" title="Noorden boven">
       <svg id="compass" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.5" fill="none" stroke="var(--line-control)" stroke-width="1.5"/><path d="M12 3.5 15.2 12H8.8z" fill="var(--signal-bright)"/><path d="M8.8 12h6.4L12 20.5z" fill="var(--text-muted)"/></svg>
     </button>
     <button class="btn ghost" id="toggleViewerLayers" aria-controls="viewerLayers">Lagen</button>
     <span class="help" tabindex="0" role="button" aria-label="Over de bediening"
-      data-tip="<b>Muis:</b> slepen verschuift, rechts slepen of Shift + slepen draait en kantelt, scrollen zoomt naar de cursor, dubbelklik vliegt erheen. Klik op iets om te zien wat het is en waar het ligt. <b>Touch:</b> één vinger verschuift, twee vingers zoomen, draaien en kantelen. <b>Toetsen:</b> pijltjes verschuiven, Shift + pijltjes draaien en kantelen, + en − zoomen, Home toont het hele gebied.">?</span>
+      data-tip="<b>Muis:</b> slepen verschuift, rechts slepen of Shift + slepen draait en kantelt, scrollen zoomt naar de cursor, dubbelklik vliegt erheen. Klik op iets om te zien wat het is en waar het ligt. <b>Wireframe</b> (of Z) toont de edges op een model zonder textures: quads zoals Blender ze toont, of met Shift + Z de triangles zoals Unity ze krijgt; die van het aangeklikte object in oranje. <b>Meten</b> (of M): klik twee punten voor de afstand en het hoogteverschil. Zoek een object of BAG-id boven de lagen. De knop met de schakels kopieert een link naar precies deze weergave. <b>Touch:</b> één vinger verschuift, twee vingers zoomen, draaien en kantelen. <b>Toetsen:</b> pijltjes verschuiven, Shift + pijltjes draaien en kantelen, + en − zoomen, Home toont het hele gebied.">?</span>
   </nav>
 
   <aside class="float" id="viewerLayers" aria-label="Lagen in het model">
+    <div class="vsearch">
+      <input id="viewerSearch" class="field" type="search" placeholder="Zoek een object of BAG-id"
+        aria-label="Zoek een object in het model" autocomplete="off">
+      <div id="viewerResults" role="listbox" aria-label="Gevonden objecten"></div>
+    </div>
     <div class="lhead">
       <span class="overline">Lagen
         <span class="help" tabindex="0" role="button" aria-label="Over de lagen in het model"
@@ -680,6 +746,14 @@
     </div>
     <div id="viewerLayerList"></div>
     <p class="muted caption" id="viewerStats" style="margin-top:8px"></p>
+    <div class="wiremode" id="wireModeBox" hidden>
+      <span class="overline">Wireframe</span>
+      <div class="seg" role="radiogroup" aria-label="Wireframe">
+        <label><input type="radio" name="wireMode" value="quads" checked><span>Quads</span></label>
+        <label><input type="radio" name="wireMode" value="triangles"><span>Triangles</span></label>
+      </div>
+      <p class="muted caption">Quads zoals Blender ze toont, triangles zoals Unity ze krijgt (Shift + Z).</p>
+    </div>
   </aside>
 
   <section class="float" id="viewerInfo" aria-label="Wat je aanklikte" hidden>
@@ -694,6 +768,17 @@
     </div>
     <div class="kv" id="infoProps"></div>
     <div><button class="btn" id="infoFocus">Inzoomen</button></div>
+  </section>
+
+  <svg id="measureLayer" aria-hidden="true"><line id="measureLine"/><circle id="measureA" r="5"/><circle id="measureB" r="5"/></svg>
+  <section class="float" id="measureCard" aria-label="Meten" aria-live="polite" hidden>
+    <div class="ihead">
+      <span class="overline">Meten</span>
+      <button class="btn ghost icon" id="measureClose" aria-label="Meten stoppen">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="kv" id="measureText"></div>
   </section>
 
   <div id="viewerCoords" aria-live="off"></div>
@@ -724,6 +809,7 @@
         In 3D bekijken
       </button>
       <button class="btn ghost" id="rebuildModel">Opnieuw bouwen</button>
+      <button class="btn ghost danger" id="deleteModel">Verwijderen</button>
       <button class="btn ghost icon" id="closeModel" aria-label="Sluiten">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
       </button>
@@ -775,7 +861,7 @@
     <p>Een map <code>output/&lt;naam&gt;/</code> met: <code>model.blend</code>, het model voor Blender, elke laag een eigen collectie en één object per gebouw en boom; <code>model.fbx</code>, hetzelfde model voor Unity; <code>maptile_tools.py</code>, Blender-gereedschap dat de grond onder de wegen houdt als je ze bewerkt; <code>aerial.png</code> en de gevelbeelden; <code>metadata.json</code>, waar het in de wereld ligt; en <code>ATTRIBUTION.txt</code>, de bronvermelding. Houd die bij het model als je het doorgeeft.</p>
     <p><b>Blender:</b> open <code>model.blend</code>. Installeer <code>maptile_tools.py</code> eenmalig als add-on (Edit &rarr; Preferences &rarr; Add-ons &rarr; Install from Disk); het tabblad <i>Maptile</i> staat dan in de zijbalk (N). In de gelaagde stijl volgen wegen, stoepen en gazons het terrein vanzelf, en is de stoeprand van elke stoep zijn <i>CurbGenerator</i>-modifier. Gebruik Blender 5 voor de stoepranden. In de inmetingsstijl druk je na het verplaatsen van een weg op <i>Fit terrain under roads</i>.</p>
     <p><b>In de browser:</b> elk gebouwd model opent hier ook in 3D, met <i>In 3D</i> op zijn kaart onder Modellen. Klik op een gebouw, boom of weg en je ziet wat het is en waar het ligt, in RD en NAP. Zet lagen uit om te zien wat eronder ligt. Bewaar je het model in Blender na een bewerking, dan toont de 3D-weergave de nieuwe versie zodra je hem opnieuw opent.</p>
-    <p><b>Unity:</b> sleep de map naar Assets. Zet op de FBX <i>Scale Factor</i> op 1, laat <i>Convert Units</i> aan en vink <i>Bake Axis Conversion</i> aan, zodat niets gedraaid binnenkomt.</p>
+    <p><b>Unity:</b> installeer eenmalig het <a href="/api/unity-package.zip" download>TerreinLab Unity-package</a>: pak het uit, en kies in Unity <i>Window &rarr; Package Manager &rarr; + &rarr; Add package from disk</i> en daarin <code>package.json</code>. Daarna importeert elk model zichzelf goed, met de BAG-gegevens op elk gebouw. Sleep de map naar Assets, zonder <code>model.blend</code>: staat Blender op die computer, dan leest Unity dat bestand ook en komt het model dubbel binnen. Zonder package zet je op de FBX <i>Scale Factor</i> op 1, laat je <i>Convert Units</i> aan en vink je <i>Bake Axis Conversion</i> aan, zodat niets gedraaid binnenkomt.</p>
     <p>Het midden van het vierkant is de oorsprong, dus het model ligt om 0,0 heen. Hoogte is gemeten vanaf NAP, net als op elke Nederlandse kaart.</p>
   </div>
 </dialog>
@@ -1681,7 +1767,7 @@ function updateBuildSummary() {
   const on = optional.filter(sourceOn).length;
   $("buildSummary").textContent =
     `${on} van ${optional.length} lagen · voorbeeldbeelden ${$("preview").checked ? "aan" : "uit"}` +
-    ($("collision").checked ? " · botsvormen" : "");
+    ($("collision").checked ? " · collision shapes" : "");
 }
 
 function refreshEstimate() {
@@ -1773,7 +1859,7 @@ function renderAreas() {
   const building = job ? 1 : 0;
   $("modelsCount").textContent =
     `${areas.length} ${areas.length === 1 ? "gebied" : "gebieden"} gebouwd` +
-    (building ? " · 1 bezig" : "");
+    (building ? " · 1 bezig" : "") + (queued ? ` · ${queued} in de wachtrij` : "");
   $("navCount").textContent = $("navCount2").textContent = areas.length || "";
   $("modelsEmpty").hidden = areas.length > 0;
 
@@ -1847,6 +1933,25 @@ function rebuild(a) {
 }
 $("rebuildModel").onclick = () => { if (openArea) rebuild(openArea); };
 
+$("deleteModel").onclick = async () => {
+  if (!openArea) return;
+  const name = openArea.name;
+  if (!confirm(`${name} verwijderen?\n\nDe map output/${name}/ met het model en work/${name}/ ` +
+               "met de tussenbestanden gaan weg. Dit kan niet ongedaan worden.")) return;
+  try {
+    const r = await fetch("/api/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }) });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.status);
+  } catch (err) {
+    alert(`${name} is niet verwijderd: ${err.message}`);
+    return;
+  }
+  $("modelDialog").close();
+  openArea = null;
+  loadAreas();
+};
+
 function openModel(a) {
   openArea = a;
   $("modelTitle").textContent = a.name;
@@ -1904,8 +2009,12 @@ function showResult(area) {
     parts.push(`</section>`);
   }
   if (area.files && area.files.length) {
+    const total = area.files.reduce((sum, f) => sum + (f.size_mb || 0), 0);
     parts.push(`<section><h3>Bestanden</h3>
-      <p class="muted small" style="margin:6px 0">In <code>output/${escapeHtml(area.name)}/</code>.</p><div class="files">`);
+      <p class="muted small" style="margin:6px 0">In <code>output/${escapeHtml(area.name)}/</code>.</p>
+      <p style="margin:8px 0 12px"><a class="btn" href="/api/zip?name=${encodeURIComponent(area.name)}" download>Alles downloaden als zip</a>
+        <span class="muted small">ca. ${total.toFixed(0)} MB, de hele map; uitpakken in Unity's Assets</span></p>
+      <div class="files">`);
     for (const f of area.files) {
       parts.push(`<div><a href="${f.url}" download>${escapeHtml(f.name)}</a>
         <span>${f.size_mb < 0.01 ? "&lt; 0,01" : String(f.size_mb).replace(".", ",")} MB</span></div>`);
@@ -1933,26 +2042,29 @@ function showResult(area) {
 --------------------------------------------------------------------------- */
 const logEl = $("log");
 let job = null, jobName = "", offset = 0, poller = null, lastArea = null;
+let followed = null, pollTicks = 0, shownFinished = null, rerunId = null, queued = 0;
 
 function showProgress(data) {
   const bar = $("pfill");
   const running = data.status === "running" || data.status === "starting";
+  const queued = data.status === "queued";
   // With no stage boundary yet there is nothing honest to show as a number.
   const indeterminate = running && !data.total_steps;
   bar.classList.toggle("indeterminate", indeterminate);
   bar.classList.toggle("done", data.status === "done");
-  bar.classList.toggle("fail", data.status === "failed" || data.status === "cancelled");
+  bar.classList.toggle("fail", ["failed", "cancelled", "interrupted"].includes(data.status));
   if (!indeterminate) bar.style.width = `${Math.round((data.fraction || 0) * 100)}%`;
 
   const step = data.total_steps
     ? `Stap ${Math.min(data.step, data.total_steps)} van ${data.total_steps} · ` : "";
-  const label = running
-    ? `${step}${data.stage || "bezig"}`
-    : ({ done: "Klaar", failed: "Mislukt", cancelled: "Gestopt" }[data.status] || data.status);
+  const label = queued ? "In de wachtrij: begint als het model ervoor klaar is"
+    : running ? `${step}${data.stage || "bezig"}`
+    : ({ done: "Klaar", failed: "Mislukt", cancelled: "Gestopt",
+         interrupted: "Onderbroken: de server stopte tijdens het bouwen" }[data.status] || data.status);
   $("pstage").textContent = label;
   $("pstage").title = label;
 
-  const parts = [humanTime(data.elapsed)];
+  const parts = queued ? [] : [humanTime(data.elapsed)];
   if (running && data.remaining != null) {
     // Once a run passes its estimate, say so instead of pretending it is about to finish.
     parts.push(data.remaining > 1 ? `nog ca. ${humanTime(data.remaining)}` : "langer dan geschat");
@@ -1988,10 +2100,14 @@ function showRunCard(name, meta) {
   $("showLog").hidden = false;
   $("openResult").hidden = true;
   $("open3dResult").hidden = true;
+  $("rerunJob").hidden = true;
   $("dismissRun").hidden = true;
 }
 
 function follow(id, name, from = 0) {
+  // A new run, a new log.
+  if (id !== followed) logEl.innerHTML = "";
+  followed = id;
   job = id;
   jobName = name;
   offset = from;
@@ -2033,7 +2149,12 @@ $("run").onclick = async () => {
     return;
   }
 
-  logEl.innerHTML = "";
+  if (job) {
+    // Another model is being built: this one waits its turn in the queue.
+    showModels();
+    refreshQueue();
+    return;
+  }
   setStatus("run", "bezig");
   showRunCard(name, `${STYLE_NAME[payload.style]} · ${DETAIL_NAME[payload.detail]} · ${Math.round(sel.size)} m`);
   showProgress({ status: "starting", elapsed: 0, fraction: 0, total_steps: 0 });
@@ -2055,7 +2176,13 @@ $("closeLog").onclick = () => $("logDialog").close();
 $("openAbout").onclick = () => $("aboutDialog").showModal();
 $("closeAbout").onclick = () => $("aboutDialog").close();
 $("openResult").onclick = () => { if (lastArea) openModel(lastArea); };
-$("dismissRun").onclick = () => { $("runCard").hidden = true; };
+$("dismissRun").onclick = () => {
+  $("runCard").hidden = true;
+  // Not shown again after a reload.
+  try {
+    localStorage.setItem("terreinlab.dismissed", JSON.stringify([...dismissedRuns(), followed].slice(-50)));
+  } catch { /* private window */ }
+};
 
 async function poll() {
   if (!job) return;
@@ -2070,8 +2197,9 @@ async function poll() {
   offset = data.offset;
   showProgress(data);
 
-  if (data.status === "running" || data.status === "starting") {
-    setStatus("run", "bezig");
+  if (["queued", "running", "starting"].includes(data.status)) {
+    setStatus("run", data.status === "queued" ? "in de wachtrij" : "bezig");
+    if (++pollTicks % 4 === 0) refreshQueue();
     return;
   }
 
@@ -2087,8 +2215,12 @@ async function poll() {
   refreshEstimate();
 
   lastArea = data.area || null;
+  shownFinished = data.id;
   if (data.status === "done") setStatus("done", `klaar in ${humanTime(data.elapsed)}`);
-  else setStatus("fail", { failed: "mislukt", cancelled: "gestopt" }[data.status] || data.status);
+  else setStatus("fail", { failed: "mislukt", cancelled: "gestopt", interrupted: "onderbroken" }[data.status] || data.status);
+  // A failed or interrupted run can go again as it was asked for.
+  rerunId = data.id;
+  $("rerunJob").hidden = !["failed", "interrupted"].includes(data.status);
   if (lastArea) {
     const checks = checksLine(lastArea.validation);
     $("runMeta").textContent = checks.text;
@@ -2102,6 +2234,9 @@ async function poll() {
     }
   }
   loadAreas();
+  // The next model in the queue has started by now; follow it in a moment,
+  // once this one's result has been seen.
+  setTimeout(resumeRunning, 4000);
 }
 
 /* A run already going when the page opens is picked up where it is. */
@@ -2117,6 +2252,86 @@ async function resumeRunning() {
     follow(running.id, running.name, 0);
   } catch { /* an older server without /api/jobs */ }
 }
+
+/* A run already going when the page opens is picked up where it is; so is
+   the next in the queue, and a run the server stopped under is shown with
+   its log and the way to start it again. */
+async function resumeRunning() {
+  let jobs;
+  try {
+    const r = await fetch("/api/jobs");
+    jobs = (await r.json()).jobs || [];
+  } catch { return; /* an older server without /api/jobs */ }
+  refreshQueue(jobs);
+  const current = jobs.find(j => j.status === "running" || j.status === "starting") ||
+    jobs.filter(j => j.status === "queued").sort((a, b) => a.queued_at - b.queued_at)[0];
+  if (current) {
+    if (job === current.id) return;
+    setStatus("run", current.status === "queued" ? "in de wachtrij" : "bezig");
+    showRunCard(current.name, current.style ? `${STYLE_NAME[current.style] || current.style} · ${DETAIL_NAME[current.detail] || current.detail}` : "");
+    showProgress(current);
+    follow(current.id, current.name, 0);
+    return;
+  }
+  const newest = jobs[0];
+  if (!job && newest && newest.status === "interrupted" && newest.id !== shownFinished
+      && !dismissedRuns().includes(newest.id)) {
+    showRunCard(newest.name, "");
+    showProgress(newest);
+    follow(newest.id, newest.name, 0);
+  }
+}
+
+/* The models waiting their turn, each with a way out of the queue. */
+async function refreshQueue(jobs) {
+  if (!jobs) {
+    try { jobs = (await (await fetch("/api/jobs")).json()).jobs || []; } catch { return; }
+  }
+  const waiting = jobs.filter(j => j.status === "queued" && j.id !== job)
+    .sort((a, b) => a.queued_at - b.queued_at);
+  $("queueCard").hidden = !waiting.length;
+  const list = $("queueList");
+  list.innerHTML = "";
+  for (const w of waiting) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span>${escapeHtml(w.name)} <span class="muted">${escapeHtml(
+      [STYLE_NAME[w.style], DETAIL_NAME[w.detail]].filter(Boolean).join(" · "))}</span></span>`;
+    const out = document.createElement("button");
+    out.className = "btn ghost";
+    out.textContent = "Uit de wachtrij";
+    out.onclick = async () => {
+      await fetch("/api/cancel", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: w.id }) });
+      refreshQueue();
+    };
+    li.append(out);
+    list.appendChild(li);
+  }
+  queued = waiting.length;
+  updateSourceStates();
+}
+
+function dismissedRuns() {
+  try { return JSON.parse(localStorage.getItem("terreinlab.dismissed") || "[]"); } catch { return []; }
+}
+
+$("rerunJob").onclick = async () => {
+  if (!rerunId) return;
+  let data;
+  try {
+    const r = await fetch("/api/rerun", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: rerunId }) });
+    data = await r.json();
+    if (!r.ok) throw new Error(data.error || "kon niet starten");
+  } catch (err) {
+    $("runMeta").textContent = err.message;
+    return;
+  }
+  setStatus("run", "bezig");
+  showRunCard(data.name, "");
+  showProgress({ status: "starting", elapsed: 0, fraction: 0, total_steps: 0 });
+  follow(data.id, data.name);
+};
 
 /* ---------------------------------------------------------------------------
    Sources.
@@ -2225,8 +2440,10 @@ function updateSourceStates() {
             het model zonder foto's.</span>`;
   }
   $("sourcesNote").innerHTML = note;
-  $("run").disabled = blocking.length > 0 || !!job;
-  $("run").title = job ? "Er loopt al een model; wacht tot het klaar is." : "";
+  $("run").disabled = blocking.length > 0;
+  // While a model is being built, another one waits its turn.
+  $("runLabel").textContent = job ? "In de wachtrij zetten" : "Model bouwen";
+  $("run").title = job ? "Er wordt al een model gebouwd. Dit komt in de wachtrij en begint daarna vanzelf." : "";
   updateBuildSummary();
 }
 
@@ -2271,7 +2488,7 @@ const LAYER_NAME = {
   "Water": "Water", "Trees": "Bomen", "Street furniture": "Straatmeubilair",
   "Traffic signs": "Verkeersborden",
   "Barriers": "Muren, hekken en hagen", "Vehicles": "Auto's en boten", "Rail": "Spoor",
-  "Structures": "Bruggen en tunnels"
+  "Structures": "Bruggen en tunnels", "Collision": "Collision shapes"
 };
 /* The layered style names its own collections after the area. */
 const LAYER_SUFFIX = {
@@ -2298,7 +2515,21 @@ function layerLabel(name) {
 }
 
 const nl = n => Number(n).toLocaleString("nl-NL");
-const hashFor = name => `#3d/${encodeURIComponent(name)}`;
+const hashFor = (name, camera) => `#3d/${encodeURIComponent(name)}` + (camera
+  ? `/c=${[...camera.target.map(v => v.toFixed(1)), camera.distance.toFixed(1),
+           camera.yaw.toFixed(3), camera.pitch.toFixed(3)].join(",")}` : "");
+
+/* #3d/<name>, and after it the camera as the address last had it:
+   /c=x,y,z,distance,yaw,pitch in the model's own metres and radians. */
+function parseHash(hash) {
+  const match = /^#3d\/([^/]+)(?:\/c=([-\d.,]+))?$/.exec(hash);
+  if (!match) return null;
+  const numbers = (match[2] || "").split(",").map(Number);
+  const camera = numbers.length === 6 && numbers.every(Number.isFinite)
+    ? { target: numbers.slice(0, 3), distance: numbers[3], yaw: numbers[4], pitch: numbers[5] }
+    : null;
+  return { name: decodeURIComponent(match[1]), camera };
+}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 let viewer = null, viewerModule = null, viewerArea = null, viewerRun = 0, viewerPushed = false;
@@ -2331,13 +2562,14 @@ function disposeViewer() {
 
 function hide3d() {
   viewerRun++;
+  setMeasure(false);
   disposeViewer();
   viewerArea = null;
   $("view3d").hidden = true;
   clearTimeout(hintTimer);
 }
 
-async function open3d(area, { push = true, retry = false } = {}) {
+async function open3d(area, { push = true, retry = false, camera = null } = {}) {
   if (!area) return;
   const run = ++viewerRun;
   disposeViewer();
@@ -2351,6 +2583,9 @@ async function open3d(area, { push = true, retry = false } = {}) {
   $("viewerMeta").textContent = areaMeta(area);
   $("viewerInfo").hidden = true;
   $("viewerCoords").textContent = "";
+  $("viewerSearch").value = "";
+  $("viewerResults").innerHTML = "";
+  setMeasure(false);
   $("viewerLayerList").innerHTML = "";
   $("viewerStats").textContent = "";
   // The layers and the hint about the mouse wait for a model to be there.
@@ -2394,10 +2629,16 @@ async function open3d(area, { push = true, retry = false } = {}) {
       progress: (stage, done, total) => run === viewerRun && progress3d(stage, done, total),
       hover: info => run === viewerRun && showPoint(info),
       select: info => run === viewerRun && showObject(info),
-      view: camera => { $("compass").style.transform = `rotate(${camera.yaw}rad)`; },
+      view: camera => {
+        $("compass").style.transform = `rotate(${camera.yaw}rad)`;
+        drawMeasure();
+        rememberCamera();
+      },
+      point: info => run === viewerRun && measurePoint(info),
       lost: () => run === viewerRun && fail3d("De grafische kaart is gestopt met tekenen, vaak omdat het geheugen vol was. Probeer het opnieuw, of sluit andere tabbladen eerst.")
     });
-    const summary = await viewer.load(state.url, { textureBase: state.textures, origin, extent });
+    viewer.setWireframe(wireOn && wireMode);
+    const summary = await viewer.load(state.url, { textureBase: state.textures, origin, extent, camera });
     if (run !== viewerRun || !summary) return;
     showLayers(summary);
     $("viewerLayers").hidden = false;
@@ -2464,7 +2705,7 @@ function progress3d(stage, done, total) {
 }
 
 function statsLine(summary) {
-  return `${nl(summary.triangles)} driehoeken, ${nl(summary.objects)} objecten`;
+  return `${nl(summary.triangles)} triangles, ${nl(summary.objects)} objecten`;
 }
 
 function showLayers(summary) {
@@ -2473,6 +2714,7 @@ function showLayers(summary) {
   for (const layer of viewer.layers) {
     const row = document.createElement("label");
     row.className = "lrow";
+    row.dataset.layer = String(layer.index);
     const name = document.createElement("span");
     name.className = "name";
     const count = layer.objects === 1 ? "1 object" : `${nl(layer.objects)} objecten`;
@@ -2525,14 +2767,203 @@ function showObject(info) {
     const [label, format] = PROPERTY[key] || [key, v => String(v)];
     rows.push([label, format(value)]);
   }
+  if (info.mesh) {
+    // As Blender counts them, with its modifiers: the quads before the
+    // export cuts them in two.
+    const m = info.mesh, faces = [];
+    if (m.quads) faces.push(`${nl(m.quads)} quads`);
+    if (m.triangles) faces.push(`${nl(m.triangles)} triangles`);
+    if (m.ngons) faces.push(`${nl(m.ngons)} n-gons`);
+    rows.push(["faces", faces.join(", ") || "geen"], ["vertices", nl(m.vertices)]);
+  }
   rows.push(...pointRows(info));
   $("infoProps").innerHTML = rows
-    .map(([k, v]) => `<b>${escapeHtml(k.padEnd(10))}</b>${escapeHtml(v)}`).join("\n");
+    .map(([k, v]) => `<b>${escapeHtml(k.padEnd(11))}</b>${escapeHtml(v)}`).join("\n");
   $("viewerInfo").hidden = false;
 }
 
 $("infoClose").onclick = () => { if (viewer) viewer.select(null); showObject(null); };
 $("infoFocus").onclick = () => { if (viewer && selectedInfo) viewer.focus(selectedInfo.point); };
+/* The wireframe stays as it was set when the next model opens: whoever is
+   checking meshes checks more than one. */
+let wireOn = false, wireMode = "quads";
+function setWire(on, mode = wireMode) {
+  wireOn = on;
+  wireMode = mode;
+  $("viewWire").setAttribute("aria-pressed", String(on));
+  $("wireModeBox").hidden = !on;
+  setRadio("wireMode", mode);
+  if (viewer) viewer.setWireframe(on && mode);
+}
+$("viewWire").onclick = () => setWire(!wireOn);
+for (const box of document.querySelectorAll('input[name="wireMode"]')) {
+  box.addEventListener("change", () => setWire(true, box.value));
+}
+
+/* Measuring: two clicks on the model, and what lies between them. */
+let measuring = false, measured = [];
+function setMeasure(on) {
+  measuring = on;
+  measured = [];
+  $("viewMeasure").setAttribute("aria-pressed", String(on));
+  $("measureCard").hidden = !on;
+  if (viewer) viewer.clickMode = on ? "point" : "select";
+  if (on) {
+    $("viewerHint").classList.add("gone");
+    if (viewer) viewer.select(null);
+    showObject(null);
+  }
+  measureText();
+  drawMeasure();
+}
+$("viewMeasure").onclick = () => setMeasure(!measuring);
+$("measureClose").onclick = () => setMeasure(false);
+
+function measurePoint(info) {
+  if (!info) return;
+  if (measured.length >= 2) measured = [];
+  measured.push(info);
+  measureText();
+  drawMeasure();
+}
+
+function measureText() {
+  const nl2 = v => v.toFixed(2).replace(".", ",");
+  if (measured.length < 2) {
+    $("measureText").textContent = measured.length
+      ? "Klik het tweede punt." : "Klik op het model: het eerste punt, dan het tweede.";
+    return;
+  }
+  const [a, b] = measured.map(m => m.point);
+  const dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+  const rows = [
+    ["afstand", `${nl2(Math.hypot(dx, dy, dz))} m`],
+    ["horizontaal", `${nl2(Math.hypot(dx, dz))} m`],
+    ["hoogteverschil", `${dy >= 0 ? "+" : ""}${nl2(dy)} m`]
+  ];
+  // Each end: what was clicked, and under it where, so a line never wraps.
+  measured.forEach((m, i) => {
+    rows.push([i ? "tot" : "van", m.name || ""]);
+    rows.push(["", pointRows(m).map(([k, v]) => `${k} ${v}`).join(" ")]);
+  });
+  $("measureText").innerHTML = rows
+    .map(([k, v]) => `<b>${escapeHtml(k.padEnd(15))}</b>${escapeHtml(v)}`).join("\n");
+}
+
+/* The line between the points, drawn over the view and moved with it. */
+function drawMeasure() {
+  const shown = measuring && viewer && measured.length;
+  const ends = shown ? measured.map(m => viewer.project(m.point)) : [];
+  const [a, b] = ends;
+  const place = (el, p) => {
+    el.style.display = p && p.front ? "" : "none";
+    if (p && p.front) { el.setAttribute("cx", p.x); el.setAttribute("cy", p.y); }
+  };
+  place($("measureA"), a);
+  place($("measureB"), b);
+  const line = $("measureLine");
+  line.style.display = a && b && a.front && b.front ? "" : "none";
+  if (a && b) {
+    line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+    line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+  }
+}
+
+/* The camera goes into the address as it moves, so the address is always a
+   link to this view; quietly, without a step in the browser's history. */
+let cameraTimer = null;
+function rememberCamera() {
+  clearTimeout(cameraTimer);
+  cameraTimer = setTimeout(() => {
+    if (!viewer || !viewerArea || $("view3d").hidden) return;
+    const here = parseHash(location.hash);
+    if (!here || here.name !== viewerArea.name) return;
+    history.replaceState(history.state, "", hashFor(viewerArea.name, viewer.getCamera()));
+  }, 400);
+}
+
+$("viewShare").onclick = async () => {
+  if (viewer && viewerArea) history.replaceState(history.state, "", hashFor(viewerArea.name, viewer.getCamera()));
+  const url = location.href;
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(url);
+    copied = true;
+  } catch { /* not over plain http on another machine */ }
+  if (!copied) {
+    prompt("Kopieer deze link naar het model, met deze camera:", url);
+    return;
+  }
+  const hint = $("viewerHint");
+  hint.textContent = "Link naar deze weergave gekopieerd";
+  hint.hidden = false;
+  hint.classList.remove("gone");
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(() => hint.classList.add("gone"), 2500);
+};
+
+/* Search: by object name or anything an object carries, a BAG id above all. */
+let findTimer = null;
+function findObjects(term) {
+  const wanted = term.trim().toLowerCase();
+  if (!viewer || wanted.length < 2) return [];
+  const found = [];
+  viewer.objects.forEach((entry, id) => {
+    if (found.length >= 40 || !Array.isArray(entry[4])) return;
+    const values = [entry[0], ...Object.values(entry[2] || {}).filter(v => typeof v === "string")];
+    const hit = values.find(v => v.toLowerCase().includes(wanted));
+    if (hit) found.push({ id, entry, exact: values.some(v => v.toLowerCase() === wanted || v.toLowerCase().endsWith("." + wanted)) });
+  });
+  found.sort((a, b) => b.exact - a.exact);
+  return found.slice(0, 12);
+}
+
+function showFound() {
+  const host = $("viewerResults");
+  host.innerHTML = "";
+  for (const { id, entry } of findObjects($("viewerSearch").value)) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.setAttribute("role", "option");
+    const layer = viewer.layers[entry[1]];
+    const props = entry[2] || {};
+    const extra = props.build_year ? ` · bouwjaar ${props.build_year}` : props.height_m ? ` · ${String(props.height_m).replace(".", ",")} m` : "";
+    row.innerHTML = `${escapeHtml(entry[0])}<span class="who">${escapeHtml(layer ? layerLabel(layer.name) : "")}${escapeHtml(extra)}</span>`;
+    row.onclick = () => goToObject(id);
+    host.appendChild(row);
+  }
+}
+
+function goToObject(id) {
+  if (!viewer) return;
+  if (measuring) setMeasure(false);
+  const info = viewer.focusObject(id);
+  if (!info) return;
+  // Its layer may have been switched on to show it.
+  for (const row of document.querySelectorAll(".lrow")) {
+    const layer = viewer.layers[Number(row.dataset.layer)];
+    if (!layer) continue;
+    row.classList.toggle("off", !layer.visible);
+    row.querySelector("input").checked = layer.visible;
+  }
+  showObject(info);
+  $("viewerResults").innerHTML = "";
+  if (window.matchMedia("(max-width: 900px)").matches) $("viewerLayers").classList.remove("shown");
+}
+
+$("viewerSearch").addEventListener("input", () => {
+  clearTimeout(findTimer);
+  findTimer = setTimeout(showFound, 120);
+});
+$("viewerSearch").addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    const first = findObjects($("viewerSearch").value)[0];
+    if (first) goToObject(first.id);
+    e.preventDefault();
+  }
+  // The search keeps its keys to itself; the view's own stay on the view.
+  e.stopPropagation();
+});
 $("viewOverview").onclick = () => viewer && viewer.overview();
 $("viewTop").onclick = () => viewer && viewer.topDown();
 $("viewNorth").onclick = () => viewer && viewer.north();
@@ -2564,12 +2995,12 @@ $("open3dModel").onclick = () => { if (openArea) open3d(openArea); };
 $("open3dResult").onclick = () => { if (lastArea) open3d(lastArea); };
 
 window.addEventListener("popstate", () => {
-  const match = /^#3d\/(.+)$/.exec(location.hash);
-  if (match) {
-    const area = areas.find(a => a.name === decodeURIComponent(match[1]));
+  const here = parseHash(location.hash);
+  if (here) {
+    const area = areas.find(a => a.name === here.name);
     if (area && (!viewerArea || viewerArea.name !== area.name)) {
       viewerPushed = true;
-      open3d(area, { push: false });
+      open3d(area, { push: false, camera: here.camera });
     }
     return;
   }
@@ -2581,6 +3012,24 @@ window.addEventListener("popstate", () => {
 });
 
 document.addEventListener("keydown", e => {
+  const viewKey = !$("view3d").hidden && !e.ctrlKey && !e.metaKey && !e.altKey
+    && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+  if (viewKey && (e.key === "z" || e.key === "Z")) {
+    // Z: wireframe on and off. Shift+Z: quads or triangles.
+    if (e.shiftKey) setWire(true, wireOn && wireMode === "quads" ? "triangles" : "quads");
+    else setWire(!wireOn);
+    e.preventDefault();
+    return;
+  }
+  if (viewKey && (e.key === "m" || e.key === "M")) {
+    setMeasure(!measuring);
+    e.preventDefault();
+    return;
+  }
+  if (e.key === "Escape" && !$("view3d").hidden && !tipOwner && measuring) {
+    setMeasure(false);
+    return;
+  }
   if (e.key === "Escape" && !$("view3d").hidden && !tipOwner && selectedInfo) {
     if (viewer) viewer.select(null);
     showObject(null);
@@ -2589,10 +3038,10 @@ document.addEventListener("keydown", e => {
 
 /* An address with #3d/<name> opens that model once the list is in. */
 function openFromAddress() {
-  const match = /^#3d\/(.+)$/.exec(location.hash);
-  if (!match) return;
-  const area = areas.find(a => a.name === decodeURIComponent(match[1]));
-  if (area && can3d(area)) open3d(area, { push: false });
+  const here = parseHash(location.hash);
+  if (!here) return;
+  const area = areas.find(a => a.name === here.name);
+  if (area && can3d(area)) open3d(area, { push: false, camera: here.camera });
   else history.replaceState(null, "", location.pathname + location.search);
 }
 

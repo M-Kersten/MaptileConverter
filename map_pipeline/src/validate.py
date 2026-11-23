@@ -556,6 +556,21 @@ def check_roads(report: CheckReport, surfaces, terrain) -> None:
     tri_class = surfaces.road_tri_class[at_grade]
     lift = float(getattr(surfaces, "road_lift_m", 0.0) or 0.0)
     kerb = float(mesh.stats.get("kerb_m", 0.0)) if mesh is not None else 0.0
+    mouths = getattr(getattr(terrain, "mesh", None), "mouths", None)
+    if mouths and len(tris):
+        # At a tunnel mouth the road was held down under the apron on purpose
+        # (`tunnels.open_mouths`); the survey there is the smeared step from
+        # the cutting floor onto the roof.
+        import shapely
+
+        from .tunnels import MOUTH_REACH_M
+
+        middle = tris.mean(axis=1)
+        clear = ~shapely.dwithin(
+            shapely.union_all(np.array(list(mouths), dtype=object)),
+            shapely.points(middle[:, 0], middle[:, 1]), MOUTH_REACH_M,
+        )
+        tris, tri_class = tris[clear], tri_class[clear]
     if len(tris):
         centroid = tris.mean(axis=1)
         ground = terrain.sample(centroid[:, 0], centroid[:, 1])
@@ -686,7 +701,7 @@ def check_signs(report: CheckReport, signs, bbox: BBox) -> None:
         )
 
 
-def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) -> None:
+def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None, mouths=None) -> None:
     """Walls and fences are closed, on the ground, and a believable height.
 
     `deck_at(x, y)` is the top of a bridge deck, NaN off one: a parapet stands
@@ -736,6 +751,21 @@ def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) ->
     if sampler is not None:
         ground = np.asarray(sampler(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
         above = vertices[:, 2] - ground
+        # At a tunnel mouth the ground was opened for the road, and held down
+        # in front of it and up behind it (`tunnels.open_mouths`), after the
+        # barriers were stood on it. Those points say nothing.
+        unread = ~np.isfinite(above)
+        if mouths:
+            import shapely
+
+            from .tunnels import MOUTH_REACH_M
+
+            unread |= shapely.dwithin(
+                shapely.union_all(np.array(list(mouths), dtype=object)),
+                shapely.points(vertices[:, 0], vertices[:, 1]), MOUTH_REACH_M,
+            )
+        above = np.where(unread, 0.0, above)
+        unread = int(unread.sum())
         if deck_at is not None:
             deck = np.asarray(deck_at(vertices[:, 0], vertices[:, 1]), dtype=np.float64)
             on_deck = vertices[:, 2] - deck
@@ -773,7 +803,8 @@ def check_barriers(report: CheckReport, barriers, sampler=None, deck_at=None) ->
             deepest <= 0.30,
             f"the lowest point is {deepest:.2f} m below the ground"
             + (f", at RD {where_deep[0]:.1f}, {where_deep[1]:.1f}, "
-               f"{where_deep[2]:.2f} m NAP" if deepest > 0.30 else ""),
+               f"{where_deep[2]:.2f} m NAP" if deepest > 0.30 else "")
+            + (f" ({unread} points over a tunnel mouth not measured)" if unread else ""),
         )
 
 
@@ -955,6 +986,14 @@ def check_structures(report: CheckReport, structures, terrain) -> None:
         return
 
     decks = structures.tri_kind == KIND_DECK
+    # The top of each deck only: its underside sits a deck's depth lower and
+    # is meant to be in the ground where the ground rises to an abutment.
+    tris = structures.tris
+    normal_z = (
+        (tris[:, 1, 0] - tris[:, 0, 0]) * (tris[:, 2, 1] - tris[:, 0, 1])
+        - (tris[:, 1, 1] - tris[:, 0, 1]) * (tris[:, 2, 0] - tris[:, 0, 0])
+    )
+    decks &= normal_z > 1e-9
     if decks.any():
         z = structures.tris[decks][:, :, 2]
         centre = structures.tris[decks].reshape(-1, 3)
@@ -980,13 +1019,32 @@ def check_structures(report: CheckReport, structures, terrain) -> None:
             f"tunnel road runs {below.min():.2f} to {below.max():.2f} m below "
             f"the surface (a drawn profile, not a survey)",
         )
-        # Portals have to reach daylight, or the tunnel is a sealed box.
+
+    plan = getattr(structures, "tunnels", None)
+    if plan is not None and len(plan):
+        mouths = [(t, p) for t in plan.tunnels for p in t.portals]
         report.add(
-            "tunnel_reaches_its_portals",
-            float(below.min()) < 1.0,
-            f"shallowest tunnel point is {below.min():.2f} m down, so the "
-            f"ramps meet the surface",
+            "tunnel_mouths_read",
+            bool(mouths),
+            f"{len(plan)} tunnels, {len(mouths)} mouths read from the survey "
+            "(a tunnel cut by the edge of the area has none there)",
+            severity="warning",
         )
+        if mouths:
+            # The reason this exists: the first tunnels started at ground
+            # level, eight metres above the measured ramp running into them.
+            worst = 0.0
+            for tunnel, portal in mouths:
+                z = tunnel.floor_at(portal.points[:, 0], portal.points[:, 1])
+                z = z[np.isfinite(z)]
+                if len(z):
+                    worst = max(worst, float(np.abs(z - portal.floor_nap).max()))
+            report.add(
+                "tunnel_floor_meets_its_mouths",
+                worst < 0.5,
+                f"the floor at every mouth is within {worst:.2f} m of the cutting "
+                "floor the survey read in front of it",
+            )
 
     walls = structures.tri_kind == KIND_TUNNEL_WALL
     if walls.any() and tunnels.any():
@@ -1126,6 +1184,138 @@ def check_photo_textures(report: CheckReport, textures, out_dir: Path, work_dir:
     )
 
 
+def check_roof_atlas(
+    report: CheckReport,
+    atlas,
+    *,
+    out_dir: Path | None,
+    work_dir: Path,
+    page_cap: int,
+) -> None:
+    """The roofs' own photo: written, within the page cap, mapped correctly.
+
+    Only called when the roofs were meant to have one. If it could not be
+    made, the roofs are on the aerial as they always were, which is a model
+    without the improvement rather than a broken one: a warning.
+    """
+    from PIL import Image
+
+    from .imagery import _allow_large_images
+
+    if not atlas.ok:
+        report.add(
+            "roof_atlas_written",
+            False,
+            f"no roof atlas: {atlas.note or 'nothing was built'}; the roofs use "
+            f"the aerial",
+            severity="warning",
+        )
+        return
+
+    plan = atlas.plan
+    folder = out_dir if out_dir is not None else work_dir
+    _allow_large_images()
+    sizes, flat, missing = [], [], []
+    for path, want in zip(atlas.paths, plan.pages):
+        path = Path(folder) / path.name
+        if not path.is_file():
+            missing.append(path.name)
+            continue
+        with Image.open(path) as image:
+            sizes.append(image.size)
+            sample = np.asarray(image.convert("RGB").resize((256, 256)), dtype=np.float64)
+        if image.size != tuple(want) or float(sample.std()) <= 5.0:
+            flat.append(f"{path.name} {image.size[0]}x{image.size[1]}")
+    megabytes = sum(
+        (Path(folder) / p.name).stat().st_size for p in atlas.paths
+        if (Path(folder) / p.name).is_file()
+    ) / 1e6
+    report.add(
+        "roof_atlas_written",
+        not missing and not flat,
+        (
+            f"missing {', '.join(missing)}" if missing
+            else f"wrong size or no content: {', '.join(flat)}" if flat
+            else f"{len(sizes)} page(s), "
+            + ", ".join(f"{w}x{h}" for w, h in sizes)
+            + f", {megabytes:.1f} MB, {plan.metres_per_px * 100:.1f} cm/px over "
+            f"{int((plan.building_rect >= 0).sum())} roofs"
+        ),
+    )
+
+    largest = max(max(w, h) for w, h in plan.pages)
+    report.add(
+        "roof_atlas_within_size_cap",
+        largest <= page_cap and plan.total_px <= plan.budget_px,
+        f"largest page {largest} px against the {page_cap} px cap; "
+        f"{plan.total_px / 1e6:.1f} of {plan.budget_px / 1e6:.0f} Mpx",
+    )
+
+    # Every roof corner inside its own rectangle, by at least the padding,
+    # so neither bilinear filtering nor the first mipmaps read a neighbour.
+    on = np.flatnonzero(atlas.roof_page >= 0)
+    outside = 0
+    if len(on):
+        uv = atlas.roof_uv[on].astype(np.float64)
+        rect = atlas.roof_rect[on]
+        page = plan.placement[rect, 0]
+        width = np.array([plan.pages[p][0] for p in page], dtype=np.float64)
+        height = np.array([plan.pages[p][1] for p in page], dtype=np.float64)
+        px = uv[:, :, 0] * width[:, None]
+        py = (1.0 - uv[:, :, 1]) * height[:, None]
+        x0 = plan.placement[rect, 1].astype(np.float64)[:, None]
+        y0 = plan.placement[rect, 2].astype(np.float64)[:, None]
+        w = (plan.rects[rect, 2] - plan.rects[rect, 0]).astype(np.float64)[:, None]
+        h = (plan.rects[rect, 3] - plan.rects[rect, 1]).astype(np.float64)[:, None]
+        # Stored as float32: a few thousandths of a pixel on an 8192 page.
+        margin = float(plan.padding_px) - 0.01
+        inside = (
+            (uv >= 0.0).all(axis=2) & (uv <= 1.0).all(axis=2)
+            & (px >= x0 + margin) & (px <= x0 + w - margin)
+            & (py >= y0 + margin) & (py <= y0 + h - margin)
+        )
+        outside = int((~inside.all(axis=1)).sum())
+    report.add(
+        "roof_uvs_inside_their_rectangles",
+        outside == 0 and len(on) > 0,
+        f"{len(on)} roof triangles on the atlas, {outside} with a corner "
+        f"outside its building's rectangle; "
+        f"{int((atlas.roof_page < 0).sum())} left on the aerial",
+    )
+
+    report.add(
+        "roof_resolution_as_asked",
+        not plan.capped,
+        f"roofs at {plan.metres_per_px * 100:.1f} cm/px"
+        + (
+            f", coarser than the {plan.requested_m_per_px * 100:.1f} cm asked: "
+            f"at that resolution this area's roofs need more than the "
+            f"{plan.budget_px / 1e6:.0f} Mpx budget (buildings.roof_max_mpx)"
+            if plan.capped
+            else " as asked"
+        ),
+        severity="warning",
+    )
+
+    summary_path = work_dir / "blender_summary.json"
+    if out_dir is None or not summary_path.is_file():
+        return
+    try:
+        built = (json.loads(summary_path.read_text(encoding="utf-8")) or {}).get("roofs")
+    except (OSError, ValueError):
+        built = None
+    if built is None:
+        return
+    report.add(
+        "roofs_use_the_atlas",
+        int(built.get("atlas_triangles", 0)) == len(on),
+        f"the model has {int(built.get('atlas_triangles', 0))} roof triangles on "
+        f"{', '.join(built.get('materials') or []) or 'no roof material'} and "
+        f"{int(built.get('aerial_triangles', 0))} on the aerial, against {len(on)} "
+        f"planned on the atlas",
+    )
+
+
 def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
     """The terrain in the model is the grid the pipeline meant to build.
 
@@ -1226,6 +1416,122 @@ def check_harbour(report: CheckReport, harbour) -> None:
             f"{int(tiers.sum())} containers in {len(tiers)} stacks, "
             f"{tiers.mean():.1f} high on average and {int(tiers.max())} at most",
         )
+
+
+# How far a guardrail may miss what it is built to, measured on the ground
+# as built: a post's foot `POST_EMBED_M` into it at its shallowest corner, the
+# top of the rail's face `RAIL_TOP_M` above it.
+GUARDRAIL_SLACK_M = 0.02
+
+
+def check_guardrails(report: CheckReport, guardrails, ground, work_dir: Path | None = None) -> None:
+    """The motorway's guardrails: there, on the verge, standing on the ground.
+
+    Where the rails are is checked against the ground's own faces: every
+    post on grass, open ground or a hard verge, none on a carriageway or
+    road. That is a different question from the distances they were laid
+    out by. How they stand is read back from Blender where it ran: a post at
+    every foot, no corner of any foot less than `POST_EMBED_M` into the
+    ground the model has (so none is in the air), and the rail's top
+    `RAIL_TOP_M` above it at every post.
+    """
+    from .guardrails import (
+        MIN_RUN_M, POST_EMBED_M, RAIL_TOP_M, motorway_edges, verge_faces,
+    )
+    from .layered import MOTORWAY
+
+    if guardrails is None or ground is None:
+        return
+    mesh = ground.mesh
+    if not (np.asarray(mesh.face_kind) == MOTORWAY).any():
+        report.add("guardrails_present", True, "no motorway here", severity="warning")
+        return
+    if not len(guardrails):
+        edges, _, verge = motorway_edges(
+            mesh.face_sizes, mesh.face_loops, mesh.face_kind, ground.face_material
+        )
+        along = float(np.linalg.norm(
+            mesh.vertices[edges[verge, 1], :2] - mesh.vertices[edges[verge, 0], :2], axis=1
+        ).sum())
+        report.add(
+            "guardrails_present",
+            along < MIN_RUN_M,
+            f"no guardrails, along {along:.0f} m of motorway edge beside a verge",
+            severity="warning",
+        )
+        return
+    counts = guardrails.counts
+    report.add(
+        "guardrails_present",
+        True,
+        f"{counts.get('runs', 0)} runs, {counts.get('length_m', 0.0):.0f} m "
+        f"({counts.get('between_carriageways_m', 0.0):.0f} m between two carriageways), "
+        f"{counts.get('posts', 0)} posts, {len(guardrails)} triangles "
+        f"({counts.get('triangles_per_m', 0.0):.1f} a metre)",
+    )
+
+    # On the verge: every post, and the rail's face at every post, on a face
+    # a guardrail may stand on.
+    verge = verge_faces(mesh.face_kind, ground.face_material)
+    _, owner = mesh.triangles()
+    points = np.vstack([guardrails.post_foot[:, :2], guardrails.rail_top[:, :2]])
+    tri, _ = mesh.locator().locate(points[:, 0], points[:, 1])
+    on = np.zeros(len(points), dtype=bool)
+    found = tri >= 0
+    on[found] = verge[owner[tri[found]]]
+    off = int((~on).sum())
+    where = points[np.argmin(on)] if off else None
+    report.add(
+        "guardrails_on_the_verge",
+        off == 0,
+        f"{len(points) - off} of {len(points)} posts and rail faces on grass, open "
+        f"ground or a hard verge"
+        + (f"; one off it at RD {where[0]:.1f}, {where[1]:.1f}" if off else ""),
+    )
+
+    # Standing on the ground: as Blender built it, else as planned.
+    built = {}
+    if work_dir is not None:
+        try:
+            summary = json.loads((Path(work_dir) / "blender_summary.json").read_text("utf-8"))
+            built = (summary.get("layered") or {}).get("guardrail") or {}
+        except (OSError, ValueError):
+            built = {}
+    if built:
+        posts, seen = int(built.get("posts", 0)), int(built.get("posts_found", 0))
+        rails, rails_seen = int(built.get("rail_points", 0)), int(built.get("rail_points_found", 0))
+        depth = (built.get("foot_depth_min_m"), built.get("foot_depth_max_m"))
+        top = (built.get("rail_top_min_m"), built.get("rail_top_max_m"))
+        source = f"in {built.get('object', 'the model')}"
+    else:
+        posts = seen = len(guardrails.post_foot)
+        rails = rails_seen = len(guardrails.rail_top)
+        corners = guardrails.post_corners.reshape(-1, 3)
+        below = np.asarray(
+            ground.surface_at(corners[:, 0], corners[:, 1]), dtype=np.float64
+        ) - corners[:, 2]
+        tops = guardrails.rail_top
+        above = tops[:, 2] - np.asarray(ground.surface_at(tops[:, 0], tops[:, 1]), dtype=np.float64)
+        depth = (float(np.nanmin(below)), float(np.nanmax(below))) if len(below) else (None, None)
+        top = (float(np.nanmin(above)), float(np.nanmax(above))) if len(above) else (None, None)
+        source = "as planned"
+    known = None not in depth and None not in top
+    ok = (
+        known and seen == posts and rails_seen == rails
+        and depth[0] >= POST_EMBED_M - GUARDRAIL_SLACK_M
+        and abs(top[0] - RAIL_TOP_M) <= GUARDRAIL_SLACK_M
+        and abs(top[1] - RAIL_TOP_M) <= GUARDRAIL_SLACK_M
+    )
+    report.add(
+        "guardrails_stand_on_the_ground",
+        bool(ok),
+        (
+            f"{seen} of {posts} posts {source}, every corner of their feet {depth[0]:.3f} to "
+            f"{depth[1]:.3f} m into the ground (built for at least {POST_EMBED_M:.2f}); "
+            f"the rail's top {top[0]:.3f} to {top[1]:.3f} m above it at {rails_seen} of "
+            f"{rails} posts (built for {RAIL_TOP_M:.2f})"
+        ) if known else f"{seen} of {posts} posts {source}; no ground under them to measure",
+    )
 
 
 def check_layered(
@@ -1393,6 +1699,19 @@ def check_terrain_mesh(report: CheckReport, terrain, *, expect_outlines: bool = 
     # Open only along one side of the area: an edge from one side to another
     # cuts a corner off.
     along = (sides(xy[open_edges[:, 0]]) & sides(xy[open_edges[:, 1]])).any(axis=1)
+    # A tunnel's mouth is opened on purpose (`tunnels.open_mouths`): the
+    # ground cannot climb onto the roof across the opening. Its edges are not
+    # cracks, and what it took is not missing.
+    mouths = list(getattr(mesh, "mouths", []) or [])
+    cut = getattr(mesh, "opened", None)
+    opened = 0
+    if cut is not None and len(open_edges):
+        import shapely
+
+        middle = 0.5 * (mesh.vertices[open_edges[:, 0], :2] + mesh.vertices[open_edges[:, 1], :2])
+        near = shapely.dwithin(cut.boundary, shapely.points(middle[:, 0], middle[:, 1]), 0.01)
+        opened = int((~along & near).sum())
+        along |= near
     cracks = int((~along).sum())
     shared_by_three = int((counts > 2).sum())
     following_vertex = loops[following]
@@ -1402,13 +1721,16 @@ def check_terrain_mesh(report: CheckReport, terrain, *, expect_outlines: bool = 
     flipped = int((twice <= 0).sum())
     covered = 0.5 * float(twice.sum())
     whole = float(span[0] * span[1])
-    missing = abs(whole - covered)
+    mouths_m2 = float(getattr(mesh, "mouths_m2", 0.0) or 0.0)
+    missing = abs(whole - covered - mouths_m2)
     report.add(
         "terrain_is_one_closed_sheet",
         cracks == 0 and shared_by_three == 0 and flipped == 0 and missing <= max(0.01, 1e-9 * whole),
         f"{cracks} crack edges, {shared_by_three} edges with more than two faces "
         f"and {flipped} faces upside down, over {len(mesh)} faces covering "
-        f"{covered:,.2f} of {whole:,.2f} m2",
+        f"{covered:,.2f} of {whole:,.2f} m2"
+        + (f"; {len(mouths)} tunnel mouths opened, {mouths_m2:,.1f} m2 "
+           f"and {opened} edges round them" if mouths else ""),
     )
     stats = mesh.stats or {}
     if "outline_edges_missing" in stats:
@@ -1670,6 +1992,7 @@ __all__ = [
     "check_layered",
     "check_passages",
     "check_roads",
+    "check_roof_atlas",
     "check_terrain",
     "check_terrain_mesh",
     "write_report",

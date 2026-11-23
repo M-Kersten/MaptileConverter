@@ -345,8 +345,8 @@ def srgb_to_linear(value: float) -> float:
 def planar_uv(points_xy: np.ndarray, aerial_bbox_local: list[float]) -> np.ndarray:
     """Top-down UV from local XY, normalised to the aerial footprint.
 
-    Both the terrain and the roofs use this, which is what lets roofs pick up
-    real photo texture and blend into the ground around them.
+    The terrain uses this, and so do the roofs when they have no atlas of
+    their own (`roof_atlas_uvs`): the same photo as the ground around them.
     """
     xmin, ymin, xmax, ymax = aerial_bbox_local
     u = (points_xy[:, 0] - xmin) / (xmax - xmin)
@@ -478,6 +478,9 @@ HARBOUR_OBJECTS = {
 }
 # Painted steel: the railings along bridges and catwalks.
 RAILING_MATERIAL = ("Staal", (0.2, 0.22, 0.24), 0.4)
+# The road through a tunnel: the layered style's own asphalt, by name, so a
+# model in that style has one asphalt rather than two.
+TUNNEL_ROAD_MATERIAL = ("Asfalt", (0.0496, 0.0496, 0.0496), 0.5)
 
 
 def _werf_brick(scene: dict, work_dir: Path):
@@ -573,6 +576,54 @@ def build_harbour(scene: dict, work_dir: Path, prefix: str) -> list:
         made.append(obj.name)
         log(f"harbour: {obj.name}, {n} triangles")
     return made
+
+
+# The corners of every guardrail post's foot and the top of the rail at every
+# post, local coordinates, for the summary to measure against the ground.
+_GUARDRAIL_POINTS = {}  # type: dict
+
+
+def build_guardrails(scene: dict, work_dir: Path, prefix: str):
+    """The steel guardrails along the motorway: one object, `<prefix>_Geleiderail`.
+
+    Rail and posts arrive as one welded triangle mesh from src/guardrails.py,
+    every face already turned outwards, in the painted steel the railings
+    wear. Returns the object, or None where there are none.
+    """
+    _GUARDRAIL_POINTS.clear()
+    name = str(scene["layered"].get("guardrails") or "")
+    path = work_dir / name
+    if not name or not path.is_file():
+        return None
+    data = np.load(path)
+    triangles = data["triangles"].astype(np.int64)
+    if not len(triangles):
+        return None
+    origin = np.array([*scene["origin_rd"], float(scene["ground_z_offset_nap"])])
+    vertices = data["vertices"].astype(np.float64) - origin
+    material = bpy.data.materials.get(RAILING_MATERIAL[0]) or make_plain_material(
+        *RAILING_MATERIAL
+    )
+    n = len(triangles)
+    obj = build_mesh_object(
+        f"{prefix}_Geleiderail",
+        vertices,
+        triangles.reshape(-1),
+        np.arange(0, n * 3, 3),
+        np.full(n, 3),
+        # Metres along the rail and up from the ground, per loop.
+        data["uv"][triangles].reshape(-1, 2),
+        np.zeros(n),
+        [material],
+        shade_smooth=False,
+    )
+    obj["maptile_role"] = "guardrail"
+    if "post_corners" in data.files and "rail_top" in data.files:
+        _GUARDRAIL_POINTS["corners"] = data["post_corners"] - origin
+        _GUARDRAIL_POINTS["tops"] = data["rail_top"] - origin
+    posts = len(_GUARDRAIL_POINTS.get("corners", ())) // 4
+    log(f"guardrails: {obj.name}, {posts} posts, {n} triangles")
+    return obj
 
 
 # The layered style's water: a dark, slightly green harbour blue.
@@ -883,6 +934,10 @@ def _layered_summary(layered: dict) -> dict:
                 heights.setdefault(role, []).append(gap)
         finally:
             holder.to_mesh_clear()
+    guardrail = {}
+    rail = bpy.data.objects.get(str(layered.get("guardrail_object") or ""))
+    if rail is not None and tree is not None:
+        guardrail = _guardrail_summary(rail, (tree, flat, standing, tris), height_on)
     above = {
         role: {
             "min_m": round(float(np.min(values)), 4),
@@ -901,7 +956,66 @@ def _layered_summary(layered: dict) -> dict:
         "walkway_faces": raw,
         "walkway_faces_evaluated": evaluated,
         "height_above_terrain": above,
+        **({"guardrail": guardrail} if guardrail else {}),
     }
+
+
+# How near a vertex of the object has to be to a point src/guardrails.py
+# placed to be that point: it is a vertex, moved only by float32.
+GUARDRAIL_POINT_REACH_M = 0.002
+
+
+def _guardrail_summary(obj, ground, height_on) -> dict:
+    """How the guardrails stand on the ground as built, for the checks.
+
+    For every post src/guardrails.py placed, whether the object has its four
+    foot corners, and how far into the ground each corner is; for every
+    post, whether the object has the top of the rail's face there, and how
+    high above the ground that is.
+    """
+    from mathutils.kdtree import KDTree
+
+    mesh = obj.data
+    co = np.empty(len(mesh.vertices) * 3)
+    mesh.vertices.foreach_get("co", co)
+    matrix = np.asarray(obj.matrix_world)
+    world = co.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+    lookup = KDTree(len(world))
+    for i, point in enumerate(world.tolist()):
+        lookup.insert(point, i)
+    lookup.balance()
+
+    def measured(points, sign):
+        """Which points the object has, and each one's height against the ground."""
+        have, heights = [], []
+        for x, y, z in np.asarray(points, dtype=np.float64).reshape(-1, 3).tolist():
+            _, _, distance = lookup.find((x, y, z))
+            have.append(distance is not None and distance <= GUARDRAIL_POINT_REACH_M)
+            below = height_on(ground, x, y)
+            if below is not None and np.isfinite(below):
+                heights.append(sign * (z - below))
+        return np.array(have, dtype=bool), heights
+
+    corners, depths = measured(_GUARDRAIL_POINTS.get("corners", ()), -1.0)
+    tops, heights = measured(_GUARDRAIL_POINTS.get("tops", ()), 1.0)
+    out = {
+        "object": obj.name,
+        "posts": int(len(corners) // 4),
+        "posts_found": int(corners.reshape(-1, 4).all(axis=1).sum()) if len(corners) else 0,
+        "rail_points": int(len(tops)),
+        "rail_points_found": int(tops.sum()),
+    }
+    if depths:
+        out.update(
+            foot_depth_min_m=round(float(min(depths)), 4),
+            foot_depth_max_m=round(float(max(depths)), 4),
+        )
+    if heights:
+        out.update(
+            rail_top_min_m=round(float(min(heights)), 4),
+            rail_top_max_m=round(float(max(heights)), 4),
+        )
+    return out
 
 
 def _terrain_summary(names="Terrain") -> dict:
@@ -1730,6 +1844,29 @@ def concrete_uvs(triangles: np.ndarray, tile_m: float = 6.0) -> np.ndarray:
     return np.column_stack([u.ravel(), v.ravel()]) / float(tile_m)
 
 
+def roof_atlas_uvs(scene: dict, work_dir: Path, n_roofs: int, n_pages: int):
+    """The roof atlas UVs and pages from roofs.npz, or None to use the aerial.
+
+    Per roof triangle in buildings.npz order: three UVs, and the page, -1 for
+    a roof left on the aerial. Anything that does not line up with the
+    buildings -- a stale file, a page this scene has no material for -- puts
+    every roof back on the aerial rather than on the wrong photo.
+    """
+    name = (scene.get("roofs") or {}).get("file")
+    if not name or not n_pages or not (work_dir / name).is_file():
+        return None
+    data = np.load(work_dir / name)
+    uv = np.asarray(data["roof_uv"], dtype=np.float64).reshape(-1, 2)
+    page = np.asarray(data["roof_page"], dtype=np.int64)
+    if len(page) != n_roofs or len(uv) != 3 * n_roofs or page.max(initial=-1) >= n_pages:
+        log(
+            f"WARNING: {name} does not match buildings.npz ({len(page)} roof "
+            f"triangles against {n_roofs}); the roofs stay on the aerial"
+        )
+        return None
+    return uv, page
+
+
 def build_buildings(
     scene: dict,
     work_dir: Path,
@@ -1738,8 +1875,14 @@ def build_buildings(
     ground_materials: list | None = None,
     photo_materials: list | None = None,
     passage_material=None,
+    roof_materials: list | None = None,
+    report: dict | None = None,
 ):
-    """One object per building, with facade and aerial material slots.
+    """One object per building, with facade and roof material slots.
+
+    A roof is on its page of the roof atlas when there is one, each triangle
+    mapped into its building's rectangle; otherwise on the aerial, as the
+    ground is. `report`, when given, is filled with how many went where.
 
     Walls that wear their own street photos take an atlas page's material
     and the texture coordinates the photo stage worked out for them,
@@ -1858,8 +2001,13 @@ def build_buildings(
         bays = np.maximum(1.0, np.round(wall_height_m / bay_height))
         effective_floor = np.where(special, wall_height_m / bays, effective_floor)
 
+    roof_materials = list(roof_materials or [])
+    atlas = roof_atlas_uvs(scene, work_dir, n_roofs, len(roof_materials))
     materials = list(facade_materials) + [aerial_material]
     aerial_slot = len(facade_materials)
+    roof_slot_base = len(materials)
+    if atlas is not None:
+        materials.extend(roof_materials)
     ground_slot_base = len(materials)
     if has_ground:
         materials.extend(ground_materials)
@@ -1885,9 +2033,11 @@ def build_buildings(
             )
         )
     if n_roofs:
-        uv_chunks.append(
-            planar_uv(roofs.reshape(-1, 3)[:, :2], scene["aerial"]["bbox_local"])
-        )
+        roof_uv = planar_uv(roofs.reshape(-1, 3)[:, :2], scene["aerial"]["bbox_local"])
+        if atlas is not None:
+            on_atlas = np.repeat(atlas[1] >= 0, 3)
+            roof_uv[on_atlas] = atlas[0][on_atlas]
+        uv_chunks.append(roof_uv)
     if n_grounds:
         # The ground storey gets exactly one tile vertically, so the shopfront
         # spans it instead of repeating inside it.
@@ -1920,6 +2070,19 @@ def build_buildings(
         else:
             material_indices[:n_walls] = 0
     material_indices[n_walls : n_walls + n_roofs] = aerial_slot
+    if atlas is not None:
+        material_indices[n_walls : n_walls + n_roofs] = np.where(
+            atlas[1] >= 0, roof_slot_base + atlas[1], aerial_slot
+        )
+    if report is not None:
+        on_atlas = int((atlas[1] >= 0).sum()) if atlas is not None else 0
+        report.update({
+            "atlas_triangles": on_atlas,
+            "aerial_triangles": int(n_roofs - on_atlas),
+            "materials": [
+                getattr(m, "name", str(m)) for m in roof_materials
+            ] if atlas is not None else [],
+        })
     if n_grounds:
         material_indices[n_walls + n_roofs : n_walls + n_roofs + n_grounds] = (
             ground_slot_base
@@ -2011,6 +2174,12 @@ def build_buildings(
             f", {n_passages} passage triangles under "
             f"{len(np.unique(passage_owner))} buildings"
             if n_passages else ""
+        )
+        + (
+            f"; {int((atlas[1] >= 0).sum())} roof triangles on "
+            f"{len(roof_materials)} roof atlas page(s)"
+            if atlas is not None
+            else ""
         )
     )
     return objects
@@ -3279,6 +3448,12 @@ def build_structures(scene: dict, work_dir: Path, material):
         elif label == "railing":
             # A railing is painted steel, not the concrete of the deck it is on.
             own = bpy.data.materials.get(RAILING_MATERIAL[0]) or make_plain_material(*RAILING_MATERIAL)
+        elif label == "tunnel_road":
+            # A tunnel's floor is the road through it.
+            own = (
+                bpy.data.materials.get(TUNNEL_ROAD_MATERIAL[0])
+                or make_plain_material(*TUNNEL_ROAD_MATERIAL)
+            )
         uvs = _face_uv(corners[indices].reshape(-1, 3, 3), tile)
         objects.append(
             build_mesh_object(
@@ -3319,7 +3494,8 @@ def reused_colliders() -> dict:
             "the real camber and a car wants the real kerb"
         ),
         "Water": "one flat quad per body",
-        "Structures_*": "bridge decks and piers, already low-poly prisms",
+        "Structures_*": "bridge decks and piers, already low-poly prisms; a tunnel's "
+                        "floor, walls and ceiling, already the surfaces a car meets",
     }
 
 
@@ -3444,7 +3620,8 @@ def _collision_tree_mesh(members, fields, origin, crowns: bool):
 def build_collision(scene: dict, work_dir: Path):
     """Physics proxies, named so a designer can set them up in one pass.
 
-    Two objects, and only two, because only two earn their place. Everything
+    Two objects, and a third for the layered style's guardrails, because only
+    those earn their place. Everything
     else in the scene is already the right shape to collide with, and
     `reused_colliders` records which object to use instead -- a copy of a
     mesh that is already minimal is only a bigger file.
@@ -3494,6 +3671,21 @@ def build_collision(scene: dict, work_dir: Path):
                 "Collision_Barriers",
                 data["collision_vertices"]
                 - np.array([origin_x, origin_y, z_offset]),
+                data["collision_triangles"],
+            )
+
+    # The motorway's guardrails, in the layered style. The beam is 8 cm deep,
+    # as easy to pass through between two steps as a fence; the proxy is a
+    # block from the rail's face back over its posts, fattened as a fence is.
+    rail_file = (scene.get("layered") or {}).get("guardrails")
+    if rail_file and (work_dir / rail_file).is_file():
+        data = np.load(work_dir / rail_file)
+        if "collision_triangles" in data.files and len(data["collision_triangles"]):
+            origin_x, origin_y = scene["origin_rd"]
+            z_offset = float(scene["ground_z_offset_nap"])
+            add(
+                "Collision_Guardrails",
+                data["collision_vertices"] - np.array([origin_x, origin_y, z_offset]),
                 data["collision_triangles"],
             )
 
@@ -3722,6 +3914,11 @@ def copy_textures(
     passage = scene.get("buildings", {}).get("passage_texture")
     if passage and (work_dir / passage).is_file():
         extras["passage"] = copy(passage)
+    # The roof atlas pages, kept in order: a page's number is its material's.
+    roof_names = (scene.get("roofs") or {}).get("textures") or []
+    if roof_names and all((work_dir / name).is_file() for name in roof_names):
+        for index, name in enumerate(roof_names):
+            extras[f"roof_{index:02d}"] = copy(name)
     return aerial_dst, facades, extras
 
 
@@ -3756,6 +3953,18 @@ def main() -> int:
     ground_textures = facade_textures[len(facade_textures) - n_ground :] if n_ground else []
 
     aerial_material = make_textured_material("M_aerial", aerial_texture, roughness=0.9)
+    # The roofs' own photo, one material per atlas page, named as
+    # src/export.py names them in the metadata.
+    roof_pages = sorted(k for k in extra_textures if k.startswith("roof_"))
+    roof_names = (scene.get("roofs") or {}).get("materials") or []
+    roof_materials = [
+        make_textured_material(
+            roof_names[i] if i < len(roof_names) else f"M_roof_{i:02d}",
+            extra_textures[key],
+            roughness=0.9,
+        )
+        for i, key in enumerate(roof_pages)
+    ]
     facade_materials = [
         make_textured_material(
             # Named after the texture, so the slot says which era and which
@@ -3819,11 +4028,13 @@ def main() -> int:
         else None
     )
 
+    roof_report: dict = {}
     with _Layer("Buildings", "Buildings"):
         build_buildings(
             scene, work_dir, facade_materials, aerial_material, ground_materials,
             photo_materials=photo_materials,
             passage_material=structure_material,
+            roof_materials=roof_materials, report=roof_report,
         )
 
     werf_entry = (scene.get("layered") or {}).get("werf") or {}
@@ -3900,6 +4111,15 @@ def main() -> int:
                 make_cutout_material("M_signs", extra_textures["sign"], roughness=0.4),
             )
 
+    if layered is not None and scene["layered"].get("guardrails"):
+        # The motorway's guardrails: a barrier like the walls and fences, so
+        # in their collection and under their parent.
+        prefix = str(scene["layered"].get("prefix") or "Area")
+        with _Layer("Barriers", "Barriers"):
+            rail = build_guardrails(scene, work_dir, prefix)
+            if rail is not None:
+                layered["guardrail_object"] = rail.name
+
     if "vehicle" in extra_textures:
         # Car paint is the one glossy thing out here.
         with _Layer("Vehicles"):
@@ -3968,6 +4188,9 @@ def main() -> int:
         },
         "objects": [obj.name for obj in bpy.context.scene.objects],
         "materials": [m.name for m in bpy.data.materials],
+        # Where the roofs ended up: on the atlas or on the aerial. Read back
+        # by the checks, which otherwise only know what was planned.
+        "roofs": roof_report,
         "collision": {
             "objects": collision,
             # The layers with no proxy, and which object to collide with
