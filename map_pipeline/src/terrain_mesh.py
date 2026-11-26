@@ -45,9 +45,10 @@ LOG = logging.getLogger(__name__)
 # kind changes.
 LAND, ROAD, WATER, BUILDING = 0, 1, 2, 3
 KIND_NAMES = {LAND: "land", ROAD: "road", WATER: "water", BUILDING: "building"}
-# Where a face sits in its region.
-CORE, ROW, FILL = 0, 1, 2
-PART_NAMES = {CORE: "grid", ROW: "row", FILL: "fill"}
+# Where a face sits in its region. OPEN is a face of the layered ground that
+# spans a whole plain stretch of an open space: an n-gon, its outline only.
+CORE, ROW, FILL, OPEN = 0, 1, 2, 3
+PART_NAMES = {CORE: "grid", ROW: "row", FILL: "fill", OPEN: "open"}
 # What an edge lies on, as bits; a vertex carries those of its edges.
 WATERLINE, ROAD_EDGE, BUILDING_EDGE, ROW_EDGE, BED = 1, 2, 4, 8, 16
 FEATURE_NAMES = {
@@ -83,13 +84,15 @@ class TerrainMesh:
     # The height as surveyed, water beds applied: what the model shows before
     # the ground is fitted under the roads, and what Reset puts back.
     measured_z: np.ndarray
-    face_sizes: np.ndarray  # (F,) 3 or 4
+    face_sizes: np.ndarray  # (F,) 3, 4, or more for an open stretch's n-gon
     # Vertex ids, counter-clockwise from above. A quad is drawn as two
     # triangles split from its first corner to its third, as Blender's fixed
-    # split and the FBX export do.
+    # split and the FBX export do; an n-gon by its constrained Delaunay
+    # triangulation, which is what Blender's beauty fill comes to on a face
+    # whose corners lie in one plane, as an n-gon's do to a few centimetres.
     face_loops: np.ndarray
     face_kind: np.ndarray  # (F,) LAND, ROAD, WATER or BUILDING
-    face_part: np.ndarray  # (F,) CORE, ROW or FILL
+    face_part: np.ndarray  # (F,) CORE, ROW, FILL or OPEN
     vertex_on: np.ndarray  # (V,) bits of the outlines a vertex lies on
     edges: np.ndarray  # (E, 2) vertex ids of the edges along outlines and rows
     edge_on: np.ndarray  # (E,) bits
@@ -107,7 +110,13 @@ class TerrainMesh:
         return np.concatenate([[0], np.cumsum(self.face_sizes)[:-1]]).astype(np.int64)
 
     def triangles(self) -> tuple[np.ndarray, np.ndarray]:
-        """Every face as triangles: ``(T, 3)`` vertex ids and the face each is from."""
+        """Every face as triangles: ``(T, 3)`` vertex ids and the face each is from.
+
+        Worked out once: where the faces are does not change, only heights.
+        """
+        cached = getattr(self, "_triangles", None)
+        if cached is not None and cached[2] == len(self.face_sizes):
+            return cached[0], cached[1]
         starts = self.loop_starts
         loops = self.face_loops
         quads = np.flatnonzero(self.face_sizes == 4)
@@ -117,8 +126,17 @@ class TerrainMesh:
         second = np.column_stack([loops[q], loops[q + 2], loops[q + 3]])
         t = starts[tris]
         single = np.column_stack([loops[t], loops[t + 1], loops[t + 2]])
-        out = np.vstack([first, second, single]).astype(np.int64)
-        owner = np.concatenate([quads, quads, tris]).astype(np.int64)
+        parts = [first, second, single]
+        owners = [quads, quads, tris]
+        for f in np.flatnonzero(self.face_sizes > 4):
+            ring = loops[starts[f]: starts[f] + self.face_sizes[f]]
+            found = _ngon_triangles(self.vertices[ring, :2])
+            if len(found):
+                parts.append(ring[found])
+                owners.append(np.full(len(found), f))
+        out = np.vstack(parts).astype(np.int64)
+        owner = np.concatenate(owners).astype(np.int64)
+        self._triangles = (out, owner, len(self.face_sizes))
         return out, owner
 
     def locator(self) -> "TriangleLocator":
@@ -155,6 +173,42 @@ class TerrainMesh:
             "edge_on": self.edge_on.astype(np.int32),
             "grid_m": np.float64(self.grid_m),
         }
+
+
+def _ngon_triangles(xy: np.ndarray) -> np.ndarray:
+    """An n-gon's corners as triangles ``(k, 3)`` of indices into `xy`.
+
+    Its constrained Delaunay triangulation: Blender's beauty fill, which the
+    export cuts n-gons with, comes to the same on a plain face. Ear clipping
+    where that fails, so no face is left out of point location.
+    """
+    import shapely
+
+    xy = np.asarray(xy, dtype=np.float64)
+    origin = xy.min(axis=0)
+    local = xy - origin
+    lookup = {(float(x), float(y)): i for i, (x, y) in enumerate(local.tolist())}
+    try:
+        polygon = shapely.Polygon(local)
+        if polygon.is_valid:
+            pieces = shapely.get_parts(shapely.constrained_delaunay_triangles(polygon))
+            coords = shapely.get_coordinates(shapely.get_exterior_ring(pieces)).reshape(-1, 4, 2)
+            ids = np.array(
+                [[lookup.get((float(x), float(y)), -1) for x, y in t[:3]] for t in coords],
+                dtype=np.int64,
+            ).reshape(-1, 3)
+            if len(ids) and (ids >= 0).all():
+                a, b, c = (local[ids[:, k]] for k in range(3))
+                cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (
+                    b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+                ids[cross < 0] = ids[cross < 0][:, ::-1]
+                return ids[np.abs(cross) > 1e-12]
+    except Exception:  # noqa: BLE001 - earcut below
+        pass
+    import mapbox_earcut
+
+    found = mapbox_earcut.triangulate_float64(local, np.array([len(local)], dtype=np.uint32))
+    return np.asarray(found, dtype=np.int64).reshape(-1, 3)
 
 
 class TriangleLocator:

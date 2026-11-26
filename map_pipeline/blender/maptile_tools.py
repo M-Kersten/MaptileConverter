@@ -41,7 +41,9 @@ Problem areas (its own section of the tab)
 
     * Slivers: long thin triangles, and quads with a spike of a corner.
     * Too dense: more vertices in one square of the ground than the budget.
-    * N-gons: faces with more than four sides.
+    * Bent n-gons: faces with more than four sides whose corners stand off
+      one plane, which every program cuts into triangles its own way. The
+      ground's open stretches are n-gons on purpose, and lie flat.
     * Flipped: ground facing down, or a face wound against its neighbour.
     * Seams: an edge of one ground piece with no partner in the next -- a
       crack, a T-junction, or a step in height between two pieces.
@@ -129,11 +131,55 @@ def _road_objects(terrain):
     return [o for o in found if terrain is None or not _follows(o, terrain)]
 
 
+def face_triangles(co, loops, starts, totals):
+    """Every face as triangles of vertex ids, ``(T, 3)``, and the face of each.
+
+    Cut as the export cuts them (`_triangulate_on_export`): a quad from its
+    first corner to its third, an n-gon by Blender's beauty fill. The fill
+    keeps a concave n-gon inside its outline, where a fan from its first
+    corner would reach over the ground beside it, and turns away the
+    triangle of no area that three stations along one straight edge would
+    make, so the middle one is a corner of the ground too. Any triangle with
+    no area left in the plan is left out.
+    """
+    import bmesh
+
+    co = np.asarray(co, dtype=np.float64).reshape(-1, 3)
+    loops = np.asarray(loops, dtype=np.int64)
+    starts = np.asarray(starts, dtype=np.int64)
+    totals = np.asarray(totals, dtype=np.int64)
+    bm = bmesh.new()
+    try:
+        verts = [bm.verts.new(p) for p in co.tolist()]
+        bm.verts.index_update()
+        owner_layer = bm.faces.layers.int.new("owner")
+        for f, (s, n) in enumerate(zip(starts.tolist(), totals.tolist())):
+            try:
+                face = bm.faces.new([verts[i] for i in loops[s: s + n].tolist()])
+            except ValueError:  # the same face twice
+                continue
+            face[owner_layer] = f
+        # The fill works in the plane of each face, which a face made here
+        # does not know until it is told.
+        bm.normal_update()
+        bmesh.ops.triangulate(bm, faces=bm.faces[:], quad_method="FIXED", ngon_method="BEAUTY")
+        triangles = np.array([[v.index for v in face.verts] for face in bm.faces],
+                             dtype=np.int64).reshape(-1, 3)
+        owner = np.array([face[owner_layer] for face in bm.faces], dtype=np.int64)
+    finally:
+        bm.free()
+    a, b, c = (co[triangles[:, k], :2] for k in range(3))
+    area = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    keep = area > 1e-10
+    return triangles[keep], owner[keep]
+
+
 def _terrain_mesh(obj):
     """The terrain as world-space vertices, triangles, and which vertices show.
 
-    Triangles as the export draws them: a quad split from its first corner to
-    its third, a larger face fanned from its first corner. A vertex shows if
+    Triangles as the export draws them (`face_triangles`): a quad split from
+    its first corner to its third, an n-gon by Blender's polygon fill. A
+    vertex shows if
     any face round it is not ground under a road (or, in the layered style,
     under a layer); without the attribute -- a terrain someone has rebuilt --
     every vertex counts as showing.
@@ -152,13 +198,7 @@ def _terrain_mesh(obj):
     mesh.polygons.foreach_get("loop_total", totals)
     loops = np.empty(len(mesh.loops), dtype=np.int64)
     mesh.loops.foreach_get("vertex_index", loops)
-    fans = totals - 2
-    face = np.repeat(np.arange(len(totals)), fans)
-    step = np.arange(int(fans.sum())) - np.repeat(np.cumsum(fans) - fans, fans) + 1
-    first = starts[face]
-    triangles = np.column_stack(
-        [loops[first], loops[first + step], loops[first + step + 1]]
-    )
+    triangles, _ = face_triangles(co, loops, starts, totals)
     visible = np.ones(count, dtype=bool)
     covered = None
     for name, test in (
@@ -569,7 +609,7 @@ class MAPTILE_OT_export_unity(bpy.types.Operator):
 PROBLEMS = (
     ("sliver", "Slivers", (1.0, 0.18, 0.12)),
     ("dense", "Too dense", (1.0, 0.58, 0.0)),
-    ("ngon", "N-gons", (0.62, 0.36, 1.0)),
+    ("ngon", "Bent n-gons", (0.62, 0.36, 1.0)),
     ("flipped", "Flipped", (1.0, 0.1, 0.8)),
     ("seam", "Seams", (0.0, 0.85, 1.0)),
     ("moved", "Moved", (1.0, 0.92, 0.15)),
@@ -583,6 +623,11 @@ SPIKE_DEG = 10.0
 DENSITY_CELL_M = 5.0
 DENSITY_MAX_VERTICES = 30
 MOVED_M = 0.5
+# An n-gon with a corner further than this off the plane of its corners is
+# bent: drawn and exported, it is cut into triangles one way or another, and
+# the ground in it moves with the cut. The ground's own n-gons are built
+# within 0.15 m.
+BENT_NGON_M = 0.25
 # Ground facing further down than this is upside down.
 DOWN_Z = -0.2
 # Problem faces are grouped into spots this size for Previous / Next.
@@ -659,7 +704,11 @@ def face_problems(
         | ((total == 4) & (sharpest < SPIKE_DEG) & (longest > SLIVER_MIN_EDGE_M))
         | (area < 1e-6)
     )
-    out["ngon"] = total > 4
+    # Off the plane through the face's middle square to its normal.
+    off_plane = np.abs(np.einsum("ij,ij->i", co[loops] - centroid[face_of], normal[face_of]))
+    bent = np.zeros(n_faces)
+    np.maximum.at(bent, face_of, off_plane)
+    out["ngon"] = (total > 4) & (bent > BENT_NGON_M)
 
     if ground:
         out["flipped"] = normal[:, 2] < DOWN_Z
@@ -1074,7 +1123,7 @@ class TerreinLabProblemSettings(bpy.types.PropertyGroup):
     index: bpy.props.IntProperty(default=0)
     show_sliver: bpy.props.BoolProperty(name="Slivers", default=True, update=_tag_all)
     show_dense: bpy.props.BoolProperty(name="Too dense", default=True, update=_tag_all)
-    show_ngon: bpy.props.BoolProperty(name="N-gons", default=True, update=_tag_all)
+    show_ngon: bpy.props.BoolProperty(name="Bent n-gons", default=True, update=_tag_all)
     show_flipped: bpy.props.BoolProperty(name="Flipped", default=True, update=_tag_all)
     show_seam: bpy.props.BoolProperty(name="Seams", default=True, update=_tag_all)
     show_moved: bpy.props.BoolProperty(name="Moved", default=True, update=_tag_all)

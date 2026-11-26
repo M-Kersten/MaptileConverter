@@ -284,11 +284,12 @@ def build_layered_ground(
     the same everywhere; a whole number of survey grid squares.
 
     `mesher` "quads" lays the terrain out in quads (`layered_mesh`);
-    "ribcage" lays it out as the 3D team draws it: ribs across what is
-    narrow, a lattice turned to each space in what is wide, triangles at the
-    edges, and no grid (`ribcage_mesh`); "triangles" is the triangulation
-    refined until every grid node is within `tolerance_m`, which is also what
-    a failed quad or ribcage mesh falls back to.
+    "ribcage", the config's default, lays it out as the 3D team draws it:
+    ribs across what is narrow, each wide space one face where its ground
+    lies flat and cut along lines turned to it where it does not, and no
+    grid (`ribcage_mesh`); "triangles" is the triangulation refined until
+    every grid node is within `tolerance_m`, which is also what a failed
+    quad or ribcage mesh falls back to.
     """
     import shapely
 

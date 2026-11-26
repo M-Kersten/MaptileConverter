@@ -40,13 +40,14 @@ DEFAULTS: dict[str, Any] = {
         "tolerance_m": 0.5,
         # How far a simplified outline may stray from the BGT's.
         "outline_m": 0.25,
-        # How the ground is laid out: "quads", rows along the outlines and one
-        # grid of square_m squares everywhere, turned to the way the streets
-        # run; "ribcage", no grid -- ribs across what is narrow and a lattice
-        # turned to each space in what is wide, 2 x square_m where the ground
-        # allows, with triangles at the edges; or "triangles", the
-        # triangulation refined until it is within tolerance_m everywhere.
-        "mesher": "quads",
+        # How the ground is laid out: "ribcage", no grid -- ribs across what
+        # is narrow, and each wide space one face where its ground lies flat,
+        # cut along lines turned to the space only where the ground moves,
+        # down to square_m; "quads", rows along the outlines and one grid of
+        # square_m squares everywhere, turned to the way the streets run; or
+        # "triangles", the triangulation refined until it is within
+        # tolerance_m everywhere.
+        "mesher": "ribcage",
         # The size of the grid squares, the same everywhere, and the spacing
         # of the points along every outline: rounded to whole survey grid
         # squares. 8 has about a third of the faces of 4 over open ground.
@@ -804,7 +805,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         if not value > 0:
             raise ValueError(f"layered.{key} must be positive, got {value}")
         layered[key] = value
-    mesher = str(layered.get("mesher", "quads")).strip().lower()
+    mesher = str(layered.get("mesher", "ribcage")).strip().lower()
     if mesher not in ("quads", "ribcage", "triangles"):
         raise ValueError(
             f"layered.mesher must be 'quads', 'ribcage' or 'triangles', got {mesher!r}"

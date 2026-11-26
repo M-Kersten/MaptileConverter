@@ -201,12 +201,12 @@ def _divide_rungs(faces, across, step_m: float, count: int | None = None):
     the strip, following its shape, at the heights the survey has there.
 
     Returns the faces, each ladder cell split into that many quads and any
-    other face with a rung edge given the cuts and filled again, and how many
-    rungs were cut.
+    other face with a rung edge given the cuts and filled again (an open
+    stretch's n-gon only takes the cuts in), and how many rungs were cut.
     """
     import shapely
 
-    from .terrain_mesh import _ccw, _fill, _key, _snap
+    from .terrain_mesh import OPEN, _ccw, _fill, _key, _snap
 
     lengths = np.array([line.length for line in across])
     if not len(lengths):
@@ -266,6 +266,9 @@ def _divide_rungs(faces, across, step_m: float, count: int | None = None):
         if not polygon.is_valid or polygon.area < 1e-6:
             out.append((coords, part))
             continue
+        if part == OPEN:
+            out.append((_ccw(np.vstack(ring)), part))
+            continue
         out.extend((c, part) for c in _fill(polygon))
     return out, len(used)
 
@@ -281,14 +284,15 @@ def _merge_slivers(local_xy, sizes, loops, face_kind, face_part, face_code,
 
     The sliver's third corner is added to that face's outline, which then
     covers both, and is filled again if it is no longer a triangle or a convex
-    quad. Nothing moves and no vertex is lost, so no crack opens.
+    quad; an open stretch's n-gon keeps it as one more corner. Nothing moves
+    and no vertex is lost, so no crack opens.
 
     Returns the new vertices, sizes, loops, kinds, parts and codes, and how
     many slivers went.
     """
     import shapely
 
-    from .terrain_mesh import _fill, _quad_score
+    from .terrain_mesh import OPEN, _fill, _quad_score
 
     xy = np.asarray(local_xy, dtype=np.float64)
     starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
@@ -360,6 +364,8 @@ def _merge_slivers(local_xy, sizes, loops, face_kind, face_part, face_code,
         alive[f] = alive[g] = False
         pts = xy_of(ring)
         if len(ring) == 4 and _quad_score(pts) is not None and _quad_score(pts) < 75.0:
+            pieces = [ring]
+        elif part[g] == OPEN and len(ring) > 4 and shapely.Polygon(pts).is_valid:
             pieces = [ring]
         else:
             polygon = shapely.Polygon(pts)
@@ -602,11 +608,12 @@ def _mend_t_junctions(xy, sizes, loops, face_kind, face_part, face_code, size,
     Two neighbours meant to share an edge can come out with a vertex on one
     side a few centimetres off the other's straight edge: an edge each, a
     sliver between them, a crack. The face with the straight edge gets the
-    vertex, and is filled again if it is no longer a triangle or a quad.
+    vertex, and is filled again if it is no longer a triangle or a quad (an
+    open stretch's n-gon keeps it as one more corner).
     """
     import shapely
 
-    from .terrain_mesh import _fill, _quad_score
+    from .terrain_mesh import OPEN, _fill, _quad_score
 
     a, b, is_open = _open_edges(xy, sizes, loops, size)
     if not is_open.any():
@@ -653,6 +660,9 @@ def _mend_t_junctions(xy, sizes, loops, face_kind, face_part, face_code, size,
         pieces = None
         if len(new) == 4 and _quad_score(coords) is not None and _quad_score(coords) < 75.0:
             pieces = [new]
+        elif face_part[f] == OPEN:
+            if shapely.Polygon(coords).is_valid:
+                pieces = [new]
         else:
             polygon = shapely.Polygon(coords)
             if polygon.is_valid and polygon.area > 1e-9:

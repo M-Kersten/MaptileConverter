@@ -6462,14 +6462,59 @@ class TestProblemFinder(unittest.TestCase):
         found, _ = scan["face_problems"](tiny, loops, start, total, ground=True)
         self.assertFalse(found["sliver"][0])
 
-    def test_ngons_and_ground_facing_down(self):
+    def test_bent_ngons_and_ground_facing_down(self):
+        """The ground's open stretches are n-gons on purpose: only one whose
+        corners stand off its plane is worth a look."""
         scan = self._scan()
         co = np.array([[0, 0, 0], [4, 0, 0], [6, 2, 0], [4, 4, 0], [0, 4, 0]], float)
         up = [0, 1, 2, 3, 4]
         loops, start, total = self._mesh([up, up[::-1]])
         found, _ = scan["face_problems"](co, loops, start, total, ground=True)
-        self.assertEqual(found["ngon"].tolist(), [True, True])
+        self.assertEqual(found["ngon"].tolist(), [False, False])
         self.assertEqual(found["flipped"].tolist(), [False, True])
+        # Tilted, it is still flat; one corner lifted a metre, it is bent.
+        tilted = co + np.column_stack([np.zeros(5), np.zeros(5), 0.3 * co[:, 0]])
+        found, _ = scan["face_problems"](tilted, *self._mesh([up]), ground=True)
+        self.assertFalse(found["ngon"][0])
+        bent = co.copy()
+        bent[2, 2] = 1.0
+        found, _ = scan["face_problems"](bent, *self._mesh([up]), ground=True)
+        self.assertTrue(found["ngon"][0])
+
+    @unittest.skipUnless(HAVE_BPY, "needs the pip bpy module")
+    def test_an_ngon_is_triangulated_inside_its_outline(self):
+        """The ground as the tools and the checks read it: a concave n-gon
+        with stations along its straight edges, as an open space is, fanned
+        from its first corner reached over the ground beside it and made
+        triangles of no area out of the stations. Cut as the export cuts it,
+        it is covered exactly, every station a corner; a quad is still split
+        first corner to third."""
+        import ast
+
+        import bpy  # noqa: F401 - brings mathutils
+        import shapely
+
+        source = (REPO_ROOT / "blender" / "maptile_tools.py").read_text(encoding="utf-8")
+        namespace = {"np": np}
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.FunctionDef) and node.name == "face_triangles":
+                exec(compile(ast.Module([node], []), "maptile_tools.py", "exec"), namespace)
+        # An L, its stations every 2 m, and a quad beside it.
+        ring = [(0, 0), (2, 0), (4, 0), (6, 0), (6, 2), (2, 2), (2, 4), (2, 6), (0, 6), (0, 4), (0, 2)]
+        co = np.array([(x, y, 0.1 * x) for x, y in ring] + [(8, 0, 0.8), (8, 2, 0.8)], float)
+        loops, start, total = self._mesh([list(range(11)), [3, 11, 12, 4]])
+        triangles, owner = namespace["face_triangles"](co, loops, start, total)
+        outline = shapely.Polygon(ring)
+        mine = triangles[owner == 0]
+        pieces = [shapely.Polygon(co[t, :2]) for t in mine]
+        self.assertAlmostEqual(sum(p.area for p in pieces), outline.area, places=9)
+        self.assertTrue(all(outline.buffer(1e-9).contains(p) for p in pieces))
+        self.assertTrue(all(p.area > 0 for p in pieces))
+        self.assertEqual(sorted(sorted(t) for t in triangles[owner == 1].tolist()),
+                         [[3, 4, 12], [3, 11, 12]])
+        # The middle stations are corners of the fill, not points on its edges.
+        corners = set(mine.ravel().tolist())
+        self.assertEqual(corners, set(range(11)))
 
     def test_a_face_wound_against_its_neighbour_is_flipped(self):
         """Barriers are closed solids: a face that disagrees with its
@@ -7729,11 +7774,30 @@ class TestQuadTerrain(unittest.TestCase):
         self.assertLessEqual(ground.stats["grid_error_max_m"], 0.5 + 1e-6)
 
 
-class TestRibcageTerrain(unittest.TestCase):
-    """The ribcage layout: the 3D team's, beside the grid, on the same fixture.
+def _plain_terrain(height=None):
+    """The layered fixture's square with the ground `height(x, y)` gives:
+    flat at 3 m unless told otherwise."""
+    from src.elevation import TerrainResult
+    from src.geo import BBox
 
-    Quads do the work across the spaces and follow their shape, triangles
-    fill in at the edges, and the quads are never just the underlying grid.
+    bbox = BBox(1000.0, 2000.0, 1160.0, 2160.0)
+    axis_x = np.linspace(bbox.xmin, bbox.xmax, 81)
+    axis_y = np.linspace(bbox.ymin, bbox.ymax, 81)
+    gx, gy = np.meshgrid(axis_x, axis_y)
+    heights = (np.full(gx.shape, 3.0) if height is None else height(gx, gy)).astype(np.float32)
+    return TerrainResult(
+        heights=heights.copy(), xs=axis_x, ys=axis_y, bbox=bbox, center_z_nap=3.0,
+        nodata_fraction_raw=0.0, filled_fraction=0.0, geotiff_path=None,
+        coverage_id="t", resolution_m=0.5, measured=heights.copy(),
+    )
+
+
+class TestRibcageTerrain(unittest.TestCase):
+    """The ribcage layout: the 3D team's, and the default.
+
+    Ribs across what is narrow; a wide space is one face where its ground
+    lies flat and is cut, along lines turned to it, only where the ground
+    moves. There is never a grid.
     """
 
     @classmethod
@@ -7755,8 +7819,12 @@ class TestRibcageTerrain(unittest.TestCase):
 
     def test_it_is_the_ribcage_and_it_is_lighter(self):
         stats = self.ground.stats
+        from src.terrain_mesh import OPEN
+
         self.assertEqual(stats["mesher"], "ribcage")
-        self.assertTrue(set(np.unique(self.ground.mesh.face_sizes)) <= {3, 4})
+        mesh = self.ground.mesh
+        # More than four corners only where a face is a stretch of open space.
+        self.assertTrue((mesh.face_part[mesh.face_sizes > 4] == OPEN).all())
         self.assertGreater(stats["quad_share"], 0.5)
         self.assertLess(len(self.ground.mesh.face_sizes), len(self.grid.mesh.face_sizes))
         self.assertEqual(stats["regions_filled_whole"], 0)
@@ -7786,9 +7854,10 @@ class TestRibcageTerrain(unittest.TestCase):
     def test_it_stays_on_the_survey(self):
         self.assertLess(self.ground.stats["grid_error_p95_m"], 0.5)
 
-    def test_an_open_space_gets_quads_turned_to_it_not_the_grid(self):
-        """A lawn set at 30 degrees to the area: its lattice runs with the
-        lawn, where the grid mesher's runs with the streets."""
+    def test_an_open_space_is_cut_with_it_not_with_the_grid(self):
+        """A lawn set at 30 degrees to the area, over the lumpy ground: where
+        it is cut, the cuts run with the lawn, where the grid mesher's squares
+        run with the streets."""
         import shapely
 
         from src.layered import GRASS, GroundArea, build_layered_ground
@@ -7800,18 +7869,124 @@ class TestRibcageTerrain(unittest.TestCase):
         lawn = GroundArea([np.vstack([corners, corners[:1]])], GRASS, "Gras")
         ground = build_layered_ground(self.terrain, [lawn], prefix="T", mesher="ribcage")
         mesh = ground.mesh
-        inner = shapely.Polygon(corners).buffer(-8.0)
+        outline = shapely.Polygon(corners).boundary
         angles = []
         starts = mesh.loop_starts
-        for f in np.flatnonzero((mesh.face_kind == GRASS) & (mesh.face_sizes == 4)):
-            q = mesh.vertices[mesh.face_loops[starts[f]: starts[f] + 4], :2]
-            if not inner.contains(shapely.Point(q.mean(axis=0))):
-                continue
-            d = q[1] - q[0]
-            angles.append(np.degrees(np.arctan2(d[1], d[0])) % 90.0)
+        for f in np.flatnonzero(mesh.face_kind == GRASS):
+            ring = mesh.vertices[mesh.face_loops[starts[f]: starts[f] + mesh.face_sizes[f]], :2]
+            for p, q in zip(ring, np.roll(ring, -1, axis=0)):
+                if min(outline.distance(shapely.Point(p)), outline.distance(shapely.Point(q))) < 0.5:
+                    continue
+                d = q - p
+                angles.append(np.degrees(np.arctan2(d[1], d[0])) % 90.0)
         self.assertGreater(len(angles), 4)
-        off = (np.array(angles) - 30.0 + 45.0) % 90.0 - 45.0
-        self.assertLess(float(np.abs(off).max()), 2.0)
+        off = np.abs((np.array(angles) - 30.0 + 45.0) % 90.0 - 45.0)
+        # A cut ends on the nearest station of the outline, so it leans by
+        # as much as that moves its end over its length: a few degrees, where
+        # the grid would be 30 off.
+        self.assertLess(float(np.median(off)), 5.0)
+        self.assertLess(float(np.percentile(off, 90)), 8.0)
+
+    def test_a_plain_open_space_is_one_face(self):
+        """A lawn on flat ground, and one on a steady slope: one face each,
+        its outline only, with the stations its neighbours share."""
+        from src.layered import GRASS, GroundArea, build_layered_ground
+        from src.terrain_mesh import OPEN
+
+        lawn = GroundArea([_rect_ring(1040.0, 2040.0, 1110.0, 2090.0)], GRASS, "Gras")
+        for height in (None, lambda x, y: 3.0 + 0.02 * (x - 1000.0) - 0.01 * (y - 2000.0)):
+            ground = build_layered_ground(_plain_terrain(height), [lawn], prefix="T",
+                                          mesher="ribcage")
+            mesh = ground.mesh
+            on_lawn = np.flatnonzero(mesh.face_kind == GRASS)
+            self.assertEqual(len(on_lawn), 1)
+            self.assertEqual(int(mesh.face_part[on_lawn[0]]), OPEN)
+            # A station every 4 m round 240 m of outline, and nothing inside.
+            f = on_lawn[0]
+            ring = mesh.vertices[mesh.face_loops[mesh.loop_starts[f]:
+                                                 mesh.loop_starts[f] + mesh.face_sizes[f]], :2]
+            self.assertGreaterEqual(len(ring), 60)
+            on_outline = (
+                np.isclose(ring[:, 0], 1040.0) | np.isclose(ring[:, 0], 1110.0)
+                | np.isclose(ring[:, 1], 2040.0) | np.isclose(ring[:, 1], 2090.0)
+            )
+            self.assertTrue(on_outline.all())
+            TestQuadTerrain._assert_closed(self, mesh)
+            self.assertLess(ground.stats["grid_error_max_m"], 0.05)
+
+    def test_a_mound_is_cut_round_and_the_rest_stays_whole(self):
+        """A mound 1.5 m high in a flat lawn: the lawn is cut where it rises,
+        the mound's top is in the ground, and most of the lawn is still one
+        face."""
+        import shapely
+
+        from src.layered import GRASS, GroundArea, build_layered_ground
+
+        def mound(x, y):
+            return 3.0 + 1.5 * np.exp(-((x - 1060.0) ** 2 + (y - 2060.0) ** 2) / (2 * 5.0 ** 2))
+
+        lawn = GroundArea([_rect_ring(1040.0, 2040.0, 1140.0, 2120.0)], GRASS, "Gras")
+        ground = build_layered_ground(_plain_terrain(mound), [lawn], prefix="T",
+                                      mesher="ribcage")
+        mesh = ground.mesh
+        starts = mesh.loop_starts
+        areas = []
+        for f in np.flatnonzero(mesh.face_kind == GRASS):
+            ring = mesh.vertices[mesh.face_loops[starts[f]: starts[f] + mesh.face_sizes[f]], :2]
+            areas.append(shapely.Polygon(ring).area)
+        self.assertGreater(len(areas), 4)
+        self.assertGreater(max(areas), 0.4 * 100.0 * 80.0)
+        top = float(mesh.heights_at(np.array([1060.0]), np.array([2060.0]))[0])
+        self.assertLess(abs(top - 4.5), 0.4)
+        self.assertLess(ground.stats["grid_error_max_m"], 0.5)
+        TestQuadTerrain._assert_closed(self, mesh)
+
+    def test_open_water_has_one_flat_bed(self):
+        """A pond 40 m across: a bank round it and one flat face for the bed,
+        at the bed's depth under the water."""
+        from src.layered import GroundArea, GRASS, build_layered_ground
+        from src.surfaces import WaterBody
+        from src.terrain_mesh import OPEN
+
+        pond = WaterBody(rings=[_rect_ring(1060.0, 2060.0, 1100.0, 2100.0)], level_nap=2.5,
+                         area_m2=1600.0, measured=True)
+        lawn = GroundArea([_rect_ring(1040.0, 2040.0, 1120.0, 2120.0)], GRASS, "Gras")
+        ground = build_layered_ground(_plain_terrain(), [lawn], prefix="T", water=[pond],
+                                      mesher="ribcage", ditch_depth_m=0.6)
+        mesh = ground.mesh
+        starts = mesh.loop_starts
+        beds = []
+        for f in np.flatnonzero(mesh.face_part == OPEN):
+            ring = mesh.vertices[mesh.face_loops[starts[f]: starts[f] + mesh.face_sizes[f]]]
+            if (ring[:, 0] > 1060.0).all() and (ring[:, 0] < 1100.0).all() \
+                    and (ring[:, 1] > 2060.0).all() and (ring[:, 1] < 2100.0).all():
+                beds.append(ring)
+        self.assertEqual(len(beds), 1)
+        np.testing.assert_allclose(beds[0][:, 2], 2.5 - 0.6, atol=0.01)
+        TestQuadTerrain._assert_closed(self, mesh)
+
+    def test_an_ngon_is_cut_into_triangles_for_placing_things(self):
+        """Everything placed on the ground reads it off its triangles: an
+        open face's are its own, covering it exactly, so a lamp post in the
+        middle of a sloping lawn stands on it."""
+        import shapely
+
+        from src.layered import GRASS, GroundArea, build_layered_ground
+
+        lawn = GroundArea([_rect_ring(1040.0, 2040.0, 1110.0, 2090.0)], GRASS, "Gras")
+        ground = build_layered_ground(
+            _plain_terrain(lambda x, y: 3.0 + 0.02 * (x - 1000.0)), [lawn], prefix="T",
+            mesher="ribcage",
+        )
+        mesh = ground.mesh
+        triangles, owner = mesh.triangles()
+        f = int(np.flatnonzero(mesh.face_kind == GRASS)[0])
+        mine = triangles[owner == f]
+        xy = mesh.vertices[:, :2]
+        covered = sum(shapely.Polygon(xy[t]).area for t in mine)
+        self.assertAlmostEqual(covered, 70.0 * 50.0, places=3)
+        z = mesh.heights_at(np.array([1075.0, 1050.0]), np.array([2065.0, 2080.0]))
+        np.testing.assert_allclose(z, [3.0 + 0.02 * 75.0, 3.0 + 0.02 * 50.0], atol=0.01)
 
     def test_two_regions_meet_vertex_for_vertex(self):
         """Each region is meshed on its own; the stations on their shared

@@ -654,7 +654,7 @@ the mesh, so nothing of it reaches an export:
 |---|---|---|
 | Slivers | red | a triangle more than *Sliver ratio* (10) times longer than it is high, once it is over a metre long; a quad with a corner under 10° |
 | Too dense | orange | more than *Vertices per square* (30) vertices in one *Density square* (5 m) of the plan, counted by place: a wall's top and bottom corner are one |
-| N-gons | violet | faces with more than four sides |
+| Bent n-gons | violet | faces with more than four sides whose corners stand more than 25 cm off one plane: Blender, the export and Unity each cut such a face into triangles their own way. The open stretches of the ground are n-gons on purpose and lie flat, so they are not shown |
 | Flipped | magenta | ground facing down; on anything else, a face wound against its neighbour |
 | Seams | cyan | an open edge of one ground piece with no partner in the next — a crack, a T-junction, or a step in height between two pieces (dots at the vertices) |
 | Moved | yellow | vertices further than *Moved by* (0.5 m) from their surveyed height (`measured_z`) |
@@ -811,7 +811,7 @@ How it is built (`src/layered.py`):
   walkway too thin for a kerb on each side, or a small one keeping a corner
   under 6°, becomes part of its neighbour. At Hazeldonk that is 0.3% of the
   footpath area.
-* **Ground, in quads** (`src/layered_mesh.py`). The modellers' feedback on
+* **Ground, in quads** (`layered.mesher: "quads"`, `src/layered_mesh.py`). The modellers' feedback on
   the first version, a triangulation refined until it fitted the survey, was:
   quads rather than a complete triangulation, with minimal but realistic height
   variation; whole continuous quads along the roads; edge loops that follow
@@ -866,35 +866,65 @@ How it is built (`src/layered.py`):
   along the edges where they meet, and none lies on another.
   `layered.mesher: "triangles"` gives the old triangulation back, and is what
   a quad mesh that fails falls back to.
-* **The ribcage, beside the grid** (`layered.mesher: "ribcage"`,
-  `src/ribcage_mesh.py`). The 3D team's layout, to compare with the grid: quads
-  do the work across the spaces and follow their shape, triangles fill in at the
-  edges, and there is no grid. Every region is meshed in its own frame:
+* **The ribcage, the default** (`layered.mesher: "ribcage"`,
+  `src/ribcage_mesh.py`). The 3D team's layout. With the hand-made Hazeldonk
+  file beside ours they pointed at the grid: in theirs a large area is a few
+  large faces, which is what they select and edit. So there is no grid, and
+  every region is meshed in its own frame:
   * **Ribs across what is narrow.** A street, a footpath, a verge, a ditch:
     ribs straight across from station to station, a ladder that follows the
     street round its bends. A road the survey shows a crown on gets a loop down
     its middle; narrow water always does, and that loop is the bed.
-  * **A lattice turned to each space in what is wide.** What the ribs leave — a
-    square, a field, a junction, open water — gets quads turned to that
-    piece's own main direction, at twice `square_m` where the ground is plain
-    enough and `square_m` in the patches where a big quad would miss the survey
-    by more than the tolerance. Ribs that only cut an open space into wedges
-    are taken back out, so it is one space with one lattice. The lattice is
-    joined to the outline by a constrained triangulation, so the outline is
-    always kept and never filled as a fan from its corners, and every pair of
-    triangles that makes a good quad is one.
+  * **One face for a plain open space.** What the ribs leave (a square, a
+    field, a yard, a junction) is one face, its outline only, wherever one face
+    draws the ground in it: its corners within 0.3 × `tolerance_m` (15 cm) of
+    one plane, and the survey inside within 0.8 × `tolerance_m` (40 cm) of that
+    plane. A field on a steady slope is one face as well. Ribs that only cut an
+    open space into wedges are taken back out first, so it is one space.
+  * **Cut only where the ground moves.** Where one face would miss, the space
+    is cut in two across its longer side, on the line of a `square_m` lattice
+    turned to the space that lies nearest its middle, so the cuts in
+    neighbouring pieces line up, and each piece is tested again, down to
+    pieces `square_m` across. A cut ends on the nearest station of the space's
+    outline, so the road, verge or rib beside it keeps its vertices and gains
+    none; the cut leans a few degrees for it. Where a cut ends on an earlier
+    one, the piece across takes the new vertex as one more corner, and is cut
+    in turn if that takes it out of its plane. A space with an island in it is
+    cut through the island, as a face cannot have a hole. Over Hazeldonk the
+    cuts gather round the loading docks, where the yards lie 1.2 m below the
+    warehouse floors.
+  * **Open water has one flat bed.** A pond or a wide canal gets an edge loop
+    half a metre in from its bank and a bed ring 2 m in, with a station every
+    `square_m`. Inside the ring the bed is one face at the bed's depth; between
+    the ring and the outline the bank is triangulated through the loop and
+    paired into quads. Two metres in, a bank eased to 45° has come down to the
+    bed.
+  * **N-gons.** A face with more than four corners is kept as one in Blender.
+    The export cuts it into triangles with Blender's beauty fill, which on a
+    face whose corners lie in one plane comes to the constrained Delaunay
+    triangulation the pipeline stands trees and lamp posts on. The problem
+    finder shows an n-gon only when its corners stand more than 25 cm off its
+    plane.
   * The outline stations are the grid mesher's, so neighbours meet vertex for
-    vertex, and the finishing — welding, heights, beds, banks, diagonals — is
+    vertex, and the finishing (welding, heights, beds, banks, diagonals) is
     the grid mesher's own, so the two differ in layout only.
 
-  Over Hoek van Holland, from the same inputs:
+  Over the square round the Hazeldonk services (RD 109,900 to 110,900 east,
+  389,350 to 390,350 north), from the same inputs:
 
   | | grid (`quads`) | `ribcage` |
   |---|---|---|
-  | faces | 82,348 | 46,315 |
-  | quads / triangles | 65,068 / 17,280 | 30,909 / 15,406 |
-  | slivers (10:1 or worse) | 1,044 | 851 |
-  | survey miss, 95% of the ground | 0.155 m | 0.18 m |
+  | faces | 79,565 | 30,507 |
+  | quads / triangles / n-gons | 63,246 / 16,319 / 0 | 22,267 / 5,542 / 2,698 |
+  | vertices | 71,903 | 35,789 |
+  | slivers (10:1 or worse) | 1,113 | 366 |
+  | survey miss, 95% of the ground | 0.274 m | 0.261 m |
+  | ground further off than `tolerance_m` | 1.6% | 1.1% |
+
+  Before an open space was one face, the ribcage laid a lattice turned to it
+  at twice `square_m`, with `square_m` where that missed: over Hoek van
+  Holland 46,315 faces against the grid's 82,348, and over this Hazeldonk
+  square 48,452.
 * **Water.** Water is meshed like the rest, with rungs across a ditch split
   at the middle: the middle line is the bed, `ditch_depth_m` (0.6 m) below the
   water level (one per connected water, see [Ground surfaces](#ground-surfaces)),
@@ -971,7 +1001,10 @@ vertices stood up to 0.65 m off the ground, at slopes and at outline points a
 few centimetres lower than their neighbours — while the same outlines laid
 flat came out exact. So the modifier wraps it: the walkway goes in flat, and
 every point that comes out is raised by the height of the walkway as it came
-in, read straight below it. Every one of the generator's inputs is passed
+in, read straight below it, off the walkway cut into triangles as the export
+cuts it. Read off the viewport's own cut, a kerb along the straight edge of a
+walkway n-gon took the height of the edge between two stations instead of the
+station's own, up to 8 cm off. Every one of the generator's inputs is passed
 through, so the modifier panel shows them as it would show the generator's
 own, and the generator itself is unchanged inside it. Move the outline, or
 raise a vertex of it, and the kerb follows. (It used to read the height off
@@ -1009,8 +1042,8 @@ The layered style's settings, all optional:
 | --- | --- | --- |
 | `layered.prefix` | the area name | what every ground object's name starts with |
 | `layered.tolerance_m` | 0.5 | how far the survey may be off a road's rungs before a loop goes down its middle, and what the checks warn past |
-| `layered.mesher` | `"quads"` | `"quads"`; `"ribcage"`, ribs across what is narrow and a lattice turned to each space in what is wide, no grid; or `"triangles"` for the triangulation refined to `tolerance_m` |
-| `layered.square_m` | 4 | the size of the grid squares and the spacing of the points along every outline, the same everywhere, in whole survey grid squares; 8 has about a third of the faces over open ground |
+| `layered.mesher` | `"ribcage"` | `"ribcage"`, ribs across what is narrow and each wide space one face where its ground lies flat, cut along lines turned to it only where the ground moves; `"quads"`, rows along the outlines and one grid of `square_m` squares; or `"triangles"` for the triangulation refined to `tolerance_m` |
+| `layered.square_m` | 4 | the spacing of the points along every outline, the same everywhere, in whole survey grid squares; the size of the grid's squares, and of the smallest piece the ribcage cuts an open space into; 8 has about a third of the faces over open ground on the grid |
 | `layered.ditch_depth_m` | 0.6 | how far below its water level a ditch is cut |
 | `layered.water_surface` | true | the flat water object over every BGT water |
 | `layered.water_level_offset_m` | 0 | added to every water level: a tide (the survey's is whatever the tide was when it was flown) |
@@ -1018,6 +1051,11 @@ The layered style's settings, all optional:
 | `layered.outline_m` | 0.25 | how far a simplified outline may stray from the BGT's |
 | `layered.kerbs` | true | the curb generator on every walkway |
 | `layered.curb.*` | the modellers' own | width 0.3 m, height 0.15 m, slant, bevels, materials |
+
+With the ribcage, over the square in the table above, the ground is 30,507
+faces: 2,698 of them open spaces and pond beds of one face each, the largest
+with 184 corners. Half of those lie within 6 cm of one plane, 95% within
+15 cm. The whole run passes all 68 checks, as it does on the grid. The rest of this paragraph is the grid.
 
 Over the Hazeldonk square kilometre the ground is 84,867 faces, 77% of them
 quads, on 75,479 vertices: 4 m squares everywhere, turned 15° to the roads,

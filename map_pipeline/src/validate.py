@@ -968,7 +968,7 @@ def check_built_terrain(report: CheckReport, work_dir: Path, terrain) -> None:
         want_others = len(mesh) - want_quads
         plan = (
             f"a mesh of {want_vertices} vertices, {want_quads} quads and "
-            f"{want_others} triangles"
+            f"{want_others} triangles and n-gons"
         )
     else:
         n = int(terrain.n)

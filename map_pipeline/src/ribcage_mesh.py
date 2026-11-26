@@ -1,9 +1,11 @@
-"""The layered style's ground as a ribcage: the 3D team's layout, beside the grid.
+"""The layered style's ground as a ribcage: the 3D team's layout, and the default.
 
 What the 3D team asked for, with the grid mesher's Hoek van Holland in front
 of them: areas designed like a ribcage, where quads do the work across the
 large spaces, triangles fill in at the edges where the outline needs them,
-and the quads are never just the underlying grid.
+and the quads are never just the underlying grid. Then, with their own
+Hazeldonk file beside ours: a large area is a few large faces there, which
+is what they select and edit.
 
 So there is no grid. Every region -- a street, a verge, a square, a field, a
 canal -- is meshed in its own frame:
@@ -14,23 +16,26 @@ canal -- is meshed in its own frame:
   ladder of quads that follows the street round its bends. Nothing else is
   put in a ladder cell; a road whose crown or dike the survey shows gets one
   loop down its middle, as with the grid.
-* **A lattice turned to the space in what is wide.** What the ribs leave --
-  a square, a field, a junction, the water -- gets a lattice of quads turned
-  to that piece's own main direction (`_own_angle`), not to a grid shared
-  with everything else. Twice the station spacing where the ground is plain
-  enough for it; where the survey shows the ground doing something a big
-  quad would miss by more than the tolerance, the station spacing there
-  (`_refined`). The lattice is joined to the outline by triangles, and every
-  pair of those that makes a good quad is one.
-* **Banks get a loop.** Water gets an edge loop a little way in from its
-  outline, so the bed is carved even in a ditch too narrow for the lattice,
-  and a hand's breadth in along a quay wall, where the ground drops sheer.
+* **One face for a plain open space.** What the ribs leave -- a square, a
+  field, a yard, a junction -- is one face, its outline only, where its
+  ground lies in one plane to the tolerance (`_plain`). Where it does not, it
+  is cut in two across its longer side along a line of a lattice turned to
+  the space (`_own_angle`, `_cut`), and each piece tested again, down to
+  pieces the station spacing across (`_open_layout`). A cut ends on a
+  station of the outline, so no neighbour gains a vertex.
+* **Open water has one flat bed.** A pond gets an edge loop a little way in
+  from its outline, and a hand's breadth in along a quay wall, where the
+  ground drops sheer; inside a ring further in, the bed is one flat face
+  (`_bed_fill`). Water too narrow for that, and with ``open_faces`` off every
+  open space, gets the lattice the ribcage first had: quads at twice the
+  station spacing, at the station spacing where those miss the survey
+  (`_refined`), joined to the outline by triangles paired into quads.
 
 The outlines carry the same stations on both sides (`layered_mesh.
 _with_stations`), so two regions meet vertex for vertex whatever each does
 inside; the finishing -- welding, mending, heights, beds, diagonals -- is the
 grid mesher's own (`layered_mesh._assemble`), so the two can be compared on
-their layout alone. Choose it with ``layered.mesher: "ribcage"``.
+their layout alone. The grid is ``layered.mesher: "quads"``.
 """
 
 from __future__ import annotations
@@ -72,6 +77,23 @@ REFINE_SHARE = 0.8
 # Water's edge loop: this far in from the bank, so the bed is carved even in a
 # ditch; along a quay, `QUAY_ROW_M`.
 BANK_LOOP_M = 0.5
+
+# An open space is one face where the ground in it is plain: its corners
+# within this share of the tolerance of one plane, so the face lies flat
+# whichever way it is cut into triangles ...
+PLAIN_CORNER_SHARE = 0.3
+# ... and the survey inside it within this share of the tolerance of that
+# plane, the same margin the lattice refines at.
+PLAIN_SURVEY_SHARE = REFINE_SHARE
+# Where it is not, the space is cut in two across its length, on a line of
+# a lattice of the station spacing turned to the space, until each piece is
+# plain; a piece no more than this many stations across is not cut again.
+SMALLEST_CUT_STEPS = 1.5
+# A cut that leaves a piece smaller than this is not made.
+CUT_MIN_M2 = 4.0
+# Open water: the bed is one flat face inside a ring this far in from the
+# bank, deep enough in that a bank eased to 45 degrees has come down to it.
+BED_RING_M = 2.0
 
 
 def _own_angle(polygon, size) -> float:
@@ -290,15 +312,346 @@ def _with_vertices(polygon, wanted):
     return shapely.Polygon(rings[0], rings[1:])
 
 
-def _rib_fill(cell, *, kind, near_m, size, height_at, tolerance_m, quay_zone=None,
-              laddered=False):
-    """One cell as faces: a ladder rung pair as one quad, a small cell from its
-    outline, an open one through a lattice turned to it. `laddered` says the
-    region's ribs are its ladder (narrow water: the bed is carved by the loop
-    the rungs are divided at, not by a loop along its banks)."""
+def _plain(piece, samples, height_at, tolerance_m: float) -> bool:
+    """Whether one face over `piece` would draw the ground in it.
+
+    Its corners, at their surveyed heights, must lie within
+    `PLAIN_CORNER_SHARE` of the tolerance of the plane through them, and the
+    survey inside it (`samples`, ``(n, 3)``) within `PLAIN_SURVEY_SHARE`.
+    """
     import shapely
 
-    from .terrain_mesh import FILL, ROW, WATER, _ccw, _fill, _fill_pinned, _quad_score
+    ring = np.asarray(piece.exterior.coords)[:-1, :2]
+    z = np.asarray(height_at(ring), dtype=np.float64)
+    if len(ring) < 3 or not np.isfinite(z).all():
+        return False
+    centre = ring.mean(axis=0)
+    a = np.column_stack([ring - centre, np.ones(len(ring))])
+    coef, *_ = np.linalg.lstsq(a, z, rcond=None)
+    if np.abs(a @ coef - z).max() > PLAIN_CORNER_SHARE * tolerance_m:
+        return False
+    if len(samples):
+        x0, y0, x1, y1 = piece.bounds
+        near = samples[
+            (samples[:, 0] >= x0) & (samples[:, 0] <= x1)
+            & (samples[:, 1] >= y0) & (samples[:, 1] <= y1)
+        ]
+        if len(near):
+            near = near[shapely.contains_xy(piece, near[:, 0], near[:, 1])]
+        if len(near):
+            drawn = (near[:, :2] - centre) @ coef[:2] + coef[2]
+            if np.abs(drawn - near[:, 2]).max() > PLAIN_SURVEY_SHARE * tolerance_m:
+                return False
+    return True
+
+
+def _cut(piece, u, v, at: float, anchor, fixed, size=None):
+    """`piece` cut along the line across `u` at `at` from `anchor`.
+
+    Each stretch of the line inside the piece is a cut from where it meets
+    the outline to where it leaves it. On the space's own outline (`fixed`)
+    an end goes to the nearer corner of the edge it meets, so the neighbour
+    across that outline keeps every vertex it shares and gains none; on an
+    earlier cut it stays where it meets it, and the piece across that cut
+    takes the new vertex in later (`_conformed`), and so it does on the edge
+    of the area, which no neighbour shares. Returns the pieces, or None where
+    the line makes no clean cut.
+    """
+    import shapely
+
+    x0, y0, x1, y1 = piece.bounds
+    reach = float(np.hypot(x1 - x0, y1 - y0)) + 1.0
+    middle = np.array([0.5 * (x0 + x1), 0.5 * (y0 + y1)])
+    base = middle + (at - float((middle - anchor) @ u)) * u
+    line = shapely.LineString([base - reach * v, base + reach * v])
+    hit = shapely.intersection(piece.boundary, line)
+    if any(g.geom_type != "Point" for g in shapely.get_parts(hit)):
+        return None  # along an edge of the outline
+    points = shapely.get_coordinates(hit)
+    if len(points) < 2:
+        return None
+    order = np.argsort((points - base) @ v)
+    points = points[order]
+    rings = [np.asarray(r.coords)[:, :2] for r in [piece.exterior, *piece.interiors]]
+    starts = np.vstack([r[:-1] for r in rings])
+    ends = np.vstack([r[1:] for r in rings])
+
+    def placed(p):
+        d = ends - starts
+        t = np.clip(((p - starts) * d).sum(axis=1) / np.maximum((d * d).sum(axis=1), 1e-18),
+                    0.0, 1.0)
+        gap = np.hypot(*(starts + t[:, None] * d - p).T)
+        k = int(np.argmin(gap))
+        a, b = starts[k], ends[k]
+        if np.hypot(*(p - a)) < 1e-6:
+            return a
+        if np.hypot(*(p - b)) < 1e-6:
+            return b
+        on_cut = fixed is not None and not shapely.dwithin(
+            fixed, shapely.Point(0.5 * (a + b)), 1e-6)
+        on_frame = size is not None and any(
+            abs(a[i] - edge) < 1e-6 and abs(b[i] - edge) < 1e-6
+            for i in (0, 1) for edge in (0.0, size[i])
+        )
+        if on_cut or on_frame:
+            return p
+        return a if np.hypot(*(p - a)) <= np.hypot(*(p - b)) else b
+
+    shapely.prepare(piece)
+    cuts = []
+    for a, b in zip(points[:-1], points[1:]):
+        if not shapely.contains_xy(piece, *(0.5 * (a + b))):
+            continue
+        a, b = placed(a), placed(b)
+        if np.hypot(*(b - a)) < 1e-3:
+            continue
+        chord = shapely.LineString([a, b])
+        mid = 0.5 * (a + b)
+        if not shapely.contains_xy(piece, *mid) or shapely.distance(
+                piece.boundary, shapely.Point(mid)) < 1e-3:
+            continue
+        # Clear of the outline between its ends: an end met on an edge lies on
+        # it only to the rounding, so the ends themselves are not asked.
+        trim = 1e-4 / max(float(np.hypot(*(b - a))), 1e-9)
+        inner = shapely.LineString([a + trim * (b - a), b - trim * (b - a)])
+        if shapely.intersects(inner, piece.boundary):
+            continue
+        cuts.append(chord)
+    if not cuts:
+        return None
+    # The ends that fall between corners made corners first: met only to the
+    # rounding, the cut would not be noded to the outline.
+    ends = np.array([c for cut in cuts for c in np.asarray(cut.coords)])
+    piece = _with_vertices_near(piece, ends)
+    lines = shapely.union_all(np.array([piece.boundary, *cuts], dtype=object))
+    cells = shapely.get_parts(shapely.polygonize(shapely.get_parts(lines)))
+    if len(cells) < 2:
+        return None
+    inside = shapely.contains_xy(
+        piece, *shapely.get_coordinates(shapely.point_on_surface(cells)).T)
+    cells = [c for c in cells[inside] if c.area > 1e-6]
+    if len(cells) < 2 or min(c.area for c in cells) < CUT_MIN_M2:
+        return None
+    if abs(sum(c.area for c in cells) - piece.area) > 1e-6 * max(piece.area, 1.0) + 1e-4:
+        return None
+    return [shapely.orient_polygons(c) for c in cells]
+
+
+def _conformed(pieces):
+    """Every piece with each corner of another that lies on its outline put in.
+
+    A cut that ends on an earlier cut is a vertex on that cut's edge in the
+    piece across it too, or the two would meet in a T and crack open.
+    """
+    import shapely
+
+    corners = {}
+    for piece in pieces:
+        for ring in [piece.exterior, *piece.interiors]:
+            for x, y in np.asarray(ring.coords)[:-1, :2]:
+                corners[(round(float(x), 6), round(float(y), 6))] = (float(x), float(y))
+    if not corners:
+        return pieces
+    wanted = np.array(list(corners.values()))
+    tree = shapely.STRtree(shapely.points(wanted))
+    out = []
+    for piece in pieces:
+        near = tree.query(piece.boundary, predicate="dwithin", distance=1e-5)
+        if not len(near):
+            out.append(piece)
+            continue
+        out.append(_with_vertices_near(piece, wanted[near]))
+    return out
+
+
+def _with_vertices_near(polygon, points, within: float = 1e-5):
+    """`_with_vertices` for points that may lie a hair off the outline."""
+    import shapely
+
+    rings = []
+    for ring in [polygon.exterior, *polygon.interiors]:
+        coords = np.asarray(ring.coords)[:, :2]
+        have = {(round(x, 6), round(y, 6)) for x, y in coords}
+        out = []
+        for k in range(len(coords) - 1):
+            a, b = coords[k], coords[k + 1]
+            out.append(a)
+            d = b - a
+            length2 = float(d @ d)
+            if length2 <= 0:
+                continue
+            t = ((points - a) @ d) / length2
+            foot = a + np.clip(t, 0, 1)[:, None] * d
+            gap = np.hypot(*(points - foot).T)
+            on = (t > 1e-9) & (t < 1 - 1e-9) & (gap < within)
+            for i in np.flatnonzero(on)[np.argsort(t[on])]:
+                key = (round(float(points[i, 0]), 6), round(float(points[i, 1]), 6))
+                if key not in have:
+                    out.append(points[i])
+                    have.add(key)
+        out.append(coords[-1])
+        rings.append(np.array(out))
+    result = shapely.Polygon(rings[0], rings[1:])
+    return result if result.is_valid else polygon
+
+
+def _open_layout(cell, *, angle, anchor, step, height_at, tolerance_m, sample_m, size):
+    """An open space cut into as few pieces as its ground allows.
+
+    Returns ``(polygon, plain)`` per piece: a plain piece is one face, its
+    outline only. Where one face would miss the ground the piece is cut in
+    two across its longer side, on the line of a lattice of `step` turned to
+    the space nearest its middle, so the cuts in neighbouring pieces line up;
+    a piece no more than `SMALLEST_CUT_STEPS` steps across is not cut again,
+    plain or not. A piece with a hole in it is cut through the hole, as a
+    face cannot have one. A cut that ends on another piece's edge gives that
+    piece a corner, and a plain piece whose new corners take it out of its
+    plane is cut in turn.
+    """
+    import shapely
+
+    a = np.radians(angle)
+    u = np.array([np.cos(a), np.sin(a)])
+    v = np.array([-np.sin(a), np.cos(a)])
+    x0, y0, x1, y1 = cell.bounds
+    gx = np.arange(x0 + 0.5 * sample_m, x1, sample_m)
+    gy = np.arange(y0 + 0.5 * sample_m, y1, sample_m)
+    samples = np.zeros((0, 3))
+    if len(gx) and len(gy):
+        sx, sy = np.meshgrid(gx, gy)
+        xy = np.column_stack([sx.ravel(), sy.ravel()])
+        xy = xy[shapely.contains_xy(cell, xy[:, 0], xy[:, 1])]
+        if len(xy):
+            z = np.asarray(height_at(xy), dtype=np.float64)
+            samples = np.column_stack([xy, z])[np.isfinite(z)]
+
+    fixed = shapely.union_all(np.array(
+        [r for r in [cell.exterior, *cell.interiors]], dtype=object))
+    shapely.prepare(fixed)
+    smallest = SMALLEST_CUT_STEPS * step
+    leaves = []
+    stack = [shapely.orient_polygons(cell)]
+    budget = 20000
+    for _ in range(8):
+        while stack:
+            piece = stack.pop()
+            budget -= 1
+            holes = len(piece.interiors) > 0
+            if not holes and _plain(piece, samples, height_at, tolerance_m):
+                leaves.append((piece, True))
+                continue
+            coords = np.vstack([np.asarray(r.coords)[:, :2]
+                                for r in [piece.exterior, *piece.interiors]]) - anchor
+            pu, pv = coords @ u, coords @ v
+            spans = [(pu.max() - pu.min(), u, v, pu), (pv.max() - pv.min(), v, -u, pv)]
+            spans.sort(key=lambda s: -s[0])
+            if budget <= 0 or (not holes and spans[0][0] <= smallest):
+                leaves.append((piece, False))
+                continue
+            tries = []
+            if holes:
+                hole = shapely.point_on_surface(shapely.Polygon(piece.interiors[0]))
+                h = np.asarray(hole.coords[0]) - anchor
+                for _, axis, across, _ in spans:
+                    tries.append((axis, across, float(h @ axis)))
+            else:
+                for span, axis, across, along in spans:
+                    if span <= smallest:
+                        continue
+                    lo, hi = float(along.min()), float(along.max())
+                    middle = 0.5 * (lo + hi)
+                    on_lattice = sorted(
+                        (k * step for k in range(int(np.floor(lo / step)),
+                                                 int(np.ceil(hi / step)) + 1)
+                         if lo + 0.25 * step < k * step < hi - 0.25 * step),
+                        key=lambda c: abs(c - middle),
+                    )
+                    for at in on_lattice[:3] or [middle]:
+                        tries.append((axis, across, at))
+            made = None
+            for axis, across, at in tries:
+                made = _cut(piece, axis, across, at, anchor, fixed, size)
+                if made is not None:
+                    break
+            if made is None:
+                leaves.append((piece, False))
+                continue
+            stack.extend(made)
+        before = [len(p.exterior.coords) for p, _ in leaves]
+        polygons = _conformed([p for p, _ in leaves])
+        kept, again = [], []
+        for polygon, (_, plain), count in zip(polygons, leaves, before):
+            if (plain and len(polygon.exterior.coords) > count
+                    and not _plain(polygon, samples, height_at, tolerance_m)):
+                again.append(polygon)
+            else:
+                kept.append((polygon, plain))
+        leaves = kept
+        if not again:
+            break
+        stack = again
+    LOG.debug("open layout: %d pieces (%d plain), budget left %d, %d left uncut",
+              len(leaves), sum(1 for _, plain in leaves if plain), budget, len(stack))
+    return leaves + [(p, False) for p in stack]
+
+
+def _bed_fill(cell, *, loop, near_m, angle, anchor, size):
+    """Open water as its bank and one flat face for the bed.
+
+    The bed is the water `BED_RING_M` in from its outline, with a station
+    every `near_m` round it; it lies flat at the bed's depth, so it is one
+    face, cut only through an island. The bank between the outline and the
+    bed is triangulated through the edge loop along it (`loop`), and paired
+    into quads. None where there is no bed that wide.
+    """
+    import shapely
+
+    from .terrain_mesh import FILL, GRID_SIZE, OPEN, ROW, _ccw, _fill, _fill_pinned, _quad_score
+
+    bed = cell.buffer(-BED_RING_M, join_style="mitre", mitre_limit=2.0)
+    bed = shapely.set_precision(shapely.segmentize(bed, near_m), GRID_SIZE)
+    parts = [p for p in _parts(bed) if p.area >= SMALL_CELL_SQUARES * near_m * near_m]
+    if not parts:
+        return None
+    bed = shapely.union_all(np.array(parts, dtype=object))
+    bank = shapely.difference(cell, bed)
+    out = []
+    for piece in _parts(bank):
+        if piece.area <= 1e-6:
+            continue
+        faces = _fill_pinned(piece, np.zeros((0, 2)), 0.0, kept=loop)
+        out.extend((c, ROW if len(c) == 4 else FILL) for c in faces)
+    flat = lambda points: np.zeros(len(np.asarray(points).reshape(-1, 2)))  # noqa: E731
+    for part in _parts(bed):
+        for piece, _ in _open_layout(part, angle=angle, anchor=anchor, step=near_m,
+                                     height_at=flat, tolerance_m=1.0, sample_m=1e9,
+                                     size=size):
+            ring = _ccw(np.asarray(piece.exterior.coords)[:-1, :2])
+            if len(piece.interiors):
+                out.extend((c, FILL) for c in _fill(piece))
+            elif len(ring) == 4 and _quad_score(ring) is not None:
+                out.append((ring, ROW))
+            elif len(ring) > 4:
+                out.append((ring, OPEN))
+            else:
+                out.extend((c, FILL) for c in _fill(piece))
+    covered = sum(abs(float(shapely.Polygon(c).area)) for c, _ in out)
+    if abs(covered - cell.area) > max(1e-3 * cell.area, 0.01):
+        return None
+    return out, 0
+
+
+def _rib_fill(cell, *, kind, near_m, size, height_at, tolerance_m, quay_zone=None,
+              laddered=False, open_faces=True, sample_m=2.0):
+    """One cell as faces: a ladder rung pair as one quad, a small cell from its
+    outline, an open one as a face per plain stretch of it (`open_faces`; the
+    lattice where the ground is not plain) or through a lattice turned to it.
+    `laddered` says the region's ribs are its ladder (narrow water: the bed is
+    carved by the loop the rungs are divided at, not by a loop along its
+    banks)."""
+    import shapely
+
+    from .terrain_mesh import FILL, OPEN, ROW, WATER, _ccw, _fill, _fill_pinned, _quad_score
 
     cell = shapely.orient_polygons(cell)
     coords = np.asarray(cell.exterior.coords)[:-1, :2]
@@ -321,19 +674,48 @@ def _rib_fill(cell, *, kind, near_m, size, height_at, tolerance_m, quay_zone=Non
     angle = _own_angle(cell, size)
     anchor = np.asarray(cell.centroid.coords[0])
     coarse = OPEN_FACTOR * near_m
-    points, _, _ = _lattice(cell, angle, coarse, anchor)
-    extra = _refined(cell, angle, near_m, anchor, height_at, tolerance_m)
-    if len(extra):
-        clear = shapely.distance(cell.boundary, shapely.points(extra)) > 0.45 * near_m
-        extra = extra[clear]
-    kept = np.vstack([extra, loop]) if len(loop) else extra
-    faces = _fill_pinned(cell, points, 0.45 * coarse, kept=kept)
-    return [(c, ROW if len(c) == 4 else FILL) for c in faces], len(extra)
+
+    def lattice_fill(piece, anchor, kept_points):
+        points, _, _ = _lattice(piece, angle, coarse, anchor)
+        extra = _refined(piece, angle, near_m, anchor, height_at, tolerance_m)
+        if len(extra):
+            clear = shapely.distance(piece.boundary, shapely.points(extra)) > 0.45 * near_m
+            extra = extra[clear]
+        kept = np.vstack([extra, kept_points]) if len(kept_points) else extra
+        faces = _fill_pinned(piece, points, 0.45 * coarse, kept=kept)
+        return [(c, ROW if len(c) == 4 else FILL) for c in faces], len(extra)
+
+    if not open_faces:
+        return lattice_fill(cell, anchor, loop)
+    if wet:
+        try:
+            faces = _bed_fill(cell, loop=loop, near_m=near_m, angle=angle, anchor=anchor,
+                              size=size)
+        except Exception as exc:  # noqa: BLE001 - the lattice always works
+            LOG.debug("ribcage: open water given the lattice: %s", exc)
+            faces = None
+        return faces if faces else lattice_fill(cell, anchor, loop)
+    out, refined = [], 0
+    for piece, plain in _open_layout(cell, angle=angle, anchor=anchor, step=near_m,
+                                     height_at=height_at, tolerance_m=tolerance_m,
+                                     sample_m=sample_m, size=size):
+        ring = _ccw(np.asarray(piece.exterior.coords)[:-1, :2])
+        if len(piece.interiors):
+            faces, extra = lattice_fill(piece, anchor, np.zeros((0, 2)))
+            out.extend(faces)
+            refined += extra
+        elif len(ring) == 4 and _quad_score(ring) is not None:
+            out.append((ring, ROW))
+        elif len(ring) > 4 and plain:
+            out.append((ring, OPEN))
+        else:
+            out.extend((c, FILL) for c in _fill(piece))
+    return out, refined
 
 
 def ribcage_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
                     paved_codes, narrow_codes=(), near_m: float = NEAR_CELL_M, quays=(),
-                    tolerance_m: float = 0.5):
+                    tolerance_m: float = 0.5, open_faces: bool = True):
     """The terrain mesh as a ribcage, conforming to every piece's outline.
 
     The same inputs and outputs as `layered_mesh.quad_terrain`, so the two
@@ -348,6 +730,7 @@ def ribcage_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
         FILL,
         GRID_SIZE,
         LAND,
+        OPEN,
         WATER,
         _cross_rungs,
         _fill,
@@ -428,6 +811,7 @@ def ribcage_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
                     tolerance_m=tolerance_m,
                     quay_zone=quay_zone if index in quay_parts else None,
                     laddered=bool(across.get(index)),
+                    open_faces=open_faces, sample_m=g,
                 )
                 if len(cell_faces) == 1 and len(cell_faces[0][0]) == 4:
                     ladder_cells += 1
@@ -463,12 +847,21 @@ def ribcage_terrain(terrain, pieces, bodies, *, codes_wet, depth_m,
         faces, terrain=terrain, bodies=bodies, depth_m=depth_m, shift=shift,
         size=size, quay_zone=quay_zone,
     )
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    open_area = 0.0
+    for f in np.flatnonzero(face_part == OPEN):
+        ring = vertices[loops[starts[f]: starts[f] + sizes[f]], :2]
+        ring = ring - ring.min(axis=0)
+        open_area += 0.5 * abs(float(np.sum(
+            ring[:, 0] * np.roll(ring[:, 1], -1) - np.roll(ring[:, 0], -1) * ring[:, 1])))
     stats = {
         "mesher": "ribcage",
         "ribs": int(sum(len(v) for v in across.values())),
         "ladder_cells": int(ladder_cells),
         "open_cells": int(open_cells),
         "open_quad_m": float(OPEN_FACTOR * near_m),
+        "open_faces": int((face_part == OPEN).sum()),
+        "open_faces_m2": round(float(open_area), 1),
         "points_refined_to_station_spacing": int(refined_points),
         "rungs_divided": int(divided),
         "roads_given_a_middle_loop": int(crowned),

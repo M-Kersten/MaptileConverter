@@ -562,11 +562,11 @@
       <div id="mesherField">
         <div class="flabel" data-explains="mesher">Grondindeling
           <span class="help" tabindex="0" role="button" aria-label="Over de grondindeling"
-            data-tip="Hoe de gelaagde grond in vlakken wordt verdeeld. <b>Raster</b>: rijen langs elke rand en één raster van vierkanten overal, gedraaid naar de straten. <b>Ribbenkast</b>: zoals het 3D-team het tekent, zonder raster: ribben dwars over wat smal is, grote vlakken gedraaid naar elke ruimte in wat breed is, en driehoeken alleen aan de randen. Ongeveer de helft van de vlakken.">?</span>
+            data-tip="Hoe de gelaagde grond in vlakken wordt verdeeld. <b>Ribbenkast</b>: zoals het 3D-team het tekent, zonder raster. Wat smal is krijgt ribben dwars over. Een brede ruimte waar de grond vlak ligt is één groot vlak; waar de grond beweegt wordt hij in stukken gesneden, langs lijnen die met de ruimte meedraaien. Een vijver heeft één vlakke bodem. <b>Raster</b>: rijen langs elke rand en één raster van vierkanten overal, gedraaid naar de straten. Over Hazeldonk 79.565 vlakken tegen 30.507 voor de ribbenkast.">?</span>
         </div>
         <div class="seg" role="radiogroup" aria-label="Grondindeling" id="mesher">
-          <label><input type="radio" name="mesher" value="quads" checked><span>Raster</span></label>
-          <label><input type="radio" name="mesher" value="ribcage"><span>Ribbenkast</span></label>
+          <label><input type="radio" name="mesher" value="ribcage" checked><span>Ribbenkast</span></label>
+          <label><input type="radio" name="mesher" value="quads"><span>Raster</span></label>
         </div>
       </div>
       <div>
@@ -1186,7 +1186,7 @@ const setRadio = (name, value) => {
   if (box) box.checked = true;
 };
 function styleValue() { return radioValue("style") || "layered"; }
-function mesherValue() { return radioValue("mesher") || "quads"; }
+function mesherValue() { return radioValue("mesher") || "ribcage"; }
 const MESHER_NAME = { quads: "Raster", ribcage: "Ribbenkast" };
 function detailValue() { return radioValue("detail") || "standard"; }
 function currentStyle() { return STYLE[styleValue()] || STYLE.layered; }
@@ -1320,7 +1320,7 @@ function areaMeta(a) {
   const parts = [];
   const style = areaStyle(a), detail = a.settings && a.settings.detail;
   if (style) parts.push(STYLE_NAME[style] || style);
-  if (style === "layered" && a.settings.mesher === "ribcage") parts.push(MESHER_NAME.ribcage);
+  if (style === "layered" && a.settings.mesher) parts.push(MESHER_NAME[a.settings.mesher] || a.settings.mesher);
   if (detail) parts.push(DETAIL_NAME[detail] || detail);
   const size = a.metadata && a.metadata.size_m;
   if (size) parts.push(`${Math.round(size)} m`);
@@ -1438,6 +1438,7 @@ function rebuild(a) {
   }
   $("name").value = a.name;
   const s = a.settings || {};
+  // A model saved without one was built before the choice: on the grid.
   setRadio("mesher", s.mesher || "quads");
   if (s.style) { setRadio("style", s.style); applyStyle(); }
   if (s.detail) { setRadio("detail", s.detail); updateQuality(); }

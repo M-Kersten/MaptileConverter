@@ -716,6 +716,49 @@ def _tag_surface_regions(
 EXTREMES = 50
 
 
+def face_triangles(co, loops, starts, totals):
+    """Every face as triangles of vertex ids, ``(T, 3)``, and the face of each.
+
+    Cut as the export cuts them (`_triangulate_on_export`): a quad from its
+    first corner to its third, an n-gon by Blender's beauty fill. The fill
+    keeps a concave n-gon inside its outline, where a fan from its first
+    corner would reach over the ground beside it, and turns away the
+    triangle of no area that three stations along one straight edge would
+    make, so the middle one is a corner of the ground too. Any triangle with
+    no area left in the plan is left out.
+    """
+    import bmesh
+
+    co = np.asarray(co, dtype=np.float64).reshape(-1, 3)
+    loops = np.asarray(loops, dtype=np.int64)
+    starts = np.asarray(starts, dtype=np.int64)
+    totals = np.asarray(totals, dtype=np.int64)
+    bm = bmesh.new()
+    try:
+        verts = [bm.verts.new(p) for p in co.tolist()]
+        bm.verts.index_update()
+        owner_layer = bm.faces.layers.int.new("owner")
+        for f, (s, n) in enumerate(zip(starts.tolist(), totals.tolist())):
+            try:
+                face = bm.faces.new([verts[i] for i in loops[s: s + n].tolist()])
+            except ValueError:  # the same face twice
+                continue
+            face[owner_layer] = f
+        # The fill works in the plane of each face, which a face made here
+        # does not know until it is told.
+        bm.normal_update()
+        bmesh.ops.triangulate(bm, faces=bm.faces[:], quad_method="FIXED", ngon_method="BEAUTY")
+        triangles = np.array([[v.index for v in face.verts] for face in bm.faces],
+                             dtype=np.int64).reshape(-1, 3)
+        owner = np.array([face[owner_layer] for face in bm.faces], dtype=np.int64)
+    finally:
+        bm.free()
+    a, b, c = (co[triangles[:, k], :2] for k in range(3))
+    area = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    keep = area > 1e-10
+    return triangles[keep], owner[keep]
+
+
 def _layered_summary(layered: dict) -> dict:
     """What the modifiers actually made of the layers, for the checks.
 
@@ -737,13 +780,10 @@ def _layered_summary(layered: dict) -> dict:
         # it, so a road reads 0 above it and a kerb its own height.
         g_vertices, g_starts, g_sizes = _GROUND["vertices"], _GROUND["starts"], _GROUND["sizes"]
         g_loops = _GROUND["loops"]
-        fans = g_sizes - 2
-        face = np.repeat(np.arange(len(g_sizes)), fans)
-        step = np.arange(int(fans.sum())) - np.repeat(np.cumsum(fans) - fans, fans) + 1
-        first = g_starts[face]
-        tris = [tuple(t) for t in np.column_stack(
-            [g_loops[first], g_loops[first + step], g_loops[first + step + 1]]
-        ).tolist()]
+        # An open space's n-gon by Blender's polygon fill: fanned from its
+        # first corner, a concave one reached over the ground beside it.
+        found, _ = face_triangles(g_vertices, g_loops, g_starts, g_sizes)
+        tris = [tuple(t) for t in found.tolist()]
         standing = [Vector(p) for p in g_vertices.tolist()]
         flat = [Vector((p.x, p.y, 0.0)) for p in standing]
         tree = BVHTree.FromPolygons(flat, tris)
@@ -769,11 +809,19 @@ def _layered_summary(layered: dict) -> dict:
         measured against.
         """
         mesh = obj.data
-        mesh.calc_loop_triangles()
         matrix = obj.matrix_world
         up = [matrix @ v.co for v in mesh.vertices]
         down = [Vector((p.x, p.y, 0.0)) for p in up]
-        faces = [tuple(t.vertices) for t in mesh.loop_triangles]
+        # Cut as the export cuts them: the viewport's own cut of an n-gon
+        # leaves triangles of no area along its straight edges.
+        starts = np.empty(len(mesh.polygons), dtype=np.int64)
+        totals = np.empty(len(mesh.polygons), dtype=np.int64)
+        mesh.polygons.foreach_get("loop_start", starts)
+        mesh.polygons.foreach_get("loop_total", totals)
+        corners = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", corners)
+        found, _ = face_triangles(np.array([tuple(p) for p in up]), corners, starts, totals)
+        faces = [tuple(t) for t in found.tolist()]
         return BVHTree.FromPolygons(down, faces), down, up, faces
 
     raw, evaluated = 0, 0
@@ -1135,8 +1183,9 @@ def _kerb_group(curb):
     -- and each point of the result raised by the height of the walkway as
     it came in, straight below it: a kerb stays 15 cm over the ground on a
     slope. The height is read off the walkway itself, laid flat with its
-    heights kept, so there is no terrain to read it from; the nearest point
-    of it is the point straight below, edge of the area included.
+    heights kept and cut into triangles as the export cuts it, so there is
+    no terrain to read it from; the nearest point of it is the point
+    straight below, edge of the area included.
     """
     name = f"{KERB_GROUP}_{curb.name}"
     group = bpy.data.node_groups.get(name)
@@ -1201,10 +1250,21 @@ def _kerb_group(curb):
         links.new(source.outputs[made.identifier], inner.inputs[item.identifier])
     built = next(s for s in inner.outputs if s.type == "GEOMETRY")
 
-    # Each point of the result raised by the walkway's height straight below.
+    # Each point of the result raised by the walkway's height straight below,
+    # read off the walkway cut into triangles as the export cuts it: an open
+    # space's n-gon cut the viewport's way gives a station along a straight
+    # edge no triangle of its own, and the kerb there the height of the edge.
+    cut = nodes.new("GeometryNodeTriangulate")
+    for key, value, attr in (("Quad Method", "Fixed", "quad_method"),
+                             ("N-gon Method", "Beauty", "ngon_method")):
+        if key in cut.inputs:
+            cut.inputs[key].default_value = value
+        elif hasattr(cut, attr):
+            setattr(cut, attr, value.upper())
+    links.new(lay.outputs[0], cut.inputs["Mesh"])
     sample = nodes.new("GeometryNodeSampleNearestSurface")
     sample.data_type = "FLOAT"
-    links.new(lay.outputs[0], sample.inputs["Mesh"])
+    links.new(cut.outputs[0], sample.inputs["Mesh"])
     links.new(capture.outputs["Height"], sample.inputs["Value"])
     flat_point, _ = level(nodes.new("GeometryNodeInputPosition").outputs[0])
     links.new(flat_point, sample.inputs["Sample Position"])
